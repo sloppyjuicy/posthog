@@ -1,29 +1,66 @@
-import React from 'react'
-import { Progress } from 'antd'
-import { red, volcano, orange, yellow, green } from '@ant-design/colors'
+import { LemonDivider } from '@posthog/lemon-ui'
+import { LemonProgress } from 'lib/lemon-ui/LemonProgress'
+import { Tooltip } from 'lib/lemon-ui/Tooltip'
 import zxcvbn from 'zxcvbn'
 
-export default function PasswordStrength({ password = '' }: { password: string }): JSX.Element {
-    // passwordScore is 0 if no password input
-    // passwordScore is 20, 40, 60, 80, or 100 if password input, based on zxcvbn score (which is 0, 1, 2, 3, or 4)
-    const passwordScore: number = password.length && zxcvbn(password).score * 20 + 20
+export type ValidatedPasswordResult = {
+    score: number // 0 is no passsword - otherwise 1-5,
+    feedback?: string
+}
+
+export function validatePassword(password: string = ''): ValidatedPasswordResult {
+    // Checks the validation against the zxcvbn library
+    // and any other custom validation we have
+
+    const result = zxcvbn(password)
+
+    if (result.score > 3 && password.length < 8) {
+        return {
+            score: 3,
+            feedback: 'Must be at least 8 characters long',
+        }
+    }
+
+    return {
+        score: password ? result.score + 1 : 0,
+        feedback: result.feedback.suggestions.join(' '),
+    }
+}
+
+export default function PasswordStrength({
+    validatedPassword,
+}: {
+    validatedPassword: ValidatedPasswordResult
+}): JSX.Element {
+    const { score, feedback } = validatedPassword
 
     return (
-        <Progress
-            percent={passwordScore}
-            size="small"
-            strokeColor={
-                passwordScore <= 20
-                    ? red.primary
-                    : passwordScore <= 40
-                    ? volcano.primary
-                    : passwordScore <= 60
-                    ? orange.primary
-                    : passwordScore <= 80
-                    ? yellow.primary
-                    : green.primary
+        <Tooltip
+            title={
+                <>
+                    Your password scores a{' '}
+                    <strong className="space-x-0.5">
+                        <span>{score}</span>
+                        <span>/</span>
+                        <span>5</span>
+                    </strong>
+                    {feedback ? (
+                        <>
+                            <LemonDivider />
+                            {feedback}
+                        </>
+                    ) : (
+                        <> 💪 Nice!</>
+                    )}
+                </>
             }
-            showInfo={false}
-        />
+        >
+            <span className="w-20">
+                <LemonProgress
+                    percent={score * 20}
+                    strokeColor={score <= 2 ? 'var(--danger)' : score <= 3 ? 'var(--warning)' : 'var(--success)'}
+                />
+            </span>
+        </Tooltip>
     )
 }

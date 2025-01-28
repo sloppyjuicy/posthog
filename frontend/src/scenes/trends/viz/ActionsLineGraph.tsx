@@ -1,62 +1,160 @@
-import React, { useState } from 'react'
-import { LineGraph } from '../../insights/LineGraph'
-import { useActions, useValues } from 'kea'
-import { trendsLogic } from 'scenes/trends/trendsLogic'
-import { LineGraphEmptyState } from '../../insights/EmptyStates'
-import { ACTIONS_BAR_CHART } from 'lib/constants'
-import { ChartParams } from '~/types'
-import { ViewType } from '~/types'
-import { router } from 'kea-router'
-import { personsModalLogic } from '../personsModalLogic'
+import { ChartType, defaults, LegendOptions } from 'chart.js'
+import { DeepPartial } from 'chart.js/dist/types/utils'
+import { useValues } from 'kea'
+import { Chart } from 'lib/Chart'
+import { insightAlertsLogic } from 'lib/components/Alerts/insightAlertsLogic'
+import { DateDisplay } from 'lib/components/DateDisplay'
+import { PropertyKeyInfo } from 'lib/components/PropertyKeyInfo'
+import { capitalizeFirstLetter, isMultiSeriesFormula } from 'lib/utils'
 import { insightLogic } from 'scenes/insights/insightLogic'
+import { datasetToActorsQuery } from 'scenes/trends/viz/datasetToActorsQuery'
+
+import { ChartDisplayType, ChartParams, GraphType } from '~/types'
+
+import { InsightEmptyState } from '../../insights/EmptyStates'
+import { LineGraph } from '../../insights/views/LineGraph/LineGraph'
+import { openPersonsModal } from '../persons-modal/PersonsModal'
+import { trendsDataLogic } from '../trendsDataLogic'
 
 export function ActionsLineGraph({
-    dashboardItemId,
-    color = 'white',
     inSharedMode = false,
     showPersonsModal = true,
+    context,
 }: ChartParams): JSX.Element | null {
-    const { insightProps } = useValues(insightLogic)
-    const logic = trendsLogic(insightProps)
-    const { filters, indexedResults, visibilityMap } = useValues(logic)
-    const { loadPeople } = useActions(personsModalLogic)
-    const [{ fromItem }] = useState(router.values.hashParams)
+    const { insightProps, insight } = useValues(insightLogic)
 
-    return indexedResults &&
-        indexedResults[0]?.data &&
-        indexedResults.filter((result) => result.count !== 0).length > 0 ? (
+    const {
+        indexedResults,
+        labelGroupType,
+        incompletenessOffsetFromEnd,
+        formula,
+        display,
+        interval,
+        showValuesOnSeries,
+        showPercentStackView,
+        supportsPercentStackView,
+        trendsFilter,
+        isLifecycle,
+        isStickiness,
+        isDataWarehouseSeries,
+        showLegend,
+        hiddenLegendIndexes,
+        querySource,
+        yAxisScaleType,
+        goalLines,
+    } = useValues(trendsDataLogic(insightProps))
+
+    const { alertThresholdLines } = useValues(
+        insightAlertsLogic({ insightId: insight.id!, insightLogicProps: insightProps })
+    )
+
+    const labels =
+        (indexedResults.length === 2 &&
+            indexedResults.every((x) => x.compare) &&
+            indexedResults.find((x) => x.compare_label === 'current')?.labels) ||
+        (indexedResults[0] && indexedResults[0].labels) ||
+        []
+
+    const shortenLifecycleLabels = (s: string | undefined): string =>
+        capitalizeFirstLetter(s?.split(' - ')?.[1] ?? s ?? 'None')
+
+    const legend: DeepPartial<LegendOptions<ChartType>> = {
+        display: false,
+    }
+    if (isLifecycle && !!showLegend) {
+        legend.display = true
+        legend.labels = {
+            generateLabels: (chart: Chart) => {
+                const labelElements = defaults.plugins.legend.labels.generateLabels(chart)
+                labelElements.forEach((elt) => {
+                    elt.text = shortenLifecycleLabels(elt.text)
+                })
+                return labelElements
+            },
+        }
+    }
+
+    if (
+        !(indexedResults && indexedResults[0]?.data && indexedResults.filter((result) => result.count !== 0).length > 0)
+    ) {
+        return <InsightEmptyState heading={context?.emptyStateHeading} detail={context?.emptyStateDetail} />
+    }
+
+    return (
         <LineGraph
             data-attr="trend-line-graph"
-            type={filters.insight === ViewType.LIFECYCLE || filters.display === ACTIONS_BAR_CHART ? 'bar' : 'line'}
-            color={color}
+            type={display === ChartDisplayType.ActionsBar || isLifecycle ? GraphType.Bar : GraphType.Line}
+            hiddenLegendIndexes={hiddenLegendIndexes}
             datasets={indexedResults}
-            visibilityMap={visibilityMap}
-            labels={(indexedResults[0] && indexedResults[0].labels) || []}
-            isInProgress={!filters.date_to}
-            dashboardItemId={dashboardItemId || fromItem /* used only for annotations, not to init any other logic */}
+            labels={labels}
             inSharedMode={inSharedMode}
-            interval={filters.interval}
+            labelGroupType={labelGroupType}
             showPersonsModal={showPersonsModal}
-            tooltipPreferAltTitle={filters.insight === ViewType.STICKINESS}
+            trendsFilter={trendsFilter}
+            formula={formula}
+            showValuesOnSeries={showValuesOnSeries}
+            showPercentStackView={showPercentStackView}
+            supportsPercentStackView={supportsPercentStackView}
+            yAxisScaleType={yAxisScaleType}
+            tooltip={
+                isLifecycle
+                    ? {
+                          altTitle: 'Users',
+                          altRightTitle: (_, date) => {
+                              return date
+                          },
+                          renderSeries: (_, datum) => {
+                              return shortenLifecycleLabels(datum.label)
+                          },
+                      }
+                    : undefined
+            }
+            isInProgress={!isStickiness && incompletenessOffsetFromEnd < 0}
+            isArea={display === ChartDisplayType.ActionsAreaGraph}
+            incompletenessOffsetFromEnd={incompletenessOffsetFromEnd}
+            legend={legend}
+            goalLines={[...alertThresholdLines, ...(goalLines || [])]}
             onClick={
-                dashboardItemId
-                    ? null
-                    : (point) => {
-                          const { dataset, day } = point
-                          loadPeople({
-                              action: dataset.action || 'session',
-                              label: dataset.label,
-                              date_from: day,
-                              date_to: day,
-                              filters: filters,
-                              breakdown_value:
-                                  dataset.breakdown_value === undefined ? dataset.status : dataset.breakdown_value,
-                              saveOriginal: true,
+                !showPersonsModal || isMultiSeriesFormula(formula) || isDataWarehouseSeries
+                    ? undefined
+                    : (payload) => {
+                          const { index, points } = payload
+
+                          const dataset = points.referencePoint.dataset
+                          if (!dataset) {
+                              return
+                          }
+
+                          const day = dataset.action?.days?.[index] ?? dataset?.days?.[index] ?? ''
+                          const label = dataset?.label ?? dataset?.labels?.[index] ?? ''
+
+                          const title = isStickiness ? (
+                              <>
+                                  <PropertyKeyInfo value={label || ''} disablePopover /> stickiness on day {day}
+                              </>
+                          ) : (
+                              (label: string) => (
+                                  <>
+                                      {label} on{' '}
+                                      <DateDisplay interval={interval || 'day'} date={day?.toString() || ''} />
+                                  </>
+                              )
+                          )
+
+                          openPersonsModal({
+                              title,
+                              query: datasetToActorsQuery({ dataset, query: querySource!, day }),
+                              additionalSelect:
+                                  isLifecycle || isStickiness
+                                      ? {}
+                                      : {
+                                            value_at_data_point: 'event_count',
+                                            matched_recordings: 'matched_recordings',
+                                        },
+                              orderBy: isLifecycle || isStickiness ? undefined : ['event_count DESC, actor_id DESC'],
                           })
                       }
             }
         />
-    ) : (
-        <LineGraphEmptyState color={color} isDashboard={!!dashboardItemId} />
     )
 }

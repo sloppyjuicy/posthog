@@ -1,58 +1,104 @@
-import { kea } from 'kea'
+import { actions, afterMount, connect, kea, listeners, path, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
 import { router } from 'kea-router'
-import api from 'lib/api'
-import { delay, idToKey, toParams } from 'lib/utils'
+import api, { PaginatedResponse } from 'lib/api'
+import { GENERATED_DASHBOARD_PREFIX } from 'lib/constants'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { idToKey, isUserLoggedIn } from 'lib/utils'
 import { DashboardEventSource, eventUsageLogic } from 'lib/utils/eventUsageLogic'
-import React from 'react'
-import { toast } from 'react-toastify'
-import { dashboardsModelType } from './dashboardsModelType'
-import { DashboardItemType, DashboardType } from '~/types'
-import { sceneLogic } from 'scenes/sceneLogic'
+import { permanentlyMount } from 'lib/utils/kea-logic-builders'
+import { teamLogic } from 'scenes/teamLogic'
 import { urls } from 'scenes/urls'
 
-export const dashboardsModel = kea<dashboardsModelType>({
-    actions: () => ({
+import { tagsModel } from '~/models/tagsModel'
+import { getQueryBasedDashboard } from '~/queries/nodes/InsightViz/utils'
+import { DashboardBasicType, DashboardTile, DashboardType, InsightShortId, QueryBasedInsightModel } from '~/types'
+
+import type { dashboardsModelType } from './dashboardsModelType'
+
+export const dashboardsModel = kea<dashboardsModelType>([
+    path(['models', 'dashboardsModel']),
+    connect({
+        actions: [tagsModel, ['loadTags']],
+    }),
+    actions(() => ({
+        // we page through the dashboards and need to manually track when that is finished
+        dashboardsFullyLoaded: true,
         delayedDeleteDashboard: (id: number) => ({ id }),
-        setDiveSourceId: (id: number | null) => ({ id }),
-        setLastDashboardId: (id: number) => ({ id }),
-        // this is moved out of dashboardLogic, so that you can click "undo" on a item move when already
+        setDiveSourceId: (id: InsightShortId | null) => ({ id }),
+        addDashboardSuccess: (dashboard: DashboardType<QueryBasedInsightModel>) => ({ dashboard }),
+        // this is moved out of dashboardLogic, so that you can click "undo" on an item move when already
         // on another dashboard - both dashboards can listen to and share this event, even if one is not yet mounted
-        updateDashboardItem: (item: DashboardItemType) => ({ item }),
-        // a side effect on this action exists in dashboardLogic so that individual refresh statuses can be bubbled up
-        // to dashboard items in dashboards
-        updateDashboardRefreshStatus: (
-            id: number | undefined | null,
-            refreshing: boolean | null,
-            last_refresh: string | null
-        ) => ({
-            id,
-            refreshing,
-            last_refresh,
+        // can provide extra dashboard ids if not all listeners will choose to respond to this action
+        // not providing a dashboard id is a signal that only listeners in the item.dashboards array should respond
+        // specifying `number` not `Pick<DashboardType, 'id'> because kea typegen couldn't figure out the import in `savedInsightsLogic`
+        // if an update is made against an insight it will hold color in dashboard context
+        updateDashboardInsight: (insight: QueryBasedInsightModel, extraDashboardIds?: number[]) => ({
+            insight,
+            extraDashboardIds,
         }),
         pinDashboard: (id: number, source: DashboardEventSource) => ({ id, source }),
         unpinDashboard: (id: number, source: DashboardEventSource) => ({ id, source }),
-        loadDashboards: true,
-        loadSharedDashboard: (shareToken: string) => ({ shareToken }),
-        addDashboard: ({ name, show, useTemplate }: { name: string; show?: boolean; useTemplate?: string }) => ({
+        duplicateDashboard: ({
+            id,
             name,
+            show,
+            duplicateTiles,
+        }: {
+            id: number
+            name?: string
+            show?: boolean
+            duplicateTiles?: boolean
+        }) => ({
+            id: id,
+            name: name || `#${id}`,
             show: show || false,
-            useTemplate: useTemplate || '',
+            duplicateTiles: duplicateTiles || false,
         }),
-    }),
-    loaders: ({ values }) => ({
-        rawDashboards: [
-            {} as Record<string, DashboardType>,
+        tileMovedToDashboard: (tile: DashboardTile<QueryBasedInsightModel>, dashboardId: number) => ({
+            tile,
+            dashboardId,
+        }),
+        tileRemovedFromDashboard: ({
+            tile,
+            dashboardId,
+        }: {
+            tile?: DashboardTile<QueryBasedInsightModel>
+            dashboardId?: number
+        }) => ({
+            tile,
+            dashboardId,
+        }),
+        tileAddedToDashboard: (dashboardId: number) => ({ dashboardId }),
+    })),
+    loaders(({ values, actions }) => ({
+        pagedDashboards: [
+            null as PaginatedResponse<DashboardBasicType> | null,
             {
-                loadDashboards: async (_, breakpoint) => {
-                    return await loadDashboardFromAPI(undefined, breakpoint)
-                },
-            },
-        ],
-        sharedDashboards: [
-            null as null | Record<string, DashboardType>,
-            {
-                loadSharedDashboard: async ({ shareToken }, breakpoint) => {
-                    return await loadDashboardFromAPI(shareToken, breakpoint)
+                loadDashboards: async (url?: string) => {
+                    // looking at a fully exported dashboard, return its contents
+                    const exportedDashboard = window.POSTHOG_EXPORTED_DATA?.dashboard
+                    if (exportedDashboard?.id && exportedDashboard?.tiles) {
+                        return {
+                            count: 1,
+                            next: null,
+                            previous: null,
+                            results: [getQueryBasedDashboard(exportedDashboard) as DashboardBasicType],
+                        }
+                    }
+
+                    if (!isUserLoggedIn()) {
+                        // If user is anonymous (i.e. viewing a shared dashboard logged out), don't load authenticated stuff
+                        return { count: 0, next: null, previous: null, results: [] }
+                    }
+                    const dashboards: PaginatedResponse<DashboardType> = await api.get(
+                        url || `api/environments/${teamLogic.values.currentTeamId}/dashboards/?limit=2000`
+                    )
+
+                    return {
+                        ...dashboards,
+                        results: dashboards.results?.map((dashboard) => getQueryBasedDashboard(dashboard)!),
+                    }
                 },
             },
         ],
@@ -60,22 +106,18 @@ export const dashboardsModel = kea<dashboardsModelType>({
         // to have the right payload ({ dashboard }) in the Success actions
         dashboard: {
             __default: null as null | DashboardType,
-            addDashboard: async ({ name, show, useTemplate }) => {
-                const result = (await api.create('api/dashboard', {
-                    name,
-                    use_template: useTemplate,
-                })) as DashboardType
-                if (show) {
-                    router.actions.push(urls.dashboard(result.id))
-                }
-                return result
-            },
-            updateDashboard: async ({ id, ...payload }, breakpoint) => {
+            updateDashboard: async ({ id, allowUndo, ...payload }, breakpoint) => {
                 if (!Object.entries(payload).length) {
                     return
                 }
-                await breakpoint(700)
-                const response = (await api.update(`api/dashboard/${id}`, payload)) as DashboardType
+                breakpoint()
+
+                const beforeChange = { ...values.rawDashboards[id] }
+
+                const response = await api.update<DashboardType>(
+                    `api/environments/${teamLogic.values.currentTeamId}/dashboards/${id}`,
+                    payload
+                )
                 const updatedAttribute = Object.keys(payload)[0]
                 if (updatedAttribute === 'name' || updatedAttribute === 'description' || updatedAttribute === 'tags') {
                     eventUsageLogic.actions.reportDashboardFrontEndUpdate(
@@ -83,32 +125,83 @@ export const dashboardsModel = kea<dashboardsModelType>({
                         values.rawDashboards[id]?.[updatedAttribute]?.length || 0,
                         payload[updatedAttribute].length
                     )
-                    if (updatedAttribute === 'name') {
-                        sceneLogic.actions.setPageTitle(response.name ? `${response.name} • Dashboard` : 'Dashboard')
+                    if (updatedAttribute === 'tags') {
+                        actions.loadTags()
                     }
                 }
-                return response
+                if (allowUndo) {
+                    lemonToast.success('Dashboard updated', {
+                        button: {
+                            label: 'Undo',
+                            action: async () => {
+                                const reverted = await api.update<DashboardType>(
+                                    `api/environments/${teamLogic.values.currentTeamId}/dashboards/${id}`,
+                                    beforeChange
+                                )
+                                actions.updateDashboardSuccess(getQueryBasedDashboard(reverted))
+                                lemonToast.success('Dashboard change reverted')
+                            },
+                        },
+                    })
+                }
+                return getQueryBasedDashboard(response)
             },
-            setIsSharedDashboard: async ({ id, isShared }) =>
-                (await api.update(`api/dashboard/${id}`, { is_shared: isShared })) as DashboardType,
-            deleteDashboard: async ({ id }) =>
-                (await api.update(`api/dashboard/${id}`, { deleted: true })) as DashboardType,
+            deleteDashboard: async ({ id, deleteInsights }) =>
+                getQueryBasedDashboard(
+                    await api.update(`api/environments/${teamLogic.values.currentTeamId}/dashboards/${id}`, {
+                        deleted: true,
+                        delete_insights: deleteInsights,
+                    })
+                ) as DashboardType<QueryBasedInsightModel>,
             restoreDashboard: async ({ id }) =>
-                (await api.update(`api/dashboard/${id}`, { deleted: false })) as DashboardType,
+                getQueryBasedDashboard(
+                    await api.update(`api/environments/${teamLogic.values.currentTeamId}/dashboards/${id}`, {
+                        deleted: false,
+                    })
+                ) as DashboardType<QueryBasedInsightModel>,
             pinDashboard: async ({ id, source }) => {
-                const response = (await api.update(`api/dashboard/${id}`, { pinned: true })) as DashboardType
+                const response = await api.update(
+                    `api/environments/${teamLogic.values.currentTeamId}/dashboards/${id}`,
+                    {
+                        pinned: true,
+                    }
+                )
                 eventUsageLogic.actions.reportDashboardPinToggled(true, source)
-                return response
+                return getQueryBasedDashboard(response)!
             },
             unpinDashboard: async ({ id, source }) => {
-                const response = (await api.update(`api/dashboard/${id}`, { pinned: false })) as DashboardType
+                const response = await api.update<DashboardType>(
+                    `api/environments/${teamLogic.values.currentTeamId}/dashboards/${id}`,
+                    {
+                        pinned: false,
+                    }
+                )
                 eventUsageLogic.actions.reportDashboardPinToggled(false, source)
-                return response
+                return getQueryBasedDashboard(response)!
+            },
+            duplicateDashboard: async ({ id, name, show, duplicateTiles }) => {
+                const result = await api.create<DashboardType>(
+                    `api/environments/${teamLogic.values.currentTeamId}/dashboards/`,
+                    {
+                        use_dashboard: id,
+                        name: `${name} (Copy)`,
+                        duplicate_tiles: duplicateTiles,
+                    }
+                )
+                if (show) {
+                    router.actions.push(urls.dashboard(result.id))
+                }
+                return getQueryBasedDashboard(result)!
             },
         },
-    }),
-
-    reducers: {
+    })),
+    reducers({
+        pagingDashboardsCompleted: [
+            false,
+            {
+                dashboardsFullyLoaded: () => true,
+            },
+        ],
         redirect: [
             true,
             {
@@ -116,140 +209,139 @@ export const dashboardsModel = kea<dashboardsModelType>({
                 restoreDashboard: (state, { redirect }) => (typeof redirect !== 'undefined' ? redirect : state),
             },
         ],
-        rawDashboards: {
-            // NB! Kea-TypeGen assignes the type of the reducer to the abcSuccess actions.
-            // This means we must get rid of the `| null` manually until it's fixed:
-            // https://github.com/keajs/kea-typegen/issues/10
-            addDashboardSuccess: (state, { dashboard }) => ({ ...state, [dashboard.id]: dashboard }),
-            restoreDashboardSuccess: (state, { dashboard }) => ({ ...state, [dashboard.id]: dashboard }),
-            updateDashboardSuccess: (state, { dashboard }) =>
-                dashboard ? { ...state, [dashboard.id]: dashboard } : state,
-            setIsSharedDashboardSuccess: (state, { dashboard }) => ({ ...state, [dashboard.id]: dashboard }),
-            deleteDashboardSuccess: (state, { dashboard }) => ({
-                ...state,
-                [dashboard.id]: { ...state[dashboard.id], deleted: true },
-            }),
-            delayedDeleteDashboard: (state, { id }) => {
-                // this gives us time to leave the /dashboard/:deleted_id page
-                const { [id]: _discard, ...rest } = state // eslint-disable-line
-                return rest
-            },
-            pinDashboardSuccess: (state, { dashboard }) => ({ ...state, [dashboard.id]: dashboard }),
-            unpinDashboardSuccess: (state, { dashboard }) => ({ ...state, [dashboard.id]: dashboard }),
-        },
-        lastDashboardId: [
-            null as null | number,
-            { persist: true },
+        rawDashboards: [
+            {} as Record<string, DashboardBasicType | DashboardType<QueryBasedInsightModel>>,
             {
-                setLastDashboardId: (_, { id }) => id,
+                loadDashboardsSuccess: (state, { pagedDashboards }) => {
+                    if (!pagedDashboards) {
+                        return state
+                    }
+                    return { ...state, ...idToKey(pagedDashboards.results) }
+                },
+                // NB! Kea-TypeGen assignes the type of the reducer to the abcSuccess actions.
+                // This means we must get rid of the `| null` manually until it's fixed:
+                // https://github.com/keajs/kea-typegen/issues/10
+                addDashboardSuccess: (state, { dashboard }) => ({ ...state, [dashboard.id]: dashboard }),
+                restoreDashboardSuccess: (state, { dashboard }) => ({ ...state, [dashboard.id]: dashboard }),
+                updateDashboardSuccess: (state, { dashboard }) =>
+                    dashboard ? { ...state, [dashboard.id]: dashboard } : state,
+                deleteDashboardSuccess: (state, { dashboard }) => ({
+                    ...state,
+                    [dashboard.id]: { ...state[dashboard.id], deleted: true },
+                }),
+                delayedDeleteDashboard: (state, { id }) => {
+                    // This gives us time to leave the /dashboard/:deleted_id page
+                    const { [id]: _discard, ...rest } = state
+                    return rest
+                },
+                pinDashboardSuccess: (state, { dashboard }) => ({ ...state, [dashboard.id]: dashboard }),
+                unpinDashboardSuccess: (state, { dashboard }) => ({ ...state, [dashboard.id]: dashboard }),
+                duplicateDashboardSuccess: (state, { dashboard }) => ({
+                    ...state,
+                    [dashboard.id]: { ...dashboard, _highlight: true },
+                }),
             },
         ],
-        diveSourceId: [
-            null as null | number,
-            { persist: true },
-            {
-                setDiveSourceId: (_, { id }) => id,
-            },
-        ],
-    },
-
-    selectors: ({ selectors }) => ({
-        sortedDashboards: [
+    }),
+    selectors(({ selectors }) => ({
+        nameSortedDashboards: [
             () => [selectors.rawDashboards],
             (rawDashboards) => {
-                return Object.values(rawDashboards).sort((a, b) =>
-                    (a.name ?? 'Untitled').localeCompare(b.name ?? 'Untitled')
+                return [...Object.values(rawDashboards)]
+                    .filter((dashboard) => !(dashboard.name ?? 'Untitled').startsWith(GENERATED_DASHBOARD_PREFIX))
+                    .sort(nameCompareFunction)
+            },
+        ],
+        /** Display dashboards are additionally sorted by pin status: pinned first. */
+        pinSortedDashboards: [
+            () => [selectors.nameSortedDashboards],
+            (nameSortedDashboards) => {
+                return [...nameSortedDashboards].sort(
+                    (a, b) => (Number(b.pinned) - Number(a.pinned)) * 10 + nameCompareFunction(a, b)
                 )
             },
         ],
-        dashboards: [
-            () => [selectors.sortedDashboards],
-            (sortedDashboards) => {
-                return [...sortedDashboards.filter((d) => d.pinned), ...sortedDashboards.filter((d) => !d.pinned)]
-            },
-        ],
         dashboardsLoading: [
-            () => [selectors.rawDashboardsLoading, selectors.sharedDashboardsLoading],
-            (dashesLoading, sharedLoading) => dashesLoading || sharedLoading,
+            () => [selectors.pagedDashboardsLoading, selectors.pagingDashboardsCompleted],
+            (pagedDashboardsLoading, pagingDashboardsCompleted) => pagedDashboardsLoading || !pagingDashboardsCompleted,
         ],
-        pinnedDashboards: [() => [selectors.dashboards], (dashboards) => dashboards.filter((d) => d.pinned)],
-    }),
-
-    events: ({ actions }) => ({
-        afterMount: () => actions.loadDashboards(),
-    }),
-
-    listeners: ({ actions, values }) => ({
+        pinnedDashboards: [
+            () => [selectors.nameSortedDashboards],
+            (nameSortedDashboards) => nameSortedDashboards.filter((d) => d.pinned),
+        ],
+    })),
+    listeners(({ actions, values }) => ({
+        loadDashboardsSuccess: ({ pagedDashboards }) => {
+            if (pagedDashboards?.next) {
+                actions.loadDashboards(pagedDashboards.next)
+            } else {
+                actions.dashboardsFullyLoaded()
+            }
+        },
         addDashboardSuccess: ({ dashboard }) => {
-            toast(`Dashboard "${dashboard.name}" created!`)
+            if (router.values.location.pathname.includes('onboarding')) {
+                // don't send a toast if we're in onboarding
+                return
+            }
+            lemonToast.success(<>Dashboard created</>, {
+                button: {
+                    label: 'View',
+                    action: () => router.actions.push(urls.dashboard(dashboard.id)),
+                },
+            })
         },
 
         restoreDashboardSuccess: ({ dashboard }) => {
-            toast(`Dashboard "${dashboard.name}" restored!`)
+            lemonToast.success(
+                <>
+                    Dashboard <b>{dashboard.name}</b> restored
+                </>
+            )
             if (values.redirect) {
                 router.actions.push(urls.dashboard(dashboard.id))
             }
         },
 
         deleteDashboardSuccess: async ({ dashboard }) => {
-            const toastId = toast(
-                <span>
-                    Dashboard "{dashboard.name}" deleted!{' '}
-                    <a
-                        href="#"
-                        onClick={(e) => {
-                            e.preventDefault()
+            lemonToast.success(
+                <>
+                    Dashboard <b>{dashboard.name}</b> deleted
+                </>,
+                {
+                    button: {
+                        label: 'Undo',
+                        action: () => {
                             actions.restoreDashboard({ id: dashboard.id, redirect: values.redirect })
-                            toast.dismiss(toastId)
-                        }}
-                    >
-                        Undo
-                    </a>
-                </span>
-            )
-
-            const { id } = dashboard
-            const nextDashboard = [...values.pinnedDashboards, ...values.dashboards].find(
-                (d) => d.id !== id && !d.deleted
-            )
-
-            if (values.redirect) {
-                if (nextDashboard) {
-                    router.actions.push(urls.dashboard(nextDashboard.id))
-                } else {
-                    router.actions.push(urls.dashboards())
+                        },
+                    },
                 }
+            )
 
-                await delay(500)
-            }
-
-            actions.delayedDeleteDashboard(id)
+            actions.delayedDeleteDashboard(dashboard.id)
         },
-    }),
 
-    urlToAction: ({ actions }) => ({
-        '/dashboard/:id': ({ id }, { dive_source_id: diveSourceId }) => {
-            if (id) {
-                actions.setLastDashboardId(parseInt(id))
-            }
-            if (diveSourceId !== undefined && diveSourceId !== null) {
-                actions.setDiveSourceId(diveSourceId)
-            } else {
-                actions.setDiveSourceId(null)
-            }
+        duplicateDashboardSuccess: async ({ dashboard }) => {
+            lemonToast.success(
+                <>
+                    Dashboard copied as <b>{dashboard.name}</b>
+                </>
+            )
         },
+    })),
+    afterMount(({ actions }) => {
+        actions.loadDashboards()
     }),
-})
+    permanentlyMount(),
+])
 
-async function loadDashboardFromAPI(
-    shareToken: string | undefined,
-    breakpoint: (ms: number) => Promise<void>
-): Promise<Record<string, DashboardType>> {
-    await breakpoint(50)
-    try {
-        const { results } = await api.get(`api/dashboard?${toParams({ share_token: shareToken })}`)
-        return idToKey(results)
-    } catch {
-        return {}
+export function nameCompareFunction(a: DashboardBasicType, b: DashboardBasicType): number {
+    if (a.pinned !== b.pinned) {
+        return b.pinned ? 1 : -1
     }
+
+    // No matter where we're comparing dashboards, we want to sort generated dashboards last
+    const firstName = a.name ?? 'Untitled'
+    const secondName = b.name ?? 'Untitled'
+
+    return firstName.localeCompare(secondName)
 }

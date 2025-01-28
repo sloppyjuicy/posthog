@@ -1,23 +1,55 @@
-from typing import Any, Dict, Optional, cast
+import datetime
+import time
+from typing import Any, Optional, cast
+from uuid import uuid4
 
 from django.conf import settings
 from django.contrib.auth import authenticate, login
 from django.contrib.auth import views as auth_views
 from django.contrib.auth.password_validation import validate_password
-from django.contrib.auth.tokens import default_token_generator
+from django.contrib.auth.signals import user_logged_in
+from django.contrib.auth.tokens import (
+    PasswordResetTokenGenerator as DefaultPasswordResetTokenGenerator,
+)
 from django.core.exceptions import ValidationError
-from django.http import JsonResponse
+from django.core.signing import BadSignature
+from django.db import transaction
+from django.dispatch import receiver
+from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import redirect
-from django.utils import timezone
 from django.views.decorators.csrf import csrf_protect
+from django_otp import login as otp_login
 from loginas.utils import is_impersonated_session, restore_original_login
 from rest_framework import mixins, permissions, serializers, status, viewsets
+from rest_framework.exceptions import APIException
 from rest_framework.request import Request
 from rest_framework.response import Response
+from sentry_sdk import capture_exception
+from social_django.views import auth
+from two_factor.utils import default_device
+from two_factor.views.core import REMEMBER_COOKIE_PREFIX
+from two_factor.views.utils import (
+    get_remember_device_cookie,
+    validate_remember_device_cookie,
+)
+from django_otp.plugins.otp_static.models import StaticDevice
 
-from posthog.email import EmailMessage, is_email_available
+from posthog.api.email_verification import EmailVerifier, is_email_verification_disabled
+from posthog.email import is_email_available
 from posthog.event_usage import report_user_logged_in, report_user_password_reset
-from posthog.models import User
+from posthog.models import OrganizationDomain, User
+from posthog.rate_limit import UserPasswordResetThrottle
+from posthog.tasks.email import send_password_reset
+from posthog.utils import get_instance_available_sso_providers
+
+
+@receiver(user_logged_in)
+def post_login(sender, user, request: HttpRequest, **kwargs):
+    """
+    This is the most reliable way of setting this value as it will be called regardless of where the login occurs
+    including tests.
+    """
+    request.session[settings.SESSION_COOKIE_CREATED_AT_KEY] = time.time()
 
 
 @csrf_protect
@@ -31,8 +63,6 @@ def logout(request):
         return redirect("/admin/")
 
     response = auth_views.logout_then_login(request)
-    response.delete_cookie(settings.TOOLBAR_COOKIE_NAME, "/")
-
     return response
 
 
@@ -49,38 +79,123 @@ def axes_locked_out(*args, **kwargs):
     )
 
 
+def sso_login(request: HttpRequest, backend: str) -> HttpResponse:
+    request.session.flush()
+    sso_providers = get_instance_available_sso_providers()
+    # because SAML is configured at the domain-level, we have to assume it's enabled for someone in the instance
+    sso_providers["saml"] = settings.EE_AVAILABLE
+
+    if backend not in sso_providers:
+        return redirect(f"/login?error_code=invalid_sso_provider")
+
+    if not sso_providers[backend]:
+        return redirect(f"/login?error_code=improperly_configured_sso")
+
+    return auth(request, backend)
+
+
+class TwoFactorRequired(APIException):
+    status_code = 401
+    default_detail = "2FA is required."
+    default_code = "2fa_required"
+
+
 class LoginSerializer(serializers.Serializer):
     email = serializers.EmailField()
     password = serializers.CharField()
 
-    def to_representation(self, instance: Any) -> Dict[str, Any]:
+    def to_representation(self, instance: Any) -> dict[str, Any]:
         return {"success": True}
 
-    def create(self, validated_data: Dict[str, str]) -> Any:
-        if getattr(settings, "SAML_ENFORCED", False):
-            raise serializers.ValidationError("This instance only allows SAML login.", code="saml_enforced")
+    def _check_if_2fa_required(self, user: User) -> bool:
+        device = default_device(user)
+        if not device:
+            return False
+        # If user has a valid 2FA cookie, use that instead of showing them the 2FA screen
+        for key, value in self.context["request"].COOKIES.items():
+            if key.startswith(REMEMBER_COOKIE_PREFIX) and value:
+                try:
+                    if validate_remember_device_cookie(value, user=user, otp_device_id=device.persistent_id):
+                        user.otp_device = device  # type: ignore
+                        device.throttle_reset()
+                        return False
+                except BadSignature:
+                    # Workaround for signature mismatches due to Django upgrades.
+                    # See https://github.com/PostHog/posthog/issues/19350
+                    pass
+        return True
+
+    def create(self, validated_data: dict[str, str]) -> Any:
+        # Check SSO enforcement (which happens at the domain level)
+        sso_enforcement = OrganizationDomain.objects.get_sso_enforcement_for_email_address(validated_data["email"])
+        if sso_enforcement:
+            raise serializers.ValidationError(
+                f"You can only login with SSO for this account ({sso_enforcement}).",
+                code="sso_enforced",
+            )
 
         request = self.context["request"]
         user = cast(
-            Optional[User], authenticate(request, email=validated_data["email"], password=validated_data["password"])
+            Optional[User],
+            authenticate(
+                request,
+                email=validated_data["email"],
+                password=validated_data["password"],
+            ),
         )
 
         if not user:
             raise serializers.ValidationError("Invalid email or password.", code="invalid_credentials")
 
+        # We still let them log in if is_email_verified is null so existing users don't get locked out
+        if is_email_available() and user.is_email_verified is not True and not is_email_verification_disabled(user):
+            EmailVerifier.create_token_and_send_email_verification(user)
+            # If it's None, we want to let them log in still since they are an existing user
+            # If it's False, we want to tell them to check their email
+            if user.is_email_verified is False:
+                raise serializers.ValidationError(
+                    "Your account is awaiting verification. Please check your email for a verification link.",
+                    code="not_verified",
+                )
+
+        if self._check_if_2fa_required(user):
+            request.session["user_authenticated_but_no_2fa"] = user.pk
+            request.session["user_authenticated_time"] = time.time()
+            raise TwoFactorRequired()
+
         login(request, user, backend="django.contrib.auth.backends.ModelBackend")
-        report_user_logged_in(user.distinct_id, social_provider="")
+
+        report_user_logged_in(user, social_provider="")
         return user
+
+
+class LoginPrecheckSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+    def to_representation(self, instance: dict[str, str]) -> dict[str, Any]:
+        return instance
+
+    def create(self, validated_data: dict[str, str]) -> Any:
+        email = validated_data.get("email", "")
+        # TODO: Refactor methods below to remove duplicate queries
+        return {
+            "sso_enforcement": OrganizationDomain.objects.get_sso_enforcement_for_email_address(email),
+            "saml_available": OrganizationDomain.objects.get_is_saml_available_for_email(email),
+        }
 
 
 class NonCreatingViewSetMixin(mixins.CreateModelMixin):
     def create(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         """
-            Method `create()` is overridden to send a more appropriate HTTP 
-            status code (as no object is actually created).
-            """
+        Method `create()` is overridden to send a more appropriate HTTP
+        status code (as no object is actually created).
+        """
         response = super().create(request, *args, **kwargs)
         response.status_code = getattr(self, "SUCCESS_STATUS_CODE", status.HTTP_200_OK)
+
+        if response.status_code == status.HTTP_204_NO_CONTENT:
+            response.data = None
+
         return response
 
 
@@ -88,16 +203,89 @@ class LoginViewSet(NonCreatingViewSetMixin, viewsets.GenericViewSet):
     queryset = User.objects.none()
     serializer_class = LoginSerializer
     permission_classes = (permissions.AllowAny,)
+    # NOTE: Throttling is handled by the `axes` package
+
+
+class TwoFactorSerializer(serializers.Serializer):
+    token = serializers.CharField(write_only=True)
+
+
+class TwoFactorViewSet(NonCreatingViewSetMixin, viewsets.GenericViewSet):
+    serializer_class = TwoFactorSerializer
+    queryset = User.objects.none()
+    permission_classes = (permissions.AllowAny,)
+
+    def _token_is_valid(self, request, user: User, device) -> Response:
+        login(request, user, backend="django.contrib.auth.backends.ModelBackend")
+        otp_login(request, device)
+        report_user_logged_in(user, social_provider="")
+        device.throttle_reset()
+
+        cookie_key = REMEMBER_COOKIE_PREFIX + str(uuid4())
+        cookie_value = get_remember_device_cookie(user=user, otp_device_id=device.persistent_id)
+        response = Response({"success": True})
+        response.set_cookie(
+            cookie_key,
+            cookie_value,
+            max_age=settings.TWO_FACTOR_REMEMBER_COOKIE_AGE,
+            domain=getattr(settings, "TWO_FACTOR_REMEMBER_COOKIE_DOMAIN", None),
+            path=getattr(settings, "TWO_FACTOR_REMEMBER_COOKIE_PATH", "/"),
+            secure=getattr(settings, "TWO_FACTOR_REMEMBER_COOKIE_SECURE", True),
+            httponly=getattr(settings, "TWO_FACTOR_REMEMBER_COOKIE_HTTPONLY", True),
+            samesite=getattr(settings, "TWO_FACTOR_REMEMBER_COOKIE_SAMESITE", "Strict"),
+        )
+        return response
+
+    def create(self, request: Request, *args: Any, **kwargs: Any) -> Any:
+        user = User.objects.get(pk=request.session["user_authenticated_but_no_2fa"])
+        expiration_time = request.session["user_authenticated_time"] + getattr(
+            settings, "TWO_FACTOR_LOGIN_TIMEOUT", 600
+        )
+        if int(time.time()) > expiration_time:
+            raise serializers.ValidationError(
+                detail="Login attempt has expired. Re-enter username/password.",
+                code="2fa_expired",
+            )
+
+        with transaction.atomic():
+            # First try TOTP device
+            totp_device = default_device(user)
+            if totp_device:
+                is_allowed = totp_device.verify_is_allowed()
+                if not is_allowed[0]:
+                    raise serializers.ValidationError(detail="Too many attempts.", code="2fa_too_many_attempts")
+                if totp_device.verify_token(request.data["token"]):
+                    return self._token_is_valid(request, user, totp_device)
+                totp_device.throttle_increment()
+
+            # Then try backup codes
+            # Backup codes are in place in case a user's device is lost or unavailable.
+            # They can be consumed in any order; each token will be removed from the
+            # database as soon as it is used.
+            static_device = StaticDevice.objects.filter(user=user).first()
+            if static_device and static_device.verify_token(request.data["token"]):
+                return self._token_is_valid(request, user, static_device)
+
+        raise serializers.ValidationError(detail="Invalid authentication code", code="2fa_invalid")
+
+
+class LoginPrecheckViewSet(NonCreatingViewSetMixin, viewsets.GenericViewSet):
+    queryset = User.objects.none()
+    serializer_class = LoginPrecheckSerializer
+    permission_classes = (permissions.AllowAny,)
 
 
 class PasswordResetSerializer(serializers.Serializer):
     email = serializers.EmailField(write_only=True)
 
     def create(self, validated_data):
+        email = validated_data.pop("email")
 
-        if getattr(settings, "SAML_ENFORCED", False):
+        # Check SSO enforcement (which happens at the domain level)
+        if OrganizationDomain.objects.get_sso_enforcement_for_email_address(email):
             raise serializers.ValidationError(
-                "Password reset is disabled because SAML login is enforced.", code="saml_enforced"
+                "Password reset is disabled because SSO login is enforced for this domain.",
+                code="sso_enforced",
             )
 
         if not is_email_available():
@@ -106,31 +294,16 @@ class PasswordResetSerializer(serializers.Serializer):
                 code="email_not_available",
             )
 
-        email = validated_data.pop("email")
         try:
-            user = User.objects.get(email=email)
+            user = User.objects.filter(is_active=True).get(email=email)
         except User.DoesNotExist:
             user = None
 
         if user:
-            token = default_token_generator.make_token(user)
-
-            message = EmailMessage(
-                campaign_key=f"password-reset-{user.uuid}-{timezone.now()}",
-                subject=f"Reset your PostHog password",
-                template_name="password_reset",
-                template_context={
-                    "preheader": "Please follow the link inside to reset your password.",
-                    "link": f"/reset/{user.uuid}/{token}",
-                    "cloud": settings.MULTI_TENANCY,
-                    "site_url": settings.SITE_URL,
-                    "social_providers": list(user.social_auth.values_list("provider", flat=True)),
-                },
-            )
-            message.add_recipient(email)
-            message.send()
-
-        # TODO: Limit number of requests for password reset emails
+            user.requested_password_reset_at = datetime.datetime.now(datetime.UTC)
+            user.save()
+            token = password_reset_token_generator.make_token(user)
+            send_password_reset(user.id, token)
 
         return True
 
@@ -145,17 +318,26 @@ class PasswordResetCompleteSerializer(serializers.Serializer):
             return True
 
         try:
-            user = User.objects.get(uuid=self.context["view"].kwargs["user_uuid"])
+            user = User.objects.filter(is_active=True).get(uuid=self.context["view"].kwargs["user_uuid"])
         except User.DoesNotExist:
+            capture_exception(
+                Exception("User not found in password reset serializer"),
+                {"user_uuid": self.context["view"].kwargs["user_uuid"]},
+            )
             raise serializers.ValidationError(
-                {"token": ["This reset token is invalid or has expired."]}, code="invalid_token"
+                {"token": ["This reset token is invalid or has expired."]},
+                code="invalid_token",
             )
 
-        if not default_token_generator.check_token(user, validated_data["token"]):
-            raise serializers.ValidationError(
-                {"token": ["This reset token is invalid or has expired."]}, code="invalid_token"
+        if not password_reset_token_generator.check_token(user, validated_data["token"]):
+            capture_exception(
+                Exception("Invalid password reset token in serializer"),
+                {"user_uuid": user.uuid, "token": validated_data["token"]},
             )
-
+            raise serializers.ValidationError(
+                {"token": ["This reset token is invalid or has expired."]},
+                code="invalid_token",
+            )
         password = validated_data["password"]
         try:
             validate_password(password, user)
@@ -163,6 +345,7 @@ class PasswordResetCompleteSerializer(serializers.Serializer):
             raise serializers.ValidationError({"password": e.messages})
 
         user.set_password(password)
+        user.requested_password_reset_at = None
         user.save()
 
         login(self.context["request"], user, backend="django.contrib.auth.backends.ModelBackend")
@@ -174,6 +357,7 @@ class PasswordResetViewSet(NonCreatingViewSetMixin, viewsets.GenericViewSet):
     queryset = User.objects.none()
     serializer_class = PasswordResetSerializer
     permission_classes = (permissions.AllowAny,)
+    throttle_classes = [UserPasswordResetThrottle]
     SUCCESS_STATUS_CODE = status.HTTP_204_NO_CONTENT
 
 
@@ -184,7 +368,6 @@ class PasswordResetCompleteViewSet(NonCreatingViewSetMixin, mixins.RetrieveModel
     SUCCESS_STATUS_CODE = status.HTTP_204_NO_CONTENT
 
     def get_object(self):
-
         token = self.request.query_params.get("token")
         user_uuid = self.kwargs.get("user_uuid")
 
@@ -196,13 +379,23 @@ class PasswordResetCompleteViewSet(NonCreatingViewSetMixin, mixins.RetrieveModel
             return {"success": True, "token": token}
 
         try:
-            user = User.objects.get(uuid=user_uuid)
+            user = User.objects.filter(is_active=True).get(uuid=user_uuid)
         except User.DoesNotExist:
-            user = None
-
-        if not user or not default_token_generator.check_token(user, token):
+            capture_exception(
+                Exception("User not found in password reset viewset"), {"user_uuid": user_uuid, "token": token}
+            )
             raise serializers.ValidationError(
-                {"token": ["This reset token is invalid or has expired."]}, code="invalid_token"
+                {"token": ["This reset token is invalid or has expired."]},
+                code="invalid_token",
+            )
+
+        if not password_reset_token_generator.check_token(user, token):
+            capture_exception(
+                Exception("Invalid password reset token in viewset"), {"user_uuid": user_uuid, "token": token}
+            )
+            raise serializers.ValidationError(
+                {"token": ["This reset token is invalid or has expired."]},
+                code="invalid_token",
             )
 
         return {"success": True, "token": token}
@@ -210,4 +403,16 @@ class PasswordResetCompleteViewSet(NonCreatingViewSetMixin, mixins.RetrieveModel
     def retrieve(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         response = super().retrieve(request, *args, **kwargs)
         response.status_code = self.SUCCESS_STATUS_CODE
+        response.data = None
         return response
+
+
+class PasswordResetTokenGenerator(DefaultPasswordResetTokenGenerator):
+    def _make_hash_value(self, user, timestamp):
+        # Due to type differences between the user model and the token generator, we need to
+        # re-fetch the user from the database to get the correct type.
+        usable_user: User = User.objects.get(pk=user.pk)
+        return f"{user.pk}{user.email}{usable_user.requested_password_reset_at}{timestamp}"
+
+
+password_reset_token_generator = PasswordResetTokenGenerator()

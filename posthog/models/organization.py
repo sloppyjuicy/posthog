@@ -1,5 +1,8 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
+import sys
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any, Optional, TypedDict, Union
 
+import structlog
 from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
 from django.db import models, transaction
@@ -9,19 +12,48 @@ from django.dispatch import receiver
 from django.utils import timezone
 from rest_framework import exceptions
 
-from posthog.constants import MAX_SLUG_LENGTH, AvailableFeature
-from posthog.email import is_email_available
-from posthog.utils import mask_email_address
+from posthog.cloud_utils import is_cloud
+from posthog.constants import INVITE_DAYS_VALIDITY, MAX_SLUG_LENGTH, AvailableFeature
+from posthog.models.utils import (
+    LowercaseSlugField,
+    UUIDModel,
+    create_with_slug,
+    sane_repr,
+)
+from posthog.plugins.plugin_server_api import (
+    reset_available_product_features_cache_on_workers,
+)
 
-from .utils import LowercaseSlugField, UUIDModel, create_with_slug, sane_repr
-
-try:
-    from ee.models.license import License
-except ImportError:
-    License = None  # type: ignore
+if TYPE_CHECKING:
+    from posthog.models import Team, User
 
 
-INVITE_DAYS_VALIDITY = 3  # number of days for which team invites are valid
+logger = structlog.get_logger(__name__)
+
+
+class OrganizationUsageResource(TypedDict):
+    usage: Optional[int]
+    limit: Optional[int]
+    todays_usage: Optional[int]
+
+
+# The "usage" field is essentially cached info from the Billing Service to be used for visual reporting to the user
+# as well as for enforcing limits.
+class OrganizationUsageInfo(TypedDict):
+    events: Optional[OrganizationUsageResource]
+    recordings: Optional[OrganizationUsageResource]
+    rows_synced: Optional[OrganizationUsageResource]
+    period: Optional[list[str]]
+
+
+class ProductFeature(TypedDict):
+    key: str
+    name: str
+    description: str
+    unit: Optional[str]
+    limit: Optional[int]
+    note: Optional[str]
+    is_plan_default: bool
 
 
 class OrganizationManager(models.Manager):
@@ -29,22 +61,33 @@ class OrganizationManager(models.Manager):
         return create_with_slug(super().create, *args, **kwargs)
 
     def bootstrap(
-        self, user: Any, *, team_fields: Optional[Dict[str, Any]] = None, **kwargs,
-    ) -> Tuple["Organization", Optional["OrganizationMembership"], Any]:
+        self,
+        user: Optional["User"],
+        *,
+        team_fields: Optional[dict[str, Any]] = None,
+        **kwargs,
+    ) -> tuple["Organization", Optional["OrganizationMembership"], "Team"]:
         """Instead of doing the legwork of creating an organization yourself, delegate the details with bootstrap."""
-        from .team import Team  # Avoiding circular import
+        from .project import Project  # Avoiding circular import
 
-        with transaction.atomic():
+        with transaction.atomic(using=self.db):
             organization = Organization.objects.create(**kwargs)
-            team = Team.objects.create(organization=organization, **(team_fields or {}))
+            _, team = Project.objects.create_with_team(
+                initiating_user=user, organization=organization, team_fields=team_fields
+            )
             organization_membership: Optional[OrganizationMembership] = None
             if user is not None:
                 organization_membership = OrganizationMembership.objects.create(
-                    organization=organization, user=user, level=OrganizationMembership.Level.OWNER,
+                    organization=organization,
+                    user=user,
+                    level=OrganizationMembership.Level.OWNER,
                 )
                 user.current_organization = organization
+                user.organization = user.current_organization  # Update cached property
                 user.current_team = team
+                user.team = user.current_team  # Update cached property
                 user.save()
+
         return organization, organization_membership, team
 
 
@@ -55,7 +98,7 @@ class Organization(UUIDModel):
                 fields=["for_internal_metrics"],
                 condition=Q(for_internal_metrics=True),
                 name="single_for_internal_metrics",
-            ),
+            )
         ]
 
     class PluginsAccessLevel(models.IntegerChoices):
@@ -71,28 +114,48 @@ class Organization(UUIDModel):
         # This includes installing plugins from the repository and managing plugin installations for all other orgs.
         ROOT = 9, "root"
 
-    members: models.ManyToManyField = models.ManyToManyField(
+    members = models.ManyToManyField(
         "posthog.User",
         through="posthog.OrganizationMembership",
         related_name="organizations",
         related_query_name="organization",
     )
-    name: models.CharField = models.CharField(max_length=64)
+    name = models.CharField(max_length=64)
     slug: LowercaseSlugField = LowercaseSlugField(unique=True, max_length=MAX_SLUG_LENGTH)
-    created_at: models.DateTimeField = models.DateTimeField(auto_now_add=True)
-    updated_at: models.DateTimeField = models.DateTimeField(auto_now=True)
-    domain_whitelist: ArrayField = ArrayField(
-        models.CharField(max_length=256, blank=False), blank=True, default=list
-    )  # Used to allow self-serve account creation based on social login (#5111)
-    setup_section_2_completed: models.BooleanField = models.BooleanField(default=True)  # Onboarding (#2822)
-    personalization: models.JSONField = models.JSONField(default=dict, null=False, blank=True)
-    plugins_access_level: models.PositiveSmallIntegerField = models.PositiveSmallIntegerField(
-        default=PluginsAccessLevel.CONFIG if settings.MULTI_TENANCY else PluginsAccessLevel.ROOT,
+    logo_media = models.ForeignKey("posthog.UploadedMedia", on_delete=models.SET_NULL, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    plugins_access_level = models.PositiveSmallIntegerField(
+        default=PluginsAccessLevel.CONFIG,
         choices=PluginsAccessLevel.choices,
     )
-    available_features = ArrayField(models.CharField(max_length=64, blank=False), blank=True, default=list)
-    for_internal_metrics: models.BooleanField = models.BooleanField(default=False)
-    is_member_join_email_enabled: models.BooleanField = models.BooleanField(default=True)
+    for_internal_metrics = models.BooleanField(default=False)
+    is_member_join_email_enabled = models.BooleanField(default=True)
+    enforce_2fa = models.BooleanField(null=True, blank=True)
+
+    is_hipaa = models.BooleanField(default=False, null=True, blank=True)
+
+    ## Managed by Billing
+    customer_id = models.CharField(max_length=200, null=True, blank=True)
+    available_product_features = ArrayField(models.JSONField(blank=False), null=True, blank=True)
+    # Managed by Billing, cached here for usage controls
+    # Like {
+    #   'events': { 'usage': 10000, 'limit': 20000, 'todays_usage': 1000 },
+    #   'recordings': { 'usage': 10000, 'limit': 20000, 'todays_usage': 1000 }
+    #   'period': ['2021-01-01', '2021-01-31']
+    # }
+    # Also currently indicates if the organization is on billing V2 or not
+    usage = models.JSONField(null=True, blank=True)
+    never_drop_data = models.BooleanField(default=False, null=True, blank=True)
+    # Scoring levels defined in billing::customer::TrustScores
+    customer_trust_scores = models.JSONField(default=dict, null=True, blank=True)
+
+    # DEPRECATED attributes (should be removed on next major version)
+    setup_section_2_completed = models.BooleanField(default=True)
+    personalization = models.JSONField(default=dict, null=False, blank=True)
+    domain_whitelist: ArrayField = ArrayField(
+        models.CharField(max_length=256, blank=False), blank=True, default=list
+    )  # DEPRECATED in favor of `OrganizationDomain` model; previously used to allow self-serve account creation based on social login (#5111)
 
     objects: OrganizationManager = OrganizationManager()
 
@@ -102,18 +165,18 @@ class Organization(UUIDModel):
     __repr__ = sane_repr("name")
 
     @property
-    def _billing_plan_details(self) -> Tuple[Optional[str], Optional[str]]:
+    def _billing_plan_details(self) -> tuple[Optional[str], Optional[str]]:
         """
         Obtains details on the billing plan for the organization.
         Returns a tuple with (billing_plan_key, billing_realm)
         """
-
-        # If on Cloud, grab the organization's price
-        if hasattr(self, "billing"):
-            if self.billing is None:  # type: ignore
-                return (None, None)
-            return (self.billing.get_plan_key(), "cloud")  # type: ignore
-
+        try:
+            from ee.models.license import License
+        except ImportError:
+            License = None  # type: ignore
+        # Demo gets all features
+        if settings.DEMO or "generate_demo_data" in sys.argv[1:2]:
+            return (License.ENTERPRISE_PLAN, "demo")
         # Otherwise, try to find a valid license on this instance
         if License is not None:
             license = License.objects.first_valid()
@@ -121,44 +184,50 @@ class Organization(UUIDModel):
                 return (license.plan, "ee")
         return (None, None)
 
-    @property
-    def billing_plan(self) -> Optional[str]:
-        return self._billing_plan_details[0]
+    def update_available_product_features(self) -> list[ProductFeature]:
+        """Updates field `available_product_features`. Does not `save()`."""
+        if is_cloud() or self.usage:
+            # Since billing V2 we just use the field which is updated when the billing service is called
+            return self.available_product_features or []
 
-    def update_available_features(self) -> List[Union[AvailableFeature, str]]:
-        """Updates field `available_features`. Does not `save()`."""
-        plan, realm = self._billing_plan_details
-        if not plan:
-            self.available_features = []
-        elif realm == "ee":
-            self.available_features = License.PLANS.get(plan, [])
+        try:
+            from ee.models.license import License
+        except ImportError:
+            self.available_product_features = []
+            return []
+
+        self.available_product_features = []
+
+        # Self hosted legacy license so we just sync the license features
+        # Demo gets all features
+        if settings.DEMO or "generate_demo_data" in sys.argv[1:2]:
+            features = License.PLANS.get(License.ENTERPRISE_PLAN, [])
+            self.available_product_features = [
+                {"key": feature, "name": " ".join(feature.split(" ")).capitalize()} for feature in features
+            ]
         else:
-            self.available_features = self.billing.available_features  # type: ignore
-        return self.available_features
+            # Otherwise, try to find a valid license on this instance
+            license = License.objects.first_valid()
+            if license:
+                features = License.PLANS.get(License.ENTERPRISE_PLAN, [])
+                self.available_product_features = [
+                    {"key": feature, "name": " ".join(feature.split(" ")).capitalize()} for feature in features
+                ]
+
+        return self.available_product_features
 
     def is_feature_available(self, feature: Union[AvailableFeature, str]) -> bool:
-        return feature in self.available_features
-
-    @property
-    def is_onboarding_active(self) -> bool:
-        return not self.setup_section_2_completed
+        available_product_feature_keys = [feature["key"] for feature in self.available_product_features or []]
+        return feature in available_product_feature_keys
 
     @property
     def active_invites(self) -> QuerySet:
-        return self.invites.filter(created_at__gte=timezone.now() - timezone.timedelta(days=INVITE_DAYS_VALIDITY))
-
-    def complete_onboarding(self) -> "Organization":
-        self.setup_section_2_completed = True
-        self.save()
-        return self
+        return self.invites.filter(created_at__gte=timezone.now() - timedelta(days=INVITE_DAYS_VALIDITY))
 
     def get_analytics_metadata(self):
         return {
             "member_count": self.members.count(),
             "project_count": self.teams.count(),
-            "person_count": sum((team.person_set.count() for team in self.teams.all())),
-            "setup_section_2_completed": self.setup_section_2_completed,
-            "personalization": self.personalization,
             "name": self.name,
         }
 
@@ -166,7 +235,21 @@ class Organization(UUIDModel):
 @receiver(models.signals.pre_save, sender=Organization)
 def organization_about_to_be_created(sender, instance: Organization, raw, using, **kwargs):
     if instance._state.adding:
-        instance.update_available_features()
+        instance.update_available_product_features()
+        if not is_cloud():
+            instance.plugins_access_level = Organization.PluginsAccessLevel.ROOT
+
+
+@receiver(models.signals.post_save, sender=Organization)
+def ensure_available_product_features_sync(sender, instance: Organization, **kwargs):
+    updated_fields = kwargs.get("update_fields") or []
+    if "available_product_features" in updated_fields:
+        logger.info(
+            "Notifying plugin-server to reset available product features cache.",
+            {"organization_id": instance.id},
+        )
+
+        reset_available_product_features_cache_on_workers(organization_id=str(instance.id))
 
 
 class OrganizationMembership(UUIDModel):
@@ -177,26 +260,27 @@ class OrganizationMembership(UUIDModel):
         ADMIN = 8, "administrator"
         OWNER = 15, "owner"
 
-    organization: models.ForeignKey = models.ForeignKey(
-        "posthog.Organization", on_delete=models.CASCADE, related_name="memberships", related_query_name="membership"
+    organization = models.ForeignKey(
+        "posthog.Organization",
+        on_delete=models.CASCADE,
+        related_name="memberships",
+        related_query_name="membership",
     )
-    user: models.ForeignKey = models.ForeignKey(
+    user = models.ForeignKey(
         "posthog.User",
         on_delete=models.CASCADE,
         related_name="organization_memberships",
         related_query_name="organization_membership",
     )
-    level: models.PositiveSmallIntegerField = models.PositiveSmallIntegerField(
-        default=Level.MEMBER, choices=Level.choices
-    )
-    joined_at: models.DateTimeField = models.DateTimeField(auto_now_add=True)
-    updated_at: models.DateTimeField = models.DateTimeField(auto_now=True)
+    level = models.PositiveSmallIntegerField(default=Level.MEMBER, choices=Level.choices)
+    joined_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["organization_id", "user_id"], name="unique_organization_membership"),
             models.UniqueConstraint(
-                fields=["organization_id"], condition=models.Q(level=15), name="only_one_owner_per_organization"
+                fields=["organization_id", "user_id"],
+                name="unique_organization_membership",
             ),
         ]
 
@@ -204,7 +288,9 @@ class OrganizationMembership(UUIDModel):
         return str(self.Level(self.level))
 
     def validate_update(
-        self, membership_being_updated: "OrganizationMembership", new_level: Optional[Level] = None
+        self,
+        membership_being_updated: "OrganizationMembership",
+        new_level: Optional[Level] = None,
     ) -> None:
         if new_level is not None:
             if membership_being_updated.id == self.id:
@@ -212,9 +298,8 @@ class OrganizationMembership(UUIDModel):
             if new_level == OrganizationMembership.Level.OWNER:
                 if self.level != OrganizationMembership.Level.OWNER:
                     raise exceptions.PermissionDenied(
-                        "You can only pass on organization ownership if you're its owner."
+                        "You can only make another member owner if you're this organization's owner."
                     )
-                self.level = OrganizationMembership.Level.ADMIN
                 self.save()
             elif new_level > self.level:
                 raise exceptions.PermissionDenied(
@@ -231,71 +316,6 @@ class OrganizationMembership(UUIDModel):
     __repr__ = sane_repr("organization", "user", "level")
 
 
-class OrganizationInvite(UUIDModel):
-    organization: models.ForeignKey = models.ForeignKey(
-        "posthog.Organization", on_delete=models.CASCADE, related_name="invites", related_query_name="invite",
-    )
-    target_email: models.EmailField = models.EmailField(null=True, db_index=True)
-    first_name: models.CharField = models.CharField(max_length=30, blank=True, default="")
-    created_by: models.ForeignKey = models.ForeignKey(
-        "posthog.User",
-        on_delete=models.SET_NULL,
-        related_name="organization_invites",
-        related_query_name="organization_invite",
-        null=True,
-    )
-    emailing_attempt_made: models.BooleanField = models.BooleanField(default=False)
-    created_at: models.DateTimeField = models.DateTimeField(auto_now_add=True)
-    updated_at: models.DateTimeField = models.DateTimeField(auto_now=True)
-
-    def validate(self, *, user: Any = None, email: Optional[str] = None) -> None:
-        _email = email or (hasattr(user, "email") and user.email)
-
-        if _email and _email != self.target_email:
-            raise exceptions.ValidationError(
-                f"This invite is intended for another email address: {mask_email_address(self.target_email)}"
-                f". You tried to sign up with {_email}.",
-                code="invalid_recipient",
-            )
-
-        if self.is_expired():
-            raise exceptions.ValidationError(
-                "This invite has expired. Please ask your admin for a new one.", code="expired",
-            )
-
-        if OrganizationMembership.objects.filter(organization=self.organization, user=user).exists():
-            raise exceptions.ValidationError(
-                "You already are a member of this organization.", code="user_already_member",
-            )
-
-        if OrganizationMembership.objects.filter(
-            organization=self.organization, user__email=self.target_email,
-        ).exists():
-            raise exceptions.ValidationError(
-                "Another user with this email address already belongs to this organization.",
-                code="existing_email_address",
-            )
-
-    def use(self, user: Any, *, prevalidated: bool = False) -> None:
-        if not prevalidated:
-            self.validate(user=user)
-        user.join(organization=self.organization)
-        if is_email_available(with_absolute_urls=True) and self.organization.is_member_join_email_enabled:
-            from posthog.tasks.email import send_member_join
-
-            send_member_join.apply_async(kwargs={"invitee_uuid": user.uuid, "organization_id": self.organization.id})
-        OrganizationInvite.objects.filter(target_email__iexact=self.target_email).delete()
-
-    def is_expired(self) -> bool:
-        """Check if invite is older than INVITE_DAYS_VALIDITY days."""
-        return self.created_at < timezone.now() - timezone.timedelta(INVITE_DAYS_VALIDITY)
-
-    def __str__(self):
-        return f"{settings.SITE_URL}/signup/{self.id}"
-
-    __repr__ = sane_repr("organization", "target_email", "created_by")
-
-
 @receiver(models.signals.pre_delete, sender=OrganizationMembership)
 def ensure_organization_membership_consistency(sender, instance: OrganizationMembership, **kwargs):
     save_user = False
@@ -309,3 +329,19 @@ def ensure_organization_membership_consistency(sender, instance: OrganizationMem
         save_user = True
     if save_user:
         instance.user.save()
+
+
+@receiver(models.signals.pre_save, sender=OrganizationMembership)
+def organization_membership_saved(sender: Any, instance: OrganizationMembership, **kwargs: Any) -> None:
+    from posthog.event_usage import report_user_organization_membership_level_changed
+
+    try:
+        old_instance = OrganizationMembership.objects.get(id=instance.id)
+        if old_instance.level != instance.level:
+            # the level has been changed
+            report_user_organization_membership_level_changed(
+                instance.user, instance.organization, instance.level, old_instance.level
+            )
+    except OrganizationMembership.DoesNotExist:
+        # The instance is new, or we are setting up test data
+        pass

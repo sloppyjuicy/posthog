@@ -1,41 +1,78 @@
-import { ActionFilter, EntityFilter, EntityTypes, FunnelStepRangeEntityFilter } from '~/types'
-import { Typography } from 'antd'
-import React from 'react'
-import { TextProps } from 'antd/es/typography/Text'
-import { getKeyMapping } from 'lib/components/PropertyKeyInfo'
-import { getDisplayNameFromEntityFilter } from 'scenes/insights/utils'
+import clsx from 'clsx'
+import { getCoreFilterDefinition } from 'lib/taxonomy'
+import { getDisplayNameFromEntityFilter, isAllEventsEntityFilter } from 'scenes/insights/utils'
 
-interface Props {
-    filter: EntityFilter | ActionFilter | FunnelStepRangeEntityFilter
-    showSubTitle?: boolean
+import { ActionFilter, EntityFilter } from '~/types'
+
+import { TaxonomicFilterGroupType } from './TaxonomicFilter/types'
+
+interface EntityFilterInfoProps {
+    filter: EntityFilter | ActionFilter
+    allowWrap?: boolean
+    showSingleName?: boolean
+    style?: React.CSSProperties
+    filterGroupType?: TaxonomicFilterGroupType
 }
 
-function TextWrapper(props: TextProps): JSX.Element {
-    return (
-        <Typography.Text ellipsis={true} style={{ maxWidth: 400 }} {...props}>
-            {props.children}
-        </Typography.Text>
-    )
-}
-
-export function EntityFilterInfo({ filter, showSubTitle = true }: Props): JSX.Element {
-    const title = getDisplayNameFromEntityFilter(filter)
-    const subtitle = getDisplayNameFromEntityFilter(filter, false)
-
-    if (filter.type === EntityTypes.NEW_ENTITY || (!title && !subtitle)) {
-        return <TextWrapper title="Select filter">Select filter</TextWrapper>
+export function EntityFilterInfo({
+    filter,
+    allowWrap = false,
+    showSingleName = false,
+    style,
+    filterGroupType,
+}: EntityFilterInfoProps): JSX.Element {
+    if (isAllEventsEntityFilter(filter) && !filter?.custom_name) {
+        return (
+            <span
+                className={clsx('EntityFilterInfo max-w-100', !allowWrap && 'whitespace-nowrap truncate')}
+                title="All events"
+            >
+                All events
+            </span>
+        )
     }
 
-    const titleToDisplay = getKeyMapping(title, 'event')?.label ?? title ?? undefined
-    const subTitleToDisplay = getKeyMapping(subtitle, 'event')?.label ?? subtitle ?? undefined
+    const title = getDisplayNameFromEntityFilter(filter, false)
+    const titleToDisplay =
+        (filterGroupType ? getCoreFilterDefinition(title, filterGroupType)?.label?.trim() : null) ?? title ?? undefined
+
+    // No custom name
+    if (!filter?.custom_name) {
+        return (
+            // eslint-disable-next-line react/forbid-dom-props
+            <span className={!allowWrap ? 'flex truncate  items-center' : ''} style={style}>
+                <span
+                    className={clsx('EntityFilterInfo max-w-100', !allowWrap && 'whitespace-nowrap truncate')}
+                    title={titleToDisplay}
+                >
+                    {titleToDisplay}
+                </span>
+            </span>
+        )
+    }
+
+    // Display custom name first and action title as secondary
+    const customTitle = getDisplayNameFromEntityFilter(filter, true)
 
     return (
-        <span style={{ display: 'flex', flexDirection: 'row', alignItems: 'center' }}>
-            <TextWrapper title={titleToDisplay}>{titleToDisplay}</TextWrapper>
-            {showSubTitle && title !== subtitle && (
-                <TextWrapper type="secondary" style={{ fontSize: 13, marginLeft: 4 }} title={subTitleToDisplay}>
-                    ({subTitleToDisplay})
-                </TextWrapper>
+        // eslint-disable-next-line react/forbid-dom-props
+        <span className={!allowWrap ? 'flex items-baseline' : ''} style={style}>
+            <span
+                className={clsx('EntityFilterInfo max-w-100', !allowWrap && 'whitespace-nowrap truncate')}
+                title={customTitle ?? undefined}
+            >
+                {customTitle}
+            </span>
+            {!showSingleName && (
+                <span
+                    className={clsx(
+                        'EntityFilterInfo max-w-100 ml-1 text-muted text-xs',
+                        !allowWrap && 'whitespace-nowrap truncate'
+                    )}
+                    title={titleToDisplay}
+                >
+                    {titleToDisplay}
+                </span>
             )}
         </span>
     )

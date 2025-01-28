@@ -1,254 +1,435 @@
+import './EmptyStates.scss'
+
+import {
+    IconArchive,
+    IconInfo,
+    IconPieChart,
+    IconPlus,
+    IconPlusSmall,
+    IconPlusSquare,
+    IconWarning,
+} from '@posthog/icons'
+import { LemonButton } from '@posthog/lemon-ui'
 import { useActions, useValues } from 'kea'
-import React from 'react'
-import imgEmptyLineGraph from 'public/empty-line-graph.svg'
-import imgEmptyLineGraphDark from 'public/empty-line-graph-dark.svg'
-import { QuestionCircleOutlined, LoadingOutlined, PlusCircleOutlined } from '@ant-design/icons'
-import { IllustrationDanger, TrendUp } from 'lib/components/icons'
-import { preflightLogic } from 'scenes/PreflightCheck/logic'
-import { funnelLogic } from 'scenes/funnels/funnelLogic'
-import { entityFilterLogic } from 'scenes/insights/ActionFilter/entityFilterLogic'
-import { Button, Empty } from 'antd'
-import { savedInsightsLogic } from 'scenes/saved-insights/savedInsightsLogic'
-import { SavedInsightsTabs } from '~/types'
+import { BuilderHog3 } from 'lib/components/hedgehogs'
+import { supportLogic } from 'lib/components/Support/supportLogic'
+import { dayjs } from 'lib/dayjs'
+import { IconErrorOutline, IconOpenInNew } from 'lib/lemon-ui/icons'
+import { Link } from 'lib/lemon-ui/Link'
+import { LoadingBar } from 'lib/lemon-ui/LoadingBar'
+import { Tooltip } from 'lib/lemon-ui/Tooltip'
+import { humanFriendlyNumber } from 'lib/utils'
+import posthog from 'posthog-js'
+import { useEffect, useState } from 'react'
+import { funnelDataLogic } from 'scenes/funnels/funnelDataLogic'
+import { entityFilterLogic } from 'scenes/insights/filters/ActionFilter/entityFilterLogic'
 import { insightLogic } from 'scenes/insights/insightLogic'
+import { preflightLogic } from 'scenes/PreflightCheck/preflightLogic'
+import { savedInsightsLogic } from 'scenes/saved-insights/savedInsightsLogic'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
 
-export function LineGraphEmptyState({ color, isDashboard }: { color: string; isDashboard?: boolean }): JSX.Element {
+import { actionsAndEventsToSeries } from '~/queries/nodes/InsightQuery/utils/filtersToQueryNode'
+import { seriesToActionsAndEvents } from '~/queries/nodes/InsightQuery/utils/queryNodeToFilter'
+import { FunnelsQuery, Node, QueryStatus } from '~/queries/schema'
+import { FilterType, InsightLogicProps, SavedInsightsTabs } from '~/types'
+
+import { samplingFilterLogic } from '../EditorFilters/samplingFilterLogic'
+import { MathAvailability } from '../filters/ActionFilter/ActionFilterRow/ActionFilterRow'
+import { insightDataLogic } from '../insightDataLogic'
+
+export function InsightEmptyState({
+    heading = 'There are no matching events for this query',
+    detail = 'Try changing the date range, or pick another action, event or breakdown.',
+}: {
+    heading?: string
+    detail?: string
+}): JSX.Element {
     return (
-        <>
-            {isDashboard ? (
-                <div className="text-center" style={{ height: '100%' }}>
-                    <img
-                        src={color === 'white' ? imgEmptyLineGraphDark : imgEmptyLineGraph}
-                        alt=""
-                        style={{ maxHeight: '100%', maxWidth: '80%', opacity: 0.5 }}
-                    />
-                    <div style={{ textAlign: 'center', fontWeight: 'bold', marginTop: 16 }}>
-                        Seems like there's no data to show this graph yet{' '}
-                        <a
-                            target="_blank"
-                            href="https://posthog.com/docs/features/trends?utm_campaign=dashboard-empty-state&utm_medium=in-product"
-                            style={{ color: color === 'white' ? 'rgba(0, 0, 0, 0.85)' : 'white' }}
-                        >
-                            <QuestionCircleOutlined />
-                        </a>
-                    </div>
-                </div>
-            ) : (
-                <p style={{ textAlign: 'center', paddingTop: '4rem' }}>
-                    We couldn't find any matching events. Try changing dates or pick another action or event.
-                </p>
-            )}
-        </>
+        <div className="insight-empty-state">
+            <div className="empty-state-inner">
+                <IconArchive className="text-5xl mb-2 text-secondary-3000" />
+                <h2 className="text-xl leading-tight">{heading}</h2>
+                <p className="text-sm text-center text-balance">{detail}</p>
+            </div>
+        </div>
     )
 }
 
-export function TimeOut({ isLoading }: { isLoading: boolean }): JSX.Element {
-    const { preflight } = useValues(preflightLogic)
+function SamplingLink({ insightProps }: { insightProps: InsightLogicProps }): JSX.Element {
+    const { setSamplingPercentage } = useActions(samplingFilterLogic(insightProps))
+    const { suggestedSamplingPercentage } = useValues(samplingFilterLogic(insightProps))
     return (
-        <div className="insight-empty-state timeout-message">
-            <div className="insight-empty-state__wrapper">
-                <div className="illustration-main">{isLoading ? <LoadingOutlined spin /> : <IllustrationDanger />}</div>
-                <h2>{isLoading ? 'Looks like things are a little slow…' : 'Your query took too long to complete'}</h2>
-                {isLoading ? (
-                    <>
-                        Your query is taking a long time to complete. <b>We're still working on it.</b> However, here
-                        are some things you can try to speed it up:
-                    </>
-                ) : (
-                    <>
-                        Here are some things you can try to speed up your query and <b>try again</b>:
-                    </>
-                )}
-                <ol>
-                    <li>Reduce the date range of your query.</li>
-                    <li>Remove some filters.</li>
-                    {!preflight?.cloud && <li>Increase the size of your database server.</li>}
-                    {!preflight?.cloud && !preflight?.is_clickhouse_enabled && (
-                        <li>
-                            <a
-                                data-attr="insight-timeout-upgrade-to-clickhouse"
-                                href="https://posthog.com/docs/self-host#deployment-options?utm_medium=in-product&utm_campaign=insight-timeout-empty-state"
-                                rel="noopener"
-                                target="_blank"
-                            >
-                                Switch to Clickhouse backend
-                            </a>{' '}
-                            (engineered for scale, and you'll get more features)
-                        </li>
+        <Tooltip
+            title={`Calculate results from ${suggestedSamplingPercentage}% of the total dataset for this insight, speeding up the calculation of results.`}
+            placement="bottom"
+        >
+            <Link
+                onClick={() => {
+                    setSamplingPercentage(suggestedSamplingPercentage)
+                    posthog.capture('sampling_enabled_on_slow_query', {
+                        samplingPercentage: suggestedSamplingPercentage,
+                    })
+                }}
+            >
+                <IconPieChart className="mt-1" /> {suggestedSamplingPercentage}% sampling
+            </Link>
+        </Tooltip>
+    )
+}
+function humanFileSize(size: number): string {
+    const i = size == 0 ? 0 : Math.floor(Math.log(size) / Math.log(1024))
+    return (+(size / Math.pow(1024, i))).toFixed(2) + ' ' + ['B', 'kB', 'MB', 'GB', 'TB'][i]
+}
+
+export function StatelessInsightLoadingState({
+    queryId,
+    pollResponse,
+    suggestion,
+}: {
+    queryId?: string | null
+    pollResponse?: Record<string, QueryStatus | null> | null
+    suggestion?: JSX.Element
+}): JSX.Element {
+    const [rowsRead, setRowsRead] = useState(0)
+    const [bytesRead, setBytesRead] = useState(0)
+    const [secondsElapsed, setSecondsElapsed] = useState(0)
+
+    useEffect(() => {
+        const status = pollResponse?.status?.query_progress
+        const previousStatus = pollResponse?.previousStatus?.query_progress
+        setRowsRead(previousStatus?.rows_read || 0)
+        setBytesRead(previousStatus?.bytes_read || 0)
+        const interval = setInterval(() => {
+            setRowsRead((rowsRead) => {
+                const diff = (status?.rows_read || 0) - (previousStatus?.rows_read || 0)
+                return Math.min(rowsRead + diff / 30, status?.rows_read || 0)
+            })
+            setBytesRead((bytesRead) => {
+                const diff = (status?.bytes_read || 0) - (previousStatus?.bytes_read || 0)
+                return Math.min(bytesRead + diff / 30, status?.bytes_read || 0)
+            })
+            setSecondsElapsed(() => {
+                return dayjs().diff(dayjs(pollResponse?.status?.start_time), 'milliseconds')
+            })
+        }, 100)
+
+        return () => clearInterval(interval)
+    }, [pollResponse])
+
+    const bytesPerSecond = (bytesRead / (secondsElapsed || 1)) * 1000
+    const estimatedRows = pollResponse?.status?.query_progress?.estimated_rows_total
+
+    const cpuUtilization =
+        (pollResponse?.status?.query_progress?.active_cpu_time || 0) /
+        (pollResponse?.status?.query_progress?.time_elapsed || 1) /
+        10000
+
+    return (
+        <div className="insight-empty-state warning">
+            <div className="empty-state-inner">
+                <p className="mx-auto text-center font-medium italic">Crunching through hogloads of data…</p>
+                <LoadingBar />
+                <p className="mx-auto text-center text-xs">
+                    {rowsRead > 0 && bytesRead > 0 && (
+                        <>
+                            {humanFriendlyNumber(rowsRead || 0, 0)}{' '}
+                            {estimatedRows && estimatedRows >= rowsRead
+                                ? `/ ${humanFriendlyNumber(estimatedRows)} `
+                                : null}{' '}
+                            rows
+                            <br />
+                            {humanFileSize(bytesRead || 0)} ({humanFileSize(bytesPerSecond || 0)}/s)
+                            <br />
+                            CPU {humanFriendlyNumber(cpuUtilization, 0)}%
+                        </>
                     )}
-                    <li>
-                        <a
-                            data-attr="insight-timeout-raise-issue"
-                            href="https://github.com/PostHog/posthog/issues/new?labels=performance&template=performance_issue_report.md"
-                            target="_blank"
-                            rel="noreferrer noopener"
-                        >
-                            Raise an issue
-                        </a>{' '}
-                        in our GitHub repository.
-                    </li>
-                    <li>
-                        Get in touch with us{' '}
-                        <a
-                            data-attr="insight-timeout-slack"
-                            href="https://posthog.com/slack"
-                            rel="noopener noreferrer"
-                            target="_blank"
-                        >
-                            on Slack
-                        </a>
-                        .
-                    </li>
-                    <li>
-                        Email us at{' '}
-                        <a data-attr="insight-timeout-email" href="mailto:hey@posthog.com">
-                            hey@posthog.com
-                        </a>
-                        .
-                    </li>
-                </ol>
+                </p>
+                {suggestion ? (
+                    suggestion
+                ) : (
+                    <div className="flex items-center p-4 rounded bg-bg-3000 gap-x-3 max-w-120">
+                        <IconInfo className="text-xl shrink-0" />
+                        <p className="text-xs m-0">Need to speed things up? Try reducing the date range.</p>
+                    </div>
+                )}
+                {queryId ? (
+                    <div className="text-muted text-xs mx-auto text-center mt-5">
+                        Query ID: <span className="font-mono">{queryId}</span>
+                    </div>
+                ) : null}
             </div>
         </div>
     )
 }
 
-export function ErrorMessage(): JSX.Element {
+export function InsightLoadingState({
+    queryId,
+    insightProps,
+}: {
+    queryId?: string | null
+    insightProps: InsightLogicProps
+}): JSX.Element {
+    const { suggestedSamplingPercentage, samplingPercentage } = useValues(samplingFilterLogic(insightProps))
+    const { insightPollResponse } = useValues(insightDataLogic(insightProps))
+    const { currentTeam } = useValues(teamLogic)
+
+    const personsOnEventsMode =
+        currentTeam?.modifiers?.personsOnEventsMode ?? currentTeam?.default_modifiers?.personsOnEventsMode ?? 'disabled'
+
     return (
-        <div className="insight-empty-state error-message">
-            <div className="insight-empty-state__wrapper">
-                <div className="illustration-main">
-                    <IllustrationDanger />
-                </div>
-                <h2>There was an error completing this query</h2>
-                <div className="mt">
-                    We apologize for this unexpected situation. There are a few things you can do:
-                    <ol>
-                        <li>
-                            First and foremost you can <b>try again</b>. We recommended you wait a few moments before
-                            doing so.
-                        </li>
-                        <li>
-                            <a
-                                data-attr="insight-error-raise-issue"
-                                href="https://github.com/PostHog/posthog/issues/new?labels=bug&template=bug_report.md"
-                                target="_blank"
-                                rel="noreferrer noopener"
+        <div>
+            <StatelessInsightLoadingState
+                queryId={queryId}
+                pollResponse={insightPollResponse}
+                suggestion={
+                    <div className="flex items-center p-4 rounded bg-bg-3000 gap-x-3 max-w-120">
+                        {personsOnEventsMode === 'person_id_override_properties_joined' ? (
+                            <>
+                                <IconWarning className="text-xl shrink-0 text-warning" />
+                                <p className="text-xs m-0">
+                                    You can speed this query up by changing the{' '}
+                                    <Link to="/settings/project#persons-on-events">person properties mode</Link>{' '}
+                                    setting.
+                                </p>
+                            </>
+                        ) : (
+                            <>
+                                <IconInfo className="text-xl shrink-0" />
+                                <p className="text-xs m-0">
+                                    {suggestedSamplingPercentage && !samplingPercentage ? (
+                                        <span data-attr="insight-loading-waiting-message">
+                                            Need to speed things up? Try reducing the date range, removing breakdowns,
+                                            or turning on <SamplingLink insightProps={insightProps} />.
+                                        </span>
+                                    ) : suggestedSamplingPercentage && samplingPercentage ? (
+                                        <>
+                                            Still waiting around? You must have lots of data! Kick it up a notch with{' '}
+                                            <SamplingLink insightProps={insightProps} />. Or try reducing the date range
+                                            and removing breakdowns.
+                                        </>
+                                    ) : (
+                                        <>
+                                            Need to speed things up? Try reducing the date range or removing breakdowns.
+                                        </>
+                                    )}
+                                </p>
+                            </>
+                        )}
+                    </div>
+                }
+            />
+        </div>
+    )
+}
+
+export function InsightTimeoutState({ queryId }: { queryId?: string | null }): JSX.Element {
+    const { openSupportForm } = useActions(supportLogic)
+
+    return (
+        <div className="insight-empty-state warning">
+            <div className="empty-state-inner">
+                <>
+                    <div className="illustration-main">
+                        <IconErrorOutline />
+                    </div>
+                    <h2 className="text-xl leading-tight mb-6">Your query took too long to complete</h2>
+                </>
+                <div className="flex items-center p-4 rounded bg-bg-3000 gap-x-3 max-w-120">
+                    <IconInfo className="text-xl shrink-0" />
+                    <p className="text-xs m-0">
+                        <>
+                            Sometimes this happens. Try refreshing the page, reducing the date range, or removing
+                            breakdowns. If you're still having issues,{' '}
+                            <Link
+                                onClick={() => {
+                                    openSupportForm({ kind: 'bug', target_area: 'analytics' })
+                                }}
                             >
-                                Raise an issue
-                            </a>{' '}
-                            in our GitHub repository.
-                        </li>
-                        <li>
-                            Get in touch with us{' '}
-                            <a
-                                data-attr="insight-error-slack"
-                                href="https://posthog.com/slack"
-                                rel="noopener noreferrer"
-                                target="_blank"
-                            >
-                                on Slack
-                            </a>
+                                let us know
+                            </Link>
                             .
-                        </li>
-                        <li>
-                            Email us at{' '}
-                            <a
-                                data-attr="insight-error-email"
-                                href="mailto:hey@posthog.com?subject=Insight%20graph%20error"
-                            >
-                                hey@posthog.com
-                            </a>
-                            .
-                        </li>
-                    </ol>
+                        </>
+                    </p>
                 </div>
+                {queryId ? (
+                    <div className="text-muted text-xs mx-auto text-center mt-5">
+                        Query ID: <span className="font-mono">{queryId}</span>
+                    </div>
+                ) : null}
             </div>
         </div>
     )
 }
 
-export function FunnelInvalidFiltersEmptyState(): JSX.Element {
+export interface InsightErrorStateProps {
+    excludeDetail?: boolean
+    title?: string
+    query?: Record<string, any> | Node | null
+    queryId?: string | null
+}
+
+export function InsightErrorState({ excludeDetail, title, query, queryId }: InsightErrorStateProps): JSX.Element {
+    const { preflight } = useValues(preflightLogic)
+    const { openSupportForm } = useActions(supportLogic)
+
+    if (!preflight?.cloud) {
+        excludeDetail = true // We don't provide support for self-hosted instances
+    }
+
+    return (
+        <div className="insight-empty-state error">
+            <div className="empty-state-inner">
+                <div className="illustration-main">
+                    <IconErrorOutline />
+                </div>
+                <h2 className="text-xl leading-tight">{title || 'There was a problem completing this query'}</h2>
+                {/* Note that this default phrasing above signals the issue is intermittent, */}
+                {/* and that perhaps the query will complete on retry */}
+                {!excludeDetail && (
+                    <div className="mt-4">
+                        We apologize for this unexpected situation. There are a couple of things you can do:
+                        <ol>
+                            <li>
+                                First and foremost you can <b>try again</b>. We recommend you wait a moment before doing
+                                so.
+                            </li>
+                            <li>
+                                <Link
+                                    data-attr="insight-error-bug-report"
+                                    onClick={() => {
+                                        openSupportForm({ kind: 'bug', target_area: 'analytics' })
+                                    }}
+                                >
+                                    If this persists, submit a bug report.
+                                </Link>
+                            </li>
+                        </ol>
+                    </div>
+                )}
+                {queryId && (
+                    <div className="text-muted text-xs text-center">
+                        Query ID: <span className="font-mono">{queryId}</span>
+                    </div>
+                )}
+                {query && (
+                    <LemonButton
+                        data-attr="insight-error-query"
+                        targetBlank
+                        size="small"
+                        type="secondary"
+                        to={urls.debugQuery(query)}
+                        className="mt-4"
+                    >
+                        Open in query debugger
+                    </LemonButton>
+                )}
+            </div>
+        </div>
+    )
+}
+
+type FunnelSingleStepStateProps = { actionable?: boolean }
+
+export function FunnelSingleStepState({ actionable = true }: FunnelSingleStepStateProps): JSX.Element {
     const { insightProps } = useValues(insightLogic)
-    const { filters, clickhouseFeaturesEnabled } = useValues(funnelLogic(insightProps))
-    const { setFilters } = useActions(funnelLogic(insightProps))
+    const { series } = useValues(funnelDataLogic(insightProps))
+    const { updateQuerySource } = useActions(funnelDataLogic(insightProps))
+
+    const filters = series ? seriesToActionsAndEvents(series) : {}
+    const setFilters = (payload: Partial<FilterType>): void => {
+        updateQuerySource({
+            series: actionsAndEventsToSeries(payload as any, true, MathAvailability.None),
+        } as Partial<FunnelsQuery>)
+    }
+
     const { addFilter } = useActions(entityFilterLogic({ setFilters, filters, typeKey: 'EditFunnel-action' }))
 
     return (
-        <div className="insight-empty-state funnels-empty-state info-message">
-            <div className="insight-empty-state__wrapper">
+        <div className="insight-empty-state funnels-empty-state">
+            <div className="empty-state-inner">
                 <div className="illustration-main">
-                    <PlusCircleOutlined />
+                    <IconPlusSquare />
                 </div>
-                <h2 className="funnels-empty-state__title">Add another step!</h2>
-                <p className="funnels-empty-state__description">
+                <h2 className="text-xl leading-tight funnels-empty-state__title">Add another step!</h2>
+                <p className="mb-0 text-sm text-center text-balance">
                     You’re almost there! Funnels require at least two steps before calculating.
-                    {clickhouseFeaturesEnabled
-                        ? ' Once you have two steps defined, additional steps will automatically recalculate and update the funnel.'
-                        : ''}
+                    {actionable &&
+                        ' Once you have two steps defined, additional changes will recalculate automatically.'}
                 </p>
-                <Button
-                    size="large"
-                    onClick={() => addFilter()}
-                    data-attr="add-action-event-button-empty-state"
-                    icon={<PlusCircleOutlined />}
-                    className="add-action-event-button"
-                >
-                    Add funnel step
-                </Button>
-                <div className="funnels-empty-state__help">
-                    <a
-                        data-attr="insight-funnels-emptystate-help"
-                        href="https://posthog.com/docs/user-guides/funnels?utm_medium=in-product&utm_campaign=funnel-empty-state"
+                {actionable && (
+                    <div className="flex justify-center mt-4">
+                        <LemonButton
+                            size="large"
+                            type="secondary"
+                            onClick={() => addFilter()}
+                            data-attr="add-action-event-button-empty-state"
+                            icon={<IconPlus />}
+                        >
+                            Add funnel step
+                        </LemonButton>
+                    </div>
+                )}
+                <div className="mt-4">
+                    <Link
+                        data-attr="funnels-single-step-help"
+                        to="https://posthog.com/docs/user-guides/funnels?utm_medium=in-product&utm_campaign=funnel-empty-state"
                         target="_blank"
-                        rel="noopener"
+                        className="flex items-center justify-center"
+                        targetBlankIcon
                     >
-                        Learn more about funnels in our support documentation.
-                    </a>
+                        Learn more about funnels in PostHog docs
+                    </Link>
                 </div>
             </div>
         </div>
     )
 }
 
-export function FunnelEmptyState(): JSX.Element {
+export function InsightValidationError({
+    detail,
+    query,
+}: {
+    detail: string
+    query?: Record<string, any> | null
+}): JSX.Element {
     return (
-        <div className="insight-empty-state funnels-empty-state info-message">
-            <div className="insight-empty-state__wrapper">
+        <div className="insight-empty-state warning">
+            <div className="empty-state-inner">
                 <div className="illustration-main">
-                    <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="" />
+                    <IconWarning />
                 </div>
-                <h2 className="funnels-empty-state__title">There are no matching events for this query.</h2>
-                <p className="funnels-empty-state__description">
-                    Try changing dates or pick another action, event, or breakdown.
-                </p>
-            </div>
-        </div>
-    )
-}
-
-export function FunnelInvalidExclusionFiltersEmptyState(): JSX.Element {
-    return (
-        <div className="insight-empty-state funnels-empty-state info-message">
-            <div className="insight-empty-state__wrapper">
-                <div className="illustration-main">
-                    <IllustrationDanger />
-                </div>
-                <h2 className="funnels-empty-state__title">
-                    Exclusion filters cannot exclude events or actions in the funnel steps.
+                <h2 className="text-xl leading-tight" data-attr="insight-loading-too-long">
+                    There is a problem with this query
+                    {/* Note that this phrasing above signals the issue is not intermittent, */}
+                    {/* but rather that it's something with the definition of the query itself */}
                 </h2>
-                <p className="funnels-empty-state__description">
-                    Try changing your funnel step filters, or removing the overlapping exclusion event.
-                </p>
-                <div className="funnels-empty-state__help">
-                    <a
-                        data-attr="insight-funnels-emptystate-help"
-                        href="https://posthog.com/docs/user-guides/funnels?utm_medium=in-product&utm_campaign=funnel-empty-state"
-                        target="_blank"
-                        rel="noopener"
-                    >
-                        Learn more about funnels in our support documentation.
-                    </a>
-                </div>
+                <p className="text-sm text-center text-balance">{detail}</p>
+                {query ? (
+                    <p className="text-center text-balance">
+                        <LemonButton
+                            data-attr="insight-error-query"
+                            targetBlank
+                            size="small"
+                            type="secondary"
+                            to={urls.debugQuery(query)}
+                        >
+                            Open in query debugger
+                        </LemonButton>
+                    </p>
+                ) : null}
+                {detail.includes('Exclusion') && (
+                    <div className="mt-4">
+                        <Link
+                            data-attr="insight-funnels-emptystate-help"
+                            to="https://posthog.com/docs/user-guides/funnels?utm_medium=in-product&utm_campaign=funnel-exclusion-filter-state"
+                            target="_blank"
+                        >
+                            Learn more about funnels in PostHog docs
+                            <IconOpenInNew style={{ marginLeft: 4, fontSize: '0.85em' }} />
+                        </Link>
+                    </div>
+                )}
             </div>
         </div>
     )
@@ -256,42 +437,64 @@ export function FunnelInvalidExclusionFiltersEmptyState(): JSX.Element {
 
 const SAVED_INSIGHTS_COPY = {
     [`${SavedInsightsTabs.All}`]: {
-        title: 'There are no insights for this project',
+        title: 'There are no insights $CONDITION.',
         description: 'Once you create an insight, it will show up here.',
     },
     [`${SavedInsightsTabs.Yours}`]: {
-        title: "You haven't created insights for this project",
+        title: "You haven't created insights $CONDITION.",
         description: 'Once you create an insight, it will show up here.',
     },
     [`${SavedInsightsTabs.Favorites}`]: {
-        title: 'There are no favorited insights for this project',
+        title: 'There are no favorited insights $CONDITION.',
         description: 'Once you favorite an insight, it will show up here.',
     },
 }
 
 export function SavedInsightsEmptyState(): JSX.Element {
-    const { addGraph } = useActions(savedInsightsLogic)
-    const { tab } = useValues(savedInsightsLogic)
+    const {
+        filters: { tab },
+        insights,
+        usingFilters,
+    } = useValues(savedInsightsLogic)
+
+    // show the search string that was used to make the results, not what it currently is
+    const searchString = insights.filters?.search || null
+    const { title, description } = SAVED_INSIGHTS_COPY[tab] ?? {}
 
     return (
         <div className="saved-insight-empty-state">
-            <div className="insight-empty-state__wrapper">
-                <div className="illustration-main">
-                    <TrendUp />
+            <div className="empty-state-inner">
+                <div className="illustration-main w-40 m-auto">
+                    <BuilderHog3 className="w-full h-full" />
                 </div>
-                <h2 className="empty-state__title">{SAVED_INSIGHTS_COPY[tab].title}</h2>
-                <p className="empty-state__description">{SAVED_INSIGHTS_COPY[tab].description}</p>
+                <h2 className="empty-state__title">
+                    {usingFilters
+                        ? searchString
+                            ? title.replace('$CONDITION', `matching "${searchString}"`)
+                            : title.replace('$CONDITION', `matching these filters`)
+                        : title.replace('$CONDITION', 'for this project')}
+                </h2>
+                {usingFilters ? (
+                    <p className="empty-state__description">
+                        Refine your keyword search, or try using other filters such as type, last modified or created
+                        by.
+                    </p>
+                ) : (
+                    <p className="empty-state__description">{description}</p>
+                )}
                 {tab !== SavedInsightsTabs.Favorites && (
-                    <Button
-                        size="large"
-                        type="primary"
-                        onClick={() => addGraph('Trends')} // Add trends graph by default
-                        data-attr="add-insight-button-empty-state"
-                        icon={<PlusCircleOutlined />}
-                        className="add-insight-button"
-                    >
-                        New Insight
-                    </Button>
+                    <div className="flex justify-center">
+                        <Link to={urls.insightNew()}>
+                            <LemonButton
+                                type="primary"
+                                data-attr="add-insight-button-empty-state"
+                                icon={<IconPlusSmall />}
+                                className="add-insight-button"
+                            >
+                                New insight
+                            </LemonButton>
+                        </Link>
+                    </div>
                 )}
             </div>
         </div>

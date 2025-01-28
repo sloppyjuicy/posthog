@@ -4,15 +4,19 @@ There are many ways to contribute to PostHog. We want to help developers know ex
 
 Just create a new pull request if you want to make an update.
 
-For now, please request Tim (tim@posthog.com) to do the QA.
+We recommend you create an issue if one doesn't already exist, and continue the conversation on the issue to get more info/alignment on what to build.
 
-If you want to speak to us before doing lots of work, just email hey@posthog.com - we're very responsive and friendly!
+For more information on how we review PRs, please refer to our [handbook](https://posthog.com/handbook/engineering/how-we-review).
 
 # Issues
 
 Spotted a bug? Has deployment gone wrong? Do you have user feedback? Raise an issue for the fastest response.
 
 ... or pick up and fix an issue if you want to do a Pull Request.
+
+## Issues with paid features
+
+We prefer not to accept external contributions for paid features. If you don't see the feature on your local build, it's most probably paid.
 
 # Feature requests
 

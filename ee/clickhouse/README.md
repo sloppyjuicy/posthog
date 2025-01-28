@@ -1,16 +1,12 @@
 ## Clickhouse Support (Enterprise Feature)
 
-To accomodate high volume deployments, Posthog can use Clickhouse instead of Postgres. Clickhouse isn't used by default because Postgres is easier to deploy and maintain on smaller instances and on platforms such as Heroku.
+To accomodate high volume deployments, PostHog can use Clickhouse instead of Postgres. Clickhouse isn't used by default because Postgres is easier to deploy and maintain on smaller instances and on platforms such as Heroku.
 
 Clickhouse Support works by swapping in separate queries and classes in the system for models that are most impacted by high volume usage (ex: events and actions).
 
 ### Migrations and Models
 
 The `django_clickhouse` orm is used to manage migrations and models. The ORM is used to mimic the django model and migration structure in the main folder.
-
-Certain migrations (e.g. changing table engines) can be quite expensive and tricky, especially for deployments outside of cloud. To skip these steps during deployment setup, check for the `CLICKHOUSE_INITIAL_MIGRATIONS` environment variable.
-
-If you need help in making them happen, ask for help from team deployments.
 
 ### Queries
 

@@ -17,14 +17,15 @@ def backwards(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0030_migrate_dashboard_days"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name="team", name="signup_token", field=models.CharField(blank=True, max_length=200, null=True),
+            model_name="team",
+            name="signup_token",
+            field=models.CharField(blank=True, max_length=200, null=True),
         ),
-        migrations.RunPython(add_signup_tokens, backwards),
+        migrations.RunPython(add_signup_tokens, backwards, elidable=True),
     ]

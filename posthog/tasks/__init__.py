@@ -1,12 +1,47 @@
 # Make tasks ready for celery autoimport
-import posthog.tasks.calculate_action
-import posthog.tasks.calculate_cohort
-import posthog.tasks.calculate_event_property_usage
-import posthog.tasks.delete_old_plugin_logs
-import posthog.tasks.email
-import posthog.tasks.session_recording_retention
-import posthog.tasks.split_person
-import posthog.tasks.status_report
-import posthog.tasks.sync_all_organization_available_features
-import posthog.tasks.update_cache
-import posthog.tasks.user_identify
+
+from . import (
+    async_migrations,
+    calculate_cohort,
+    check_clickhouse_schema_drift,
+    demo_create_data,
+    demo_reset_master_team,
+    email,
+    exporter,
+    hog_functions,
+    integrations,
+    plugin_server,
+    process_scheduled_changes,
+    remote_config,
+    split_person,
+    sync_all_organization_available_product_features,
+    sync_to_billing,
+    tasks,
+    usage_report,
+    user_identify,
+    verify_persons_data_in_sync,
+    warehouse,
+)
+
+__all__ = [
+    "async_migrations",
+    "calculate_cohort",
+    "check_clickhouse_schema_drift",
+    "demo_create_data",
+    "demo_reset_master_team",
+    "email",
+    "exporter",
+    "hog_functions",
+    "integrations",
+    "plugin_server",
+    "process_scheduled_changes",
+    "remote_config",
+    "split_person",
+    "sync_all_organization_available_product_features",
+    "sync_to_billing",
+    "tasks",
+    "usage_report",
+    "user_identify",
+    "verify_persons_data_in_sync",
+    "warehouse",
+]

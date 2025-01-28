@@ -1,24 +1,38 @@
 import { DependencyList, useEffect, useRef } from 'react'
 
 export type KeyboardEventHandler = (event: KeyboardEvent) => void
+export type TouchEventHandler = (event: TouchEvent) => void
+export type MouseEventHandler = (event: MouseEvent) => void
 export type EventHandler = (event: Event) => void
 
 export function useEventListener(
-    eventName: 'keyup' | 'keydown',
+    eventName: `key${string}`,
     handler: KeyboardEventHandler,
-    element?: Element | Window,
+    element?: Element | Window | null,
+    deps?: DependencyList
+): void
+export function useEventListener(
+    eventName: `touch${string}`,
+    handler: TouchEventHandler,
+    element?: Element | Window | null,
+    deps?: DependencyList
+): void
+export function useEventListener(
+    eventName: `mouse${string}`,
+    handler: MouseEventHandler,
+    element?: Element | Window | null,
     deps?: DependencyList
 ): void
 export function useEventListener(
     eventName: string,
     handler: EventHandler,
-    element?: Element | Window,
+    element?: Element | Window | null,
     deps?: DependencyList
 ): void
 export function useEventListener(
     eventName: string,
-    handler: EventHandler | KeyboardEventHandler,
-    element: Element | Window = window,
+    handler: KeyboardEventHandler | TouchEventHandler | MouseEventHandler | EventHandler,
+    element: Element | Window | null = window,
     deps?: DependencyList
 ): void {
     // Create a ref that stores handler
@@ -35,7 +49,9 @@ export function useEventListener(
             // Make sure element supports addEventListener
             if (!element?.addEventListener) {
                 console.warn(
-                    `Could not start listening to ${eventName} on ${(element as Element)?.localName ?? 'window'}!`
+                    `Could not start listening to ${eventName} on ${
+                        !element ? element : (element as Element)?.localName ?? 'window'
+                    }!`
                 )
                 return
             }
@@ -48,6 +64,7 @@ export function useEventListener(
                 element?.removeEventListener(eventName, eventListener)
             }
         },
+
         [eventName, element, ...(deps || [])] // Re-run if eventName or element changes
     )
 }

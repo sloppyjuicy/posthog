@@ -17,11 +17,10 @@ def backwards(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0108_plugin_organization"),
     ]
 
     operations = [
-        migrations.RunPython(fix_retention_dashboard_items, backwards),
+        migrations.RunPython(fix_retention_dashboard_items, backwards, elidable=True),
     ]

@@ -1,86 +1,129 @@
-import { Alert, Input, Modal } from 'antd'
+import { LemonButton, LemonInput, LemonModal, Link } from '@posthog/lemon-ui'
 import { useActions, useValues } from 'kea'
+import { LemonField } from 'lib/lemon-ui/LemonField'
 import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
-import React, { useCallback, useRef, useState } from 'react'
-import { teamLogic } from 'scenes/teamLogic'
-import { userLogic } from 'scenes/userLogic'
+import { useEffect, useState } from 'react'
+import { projectLogic } from 'scenes/projectLogic'
+
+import { organizationLogic } from '../organizationLogic'
+
+const MOCK_PRODUCT_NAMES = [
+    'Lemonify',
+    'Pineapplify',
+    'Bananify',
+    'Mangofy',
+    'Peachify',
+    'Plumify',
+    'Cherryfy',
+    'Raspberryfy',
+]
 
 export function CreateProjectModal({
     isVisible,
-    setIsVisible,
-    title,
-    caption,
+    onClose,
+    inline = false,
 }: {
     isVisible: boolean
-    setIsVisible?: (newValue: boolean) => void
-    title?: string
-    caption?: JSX.Element
+    onClose?: () => void
+    inline?: boolean
 }): JSX.Element {
-    const { createTeam } = useActions(teamLogic)
-    const { user } = useValues(userLogic)
+    const { currentProject, currentProjectLoading } = useValues(projectLogic)
+    const { createProject } = useActions(projectLogic)
+    const { currentOrganization } = useValues(organizationLogic)
     const { reportProjectCreationSubmitted } = useActions(eventUsageLogic)
-    const [errorMessage, setErrorMessage] = useState<string | null>(null)
-    const inputRef = useRef<Input | null>(null)
+    const [name, setName] = useState<string>('')
 
-    const closeModal: () => void = useCallback(() => {
-        if (setIsVisible) {
-            setErrorMessage(null)
-            setIsVisible(false)
-            if (inputRef.current) {
-                inputRef.current.setValue('')
+    const closeModal: () => void = () => {
+        if (onClose) {
+            onClose()
+            if (name) {
+                setName('')
             }
-        }
-    }, [inputRef, setIsVisible])
-
-    const handleSubmit = (): void => {
-        const name = inputRef.current?.state.value?.trim()
-        if (name) {
-            reportProjectCreationSubmitted(user?.organization?.teams ? user.organization.teams.length : 0, name.length)
-            setErrorMessage(null)
-            createTeam(name)
-            closeModal()
-        } else {
-            setErrorMessage('Your project needs a name!')
         }
     }
+    const handleSubmit = (): void => {
+        createProject({ name })
+        reportProjectCreationSubmitted(
+            currentOrganization?.projects ? currentOrganization.projects.length : 0,
+            name.length
+        )
+    }
 
-    const defaultCaption = (
-        <p>
-            Projects are a way of tracking multiple products under the umbrella of a single organization.
-            <br />
-            All organization members will be able to access the new project.
-        </p>
-    )
+    // Anytime the project changes close the modal as it indicates we have created a new project
+    useEffect(() => {
+        closeModal()
+    }, [currentProject])
 
     return (
-        <Modal
-            title={
-                title || (user?.organization ? `Creating a Project in ${user.organization.name}` : 'Creating a Project')
+        <LemonModal
+            width={560}
+            title={currentOrganization ? `Create a project within ${currentOrganization.name}` : 'Create a project'}
+            description={
+                <>
+                    <p>
+                        Use projects to isolate products that share nothing at all. Both data and setup (such as
+                        dashboards or taxonomy) is separate between projects.
+                    </p>
+                    <p>
+                        <strong>Tip:</strong> We recommend using the same project for both your website and app to track
+                        conversion fully.{' '}
+                        <Link
+                            to="https://posthog.com/docs/settings/organizations-and-projects#projects"
+                            target="_blank"
+                        >
+                            Learn more in PostHog Docs.
+                        </Link>
+                    </p>
+                    {currentOrganization?.projects?.some(
+                        (project) => project.name.toLowerCase() === 'default project'
+                    ) && (
+                        <p>
+                            <strong>Bonus tip:</strong> You can always rename your "Default project".
+                        </p>
+                    )}
+                </>
             }
-            okText="Create Project"
-            cancelButtonProps={setIsVisible ? undefined : { style: { display: 'none' } }}
-            closable={!!setIsVisible}
-            onOk={handleSubmit}
-            onCancel={closeModal}
-            visible={isVisible}
+            footer={
+                <>
+                    {onClose && (
+                        <LemonButton
+                            type="secondary"
+                            onClick={onClose}
+                            disabledReason={currentProjectLoading ? 'Creating project...' : undefined}
+                        >
+                            Cancel
+                        </LemonButton>
+                    )}
+                    <LemonButton
+                        type="primary"
+                        onClick={handleSubmit}
+                        loading={currentProjectLoading}
+                        disabledReason={!name ? 'Think of a name!' : null}
+                    >
+                        Create project
+                    </LemonButton>
+                </>
+            }
+            isOpen={isVisible}
+            onClose={onClose}
+            inline={inline}
+            closable={!currentProjectLoading}
         >
-            {caption || defaultCaption}
-            <div className="input-set">
-                <label htmlFor="projectName">Project Name</label>
-                <Input
-                    ref={inputRef}
-                    placeholder='for example "Web app", "Mobile app", "Production", "Landing website"'
+            <LemonField.Pure label="Project name">
+                <LemonInput
+                    placeholder={`E.g. ${MOCK_PRODUCT_NAMES[Math.floor(Math.random() * MOCK_PRODUCT_NAMES.length)]}`}
                     maxLength={64}
                     autoFocus
-                    name="projectName"
+                    value={name}
+                    onChange={(value) => setName(value)}
                     onKeyDown={(e) => {
                         if (e.key === 'Enter') {
                             handleSubmit()
                         }
                     }}
+                    disabled={currentProjectLoading}
                 />
-            </div>
-            {errorMessage && <Alert message={errorMessage} type="error" />}
-        </Modal>
+            </LemonField.Pure>
+        </LemonModal>
     )
 }

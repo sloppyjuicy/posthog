@@ -1,81 +1,99 @@
-@import '~/vars';
-
-.ph-graph-tooltip,
-.ant-popover {
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-    font-size: 14px;
-    overflow-x: hidden;
-    z-index: $z_graph_tooltip;
+.InsightTooltipWrapper {
+    position: absolute;
+    z-index: var(--z-graph-tooltip);
+    pointer-events: none;
     transition: all 0.4s;
 }
 
-.ph-graph-tooltip {
-    max-width: 480px;
-    padding: 8px 12px;
-    border: 1px solid $border;
-    border-radius: $radius;
-    background: #fafafa;
-}
+.InsightTooltip {
+    max-width: 30rem;
+    overflow: hidden;
+    font-size: 0.8125rem;
+    pointer-events: none;
+    background: var(--bg-light);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-elevation-3000);
 
-.inner-tooltip {
-    &.multiple {
-        header {
-            padding-bottom: 8px;
-            border-bottom: 1px solid $border;
+    &--embedded {
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+    }
+
+    .LemonRow {
+        font-size: 0.8125rem;
+    }
+
+    .LemonTable {
+        font-size: 0.75rem;
+        border: none;
+        border-bottom-right-radius: 0;
+        border-bottom-left-radius: 0;
+
+        &:not(:last-child) {
+            border-bottom: 1px solid var(--border);
         }
 
-        footer {
-            margin-top: 0 !important;
-            padding-top: 6px;
-            border-top: 1px solid $border;
+        .insights-label {
+            margin: 0;
+        }
+
+        .datum-column {
+            padding-left: 0.5rem;
+            overflow-wrap: anywhere;
+        }
+
+        .LemonTable__content > table > thead {
+            letter-spacing: 0;
+
+            .datum-column {
+                .LemonTable__header-content {
+                    white-space: nowrap;
+                }
+            }
+        }
+
+        .LemonTable__content > table {
+            .datum-label-column {
+                display: flex;
+                align-items: center;
+                font-weight: 600;
+            }
+
+            .series-data-cell {
+                font-weight: 600;
+            }
+
+            .tag-pill {
+                margin-right: 0;
+                overflow: hidden;
+                color: var(--primary-alt);
+                vertical-align: middle;
+                background-color: var(--border-3000);
+                border: 0;
+            }
         }
     }
 
-    header {
-        font-weight: bold;
-        margin-bottom: $default_spacing / 2;
-    }
+    .table-subtext {
+        padding: 0.5rem 1rem;
+        font-size: 0.75rem;
+        color: var(--muted);
+        text-align: center;
+        background-color: var(--bg-light);
 
-    footer {
-        margin-top: 0.5rem;
-        font-weight: bold;
-        font-size: 85%;
-        color: $text_muted;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        svg {
-            font-size: 1.4em;
-            margin-right: 4px;
+        .table-subtext-truncated {
+            margin-bottom: 4px;
         }
-    }
 
-    .series-container {
-        position: relative;
-    }
-
-    .inspect-persons-label {
-        display: flex;
-        align-items: center;
-        margin-top: 2px;
-        font-style: italic;
-        svg {
-            margin-left: 2px;
-            margin-right: 6px;
-        }
-    }
-
-    ul {
-        list-style-type: none;
-        padding: 0;
-        margin-bottom: 0;
-        max-height: 32vh;
-        overflow-y: hidden; // As the element has pointer-events: none to allow proper function, scrolling is not supported anyways
-
-        li {
+        .table-subtext-click-to-inspect {
             display: flex;
             align-items: center;
-            padding-bottom: 2px;
+            justify-content: center;
+            font-weight: 600;
+            color: var(--text-3000);
+            white-space: nowrap;
         }
     }
 }

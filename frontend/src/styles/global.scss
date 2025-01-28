@@ -2,604 +2,326 @@
 nimble to simplify maintenance. We separate variables and mixins in vars.scss to be able to import those into local
 style files without adding already imported styles.
 
-Font weights: only `normal` (400), `$medium` (500) or `bold` (700) should be used.
-NOTE: $medium is a SCSS var; not a keyword
+Font weights:
+Only 400 (`normal`), 500 (`var(--font-medium)`), 600 (`var(--font-semibold)`), or 700 (`bold`) should be used
 
 */
 
+@use 'sass:map';
+
 // Global components
-@import 'react-toastify/dist/ReactToastify';
-@import '~/vars';
+@import 'vars';
+@import '../../../node_modules/react-toastify/dist/ReactToastify';
 @import 'fonts';
+@import 'functions';
+@import 'mixins';
+@import 'tailwindcss/components'; // NOTE: The components layer must be before utilities for correct specificity
+@import 'utilities';
+@import 'utilities-legacy'; // TODO: Remove all legacy utilities
+@import 'design-system';
 
 :root {
-    --primary: #{$primary};
-    --primary-alt: #{$primary_alt};
-    --success: #{$success};
-    --danger: #{$danger};
-    --warning: #{$warning};
-    --bg-menu: #{$bg_menu};
-    --bg-mid: #{$bg_mid};
-    --bg-charcoal: #{$bg_charcoal};
-    --text-default: #{$text_default};
-    --text-muted: #{$text_muted};
-    --text-light: #{$text_light};
-    --muted: #{$text_muted};
-    --muted-alt: #{$text_muted_alt};
-    --border-light: #{$border_light};
-    --border: #{$border};
-    --border-dark: #{$border_dark};
-    // Used for graph series
-    --blue: #{$blue_500};
-    --purple: #{$purple_500};
-    --salmon: #ff906e;
-    --yellow: #ffc035;
-    --green: #{$success};
-    --indigo: #{$purple_700};
-    --cyan: #17a2b8;
-    --pink: #e83e8c;
-    --white: #f4f6ff;
-    --maroon: #7f0000;
-    --mint: #aaffc3;
-    --olive: #807500;
-    --navy: #000075;
-    --orange: #f58231;
-    --lime: #bfef45;
-    --apricot: #ffd8b1;
-    --brown: #9a6324;
-    // Lifecycle series
-    --lifecycle-new: #{$lifecycle_new};
-    --lifecycle-returning: #{$lifecycle_returning};
-    --lifecycle-resurrecting: #{$lifecycle_resurrecting};
-    --lifecycle-dormant: #{$lifecycle_dormant};
-    --lifecycle-new-hover: #{darken($lifecycle_new, 20%)};
-    --lifecycle-returning-hover: #{darken($lifecycle_returning, 20%)};
-    --lifecycle-resurrecting-hover: #{darken($lifecycle_resurrecting, 20%)};
-    --lifecycle-dormant-hover: #{darken($lifecycle_dormant, 20%)};
+    @include root-variables;
 }
 
-// Text styles
-.text-default {
-    color: $text_default;
-    font-size: 14px;
-    line-height: 20px;
-    font-weight: 400;
+*,
+*::before,
+*::after {
+    border-color: var(--border); // Tailwind's default is currentColor, but --border is more useful
 }
 
-.text-small {
-    @extend .text-default;
-    font-size: 12px;
+input[type='radio'] {
+    accent-color: var(--accent-primary);
 }
 
-.text-extra-small {
-    @extend .text-default;
-    font-size: 10px;
-}
-
-.text-xxs {
-    @extend .text-default;
-    font-size: 8px;
+input[type='search'] {
+    &::-webkit-search-decoration,
+    &::-webkit-search-cancel-button,
+    &::-webkit-search-results-button,
+    &::-webkit-search-results-decoration {
+        display: none;
+    }
 }
 
 .page-title-row {
-    margin-top: 16px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1rem;
+    align-items: center;
+    min-height: 2.5rem;
+    margin: 1rem 0 0.25rem;
+
+    @include screen($md) {
+        flex-wrap: nowrap;
+    }
 }
 
 .page-title {
+    min-width: 0;
+    margin: 0;
     font-size: 28px;
+    font-weight: 600;
     line-height: 34px;
-    margin-top: 0.5em;
-    font-weight: bold;
 }
 
 .page-caption {
-    @extend .text-default;
-    max-width: 640px;
-    margin-bottom: 32px;
-}
+    max-width: 48rem;
+    margin-bottom: 1rem;
+    font-size: 0.875rem;
+    line-height: 1.25rem;
 
-.subtitle-row {
-    margin-top: 8px;
-}
-
-.subtitle {
-    display: flex;
-    align-items: center;
-    margin-top: 12px;
-    font-size: 22px;
-    line-height: 26px;
-    font-weight: bold;
-
-    &.highlighted {
-        padding: $default_spacing $default_spacing $default_spacing $default_spacing / 2;
+    &.tabbed {
+        margin-bottom: 0.5rem;
     }
 }
 
-.l3 {
-    /* Level 3 title (ideally H3) */
-    font-size: 16px;
-    font-weight: bold;
-    line-height: 19px;
+.secondary {
+    font-size: 0.9em;
+    font-weight: var(--font-medium);
+    color: var(--primary-alt);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    background: none;
+    border: 0;
 }
 
-.l4 {
-    font-size: 14px;
-    font-weight: bold;
+.card-secondary {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
 }
 
-.l5 {
-    font-size: 13px;
-    font-weight: bold;
+mark {
+    background-color: var(--mark) !important;
+    border-radius: var(--radius);
 }
 
-.text-right {
-    text-align: right;
+hr {
+    margin: 1em 0;
+    border-top: 1px solid var(--border);
 }
 
-.text-left {
-    text-align: left;
+// Vendor-specific adjustments
+
+input::-ms-clear {
+    display: none; // Hide IE/Edge's clear button that can mess input sizing up
 }
 
-.text-center {
-    text-align: center;
-}
+// Highlight background blink
 
-.text-muted {
-    color: $text_muted;
-}
-
-.text-muted-alt {
-    color: $text_muted_alt;
-}
-
-.primary {
-    color: $primary;
-}
-
-code.code {
-    // Temporary: .code class to transition legacy elements
-    color: $danger;
-    background-color: $bg_mid;
-    border-radius: $radius;
-    padding: 2px 6px;
-}
-
-// Spacing & layout
-.mb {
-    margin-bottom: $default_spacing;
-}
-
-.mt {
-    margin-top: $default_spacing;
-}
-
-.mb-2 {
-    margin-bottom: $default_spacing * 2;
-}
-
-.mt-2 {
-    margin-top: $default_spacing * 2;
-}
-
-.mb-05 {
-    margin-bottom: $default_spacing * 0.5;
-}
-
-.mb-025 {
-    margin-bottom: $default_spacing * 0.25;
-}
-
-.mt-05 {
-    margin-top: $default_spacing * 0.5;
-}
-
-.mt-025 {
-    margin-top: $default_spacing * 0.25;
-}
-
-.mr {
-    margin-right: $default_spacing;
-}
-
-.ml {
-    margin-left: $default_spacing;
-}
-
-.mr-05 {
-    margin-right: $default_spacing * 0.5;
-}
-
-.mr-025 {
-    margin-right: $default_spacing * 0.25;
-}
-
-.ml-05 {
-    margin-left: $default_spacing * 0.5;
-}
-
-.ml-025 {
-    margin-left: $default_spacing * 0.25;
-}
-
-.mx-0 {
-    margin-left: 0 !important;
-    margin-right: 0 !important;
-}
-
-.my-0 {
-    margin-top: 0 !important;
-    margin-bottom: 0 !important;
-}
-
-.pa {
-    // Padding all
-    padding: $default_spacing;
-}
-
-.pb {
-    padding-bottom: $default_spacing;
-}
-
-.pt {
-    padding-top: $default_spacing;
-}
-
-.pr {
-    padding-right: $default_spacing;
-}
-
-.pl {
-    padding-left: $default_spacing;
-}
-
-.full-width {
-    width: 100%;
-}
-
-.float-right {
-    float: right;
-}
-
-.float-left {
-    float: left;
-}
-
-.space-between-items {
-    display: flex;
-    justify-content: space-between;
-}
-
-.main-app-content {
-    /* top | horizontal | bottom */
-    padding: 0px $default_spacing * 3 $default_spacing * 3;
-
-    @media (min-width: 480px) and (max-width: 639px) {
-        padding: $default_spacing $default_spacing * 2 !important;
-    }
-
-    @media (max-width: 480px) {
-        padding: $default_spacing $default_spacing !important;
-    }
-}
-
-// Color styles
-.bg-primary {
-    background-color: $primary;
-}
-
-.text-primary {
-    color: var(--primary) !important;
-}
-
-.text-success {
-    color: var(--success) !important;
-}
-
-.text-danger {
-    color: var(--danger) !important;
-}
-
-.text-warning {
-    color: var(--warning) !important;
-}
-
-// Random general styles
-
-.cursor-pointer {
-    cursor: pointer;
-}
-
-.highlighted {
-    border-radius: $radius;
-    animation: highlight 2000ms ease-out;
-}
-
+/* stylelint-disable-next-line keyframes-name-pattern */
 @keyframes highlight {
     0% {
-        background-color: $yellow_50;
+        background-color: var(--mark);
     }
+
     100% {
         background-color: initial;
     }
 }
 
-.fullscreen-scroll {
-    overflow-y: auto;
+// Generic 360 spin
+
+/* stylelint-disable-next-line keyframes-name-pattern */
+@keyframes spin {
+    0% {
+        transform: rotateZ(0deg);
+    }
+
+    100% {
+        transform: rotateZ(360deg);
+    }
 }
 
 // Toasts
 
-.Toastify__toast-container {
-    opacity: 1;
-    transform: none;
-    margin-top: $top_nav_height;
+.Toastify__toast {
+    align-items: center;
+    padding: 0.75rem;
+    margin-bottom: 0.5rem;
+    font-family: var(--font-sans);
+    font-size: 1rem;
+    cursor: unset;
+    border: 1px solid var(--secondary-3000-button-border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-elevation-3000);
+    opacity: 1 !important;
 }
 
-.Toastify__toast {
-    padding: 16px;
-    border-radius: $radius;
-    font-family: inherit;
-    background-color: $bg_light;
-    border: 1px solid $border;
-    @extend .text-default;
+.Toastify__toast-container {
+    padding: 0;
+}
 
-    h1 {
-        font-size: 1.14rem;
-        font-weight: bold;
+.Toastify__toast-body {
+    padding: 0;
+    font-size: 0.875rem;
+    font-weight: 500;
+    line-height: 1.25rem;
+    color: var(--text-3000);
+
+    b,
+    strong {
+        font-weight: 700;
     }
 
-    .action-bar {
-        @extend .text-small;
-        color: $text_muted;
-        margin-top: $default_spacing / 2;
-        display: flex;
-        align-items: center;
-        a {
-            color: $text_muted;
-        }
-        .help-button {
-            flex-grow: 1;
-            text-align: right;
-        }
-        .ant-btn-link {
-            padding: 0;
-        }
+    button {
+        margin: 0 0.75rem;
+    }
+}
+
+.Toastify__toast-icon {
+    width: 1.5rem;
+    height: 1.5rem;
+    margin-right: 0.75rem;
+    font-size: 1.5rem;
+    color: var(--muted-alt);
+
+    .Toastify__toast--success & {
+        color: var(--toastify-color-success);
+    }
+
+    .Toastify__toast--warning & {
+        color: var(--toastify-color-warning);
+    }
+
+    .Toastify__toast--error & {
+        color: var(--toastify-color-error);
     }
 }
 
 .Toastify__progress-bar {
-    background: $success;
-}
-
-.Toastify__toast--success {
-    h1 {
-        color: $success;
-    }
-}
-
-.Toastify__toast--info {
-    h1 {
-        color: $primary_alt;
-    }
-    &.accent-border {
-        border-color: $primary_alt;
-    }
-    .Toastify__progress-bar {
-        background: $primary_alt;
-    }
-}
-
-.Toastify__toast--error {
-    h1 {
-        color: $danger;
-    }
-    .Toastify__progress-bar {
-        background: $danger;
-    }
-    .error-details {
-        font-style: italic;
-    }
-}
-
-// Table styles
-
-.table-bordered td {
-    border: 1px solid $border;
-}
-
-// Card styles
-
-.ant-card-body > :first-child {
-    margin-top: 0;
-}
-
-.card-elevated {
-    @extend %mixin-elevated;
+    height: var(--radius);
 }
 
 // Form & input styles
 
-.input-set {
-    padding-bottom: $default_spacing;
-    color: $text_default;
-
-    label {
-        font-weight: bold;
-        @extend .text-default;
-    }
-
-    .caption {
-        color: $text_muted;
-        @extend .text-small;
-    }
-
-    .ant-radio-button-wrapper {
-        // To properly handle label styles above
-        font-weight: normal !important;
-        line-height: 30px !important;
-    }
-
-    &.errored {
-        .caption {
-            color: $danger;
-        }
-        input[type='password'],
-        input[type='text'] {
-            border-color: $danger !important;
-        }
-    }
-}
-
 .error-on-blur {
     &.errored:not(:focus) {
-        border-color: $danger !important;
+        border-color: var(--danger) !important;
     }
-}
-
-.ant-form-item-label label {
-    font-weight: $medium;
 }
 
 // Button styles
 
-.btn-close {
-    color: $text_muted;
-}
-
-.ant-btn-sm {
-    font-size: 12px !important;
-}
-
-.ant-btn-md {
-    // Size between `small` & `default`
-    font-size: 13px !important;
-    height: 28px !important;
-    padding: 0px 10px !important;
-}
-
 .info-indicator {
-    color: $primary !important;
+    margin-left: 4px;
+    color: var(--primary-alt) !important;
     cursor: pointer;
-    margin-left: 5px;
 
     &.left {
+        margin-right: 4px;
         margin-left: 0;
-        margin-right: 5px;
     }
 }
 
-.btn-lg-2x {
-    font-size: 1.5rem !important;
-    line-height: 1 !important;
-    svg {
-        width: 1.5rem !important;
-        height: 1.5rem !important;
-    }
-}
-
-// Badges styles
-
-.badge {
-    border-radius: 50%;
-    width: 22px;
-    height: 22px;
-    background-color: $border_dark;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: white;
-    font-size: 12px;
-}
+// Graph series glyph
 
 .graph-series-glyph {
-    border-radius: 50%;
-    border: 2px solid $text_default;
-    font-weight: bold;
-    font-size: 12px;
-    height: 22px;
-    width: 22px;
     display: flex;
+    flex-shrink: 0;
     align-items: center;
     justify-content: center;
+    width: 22px;
+    height: 22px;
+    font-size: 12px;
+    font-weight: bold;
     pointer-events: none;
+    border: 2px solid var(--text-3000);
+    border-radius: 50%;
 
     // variants
     &.funnel-step-glyph {
-        border-color: $border;
-        background-color: white;
-        color: $primary_alt;
-        height: 23px;
         width: 23px;
+        height: 23px;
         font-size: unset;
+        color: var(--primary-alt);
+        background-color: var(--bg-light);
+        border-color: var(--border);
     }
 }
 
-// Overlays styles
+// Bottom notice (DEBUG=1 mode)
 
 #bottom-notice {
-    z-index: $z_bottom_notice;
-    display: flex !important;
-    flex-direction: row;
     position: fixed;
-    width: 100%;
     bottom: 0;
     left: 0;
-    background: #000;
-    color: #fff;
+    z-index: var(--z-bottom-notice);
+    display: flex !important;
+    flex-direction: row;
+    width: 100%;
     font-size: 0.75rem;
     line-height: 1.5rem;
+    color: #fff;
+    background: #000;
+
     code {
-        color: inherit;
         font-size: inherit;
+        color: inherit;
     }
+
     &.warning div {
         height: auto;
-        background: $danger;
+        background: var(--danger);
     }
+
     &.tricolor {
         cursor: pointer;
+
         div:nth-child(1) {
-            background: $brand_blue;
+            background: var(--brand-blue);
         }
+
         div:nth-child(2) {
-            background: $brand_red;
+            background: var(--brand-red);
         }
+
         div:nth-child(3) {
-            background: $brand_yellow;
+            background: var(--brand-yellow);
         }
+
         span {
             cursor: text;
         }
     }
+
     div {
         flex-basis: 0;
         flex-grow: 1;
         height: 1.5rem;
         text-align: center;
     }
+
     span {
         display: none;
     }
+
     button {
-        border: none;
-        background: transparent;
-        color: inherit;
         width: 1.5rem;
         height: 1.5rem;
         padding: 0;
         font-size: 1rem;
         font-weight: bold;
+        color: inherit;
         cursor: pointer;
+        background: transparent;
+        border: none;
     }
+
     @media screen and (min-width: 750px) {
         font-size: 1rem;
         line-height: 2rem;
+
         div {
             height: 2rem;
         }
+
         span {
             display: inline;
         }
+
         button {
             width: 2rem;
             height: 2rem;
@@ -608,107 +330,231 @@ code.code {
     }
 }
 
-// Overlays
-
-.overlay__parent {
-    position: relative;
+html {
+    text-size-adjust: 100%;
 }
 
-.overlay__child {
-    transition: opacity 0.25s ease;
-    position: absolute;
-    width: 100%;
-    height: 100%;
-    top: 0;
-    left: 0;
-    .overlay--danger & {
-        background: repeating-linear-gradient(
-            -45deg,
-            rgba(255, 255, 255, 0.5),
-            rgba(255, 255, 255, 0.5) 0.75rem,
-            var(--danger) 0.5rem,
-            var(--danger) 20px
-        );
-    }
+input::placeholder,
+textarea::placeholder {
+    color: var(--muted); // Overrides Tailwind's default
 }
 
-.clickable-card {
-    cursor: pointer;
-    &:hover {
-        border-color: $primary;
-    }
-}
+// Global styles nested under body to ensure they're more specific than Tailwind's base
+body {
+    font-size: 14px;
+    line-height: 1.5715;
+    color: var(--text-3000);
+    touch-action: manipulation; // Disable double-tap-to-zoom on mobile, making taps slightly snappier
+    background: var(--bg-3000);
 
-// Stateful badges
-
-.stateful-badge {
-    padding: 2px 8px;
-    border-radius: 2px;
-    font-weight: bold;
-
-    &.or {
-        background-color: $blue_300;
-        text-align: center;
-        max-width: 50px;
+    &[theme='light'] {
+        @include light-mode-3000-variables;
     }
 
-    &.width-locked {
-        width: 40px;
-        text-align: center;
+    &[theme='dark'] {
+        @include dark-mode-3000-variables;
     }
 
-    &.and {
-        background-color: $yellow_100;
-        color: $primary_alt;
+    * > {
+        ::-webkit-scrollbar {
+            width: 0.5rem;
+            height: 0.5rem;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--accent-3000);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--trace-3000);
+            border-radius: var(--radius);
+
+            &:hover {
+                background: var(--muted-3000);
+            }
+        }
     }
 
-    &.pos-center-end {
-        position: absolute;
-        top: 50%;
-        left: -30px;
+    b,
+    strong {
+        font-weight: 600; // Tailwind's default is "bolder" (800)
     }
-}
 
-// Simple tags
-
-.simple-tag {
-    border-radius: $radius;
-    font-weight: bold;
-    padding: 2px 6px;
-
-    &.tag-light-lilac {
-        background-color: $hc_light_lilac;
-        color: $hc_navy;
+    h1,
+    h2,
+    h3:not(.thank-you-message), // to prevent the survey thank you message to be styled, as these styles are only for PostHog main app
+    h4,
+    h5 {
+        margin-top: 0;
+        margin-bottom: 0.5em;
+        font-family: var(--font-title);
+        font-weight: 500;
     }
-}
 
-// Hotkey styles
-.hotkey {
-    width: 22px;
-    height: 22px;
-    border-radius: $radius;
-    font-weight: bold;
-    margin-left: 6px;
-    background-color: white;
-    color: $primary;
-    text-shadow: none;
-    text-transform: uppercase;
-    border: 1px solid $border_light;
-    margin-bottom: 2px;
-    font-size: 0.85rem;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-}
+    h1,
+    h2,
+    h3,
+    h4 {
+        color: var(--text-3000);
+    }
 
-.hotkey-plus {
-    display: inline;
-    &::after {
-        content: '+';
-        margin-left: 6px;
+    h1 {
+        font-size: 1.75rem;
+    }
+
+    h2 {
+        font-size: 1.3125rem;
+    }
+
+    h3 {
         font-size: 1rem;
     }
+
+    h5 {
+        margin-bottom: 0.25rem;
+        font-size: 0.6875rem;
+        font-weight: 600;
+        line-height: 1.5rem;
+        color: var(--muted-alt);
+        text-transform: uppercase;
+        letter-spacing: 0.075em;
+    }
+
+    pre {
+        margin-top: 0;
+        margin-bottom: 1em;
+        overflow: auto;
+    }
+
+    dialog {
+        background-color: var(--bg-3000);
+    }
+
+    .LemonButton,
+    .Link {
+        .text-link {
+            color: var(--text-3000) !important;
+        }
+
+        &:hover {
+            .text-link {
+                color: var(--accent-primary) !important;
+            }
+        }
+    }
+
+    @include common-variables;
 }
-.fullscreen-scroll {
-    overflow-y: auto;
+
+a {
+    color: var(--link);
+    text-decoration: none;
+}
+
+p {
+    margin-top: 0;
+    margin-bottom: 1em;
+}
+
+img {
+    vertical-align: middle;
+    border-style: none;
+}
+
+[tabindex='-1']:focus {
+    outline: none !important;
+}
+
+.storybook-test-runner {
+    &.storybook-test-runner--fullscreen {
+        height: fit-content;
+    }
+
+    &.storybook-test-runner--padded {
+        #storybook-root {
+            // Make the root element (which is the default screenshot reference) hug the component
+            display: inline-block;
+        }
+    }
+
+    // Only use this class in visual regression tests
+    *,
+    *::before,
+    *::after {
+        transition-duration: 0ms !important;
+        animation-fill-mode: forwards !important;
+        animation-duration: 0ms !important;
+        animation-iteration-count: 1 !important;
+    }
+
+    // Hide some parts of the UI that were causing flakiness
+    ::-webkit-scrollbar,
+    *> ::-webkit-scrollbar,
+    // Scrollbar in WebKit/Blink browsers
+    .LemonTabs__bar::after,
+    // Active tab slider
+    .scrollable::after,
+    // Scrollability indicators
+    .scrollable::before {
+        display: none;
+    }
+
+    #storybook-root > .fixed:only-child {
+        // Fix for stories of fixed overlays like CommandBar - otherwise body would be zero-sized
+        position: static !important;
+    }
+
+    #storybook-root:empty ~ .ReactModalPortal > .ReactModal__Overlay {
+        // Fix for stories of fixed modals - otherwise body would be zero-sized
+        position: static !important;
+    }
+}
+
+.ligatures-none {
+    font-variant-ligatures: none;
+}
+
+.hide-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+
+    &::-webkit-scrollbar {
+        display: none;
+    }
+}
+
+.arial {
+    font-family: Arial, sans-serif;
+}
+
+.verdana {
+    font-family: Verdana, sans-serif;
+}
+
+.tahoma {
+    font-family: Tahoma, sans-serif;
+}
+
+.trebuchet-ms {
+    font-family: 'Trebuchet MS', sans-serif;
+}
+
+.helvetica {
+    font-family: Helvetica, sans-serif;
+}
+
+.times-new-roman {
+    font-family: 'Times New Roman', serif;
+}
+
+.georgia {
+    font-family: Georgia, serif;
+}
+
+.courier-new {
+    font-family: 'Courier New', monospace;
+}
+
+.system-ui {
+    font-family: system-ui;
 }

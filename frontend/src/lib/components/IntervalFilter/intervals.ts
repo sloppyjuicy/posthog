@@ -1,26 +1,33 @@
-export const intervals = {
+export type IntervalKeyType = 'minute' | 'hour' | 'day' | 'week' | 'month'
+
+export type Intervals = {
+    [key in IntervalKeyType]: {
+        label: string
+        newDateFrom?: string
+        disabledReason?: string
+        hidden?: boolean
+    }
+}
+
+export const intervals: Intervals = {
     minute: {
-        label: 'Minute',
-        newDateFrom: 'dStart',
+        label: 'minute',
+        newDateFrom: 'hStart',
     },
     hour: {
-        label: 'Hourly',
+        label: 'hour',
         newDateFrom: 'dStart',
     },
     day: {
-        label: 'Daily',
+        label: 'day',
         newDateFrom: undefined,
     },
     week: {
-        label: 'Weekly',
+        label: 'week',
         newDateFrom: '-30d',
     },
     month: {
-        label: 'Monthly',
+        label: 'month',
         newDateFrom: '-90d',
     },
 }
-
-export const defaultInterval = intervals.day
-
-export type IntervalKeyType = keyof typeof intervals

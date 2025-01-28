@@ -1,9 +1,24 @@
+import type { Config } from 'jest'
+import fs from 'fs'
+
+process.env.TZ = process.env.TZ || 'UTC'
+
 /*
  * For a detailed explanation regarding each configuration property and type check, visit:
  * https://jestjs.io/docs/en/configuration.html
  */
 
-export default {
+const esmModules = ['query-selector-shadow-dom', 'react-syntax-highlighter', '@react-hook', '@medv', 'monaco-editor']
+const eeFolderExists = fs.existsSync('ee/frontend/exports.ts')
+function rootDirectories() {
+    const rootDirectories = ['<rootDir>/frontend/src']
+    if (eeFolderExists) {
+        rootDirectories.push('<rootDir>/ee/frontend')
+    }
+    return rootDirectories
+}
+
+const config: Config = {
     // All imported modules in your tests should be mocked automatically
     // automock: false,
 
@@ -59,9 +74,6 @@ export default {
     // A path to a module which exports an async function that is triggered once after all test suites
     // globalTeardown: undefined,
 
-    // A set of global variables that need to be available in all test environments
-    // globals: {},
-
     // The maximum amount of workers used to run your tests. Can be specified as % or a number. E.g. maxWorkers: 10% will use 10% of your CPU amount + 1 as the maximum worker number. maxWorkers: 2 will use a maximum of 2 workers.
     // maxWorkers: "50%",
 
@@ -82,11 +94,17 @@ export default {
 
     // A map from regular expressions to module names or to arrays of module names that allow to stub out resources with a single module
     moduleNameMapper: {
-        '^.+\\.(css|less|scss|svg|png)$': '<rootDir>/test/mocks/styleMock.js',
-        '^~/(.*)$': '<rootDir>/$1',
-        '^lib/(.*)$': '<rootDir>/lib/$1',
-        '^scenes/(.*)$': '<rootDir>/scenes/$1',
-        '^antd/es/(.*)$': 'antd/lib/$1',
+        '^.+\\.(css|less|scss|svg|png|lottie)$': '<rootDir>/frontend/src/test/mocks/styleMock.js',
+        '^~/(.*)$': '<rootDir>/frontend/src/$1',
+        '^@posthog/lemon-ui(|/.*)$': '<rootDir>/frontend/@posthog/lemon-ui/src/$1',
+        '^@posthog/ee/exports': ['<rootDir>/ee/frontend/exports', '<rootDir>/frontend/@posthog/ee/exports'],
+        '^lib/(.*)$': '<rootDir>/frontend/src/lib/$1',
+        'monaco-editor': '<rootDir>/node_modules/monaco-editor/esm/vs/editor/editor.api.d.ts',
+        '^scenes/(.*)$': '<rootDir>/frontend/src/scenes/$1',
+        '^react-virtualized/dist/es/(.*)$': 'react-virtualized/dist/commonjs/$1',
+        '^rrweb/es/rrweb': 'rrweb/dist/rrweb.min.js',
+        d3: '<rootDir>/node_modules/d3/dist/d3.min.js',
+        '^d3-(.*)$': `d3-$1/dist/d3-$1`,
     },
 
     // An array of regexp pattern strings, matched against all module paths before considered 'visible' to the module loader
@@ -120,22 +138,19 @@ export default {
     // restoreMocks: false,
 
     // The root directory that Jest should scan for tests and modules within
-    rootDir: 'frontend/src',
     modulePaths: ['<rootDir>/'],
 
     // A list of paths to directories that Jest should use to search for files in
-    // roots: [
-    //   "<rootDir>"
-    // ],
+    roots: rootDirectories(),
 
     // Allows you to use a custom runner instead of Jest's default test runner
     // runner: "jest-runner",
 
     // The paths to modules that run some code to configure or set up the testing environment before each test
-    setupFiles: ['../../jest.setup.ts'],
+    setupFiles: ['<rootDir>/jest.setup.ts'],
 
     // A list of paths to modules that run some code to configure or set up the testing framework before each test
-    setupFilesAfterEnv: ['givens/setup'],
+    setupFilesAfterEnv: ['<rootDir>/jest.setupAfterEnv.ts', 'givens/setup', '<rootDir>/frontend/src/mocks/jest.ts'],
 
     // The number of seconds after which a test is considered as slow and reported as such in the results.
     // slowTestThreshold: 5,
@@ -144,10 +159,10 @@ export default {
     // snapshotSerializers: [],
 
     // The test environment that will be used for testing
-    // testEnvironment: "jest-environment-jsdom",
+    testEnvironment: 'jsdom',
 
     // Options that will be passed to the testEnvironment
-    // testEnvironmentOptions: {},
+    testEnvironmentOptions: {},
 
     // Adds a location field to test results
     // testLocationInResults: false,
@@ -179,13 +194,12 @@ export default {
     // timers: "real",
 
     // A map from regular expressions to paths to transformers
-    // transform: undefined,
+    transform: {
+        '\\.[jt]sx?$': '@sucrase/jest-plugin',
+    },
 
     // An array of regexp pattern strings that are matched against all source file paths, matched files will skip transformation
-    // transformIgnorePatterns: [
-    //   "/node_modules/",
-    //   "\\.pnp\\.[^\\/]+$"
-    // ],
+    transformIgnorePatterns: [`node_modules/(?!(?:.pnpm/)?(${esmModules.join('|')}))`],
 
     // An array of regexp pattern strings that are matched against all modules before the module loader will automatically return a mock for them
     // unmockedModulePathPatterns: undefined,
@@ -199,3 +213,5 @@ export default {
     // Whether to use watchman for file crawling
     // watchman: true,
 }
+
+export default config

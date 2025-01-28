@@ -1,109 +1,70 @@
-import React, { useState } from 'react'
-import dayjs from 'dayjs'
-import { retentionTableLogic } from './retentionTableLogic'
-import { LineGraph } from '../insights/LineGraph'
 import { useActions, useValues } from 'kea'
-import { LineGraphEmptyState } from '../insights/EmptyStates'
-import { Modal, Button } from 'antd'
-import { PersonsTable } from 'scenes/persons/PersonsTable'
-import { PersonType } from '~/types'
-import { RetentionTrendPayload, RetentionTrendPeoplePayload } from 'scenes/retention/types'
-import { router } from 'kea-router'
+import { roundToDecimal } from 'lib/utils'
 import { insightLogic } from 'scenes/insights/insightLogic'
 
+import { TrendsFilter } from '~/queries/schema'
+import { GraphDataset, GraphType } from '~/types'
+
+import { InsightEmptyState } from '../insights/EmptyStates'
+import { LineGraph } from '../insights/views/LineGraph/LineGraph'
+import { retentionLineGraphLogic } from './retentionLineGraphLogic'
+import { retentionModalLogic } from './retentionModalLogic'
+
 interface RetentionLineGraphProps {
-    dashboardItemId?: number | null
-    color?: string
-    inSharedMode?: boolean | null
-    filters?: Record<string, unknown>
+    inSharedMode?: boolean
 }
 
-export function RetentionLineGraph({
-    dashboardItemId = null,
-    color = 'white',
-    inSharedMode = false,
-}: RetentionLineGraphProps): JSX.Element | null {
+export function RetentionLineGraph({ inSharedMode = false }: RetentionLineGraphProps): JSX.Element | null {
     const { insightProps } = useValues(insightLogic)
-    const logic = retentionTableLogic(insightProps)
-    const { filters, results: _results, people: _people, peopleLoading, loadingMore } = useValues(logic)
-    const results = _results as RetentionTrendPayload[]
-    const people = _people as RetentionTrendPeoplePayload
+    const { trendSeries, incompletenessOffsetFromEnd, aggregationGroupTypeIndex } = useValues(
+        retentionLineGraphLogic(insightProps)
+    )
+    const { openModal } = useActions(retentionModalLogic(insightProps))
 
-    const { loadPeople, loadMorePeople } = useActions(logic)
-    const [{ fromItem }] = useState(router.values.hashParams)
-    const [modalVisible, setModalVisible] = useState(false)
-    const [day, setDay] = useState(0)
-    function closeModal(): void {
-        setModalVisible(false)
-    }
-    const peopleData = people?.result as PersonType[]
-    const peopleNext = people?.next
-    if (results.length === 0) {
+    if (trendSeries.length === 0) {
         return null
     }
 
-    return results ? (
-        <>
-            <LineGraph
-                data-attr="trend-line-graph"
-                type="line"
-                color={color}
-                datasets={results}
-                labels={(results[0] && results[0].labels) || []}
-                isInProgress={!filters.date_to}
-                dashboardItemId={
-                    dashboardItemId || fromItem /* used only for annotations, not to init any other logic */
+    return trendSeries ? (
+        <LineGraph
+            data-attr="trend-line-graph"
+            type={GraphType.Line}
+            datasets={trendSeries as GraphDataset[]}
+            labels={(trendSeries[0] && trendSeries[0].labels) || []}
+            isInProgress={incompletenessOffsetFromEnd < 0}
+            inSharedMode={!!inSharedMode}
+            showPersonsModal={false}
+            labelGroupType={aggregationGroupTypeIndex}
+            trendsFilter={{ aggregationAxisFormat: 'percentage' } as TrendsFilter}
+            tooltip={{
+                rowCutoff: 11, // 11 time units is hardcoded into retention insights
+                renderSeries: function _renderCohortPrefix(value) {
+                    return (
+                        <>
+                            {value}
+                            <span className="ml-1">Cohort</span>
+                        </>
+                    )
+                },
+                showHeader: false,
+                renderCount: (count) => {
+                    return `${roundToDecimal(count)}%`
+                },
+            }}
+            onClick={(payload) => {
+                const { points } = payload
+                const rowIndex = points.clickedPointNotLine
+                    ? points.pointsIntersectingClick[0].dataset.index
+                    : points.pointsIntersectingLine[0].dataset.index
+
+                // we should always have a rowIndex, but adding a guard nonetheless
+                if (rowIndex !== undefined) {
+                    openModal(rowIndex)
                 }
-                inSharedMode={inSharedMode}
-                percentage={true}
-                onClick={
-                    dashboardItemId
-                        ? null
-                        : (point) => {
-                              const { index } = point
-                              loadPeople(index) // start from 0
-                              setDay(index)
-                              setModalVisible(true)
-                          }
-                }
-            />
-            <Modal
-                title={filters.period + ' ' + day + ' people'}
-                visible={modalVisible}
-                onOk={closeModal}
-                onCancel={closeModal}
-                footer={<Button onClick={closeModal}>Close</Button>}
-                width={700}
-            >
-                {peopleData ? (
-                    <p>
-                        Found {peopleData.length === 99 ? '99+' : peopleData.length}{' '}
-                        {peopleData.length === 1 ? 'user' : 'users'}
-                    </p>
-                ) : (
-                    <p>Loading persons…</p>
-                )}
-                <PersonsTable
-                    loading={peopleLoading}
-                    people={peopleData}
-                    date={filters.date_to ? dayjs(filters.date_to).format('YYYY-MM-DD') : undefined}
-                    backTo="Insights"
-                />
-                <div
-                    style={{
-                        margin: '1rem',
-                        textAlign: 'center',
-                    }}
-                >
-                    {peopleNext && (
-                        <Button type="primary" onClick={loadMorePeople} loading={loadingMore}>
-                            Load more people
-                        </Button>
-                    )}
-                </div>
-            </Modal>
-        </>
+            }}
+            incompletenessOffsetFromEnd={incompletenessOffsetFromEnd}
+        />
     ) : (
-        <LineGraphEmptyState color={color} isDashboard={!!dashboardItemId} />
+        <InsightEmptyState />
     )
 }

@@ -1,17 +1,17 @@
-import React from 'react'
-import { ComponentStory, ComponentMeta } from '@storybook/react'
+import { Meta, StoryFn, StoryObj } from '@storybook/react'
 
 import { NotFound } from './index'
 
-export default {
-    title: 'PostHog/Components/NotFound',
+type Story = StoryObj<typeof NotFound>
+const meta: Meta<typeof NotFound> = {
+    title: 'Components/Not Found',
     component: NotFound,
-    parameters: { options: { showPanel: true } },
-} as ComponentMeta<typeof NotFound>
+}
+export default meta
 
-const Template: ComponentStory<typeof NotFound> = (args) => <NotFound {...args} />
+const Template: StoryFn<typeof NotFound> = (args) => <NotFound {...args} />
 
-export const Person = Template.bind({})
-Person.args = {
+export const NotFound_: Story = Template.bind({})
+NotFound_.args = {
     object: 'Person',
 }

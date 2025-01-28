@@ -1,54 +1,32 @@
-import React, { useState, useEffect, useRef } from 'react'
-import { AutoComplete, Select } from 'antd'
-import { useThrottledCallback } from 'use-debounce'
-import api from 'lib/api'
-import { isOperatorFlag, isOperatorMulti, isOperatorRegex, toString } from 'lib/utils'
-import { SelectGradientOverflow } from 'lib/components/SelectGradientOverflow'
-import { PropertyOperator } from '~/types'
+import { useActions, useValues } from 'kea'
+import { DateFilter } from 'lib/components/DateFilter/DateFilter'
+import { DurationPicker } from 'lib/components/DurationPicker/DurationPicker'
+import { PropertyFilterDatePicker } from 'lib/components/PropertyFilters/components/PropertyFilterDatePicker'
+import { propertyFilterTypeToPropertyDefinitionType } from 'lib/components/PropertyFilters/utils'
+import { dayjs } from 'lib/dayjs'
+import { LemonInputSelect } from 'lib/lemon-ui/LemonInputSelect/LemonInputSelect'
+import { formatDate, isOperatorDate, isOperatorFlag, isOperatorMulti, toString } from 'lib/utils'
+import { useEffect } from 'react'
 
-type PropValue = {
-    id?: number
-    name?: string | boolean
-}
+import {
+    PROPERTY_FILTER_TYPES_WITH_ALL_TIME_SUGGESTIONS,
+    PROPERTY_FILTER_TYPES_WITH_TEMPORAL_SUGGESTIONS,
+    propertyDefinitionsModel,
+} from '~/models/propertyDefinitionsModel'
+import { PropertyFilterType, PropertyOperator, PropertyType } from '~/types'
 
-type Option = {
-    label?: string
-    name?: string
-    status?: 'loading' | 'loaded'
-    values?: PropValue[]
-}
-
-interface PropertyValueProps {
+export interface PropertyValueProps {
     propertyKey: string
-    type: string
+    type: PropertyFilterType
     endpoint?: string // Endpoint to fetch options from
     placeholder?: string
-    style?: Partial<React.CSSProperties>
-    bordered?: boolean
     onSet: CallableFunction
-    value?: string | number | Array<string | number> | null
-    operator?: PropertyOperator
-    outerOptions?: Option[] // If no endpoint provided, options are given here
+    value?: string | number | bigint | Array<string | number | bigint> | null
+    operator: PropertyOperator
     autoFocus?: boolean
-    allowCustom?: boolean
-}
-
-function matchesLowerCase(needle?: string, haystack?: string): boolean {
-    if (typeof haystack !== 'string' || typeof needle !== 'string') {
-        return false
-    }
-    return haystack.toLowerCase().indexOf(needle.toLowerCase()) > -1
-}
-
-function getValidationError(operator: PropertyOperator, value: any): string | null {
-    if (isOperatorRegex(operator)) {
-        try {
-            new RegExp(value)
-        } catch (e) {
-            return e.message
-        }
-    }
-    return null
+    eventNames?: string[]
+    addRelativeDateTimeOptions?: boolean
+    forceSingleSelect?: boolean
 }
 
 export function PropertyValue({
@@ -56,211 +34,130 @@ export function PropertyValue({
     type,
     endpoint = undefined,
     placeholder = undefined,
-    style = {},
-    bordered = true,
     onSet,
     value,
     operator,
-    outerOptions = undefined,
     autoFocus = false,
-    allowCustom = true,
+    eventNames = [],
+    addRelativeDateTimeOptions = false,
+    forceSingleSelect = false,
 }: PropertyValueProps): JSX.Element {
-    const isMultiSelect = operator && isOperatorMulti(operator)
-    const [input, setInput] = useState(isMultiSelect ? '' : toString(value))
-    const [shouldBlur, setShouldBlur] = useState(false)
-    const [options, setOptions] = useState({} as Record<string, Option>)
-    const autoCompleteRef = useRef<HTMLElement>(null)
+    const { formatPropertyValueForDisplay, describeProperty, options } = useValues(propertyDefinitionsModel)
+    const { loadPropertyValues } = useActions(propertyDefinitionsModel)
 
-    // update the input field if passed a new `value` prop
-    useEffect(() => {
-        if (!value) {
-            setInput('')
-        } else if (value !== input) {
-            const valueObject = options[propertyKey]?.values?.find((v) => v.id === value)
-            if (valueObject) {
-                setInput(toString(valueObject.name))
-            }
-        }
-    }, [value])
+    const isMultiSelect = operator && isOperatorMulti(operator) && !forceSingleSelect
+    const isDateTimeProperty = operator && isOperatorDate(operator)
+    const propertyDefinitionType = propertyFilterTypeToPropertyDefinitionType(type)
 
-    const loadPropertyValues = useThrottledCallback((newInput) => {
-        if (type === 'cohort') {
-            return
-        }
-        const key = propertyKey.split('__')[0]
-        setOptions({ [propertyKey]: { ...options[propertyKey], status: 'loading' }, ...options })
-        if (outerOptions) {
-            setOptions({
-                [propertyKey]: {
-                    values: [...Array.from(new Set(outerOptions))],
-                    status: 'loaded',
-                },
-                ...options,
-            })
-        } else {
-            api.get(endpoint || 'api/' + type + '/values/?key=' + key + (newInput ? '&value=' + newInput : '')).then(
-                (propValues: PropValue[]) => {
-                    setOptions({
-                        [propertyKey]: {
-                            values: [...Array.from(new Set(propValues))],
-                            status: 'loaded',
-                        },
-                        ...options,
-                    })
-                }
-            )
-        }
-    }, 300)
+    const isDurationProperty =
+        propertyKey && describeProperty(propertyKey, propertyDefinitionType) === PropertyType.Duration
 
-    function setValue(newValue: PropertyValueProps['value']): void {
-        onSet(newValue)
-        if (isMultiSelect) {
-            setInput('')
-        }
+    const load = (newInput: string | undefined): void => {
+        loadPropertyValues({
+            endpoint,
+            type: propertyDefinitionType,
+            newInput,
+            propertyKey,
+            eventNames,
+        })
     }
 
+    const setValue = (newValue: PropertyValueProps['value']): void => onSet(newValue)
+
     useEffect(() => {
-        loadPropertyValues('')
+        load('')
     }, [propertyKey])
 
-    useEffect(() => {
-        if (input === '' && shouldBlur) {
-            ;(document.activeElement as HTMLElement)?.blur()
-            setShouldBlur(false)
+    const displayOptions = options[propertyKey]?.values || []
+
+    const onSearchTextChange = (newInput: string): void => {
+        if (!Object.keys(options).includes(newInput) && !(operator && isOperatorFlag(operator))) {
+            load(newInput.trim())
         }
-    }, [input, shouldBlur])
-
-    const displayOptions = (options[propertyKey]?.values || []).filter(
-        (option) => input === '' || matchesLowerCase(input, toString(option?.name))
-    )
-
-    const validationError = operator ? getValidationError(operator, value) : null
-
-    const commonInputProps = {
-        style: { width: '100%', ...style },
-        loading: options[input]?.status === 'loading',
-        onSearch: (newInput: string) => {
-            setInput(newInput)
-            if (!Object.keys(options).includes(newInput) && !(operator && isOperatorFlag(operator))) {
-                loadPropertyValues(newInput)
-            }
-        },
-        ['data-attr']: 'prop-val',
-        dropdownMatchSelectWidth: 350,
-        bordered,
-        placeholder,
-        allowClear: Boolean(value),
-        onKeyDown: (e: React.KeyboardEvent) => {
-            if (e.key === 'Escape') {
-                setInput('')
-                setShouldBlur(true)
-                return
-            }
-            if (!isMultiSelect && e.key === 'Enter') {
-                // We have not explicitly selected a dropdown item by pressing the up/down keys; or the ref is unavailable
-                if (
-                    !autoCompleteRef.current ||
-                    autoCompleteRef.current?.querySelectorAll?.('.ant-select-item-option-active')?.length === 0
-                ) {
-                    setValue(input)
-                }
-            }
-        },
-        handleBlur: () => {
-            if (input != '') {
-                if (Array.isArray(value) && !value.includes(input)) {
-                    setValue([...value, ...[input]])
-                } else if (!Array.isArray(value)) {
-                    setValue(input)
-                }
-                setInput('')
-            }
-        },
     }
 
+    if (isDurationProperty) {
+        return <DurationPicker autoFocus={autoFocus} value={value as number} onChange={setValue} />
+    }
+
+    if (isDateTimeProperty) {
+        if (!addRelativeDateTimeOptions || operator === PropertyOperator.IsDateExact) {
+            return (
+                <PropertyFilterDatePicker autoFocus={autoFocus} operator={operator} value={value} setValue={setValue} />
+            )
+        }
+
+        return (
+            <DateFilter
+                dateFrom={String(value)}
+                onChange={setValue}
+                max={10000}
+                isFixedDateMode
+                dateOptions={[
+                    {
+                        key: 'Last 24 hours',
+                        values: ['-24h'],
+                        getFormattedDate: (date: dayjs.Dayjs): string => formatDate(date.subtract(24, 'h')),
+                        defaultInterval: 'hour',
+                    },
+                    {
+                        key: 'Last 7 days',
+                        values: ['-7d'],
+                        getFormattedDate: (date: dayjs.Dayjs): string => formatDate(date.subtract(7, 'd')),
+                        defaultInterval: 'day',
+                    },
+                    {
+                        key: 'Last 14 days',
+                        values: ['-14d'],
+                        getFormattedDate: (date: dayjs.Dayjs): string => formatDate(date.subtract(14, 'd')),
+                        defaultInterval: 'day',
+                    },
+                ]}
+                size="medium"
+                makeLabel={(_, startOfRange) => (
+                    <span className="hide-when-small">
+                        Matches all values {operator === PropertyOperator.IsDateBefore ? 'before' : 'after'}{' '}
+                        {startOfRange} if evaluated today.
+                    </span>
+                )}
+            />
+        )
+    }
+
+    const formattedValues = (value === null || value === undefined ? [] : Array.isArray(value) ? value : [value]).map(
+        (label) => String(formatPropertyValueForDisplay(propertyKey, label))
+    )
+
     return (
-        <>
-            {isMultiSelect ? (
-                <SelectGradientOverflow
-                    {...commonInputProps}
-                    autoFocus={autoFocus}
-                    value={value === null ? [] : value}
-                    mode="multiple"
-                    showSearch
-                    onChange={(val, payload) => {
-                        if (Array.isArray(payload) && payload.length > 0) {
-                            setValue(val)
-                        } else if (payload instanceof Option) {
-                            setValue(payload?.value ?? [])
-                        } else {
-                            setValue([])
-                        }
-                    }}
-                >
-                    {input && !displayOptions.some(({ name }) => input === toString(name)) && (
-                        <Select.Option key="specify-value" value={input} className="ph-no-capture">
-                            Specify: {input}
-                        </Select.Option>
-                    )}
-                    {displayOptions.map(({ name: _name }, index) => {
-                        const name = toString(_name)
-                        return (
-                            <Select.Option
-                                key={name}
-                                value={name}
-                                data-attr={'prop-val-' + index}
-                                className="ph-no-capture"
-                                title={name}
-                            >
-                                {name === '' ? <i>(empty string)</i> : name}
-                            </Select.Option>
-                        )
-                    })}
-                </SelectGradientOverflow>
-            ) : (
-                <AutoComplete
-                    {...commonInputProps}
-                    autoFocus={autoFocus}
-                    value={input}
-                    onClear={() => {
-                        setInput('')
-                        setValue('')
-                    }}
-                    onChange={(val) => {
-                        setInput(toString(val))
-                    }}
-                    onSelect={(val, option) => {
-                        setInput(option.title)
-                        setValue(toString(val))
-                    }}
-                    ref={autoCompleteRef}
-                >
-                    {[
-                        ...(input && allowCustom && !displayOptions.some(({ name }) => input === toString(name))
-                            ? [
-                                  <AutoComplete.Option key="@@@specify-value" value={input} className="ph-no-capture">
-                                      Specify: {input}
-                                  </AutoComplete.Option>,
-                              ]
-                            : []),
-                        ...displayOptions.map(({ name: _name, id }, index) => {
-                            const name = toString(_name)
-                            return (
-                                <AutoComplete.Option
-                                    key={id ? toString(id) : name}
-                                    value={id ? toString(id) : name}
-                                    data-attr={'prop-val-' + index}
-                                    className="ph-no-capture"
-                                    title={name}
-                                >
-                                    {name}
-                                </AutoComplete.Option>
-                            )
-                        }),
-                    ]}
-                </AutoComplete>
-            )}
-            {validationError && <p className="text-danger">{validationError}</p>}
-        </>
+        <LemonInputSelect
+            data-attr="prop-val"
+            loading={options[propertyKey]?.status === 'loading'}
+            value={formattedValues}
+            mode={isMultiSelect ? 'multiple' : 'single'}
+            allowCustomValues={options[propertyKey]?.allowCustomValues ?? true}
+            onChange={(nextVal) => (isMultiSelect ? setValue(nextVal) : setValue(nextVal[0]))}
+            onInputChange={onSearchTextChange}
+            placeholder={placeholder}
+            title={
+                PROPERTY_FILTER_TYPES_WITH_TEMPORAL_SUGGESTIONS.includes(type)
+                    ? 'Suggested values (last 7 days)'
+                    : PROPERTY_FILTER_TYPES_WITH_ALL_TIME_SUGGESTIONS.includes(type)
+                    ? 'Suggested values'
+                    : undefined
+            }
+            popoverClassName="max-w-200"
+            options={displayOptions.map(({ name: _name }, index) => {
+                const name = toString(_name)
+                return {
+                    key: name,
+                    label: name,
+                    labelComponent: (
+                        <span key={name} data-attr={'prop-val-' + index} className="ph-no-capture" title={name}>
+                            {name === '' ? <i>(empty string)</i> : formatPropertyValueForDisplay(propertyKey, name)}
+                        </span>
+                    ),
+                }
+            })}
+        />
     )
 }

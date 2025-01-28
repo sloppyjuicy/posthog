@@ -17,14 +17,17 @@ def backwards(app, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0142_fix_team_data_attributes_default"),
     ]
 
     operations = [
-        migrations.AddField(model_name="user", name="uuid", field=models.UUIDField(blank=True, null=True),),
-        migrations.RunPython(create_user_uuid, backwards),
+        migrations.AddField(
+            model_name="user",
+            name="uuid",
+            field=models.UUIDField(blank=True, null=True),
+        ),
+        migrations.RunPython(create_user_uuid, backwards, elidable=True),
         migrations.AlterField(
             model_name="user",
             name="uuid",

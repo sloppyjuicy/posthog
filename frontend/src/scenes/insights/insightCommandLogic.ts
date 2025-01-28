@@ -1,33 +1,47 @@
+import { IconTrending } from '@posthog/icons'
+import { connect, events, kea, key, path, props } from 'kea'
 import { Command, commandPaletteLogic } from 'lib/components/CommandPalette/commandPaletteLogic'
-import { kea } from 'kea'
-import { insightCommandLogicType } from './insightCommandLogicType'
-import { compareFilterLogic } from 'lib/components/CompareFilter/compareFilterLogic'
-import { RiseOutlined } from '@ant-design/icons'
-import { insightDateFilterLogic } from 'scenes/insights/InsightDateFilter/insightDateFilterLogic'
 import { dateMapping } from 'lib/utils'
+import { keyForInsightLogicProps } from 'scenes/insights/sharedUtils'
+
+import { InsightLogicProps } from '~/types'
+
+import type { insightCommandLogicType } from './insightCommandLogicType'
+import { insightVizDataLogic } from './insightVizDataLogic'
 
 const INSIGHT_COMMAND_SCOPE = 'insights'
 
-export const insightCommandLogic = kea<insightCommandLogicType>({
-    connect: [commandPaletteLogic, compareFilterLogic, insightDateFilterLogic],
-    events: () => ({
+export const insightCommandLogic = kea<insightCommandLogicType>([
+    props({} as InsightLogicProps),
+    key(keyForInsightLogicProps('new')),
+    path((key) => ['scenes', 'insights', 'insightCommandLogic', key]),
+
+    connect((props: InsightLogicProps) => [commandPaletteLogic, insightVizDataLogic(props)]),
+    events(({ props }) => ({
         afterMount: () => {
             const funnelCommands: Command[] = [
                 {
                     key: 'insight-graph',
                     resolver: [
                         {
-                            icon: RiseOutlined,
+                            icon: IconTrending,
                             display: 'Toggle "Compare Previous" on Graph',
                             executor: () => {
-                                compareFilterLogic.actions.toggleCompare()
+                                const compareFilter = insightVizDataLogic(props).values.compareFilter
+                                insightVizDataLogic(props).actions.updateCompareFilter({
+                                    compare: !compareFilter?.compare,
+                                    compare_to: compareFilter?.compare_to,
+                                })
                             },
                         },
-                        ...Object.entries(dateMapping).map(([key, { values }]) => ({
-                            icon: RiseOutlined,
+                        ...dateMapping.map(({ key, values }) => ({
+                            icon: IconTrending,
                             display: `Set Time Range to ${key}`,
                             executor: () => {
-                                insightDateFilterLogic.actions.setDates(values[0], values[1])
+                                insightVizDataLogic(props).actions.updateDateRange({
+                                    date_from: values[0],
+                                    date_to: values[1],
+                                })
                             },
                         })),
                     ],
@@ -41,5 +55,5 @@ export const insightCommandLogic = kea<insightCommandLogicType>({
         beforeUnmount: () => {
             commandPaletteLogic.actions.deregisterScope(INSIGHT_COMMAND_SCOPE)
         },
-    }),
-})
+    })),
+])

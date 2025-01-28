@@ -1,18 +1,20 @@
-import json
-import os
-from typing import Any, Dict, List, Union
+from typing import Any, Union
 
+from django.conf import settings
 from django.db import connection
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_page
 from rest_framework import viewsets
-from rest_framework.decorators import action
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from posthog.api.utils import action
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from posthog.gitsha import GIT_SHA
-from posthog.internal_metrics.team import get_internal_metrics_dashboards
-from posthog.models import Element, Event, SessionRecordingEvent
-from posthog.permissions import OrganizationAdminAnyPermissions, SingleTenancyOrAdmin
+from posthog.async_migrations.status import async_migrations_ok
+from posthog.cloud_utils import is_cloud
+from posthog.git import get_git_commit_short
+from posthog.permissions import SingleTenancyOrAdmin
+from posthog.storage import object_storage
 from posthog.utils import (
     dict_from_cursor_fetchall,
     get_helm_info_env,
@@ -20,14 +22,10 @@ from posthog.utils import (
     get_plugin_server_version,
     get_redis_info,
     get_redis_queue_depth,
-    get_table_approx_count,
-    get_table_size,
-    is_clickhouse_enabled,
     is_plugin_server_alive,
     is_postgres_alive,
     is_redis_alive,
 )
-from posthog.version import VERSION
 
 
 class InstanceStatusViewSet(viewsets.ViewSet):
@@ -37,15 +35,16 @@ class InstanceStatusViewSet(viewsets.ViewSet):
 
     permission_classes = [IsAuthenticated, SingleTenancyOrAdmin]
 
+    @method_decorator(cache_page(60))
     def list(self, request: Request) -> Response:
         redis_alive = is_redis_alive()
         postgres_alive = is_postgres_alive()
 
-        metrics: List[Dict[str, Union[str, bool, int, float, Dict[str, Any]]]] = []
+        metrics: list[dict[str, Union[str, bool, int, float, dict[str, Any]]]] = []
 
-        metrics.append({"key": "posthog_version", "metric": "PostHog version", "value": VERSION})
-
-        metrics.append({"key": "posthog_git_sha", "metric": "PostHog Git SHA", "value": GIT_SHA})
+        metrics.append(
+            {"key": "posthog_git_sha", "metric": "PostHog Git SHA", "value": get_git_commit_short() or "unknown"}
+        )
 
         helm_info = get_helm_info_env()
         if len(helm_info) > 0:
@@ -54,20 +53,19 @@ class InstanceStatusViewSet(viewsets.ViewSet):
                     "key": "helm",
                     "metric": "Helm Info",
                     "value": "",
-                    "subrows": {"columns": ["key", "value"], "rows": list(helm_info.items())},
+                    "subrows": {
+                        "columns": ["key", "value"],
+                        "rows": list(helm_info.items()),
+                    },
                 }
             )
 
         metrics.append(
             {
-                "key": "analytics_database",
-                "metric": "Analytics database in use",
-                "value": "ClickHouse" if is_clickhouse_enabled() else "Postgres",
+                "key": "plugin_sever_alive",
+                "metric": "Plugin server alive",
+                "value": is_plugin_server_alive(),
             }
-        )
-
-        metrics.append(
-            {"key": "plugin_sever_alive", "metric": "Plugin server alive", "value": is_plugin_server_alive()}
         )
         metrics.append(
             {
@@ -88,9 +86,15 @@ class InstanceStatusViewSet(viewsets.ViewSet):
             }
         )
 
-        metrics.append({"key": "db_alive", "metric": "Postgres database alive", "value": postgres_alive})
+        metrics.append(
+            {
+                "key": "db_alive",
+                "metric": "Postgres database alive",
+                "value": postgres_alive,
+            }
+        )
         if postgres_alive:
-            postgres_version = connection.cursor().connection.server_version
+            postgres_version = connection.cursor().connection.info.server_version
             metrics.append(
                 {
                     "key": "pg_version",
@@ -98,36 +102,17 @@ class InstanceStatusViewSet(viewsets.ViewSet):
                     "value": f"{postgres_version // 10000}.{(postgres_version // 100) % 100}.{postgres_version % 100}",
                 }
             )
+            metrics.append(
+                {
+                    "key": "async_migrations_ok",
+                    "metric": "Async migrations up-to-date",
+                    "value": async_migrations_ok(),
+                }
+            )
 
-            if not is_clickhouse_enabled():
-                event_table_count = get_table_approx_count(Event._meta.db_table)
-                event_table_size = get_table_size(Event._meta.db_table)
+        from posthog.clickhouse.system_status import system_status
 
-                element_table_count = get_table_approx_count(Element._meta.db_table)
-                element_table_size = get_table_size(Element._meta.db_table)
-
-                session_recording_event_table_count = get_table_approx_count(SessionRecordingEvent._meta.db_table)
-                session_recording_event_table_size = get_table_size(SessionRecordingEvent._meta.db_table)
-
-                metrics.append(
-                    {
-                        "metric": "Postgres elements table size",
-                        "value": f"{element_table_count} rows (~{element_table_size})",
-                    }
-                )
-                metrics.append(
-                    {"metric": "Postgres events table size", "value": f"{event_table_count} rows (~{event_table_size})"}
-                )
-                metrics.append(
-                    {
-                        "metric": "Postgres session recording table size",
-                        "value": f"{session_recording_event_table_count} rows (~{session_recording_event_table_size})",
-                    }
-                )
-        if is_clickhouse_enabled():
-            from ee.clickhouse.system_status import system_status
-
-            metrics.extend(list(system_status()))
+        metrics.extend(list(system_status()))
 
         metrics.append({"key": "redis_alive", "metric": "Redis alive", "value": redis_alive})
         if redis_alive:
@@ -136,14 +121,35 @@ class InstanceStatusViewSet(viewsets.ViewSet):
             try:
                 redis_info = get_redis_info()
                 redis_queue_depth = get_redis_queue_depth()
-                metrics.append({"metric": "Redis version", "value": f"{redis_info.get('redis_version')}"})
-                metrics.append({"metric": "Redis current queue depth", "value": f"{redis_queue_depth}"})
                 metrics.append(
-                    {"metric": "Redis connected client count", "value": f"{redis_info.get('connected_clients')}"}
+                    {
+                        "metric": "Redis version",
+                        "value": f"{redis_info.get('redis_version')}",
+                    }
                 )
-                metrics.append({"metric": "Redis memory used", "value": f"{redis_info.get('used_memory_human', '?')}B"})
                 metrics.append(
-                    {"metric": "Redis memory peak", "value": f"{redis_info.get('used_memory_peak_human', '?')}B"}
+                    {
+                        "metric": "Redis current queue depth",
+                        "value": f"{redis_queue_depth}",
+                    }
+                )
+                metrics.append(
+                    {
+                        "metric": "Redis connected client count",
+                        "value": f"{redis_info.get('connected_clients')}",
+                    }
+                )
+                metrics.append(
+                    {
+                        "metric": "Redis memory used",
+                        "value": f"{redis_info.get('used_memory_human', '?')}B",
+                    }
+                )
+                metrics.append(
+                    {
+                        "metric": "Redis memory peak",
+                        "value": f"{redis_info.get('used_memory_peak_human', '?')}B",
+                    }
                 )
                 metrics.append(
                     {
@@ -151,47 +157,78 @@ class InstanceStatusViewSet(viewsets.ViewSet):
                         "value": f"{redis_info.get('total_system_memory_human', '?')}B",
                     }
                 )
+                metrics.append(
+                    {
+                        "metric": "Redis 'maxmemory' setting",
+                        "value": f"{redis_info.get('maxmemory_human', '?')}B",
+                    }
+                )
+                metrics.append(
+                    {
+                        "metric": "Redis 'maxmemory-policy' setting",
+                        "value": f"{redis_info.get('maxmemory_policy', '?')}",
+                    }
+                )
             except redis.exceptions.ConnectionError as e:
                 metrics.append(
-                    {"metric": "Redis metrics", "value": f"Redis connected but then failed to return metrics: {e}"}
+                    {
+                        "metric": "Redis metrics",
+                        "value": f"Redis connected but then failed to return metrics: {e}",
+                    }
                 )
 
-        return Response({"results": {"overview": metrics, "internal_metrics": get_internal_metrics_dashboards()}})
+        metrics.append(
+            {
+                "key": "object_storage",
+                "metric": "Object Storage enabled",
+                "value": settings.OBJECT_STORAGE_ENABLED,
+            }
+        )
+        if settings.OBJECT_STORAGE_ENABLED:
+            metrics.append(
+                {
+                    "key": "object_storage",
+                    "metric": "Object Storage healthy",
+                    "value": object_storage.health_check(),
+                }
+            )
 
-    # Used to capture internal metrics shown on dashboards
-    @action(methods=["POST"], detail=False, permission_classes=[AllowAny])
-    def capture(self, request: Request) -> Response:
-        from posthog.internal_metrics import incr, timing
+        return Response({"results": {"overview": metrics}})
 
-        method: Any = timing if request.data["method"] == "timing" else incr
-        method(request.data["metric"], request.data["value"], request.data.get("tags", None))
-        return Response({"status": 1})
+    @action(methods=["GET"], detail=False)
+    def navigation(self, request: Request) -> Response:
+        # Import here to avoid circular import
+        from posthog.clickhouse.system_status import dead_letter_queue_ratio_ok_cached
+
+        return Response(
+            {
+                "system_status_ok": (
+                    # :TRICKY: Cloud alerts of services down via pagerduty
+                    is_cloud()
+                    or (
+                        is_redis_alive()
+                        and is_postgres_alive()
+                        and is_plugin_server_alive()
+                        and dead_letter_queue_ratio_ok_cached()
+                    )
+                ),
+                "async_migrations_ok": async_migrations_ok(),
+            }
+        )
 
     @action(methods=["GET"], detail=False)
     def queries(self, request: Request) -> Response:
         queries = {"postgres_running": self.get_postgres_running_queries()}
 
-        if is_clickhouse_enabled():
-            from ee.clickhouse.system_status import get_clickhouse_running_queries, get_clickhouse_slow_log
+        from posthog.clickhouse.system_status import (
+            get_clickhouse_running_queries,
+            get_clickhouse_slow_log,
+        )
 
-            queries["clickhouse_running"] = get_clickhouse_running_queries()
-            queries["clickhouse_slow_log"] = get_clickhouse_slow_log()
+        queries["clickhouse_running"] = get_clickhouse_running_queries()
+        queries["clickhouse_slow_log"] = get_clickhouse_slow_log()
 
         return Response({"results": queries})
-
-    @action(
-        methods=["POST"],
-        detail=False,
-        permission_classes=[IsAuthenticated, SingleTenancyOrAdmin, OrganizationAdminAnyPermissions],
-    )
-    def analyze_ch_query(self, request: Request) -> Response:
-        response = {}
-        if is_clickhouse_enabled():
-            from ee.clickhouse.system_status import analyze_query
-
-            response["results"] = analyze_query(request.data["query"])
-
-        return Response(response)
 
     def get_postgres_running_queries(self):
         from django.db import connection

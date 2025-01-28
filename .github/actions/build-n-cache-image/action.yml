@@ -1,0 +1,45 @@
+name: Build and cache Docker image
+
+inputs:
+    actions-id-token-request-url:
+        required: true
+        description: "ACTIONS_ID_TOKEN_REQUEST_URL, issued by GitHub when permission 'id-token' is set to 'write'"
+    save:
+        required: false
+        default: 'false'
+        description: Whether to save the image in the Depot ephemeral registry after building it
+
+outputs:
+    tag:
+        description: The tag of the image that was built
+        value: ${{ steps.emit.outputs.tag }}
+    build-id:
+        description: The ID of the build
+        value: ${{ steps.build.outputs.build-id }}
+
+runs:
+    using: 'composite'
+    steps:
+        - name: Checkout
+          uses: actions/checkout@v4
+
+        - name: Set up Depot CLI
+          uses: depot/setup-action@v1
+
+        - name: Emit image tag
+          id: emit
+          shell: bash
+          run: echo "tag=posthog/posthog:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+        - name: Build image # We don't push this because we use Depot cache as the communication channel
+          id: build
+          uses: depot/build-push-action@v1
+          with:
+              context: .
+              buildx-fallback: false # buildx is so slow it's better to just fail
+              tags: ${{ steps.emit.outputs.tag }}
+              platforms: linux/amd64,linux/arm64
+              build-args: COMMIT_HASH=${{ github.sha }}
+              save: ${{ inputs.save }}
+          env:
+              ACTIONS_ID_TOKEN_REQUEST_URL: ${{ inputs.actions-id-token-request-url }}

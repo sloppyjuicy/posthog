@@ -1,108 +1,132 @@
-import React, { useState } from 'react'
-import { Checkbox, Dropdown, Menu, Radio, Space } from 'antd'
-import { dashboardLogic } from 'scenes/dashboard/dashboardLogic'
-import { DownOutlined, LoadingOutlined, ReloadOutlined } from '@ant-design/icons'
-import { useActions, useValues } from 'kea'
-import dayjs from 'dayjs'
-import { humanFriendlyDuration } from 'lib/utils'
+import { IconCheck } from '@posthog/icons'
+import { LemonBadge, LemonButton, LemonSwitch } from '@posthog/lemon-ui'
 import clsx from 'clsx'
-import { Tooltip } from 'lib/components/Tooltip'
+import { useActions, useValues } from 'kea'
+import { dayjs } from 'lib/dayjs'
+import { usePageVisibility } from 'lib/hooks/usePageVisibility'
+import { IconRefresh } from 'lib/lemon-ui/icons'
+import { LemonMenuOverlay } from 'lib/lemon-ui/LemonMenu/LemonMenu'
+import { LemonRadio } from 'lib/lemon-ui/LemonRadio'
+import { Spinner } from 'lib/lemon-ui/Spinner'
+import { humanFriendlyDuration } from 'lib/utils'
+import { dashboardLogic } from 'scenes/dashboard/dashboardLogic'
 
 export const LastRefreshText = (): JSX.Element => {
-    const { lastRefreshed } = useValues(dashboardLogic)
-    return (
-        <>
-            Last updated <b>{lastRefreshed ? dayjs(lastRefreshed).fromNow() : 'a while ago'}</b>
-        </>
-    )
+    const { newestRefreshed } = useValues(dashboardLogic)
+    return <span>Last updated {newestRefreshed ? dayjs(newestRefreshed).fromNow() : 'a while ago'}</span>
 }
 
-// in seconds
-const intervalOptions = [
-    ...Array.from([60, 120, 300, 900], (v) => ({
-        label: humanFriendlyDuration(v),
-        value: v,
+const REFRESH_INTERVAL_SECONDS = [1800, 3600]
+if (process.env.NODE_ENV === 'development') {
+    REFRESH_INTERVAL_SECONDS.unshift(10)
+}
+const INTERVAL_OPTIONS = [
+    ...Array.from(REFRESH_INTERVAL_SECONDS, (value) => ({
+        label: humanFriendlyDuration(value),
+        value: value,
     })),
 ]
 
 export function DashboardReloadAction(): JSX.Element {
-    const { itemsLoading, autoRefresh, refreshMetrics } = useValues(dashboardLogic)
-    const { refreshAllDashboardItemsManual, setAutoRefresh } = useActions(dashboardLogic)
-    const [open, setOpen] = useState(false)
+    const { itemsLoading, autoRefresh, refreshMetrics, blockRefresh, oldestClientRefreshAllowed } =
+        useValues(dashboardLogic)
+    const { refreshAllDashboardItemsManual, setAutoRefresh, setPageVisibility } = useActions(dashboardLogic)
+
+    usePageVisibility((pageIsVisible) => {
+        setPageVisibility(pageIsVisible)
+    })
+
+    const options = INTERVAL_OPTIONS.map((option) => {
+        return {
+            ...option,
+            disabledReason: !autoRefresh.enabled ? 'Enable auto refresh to set the interval' : undefined,
+        }
+    })
 
     return (
-        <>
-            <Dropdown.Button
-                overlay={
-                    <Menu data-attr="auto-refresh-picker" id="auto-refresh-picker">
-                        <div
-                            id="auto-refresh-check"
-                            key="auto-refresh-check"
-                            onClick={(e) => {
-                                e.stopPropagation()
-                                setOpen(true)
-                                setAutoRefresh(!autoRefresh.enabled, autoRefresh.interval)
-                            }}
-                        >
-                            <Tooltip title={`Refresh dashboard automatically`} placement="bottomLeft">
-                                <Checkbox
-                                    onChange={(e) => {
-                                        e.stopPropagation()
-                                        e.preventDefault()
-                                    }}
-                                    checked={autoRefresh.enabled}
-                                />
-                                <label
-                                    style={{
-                                        marginLeft: 10,
-                                        cursor: 'pointer',
-                                    }}
-                                >
-                                    Auto refresh
-                                </label>
-                            </Tooltip>
-                        </div>
-                        <Menu.Divider />
-                        <Menu.ItemGroup title="Refresh interval">
-                            <Radio.Group
-                                onChange={(e) => {
-                                    setAutoRefresh(true, parseInt(e.target.value))
-                                }}
-                                value={autoRefresh.interval}
-                                style={{ width: '100%' }}
-                            >
-                                <Space direction="vertical" style={{ width: '100%' }}>
-                                    {intervalOptions.map(({ label, value }) => (
-                                        <Radio key={value} value={value} style={{ width: '100%' }}>
-                                            {label}
-                                        </Radio>
-                                    ))}
-                                </Space>
-                            </Radio.Group>
-                        </Menu.ItemGroup>
-                    </Menu>
-                }
-                trigger={['click']}
+        <div className="relative">
+            <LemonButton
                 onClick={() => refreshAllDashboardItemsManual()}
-                icon={<DownOutlined />}
-                disabled={itemsLoading}
-                buttonsRender={([leftButton, rightButton]) => [
-                    React.cloneElement(leftButton as React.ReactElement, { style: { paddingLeft: 10 } }),
-                    rightButton,
-                ]}
-                visible={open}
-                onVisibleChange={(toOpen) => setOpen(toOpen)}
+                type="secondary"
+                icon={itemsLoading ? <Spinner textColored /> : blockRefresh ? <IconCheck /> : <IconRefresh />}
+                size="small"
+                data-attr="dashboard-items-action-refresh"
+                disabledReason={
+                    blockRefresh
+                        ? `Next bulk refresh possible ${dayjs(oldestClientRefreshAllowed).fromNow()}`
+                        : itemsLoading
+                        ? 'Refreshing...'
+                        : ''
+                }
+                sideAction={{
+                    'data-attr': 'dashboard-items-action-refresh-dropdown',
+                    dropdown: {
+                        closeOnClickInside: false,
+                        placement: 'bottom-end',
+                        overlay: (
+                            <LemonMenuOverlay
+                                items={[
+                                    {
+                                        label: () => (
+                                            <LemonSwitch
+                                                onChange={(checked) => setAutoRefresh(checked, autoRefresh.interval)}
+                                                label="Auto refresh while on page"
+                                                checked={autoRefresh.enabled}
+                                                fullWidth
+                                                className="mt-1 mb-2"
+                                            />
+                                        ),
+                                    },
+                                    {
+                                        title: 'Refresh interval',
+                                        items: [
+                                            {
+                                                label: () => (
+                                                    <LemonRadio
+                                                        value={autoRefresh.interval}
+                                                        options={options}
+                                                        onChange={(value: number) => {
+                                                            setAutoRefresh(true, value)
+                                                        }}
+                                                        className="mx-2 mb-1"
+                                                    />
+                                                ),
+                                            },
+                                        ],
+                                    },
+                                ]}
+                            />
+                        ),
+                    },
+                }}
             >
-                <span className="dashboard-items-action-icon">
-                    {itemsLoading ? <LoadingOutlined /> : <ReloadOutlined />}
+                <span className={clsx('dashboard-items-action-refresh-text')}>
+                    {itemsLoading ? (
+                        <>
+                            {refreshMetrics.total ? (
+                                <>
+                                    Refreshed {refreshMetrics.completed} out of {refreshMetrics.total}
+                                </>
+                            ) : (
+                                <>Refreshing...</>
+                            )}
+                        </>
+                    ) : (
+                        <LastRefreshText />
+                    )}
                 </span>
-                <span className={clsx('dashboard-items-action-refresh-text', { hidden: itemsLoading })}>
-                    <LastRefreshText />
-                </span>
-                <span className={clsx('dashboard-items-action-refresh-text', 'completed', { hidden: !itemsLoading })}>
-                    Refreshed {refreshMetrics.completed} out of {refreshMetrics.total}
-                </span>
-            </Dropdown.Button>
-        </>
+            </LemonButton>
+            <LemonBadge
+                size="small"
+                content={
+                    <>
+                        <IconRefresh className="mr-0" /> {humanFriendlyDuration(autoRefresh.interval)}
+                    </>
+                }
+                visible={autoRefresh.enabled}
+                position="top-right"
+                status="muted"
+            />
+        </div>
     )
 }

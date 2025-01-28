@@ -1,43 +1,118 @@
-import React from 'react'
-import { kea } from 'kea'
+import { actions, connect, kea, listeners, path, reducers, selectors } from 'kea'
+import { forms } from 'kea-forms'
+import { subscriptions } from 'kea-subscriptions'
 import api from 'lib/api'
-import { actionsLogic } from '~/toolbar/actions/actionsLogic'
-import { elementToActionStep, actionStepToAntdForm, stepToDatabaseFormat } from '~/toolbar/utils'
-import { toolbarLogic } from '~/toolbar/toolbarLogic'
-import { toast } from 'react-toastify'
-import { toolbarButtonLogic } from '~/toolbar/button/toolbarButtonLogic'
-import { actionsTabLogicType } from './actionsTabLogicType'
-import { ActionType } from '~/types'
-import { ActionDraftType, ActionForm, AntdFieldData } from '~/toolbar/types'
-import { FormInstance } from 'antd/es/form'
-import { posthog } from '~/toolbar/posthog'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { urls } from 'scenes/urls'
 
-function newAction(element: HTMLElement | null, dataAttributes: string[] = []): ActionDraftType {
+import { actionsLogic } from '~/toolbar/actions/actionsLogic'
+import { toolbarLogic } from '~/toolbar/bar/toolbarLogic'
+import { toolbarConfigLogic } from '~/toolbar/toolbarConfigLogic'
+import { toolbarPosthogJS } from '~/toolbar/toolbarPosthogJS'
+import { ActionDraftType, ActionForm } from '~/toolbar/types'
+import { actionStepToActionStepFormItem, elementToActionStep, stepToDatabaseFormat } from '~/toolbar/utils'
+import { ActionType, ElementType } from '~/types'
+
+import type { actionsTabLogicType } from './actionsTabLogicType'
+import { ActionStepPropertyKey } from './ActionStep'
+
+function newAction(
+    element: HTMLElement | null,
+    dataAttributes: string[] = [],
+    name: string | null,
+    includedPropertyKeys?: ActionStepPropertyKey[]
+): ActionDraftType {
     return {
-        name: '',
-        steps: [element ? actionStepToAntdForm(elementToActionStep(element, dataAttributes), true) : {}],
+        name: name || '',
+        steps: [
+            element
+                ? actionStepToActionStepFormItem(
+                      elementToActionStep(element, dataAttributes),
+                      true,
+                      includedPropertyKeys
+                  )
+                : {},
+        ],
+        pinned_at: null,
     }
 }
 
-type ActionFormInstance = FormInstance<ActionForm>
+function toElementsChain(element: HTMLElement): ElementType[] {
+    const chain: HTMLElement[] = []
+    let currentElement: HTMLElement | null | undefined = element
+    while (currentElement && currentElement !== document.documentElement) {
+        chain.push(currentElement)
+        currentElement = currentElement.parentElement
+    }
+    return chain.map(
+        (element, index) =>
+            ({
+                attr_class: element.getAttribute('class')?.split(' '),
+                attr_id: element.getAttribute('id') || undefined,
+                attributes: Array.from(element.attributes).reduce((acc, attr) => {
+                    if (!acc[attr.name]) {
+                        acc[attr.name] = attr.value
+                    } else {
+                        acc[attr.name] += ` ${attr.value}`
+                    }
+                    return acc
+                }, {} as Record<string, string>),
+                href: element.getAttribute('href') || undefined,
+                tag_name: element.tagName.toLowerCase(),
+                text: index === 0 ? element.innerText : undefined,
+            } as ElementType)
+    )
+}
 
-export const actionsTabLogic = kea<actionsTabLogicType<ActionFormInstance>>({
-    actions: {
-        setForm: (form: ActionFormInstance) => ({ form }),
+export const actionsTabLogic = kea<actionsTabLogicType>([
+    path(['toolbar', 'actions', 'actionsTabLogic']),
+    actions({
         selectAction: (id: number | null) => ({ id: id || null }),
-        newAction: (element?: HTMLElement) => ({ element: element || null }),
+        newAction: (element?: HTMLElement) => ({
+            element: element || null,
+        }),
         inspectForElementWithIndex: (index: number | null) => ({ index }),
+        editSelectorWithIndex: (index: number | null) => ({ index }),
         inspectElementSelected: (element: HTMLElement, index: number | null) => ({ element, index }),
-        setEditingFields: (editingFields: AntdFieldData[]) => ({ editingFields }),
         incrementCounter: true,
         saveAction: (formValues: ActionForm) => ({ formValues }),
         deleteAction: true,
         showButtonActions: true,
         hideButtonActions: true,
         setShowActionsTooltip: (showActionsTooltip: boolean) => ({ showActionsTooltip }),
-    },
+        setElementSelector: (selector: string, index: number) => ({ selector, index }),
+        setAutomaticActionCreationEnabled: (enabled: boolean, name?: string) => ({ enabled, name }),
+        actionCreatedSuccess: (action: ActionType) => ({ action }),
+        setautomaticCreationIncludedPropertyKeys: (keys: ActionStepPropertyKey[]) => ({ keys }),
+        removeAutomaticCreationIncludedPropertyKey: (key: ActionStepPropertyKey) => ({ key }),
+        addAutomaticCreationIncludedPropertyKey: (key: ActionStepPropertyKey) => ({ key }),
+    }),
 
-    reducers: {
+    connect(() => ({
+        values: [
+            toolbarConfigLogic,
+            ['dataAttributes', 'apiURL', 'temporaryToken', 'buttonVisible', 'userIntent', 'actionId', 'dataAttributes'],
+            actionsLogic,
+            ['allActions'],
+        ],
+    })),
+
+    reducers({
+        actionFormElementsChains: [
+            {} as Record<number, ElementType[]>,
+            {
+                inspectElementSelected: (state, { element, index }) =>
+                    index === null
+                        ? []
+                        : {
+                              ...state,
+                              [index]: toElementsChain(element),
+                          },
+                newAction: (_, { element }) => ({
+                    0: element ? toElementsChain(element) : [],
+                }),
+            },
+        ],
         buttonActionsVisible: [
             false,
             {
@@ -68,18 +143,10 @@ export const actionsTabLogic = kea<actionsTabLogicType<ActionFormInstance>>({
                 newAction: () => null,
             },
         ],
-        editingFields: [
-            null as AntdFieldData[] | null,
+        editingSelector: [
+            null as number | null,
             {
-                setEditingFields: (_, { editingFields }) => editingFields,
-                selectAction: () => null,
-                newAction: () => null,
-            },
-        ],
-        form: [
-            null as ActionFormInstance | null,
-            {
-                setForm: (_, { form }) => form,
+                editSelectorWithIndex: (_, { index }) => index,
             },
         ],
         counter: [
@@ -94,131 +161,239 @@ export const actionsTabLogic = kea<actionsTabLogicType<ActionFormInstance>>({
                 setShowActionsTooltip: (_, { showActionsTooltip }) => showActionsTooltip,
             },
         ],
-    },
+        // we automatically create actions for people from analytics onboarding. This flag controls that experience.
+        automaticActionCreationEnabled: [
+            false as boolean,
+            {
+                setAutomaticActionCreationEnabled: (_, { enabled, name }) => (enabled && !!name) || false,
+            },
+        ],
+        newActionName: [
+            null as string | null,
+            {
+                setAutomaticActionCreationEnabled: (_, { enabled, name }) => (enabled && name ? name : null),
+            },
+        ],
+        automaticCreationIncludedPropertyKeys: [
+            [] as ActionStepPropertyKey[],
+            {
+                setAutomaticActionCreationEnabled: (_, { enabled }) =>
+                    enabled ? ['text', 'href', 'name', 'selector', 'url'] : [],
+                setautomaticCreationIncludedPropertyKeys: (_, { keys }) => keys || [],
+                removeAutomaticCreationIncludedPropertyKey: (state, { key }) => state.filter((k) => k !== key),
+                addAutomaticCreationIncludedPropertyKey: (state, { key }) =>
+                    !state.includes(key) ? [...state, key] : state,
+            },
+        ],
+    }),
 
-    selectors: {
+    forms(({ values, actions }) => ({
+        actionForm: {
+            defaults: { name: null, steps: [{}] } as ActionForm,
+            errors: ({ name }) => ({
+                name: !name || !name.length ? 'Must name this action' : undefined,
+            }),
+            submit: async (formValues, breakpoint) => {
+                const actionToSave = {
+                    ...formValues,
+                    steps: formValues.steps?.map(stepToDatabaseFormat) || [],
+                    creation_context: values.automaticActionCreationEnabled ? 'onboarding' : null,
+                }
+                const { apiURL, temporaryToken } = values
+                const { selectedActionId } = values
+
+                const findUniqueActionName = (baseName: string, index = 0): string => {
+                    const proposedName = index === 0 ? baseName : `${baseName} - ${index}`
+                    if (!values.allActions.find((action) => action.name === proposedName)) {
+                        return proposedName
+                    }
+                    return findUniqueActionName(baseName, index + 1)
+                }
+
+                if (values.newActionName) {
+                    // newActionName is programmatically set, but they may already have an existing action with that name. Append an index.
+                    actionToSave.name = findUniqueActionName(values.newActionName)
+                }
+
+                let response: ActionType
+                if (selectedActionId && selectedActionId !== 'new') {
+                    response = await api.update(
+                        `${apiURL}/api/projects/@current/actions/${selectedActionId}/?temporary_token=${temporaryToken}`,
+                        actionToSave
+                    )
+                } else {
+                    response = await api.create(
+                        `${apiURL}/api/projects/@current/actions/?temporary_token=${temporaryToken}`,
+                        actionToSave
+                    )
+                }
+                breakpoint()
+
+                actions.selectAction(null)
+                actionsLogic.actions.updateAction({ action: response })
+
+                if (!values.automaticActionCreationEnabled) {
+                    lemonToast.success('Action saved', {
+                        button: {
+                            label: 'Open in PostHog',
+                            action: () => window.open(`${apiURL}${urls.action(response.id)}`, '_blank'),
+                        },
+                    })
+                }
+
+                actions.actionCreatedSuccess(response)
+            },
+
+            // whether we show errors after touch (true) or submit (false)
+            showErrorsOnTouch: true,
+            // show errors even without submitting first
+            alwaysShowErrors: false,
+        },
+    })),
+
+    selectors({
+        editingSelectorValue: [
+            (s) => [s.editingSelector, s.actionForm],
+            (editingSelector, actionForm): string | null => {
+                if (editingSelector === null) {
+                    return null
+                }
+                const selector = actionForm.steps?.[editingSelector].selector
+                return selector || null
+            },
+        ],
+        elementsChainBeingEdited: [
+            (s) => [s.editingSelector, s.actionFormElementsChains],
+            (editingSelector, elementChains): ElementType[] => {
+                if (editingSelector === null) {
+                    return []
+                }
+                return elementChains[editingSelector] || []
+            },
+        ],
         selectedAction: [
-            (s) => [s.selectedActionId, s.newActionForElement, actionsLogic.selectors.allActions],
-            (selectedActionId, newActionForElement, allActions): ActionType | ActionDraftType | null => {
+            (s) => [
+                s.selectedActionId,
+                s.newActionForElement,
+                s.allActions,
+                s.dataAttributes,
+                s.newActionName,
+                s.automaticCreationIncludedPropertyKeys,
+            ],
+            (
+                selectedActionId,
+                newActionForElement,
+                allActions,
+                dataAttributes,
+                newActionName,
+                automaticCreationIncludedPropertyKeys
+            ): ActionType | ActionDraftType | null => {
                 if (selectedActionId === 'new') {
-                    return newAction(newActionForElement, [])
+                    return newAction(
+                        newActionForElement,
+                        dataAttributes,
+                        newActionName,
+                        automaticCreationIncludedPropertyKeys
+                    )
                 }
                 return allActions.find((a) => a.id === selectedActionId) || null
             },
         ],
-        initialValuesForForm: [
-            (s) => [s.selectedAction],
-            (selectedAction): Partial<ActionForm> =>
-                selectedAction
-                    ? {
-                          ...selectedAction,
-                          steps: selectedAction.steps?.map((step) => actionStepToAntdForm(step)) || [],
-                      }
-                    : { name: '', steps: [] },
-        ],
-        selectedEditedAction: [
-            // `editingFields` don't update on values.form.setFields(fields), so reloading by tagging a few other selectors
-            (s) => [s.selectedAction, s.initialValuesForForm, s.form, s.editingFields, s.inspectingElement, s.counter],
-            (selectedAction, initialValuesForForm, form): ActionForm => {
-                return selectedAction ? { ...initialValuesForForm, ...(form?.getFieldValue('') || {}) } : null
+        isReadyForAutomaticSubmit: [
+            (s) => [s.automaticActionCreationEnabled, s.selectedAction, s.actionForm],
+            (automaticActionCreationEnabled, selectedAction, actionForm): boolean => {
+                return (
+                    (automaticActionCreationEnabled &&
+                        selectedAction?.name &&
+                        actionForm.steps?.[0]?.selector_selected) ||
+                    false
+                )
             },
         ],
-    },
+    }),
 
-    listeners: ({ actions, values }) => ({
+    subscriptions(({ actions, values }) => ({
+        selectedAction: (selectedAction: ActionType | ActionDraftType | null) => {
+            if (!selectedAction) {
+                actions.setActionFormValues({ name: null, steps: [{}] })
+            } else {
+                actions.setActionFormValues({
+                    ...selectedAction,
+                    steps: selectedAction.steps
+                        ? selectedAction.steps.map((step) => actionStepToActionStepFormItem(step, false))
+                        : [{}],
+                })
+                if (values.isReadyForAutomaticSubmit) {
+                    actions.submitActionForm()
+                }
+            }
+        },
+    })),
+
+    listeners(({ actions, values }) => ({
+        setElementSelector: ({ selector, index }) => {
+            if (values.actionForm) {
+                const steps = [...(values.actionForm.steps || [])]
+                if (steps && steps[index]) {
+                    steps[index].selector = selector
+                }
+                actions.setActionFormValue('steps', steps)
+            }
+        },
         selectAction: ({ id }) => {
             if (id) {
-                if (!toolbarLogic.values.buttonVisible) {
-                    toolbarLogic.actions.showButton()
+                if (!values.buttonVisible) {
+                    toolbarConfigLogic.actions.showButton()
                 }
 
                 if (!values.buttonActionsVisible) {
                     actions.showButtonActions()
                 }
-                if (!toolbarButtonLogic.values.actionsInfoVisible) {
-                    toolbarButtonLogic.actions.showActionsInfo()
-                }
+
+                toolbarLogic.actions.setVisibleMenu('actions')
             }
         },
         inspectElementSelected: ({ element, index }) => {
-            if (values.form) {
-                const actionStep = actionStepToAntdForm(
-                    elementToActionStep(element, toolbarLogic.values.dataAttributes),
+            if (values.actionForm) {
+                const actionStep = actionStepToActionStepFormItem(
+                    elementToActionStep(element, values.dataAttributes),
                     true
                 )
-                const fields = Object.entries(actionStep).map(([key, value]) => {
-                    return { name: ['steps', index || 0, key], value }
-                })
-                values.form.setFields(fields)
+                const newSteps = (values.actionForm.steps || []).map((step, i) =>
+                    // null index implicitly means "new step front of the list"
+                    i === (index ?? 0) ? actionStep : step
+                )
+
+                actions.setActionFormValue('steps', newSteps)
                 actions.incrementCounter()
             }
         },
-        saveAction: async ({ formValues }, breakpoint) => {
-            const actionToSave = {
-                ...formValues,
-                steps: formValues.steps?.map(stepToDatabaseFormat) || [],
-            }
-            const { apiURL, temporaryToken } = toolbarLogic.values
-            const { selectedActionId } = values
-
-            let response
-            if (selectedActionId && selectedActionId !== 'new') {
-                response = await api.update(
-                    `${apiURL}/api/action/${selectedActionId}/?temporary_token=${temporaryToken}`,
-                    actionToSave
-                )
-            } else {
-                response = await api.create(`${apiURL}/api/action/?temporary_token=${temporaryToken}`, actionToSave)
-            }
-            breakpoint()
-
-            actionsLogic.actions.updateAction({ action: response })
-            actions.selectAction(null)
-
-            const insightsUrl = `/insights?insight=TRENDS&interval=day&actions=${encodeURIComponent(
-                JSON.stringify([{ type: 'actions', id: response.id, order: 0, name: response.name }])
-            )}`
-
-            toast(
-                <>
-                    Action saved! Open it in PostHog:{' '}
-                    <a href={`${apiURL}${insightsUrl}`} target="_blank" rel="noreferrer noopener">
-                        Insights
-                    </a>{' '}
-                    -{' '}
-                    <a href={`${apiURL}/action/${response.id}`} target="_blank" rel="noreferrer noopener">
-                        Actions
-                    </a>
-                </>
-            )
-        },
         deleteAction: async () => {
-            const { apiURL, temporaryToken } = toolbarLogic.values
-            const { selectedActionId } = values
+            const { selectedActionId, apiURL, temporaryToken } = values
             if (selectedActionId && selectedActionId !== 'new') {
-                await api.delete(`${apiURL}/api/action/${selectedActionId}/?temporary_token=${temporaryToken}`)
-
+                await api.delete(
+                    `${apiURL}/api/projects/@current/actions/${selectedActionId}/?temporary_token=${temporaryToken}`
+                )
                 actionsLogic.actions.deleteAction({ id: selectedActionId })
                 actions.selectAction(null)
-                toast('Action deleted!')
+                lemonToast.info('Action deleted')
             }
         },
         showButtonActions: () => {
-            actionsLogic.actions.getActions()
-            posthog.capture('toolbar mode triggered', { mode: 'actions', enabled: true })
+            toolbarPosthogJS.capture('toolbar mode triggered', { mode: 'actions', enabled: true })
         },
         hideButtonActions: () => {
             actions.setShowActionsTooltip(false)
-            posthog.capture('toolbar mode triggered', { mode: 'actions', enabled: false })
+            toolbarPosthogJS.capture('toolbar mode triggered', { mode: 'actions', enabled: false })
         },
         [actionsLogic.actionTypes.getActionsSuccess]: () => {
-            const { userIntent } = toolbarLogic.values
+            const { userIntent, actionId } = values
             if (userIntent === 'edit-action') {
-                actions.selectAction(toolbarLogic.values.actionId)
-                toolbarLogic.actions.clearUserIntent()
+                actions.selectAction(actionId)
+                toolbarConfigLogic.actions.clearUserIntent()
             } else if (userIntent === 'add-action') {
                 actions.newAction()
-                toolbarLogic.actions.clearUserIntent()
+                toolbarConfigLogic.actions.clearUserIntent()
             } else {
                 actions.setShowActionsTooltip(true)
             }
@@ -229,5 +404,5 @@ export const actionsTabLogic = kea<actionsTabLogicType<ActionFormInstance>>({
                 actions.setShowActionsTooltip(false)
             }
         },
-    }),
-})
+    })),
+])

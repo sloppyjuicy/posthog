@@ -1,108 +1,113 @@
-import { Col, Row, Skeleton, Card } from 'antd'
-import { HotkeyButton } from 'lib/components/HotkeyButton'
-import React from 'react'
-import { PlusOutlined } from '@ant-design/icons'
-import { dashboardLogic } from './dashboardLogic'
+import './EmptyDashboardComponent.scss'
+
+import { IconPlus } from '@posthog/icons'
 import { useActions } from 'kea'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { LemonSkeleton } from 'lib/lemon-ui/LemonSkeleton'
+import React from 'react'
 
-function SkeletonOne(): JSX.Element {
-    return (
-        <Card className="hide-lte-lg">
-            <Row>
-                <Col span={12}>
-                    <Skeleton paragraph={{ rows: 1 }} />
-                    <div className="mt">
-                        <div className="mt">
-                            <Skeleton.Button />
-                            <Skeleton.Button style={{ marginLeft: 4, width: 140 }} />
-                        </div>
-                        <div className="mt">
-                            <Skeleton.Button />
-                            <Skeleton.Button style={{ marginLeft: 4, width: 140 }} />
-                        </div>
-                        <div className="mt">
-                            <Skeleton.Button />
-                            <Skeleton.Button style={{ marginLeft: 4, width: 140 }} />
-                        </div>
-                    </div>
-                </Col>
-                <Col span={12}>
-                    <div className="skeleton-actions">
-                        <Skeleton.Avatar shape="circle" size="small" />
-                        <Skeleton.Avatar shape="circle" size="small" />
-                    </div>
-                    <Skeleton.Avatar shape="circle" size="large" className="pie-chart" />
-                </Col>
-            </Row>
-        </Card>
-    )
-}
+import { addInsightToDashboardLogic } from './addInsightToDashboardModalLogic'
+import { DASHBOARD_CANNOT_EDIT_MESSAGE } from './DashboardHeader'
 
-function SkeletonTwo(): JSX.Element {
+function SkeletonCard({ children, active }: { children: React.ReactNode; active: boolean }): JSX.Element {
     return (
-        <Card>
-            <Row>
-                <Col span={12}>
-                    <Skeleton paragraph={{ rows: 1 }} />
-                </Col>
-                <Col span={12}>
-                    <div className="skeleton-actions">
-                        <Skeleton.Avatar shape="circle" size="small" />
-                        <Skeleton.Avatar shape="circle" size="small" />
-                    </div>
-                </Col>
-            </Row>
-            <div className="bar-chart">
-                {Array(8)
-                    .fill(0)
-                    .map((_, index) => {
-                        const max = 200
-                        const min = 40
-                        const height = Math.floor(Math.random() * (max - min + 1)) + min
-                        return <div className="bar-el" key={index} style={{ height: height }} />
-                    })}
+        <div className="border rounded p-10 h-full space-y-4 flex-1 flex flex-col justify-between">
+            <div className="space-y-4">
+                <LemonSkeleton className="w-1/3 h-4" active={active} />
+                <LemonSkeleton className="w-1/2 h-4" active={active} />
             </div>
-        </Card>
+            {children}
+        </div>
     )
 }
 
-export function EmptyDashboardComponent(): JSX.Element {
-    const { addGraph } = useActions(dashboardLogic)
-
+function SkeletonCardOne({ active }: { active: boolean }): JSX.Element {
     return (
-        <div className="empty-state">
-            <div className="cta">
-                <Card className="card-elevated">
+        <SkeletonCard active={active}>
+            <div className="flex justify-center flex-1 items-end gap-10">
+                {[100, 66, 33].map((height) => (
+                    <div
+                        key={height}
+                        className="border border-border-light rounded overflow-hidden flex flex-col justify-end w-[15%] h-[80%]"
+                    >
+                        {/* eslint-disable-next-line react/forbid-dom-props */}
+                        <div style={{ height: `${height}%` }}>
+                            <LemonSkeleton active={active} className="h-full w-full" />
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </SkeletonCard>
+    )
+}
+
+function SkeletonBarsRaw({ active }: { active: boolean }): JSX.Element {
+    return (
+        <div className="flex items-end gap-1 flex-1">
+            {Array(8)
+                .fill(0)
+                .map((_, index) => {
+                    const height = Math.random() * 60 + 10
+                    return (
+                        <div
+                            key={index}
+                            className="w-[12.5%]"
+                            // eslint-disable-next-line react/forbid-dom-props
+                            style={{
+                                height: `${height}%`,
+                            }}
+                        >
+                            <LemonSkeleton active={active} className="h-full w-full" />
+                        </div>
+                    )
+                })}
+        </div>
+    )
+}
+/** This component looks different on each render due to Math.random() calls within, so it's memoized to avoid that. */
+const SkeletonBars = React.memo(SkeletonBarsRaw)
+
+function SkeletonCardTwo({ active }: { active: boolean }): JSX.Element {
+    return (
+        <SkeletonCard active={active}>
+            <SkeletonBars active={active} />
+        </SkeletonCard>
+    )
+}
+
+export function EmptyDashboardComponent({ loading, canEdit }: { loading: boolean; canEdit: boolean }): JSX.Element {
+    const { showAddInsightToDashboardModal } = useActions(addInsightToDashboardLogic)
+    return (
+        <div className="EmptyDashboard">
+            {!loading && (
+                <div className="EmptyDashboard__cta">
                     <h3 className="l3">Dashboard empty</h3>
                     <p>This dashboard sure would look better with some graphs!</p>
-                    <div className="mt text-center">
-                        <HotkeyButton
-                            onClick={() => addGraph()}
+                    <div className="mt-4 text-center">
+                        <LemonButton
                             data-attr="dashboard-add-graph-header"
-                            icon={<PlusOutlined />}
-                            hotkey="n"
+                            onClick={showAddInsightToDashboardModal}
+                            type="primary"
+                            icon={<IconPlus />}
+                            center
+                            fullWidth
+                            disabledReason={canEdit ? null : DASHBOARD_CANNOT_EDIT_MESSAGE}
                         >
-                            Add graph
-                        </HotkeyButton>
+                            Add insight
+                        </LemonButton>
                     </div>
-                </Card>
+                </div>
+            )}
+            <div className="flex items-center gap-2 h-[30rem]">
+                <SkeletonCardOne active={loading} />
+                <SkeletonCardTwo active={loading} />
             </div>
-            <Row gutter={16}>
-                <Col span={24} lg={12}>
-                    <SkeletonOne />
-                </Col>
-                <Col span={24} lg={12}>
-                    <SkeletonTwo />
-                </Col>
-            </Row>
-            <Row gutter={16} className="fade-out-graphs">
-                <Col span={24} lg={12}>
-                    <SkeletonOne />
-                </Col>
-                <Col span={24} lg={12}>
-                    <SkeletonTwo />
-                </Col>
-            </Row>
+            <div className="EmptyDashboard__fade">
+                <div className="flex items-center gap-2 h-[30rem]">
+                    <SkeletonCardOne active={loading} />
+                    <SkeletonCardTwo active={loading} />
+                </div>
+            </div>
         </div>
     )
 }

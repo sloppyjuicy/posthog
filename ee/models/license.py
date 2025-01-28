@@ -1,15 +1,16 @@
-from typing import Any, List, Optional, cast
+from typing import Optional
 
-import requests
 from django.contrib.auth import get_user_model
 from django.db import models
+from django.db.models import Q
 from django.db.models.signals import post_save
 from django.dispatch.dispatcher import receiver
 from django.utils import timezone
 from rest_framework import exceptions, status
 
-from posthog.celery import sync_all_organization_available_features
 from posthog.constants import AvailableFeature
+from posthog.models.utils import sane_repr
+from posthog.tasks.tasks import sync_all_organization_available_product_features
 
 
 class LicenseError(exceptions.APIException):
@@ -28,49 +29,69 @@ class LicenseError(exceptions.APIException):
 
 
 class LicenseManager(models.Manager):
-    def create(self, *args: Any, **kwargs: Any) -> "License":
-        validate = requests.post("https://license.posthog.com/licenses/activate", data={"key": kwargs["key"]})
-        resp = validate.json()
-        if not validate.ok:
-            raise LicenseError(resp["code"], resp["detail"])
-
-        kwargs["valid_until"] = resp["valid_until"]
-        kwargs["plan"] = resp["plan"]
-        kwargs["max_users"] = resp.get("max_users", 0)
-        return cast(License, super().create(*args, **kwargs))
-
     def first_valid(self) -> Optional["License"]:
-        return cast(Optional[License], (self.filter(valid_until__gte=timezone.now()).first()))
+        """Return the highest valid license or cloud licenses if any"""
+        valid_licenses = list(self.filter(Q(valid_until__gte=timezone.now()) | Q(plan="cloud")))
+        if not valid_licenses:
+            return None
+        return max(
+            valid_licenses,
+            key=lambda license: License.PLAN_TO_SORTING_VALUE.get(license.plan, 0),
+        )
 
 
 class License(models.Model):
     objects: LicenseManager = LicenseManager()
 
-    created_at: models.DateTimeField = models.DateTimeField(auto_now_add=True)
-    plan: models.CharField = models.CharField(max_length=200)
-    valid_until: models.DateTimeField = models.DateTimeField()
-    key: models.CharField = models.CharField(max_length=200)
-    max_users: models.IntegerField = models.IntegerField(default=None, null=True)  # None = no restriction
+    created_at = models.DateTimeField(auto_now_add=True)
+    plan = models.CharField(max_length=200)
+    valid_until = models.DateTimeField()
+    key = models.CharField(max_length=200)
+    # DEPRECATED: This is no longer used
+    max_users = models.IntegerField(default=None, null=True)  # None = no restriction
 
+    # NOTE: Remember to update the Billing Service as well. Long-term it will be the source of truth.
     SCALE_PLAN = "scale"
     SCALE_FEATURES = [
         AvailableFeature.ZAPIER,
         AvailableFeature.ORGANIZATIONS_PROJECTS,
-        AvailableFeature.PROJECT_BASED_PERMISSIONING,
-        AvailableFeature.GOOGLE_LOGIN,
-        AvailableFeature.DASHBOARD_COLLABORATION,
+        AvailableFeature.SOCIAL_SSO,
         AvailableFeature.INGESTION_TAXONOMY,
+        AvailableFeature.PATHS_ADVANCED,
+        AvailableFeature.CORRELATION_ANALYSIS,
+        AvailableFeature.GROUP_ANALYTICS,
+        AvailableFeature.TAGGING,
+        AvailableFeature.BEHAVIORAL_COHORT_FILTERING,
+        AvailableFeature.WHITE_LABELLING,
+        AvailableFeature.SUBSCRIPTIONS,
+        AvailableFeature.APP_METRICS,
+        AvailableFeature.RECORDINGS_PLAYLISTS,
+        AvailableFeature.RECORDINGS_FILE_EXPORT,
+        AvailableFeature.RECORDINGS_PERFORMANCE,
     ]
 
     ENTERPRISE_PLAN = "enterprise"
-    ENTERPRISE_FEATURES = SCALE_FEATURES + [
+    ENTERPRISE_FEATURES = [
+        *SCALE_FEATURES,
+        AvailableFeature.ADVANCED_PERMISSIONS,
+        AvailableFeature.PROJECT_BASED_PERMISSIONING,
         AvailableFeature.SAML,
+        AvailableFeature.SSO_ENFORCEMENT,
+        AvailableFeature.ROLE_BASED_ACCESS,
     ]
     PLANS = {SCALE_PLAN: SCALE_FEATURES, ENTERPRISE_PLAN: ENTERPRISE_FEATURES}
+    # The higher the plan, the higher its sorting value - sync with front-end licenseLogic
+    PLAN_TO_SORTING_VALUE = {SCALE_PLAN: 10, ENTERPRISE_PLAN: 20}
 
     @property
-    def available_features(self) -> List[AvailableFeature]:
+    def available_features(self) -> list[AvailableFeature]:
         return self.PLANS.get(self.plan, [])
+
+    @property
+    def is_v2_license(self) -> bool:
+        return self.key and len(self.key.split("::")) == 2
+
+    __repr__ = sane_repr("key", "plan", "valid_until")
 
 
 def get_licensed_users_available() -> Optional[int]:
@@ -95,4 +116,4 @@ def get_licensed_users_available() -> Optional[int]:
 
 @receiver(post_save, sender=License)
 def license_saved(sender, instance, created, raw, using, **kwargs):
-    sync_all_organization_available_features()
+    sync_all_organization_available_product_features()

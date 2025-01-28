@@ -1,37 +1,42 @@
-import React from 'react'
-import { retentionTableLogic } from './retentionTableLogic'
-import { useValues } from 'kea'
-import { RetentionLineGraph } from './RetentionLineGraph'
-import { ACTIONS_LINE_GRAPH_LINEAR } from 'lib/constants'
-import { RetentionTable } from './RetentionTable'
-import { insightLogic } from 'scenes/insights/insightLogic'
+import { LemonDivider } from '@posthog/lemon-ui'
 
-export function RetentionContainer(props: {
-    dashboardItemId?: number
-    filters?: Record<string, any>
-    color?: string
+import { VizSpecificOptions } from '~/queries/schema'
+import { QueryContext } from '~/queries/types'
+import { InsightType } from '~/types'
+
+import { RetentionLineGraph } from './RetentionLineGraph'
+import { RetentionModal } from './RetentionModal'
+import { RetentionTable } from './RetentionTable'
+
+export function RetentionContainer({
+    inCardView,
+    inSharedMode,
+    vizSpecificOptions,
+}: {
+    inCardView?: boolean
     inSharedMode?: boolean
+    context?: QueryContext
+    vizSpecificOptions?: VizSpecificOptions[InsightType.RETENTION]
 }): JSX.Element {
-    const { insightProps } = useValues(insightLogic)
-    const logic = retentionTableLogic(insightProps)
-    const { loadedFilters } = useValues(logic)
+    const hideLineGraph = vizSpecificOptions?.hideLineGraph || inCardView
     return (
-        <div
-            style={
-                !props.dashboardItemId && loadedFilters.display === ACTIONS_LINE_GRAPH_LINEAR
-                    ? {
-                          minHeight: '70vh',
-                          position: 'relative',
-                      }
-                    : {
-                          minHeight: '100%',
-                      }
-            }
-        >
-            {loadedFilters.display === ACTIONS_LINE_GRAPH_LINEAR ? (
-                <RetentionLineGraph {...props} />
+        <div className="RetentionContainer">
+            {hideLineGraph ? (
+                <>
+                    <RetentionTable inSharedMode={inSharedMode} />
+                    {!inSharedMode ? <RetentionModal /> : null}
+                </>
             ) : (
-                <RetentionTable {...props} />
+                <>
+                    <div className="RetentionContainer__graph">
+                        <RetentionLineGraph inSharedMode={inSharedMode} />
+                    </div>
+                    <LemonDivider />
+                    <div className="RetentionContainer__table overflow-x-auto">
+                        <RetentionTable inSharedMode={inSharedMode} />
+                    </div>
+                    {!inSharedMode ? <RetentionModal /> : null}
+                </>
             )}
         </div>
     )

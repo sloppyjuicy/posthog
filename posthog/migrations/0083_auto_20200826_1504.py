@@ -15,16 +15,25 @@ def create_uuid(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0082_personalapikey"),
     ]
 
     operations = [
-        migrations.AddField(model_name="team", name="ingested_event", field=models.BooleanField(default=False),),
-        migrations.AddField(model_name="team", name="uuid", field=models.UUIDField(blank=True, null=True),),
-        migrations.RunPython(create_uuid),
+        migrations.AddField(
+            model_name="team",
+            name="ingested_event",
+            field=models.BooleanField(default=False),
+        ),
+        migrations.AddField(
+            model_name="team",
+            name="uuid",
+            field=models.UUIDField(blank=True, null=True),
+        ),
+        migrations.RunPython(create_uuid, migrations.RunPython.noop, elidable=True),
         migrations.AlterField(
-            model_name="team", name="uuid", field=models.UUIDField(default=uuid.uuid4, unique=True, editable=False),
+            model_name="team",
+            name="uuid",
+            field=models.UUIDField(default=uuid.uuid4, unique=True, editable=False),
         ),
     ]

@@ -1,15 +1,10 @@
-import React, { CSSProperties } from 'react'
 import { AnyPropertyFilter } from '~/types'
-import PropertyFilterButton from './PropertyFilterButton'
 
-type Props = {
-    filters: AnyPropertyFilter[]
-    style?: CSSProperties
-}
+import { PropertyFilterButton } from './PropertyFilterButton'
 
-const PropertyFiltersDisplay: React.FunctionComponent<Props> = ({ filters, style }: Props) => {
+const PropertyFiltersDisplay = ({ filters }: { filters: AnyPropertyFilter[] }): JSX.Element => {
     return (
-        <div className="mb" style={style}>
+        <div className="PropertyFilters flex-wrap">
             {filters &&
                 filters.map((item) => {
                     return <PropertyFilterButton key={item.key} item={item} />

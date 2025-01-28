@@ -1,8 +1,5 @@
-import { ExplicitTeamMemberType, OrganizationMemberType, UserType } from '../../types'
-import { OrganizationMembershipLevel, TeamMembershipLevel } from '../constants'
-
-export type EitherMembershipLevel = OrganizationMembershipLevel | TeamMembershipLevel
-export type EitherMemberType = OrganizationMemberType | ExplicitTeamMemberType
+import { EitherMemberType, ExplicitTeamMemberType, OrganizationMemberType, UserType } from '../../types'
+import { EitherMembershipLevel, OrganizationMembershipLevel, TeamMembershipLevel } from '../constants'
 
 /** If access level change is disallowed given the circumstances, returns a reason why so. Otherwise returns null. */
 export function getReasonForAccessLevelChangeProhibition(
@@ -53,7 +50,7 @@ export function getReasonForAccessLevelChangeProhibition(
 
 export const membershipLevelToName = new Map<EitherMembershipLevel, string>([
     [OrganizationMembershipLevel.Member, 'member'],
-    [OrganizationMembershipLevel.Admin, 'administrator'],
+    [OrganizationMembershipLevel.Admin, 'admin'],
     [OrganizationMembershipLevel.Owner, 'owner'],
 ])
 

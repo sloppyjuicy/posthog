@@ -1,0 +1,366 @@
+#
+# docker-compose base file used for local development, hobby deploys, and other compose use cases.
+#
+
+services:
+    proxy:
+        image: caddy
+        entrypoint: sh
+        restart: always
+        command: -c 'set -x && echo "$$CADDYFILE" > /etc/caddy/Caddyfile && exec caddy run -c /etc/caddy/Caddyfile'
+        volumes:
+            - /root/.caddy
+        environment:
+            CADDYFILE: |
+                http://localhost:8000 {
+                    @replay-capture {
+                        path /s
+                        path /s/*
+                    }
+
+                    @capture {
+                        path /e
+                        path /e/*
+                        path /i/v0/e
+                        path /i/v0/e*
+                        path /batch
+                        path /batch*
+                        path /capture
+                        path /capture*
+                    }
+
+                    @flags {
+                        path /flags
+                        path /flags*
+                    }
+
+                    handle @capture {
+                        reverse_proxy capture:3000
+                    }
+
+                    handle @replay-capture {
+                        reverse_proxy replay-capture:3000
+                    }
+
+                    handle @flags {
+                        reverse_proxy feature-flags:3001
+                    }
+
+                    handle {
+                        reverse_proxy web:8000
+                    }
+                }
+
+    db:
+        image: postgres:12-alpine
+        restart: on-failure
+        environment:
+            POSTGRES_USER: posthog
+            POSTGRES_DB: posthog
+            POSTGRES_PASSWORD: posthog
+        healthcheck:
+            test: ['CMD-SHELL', 'pg_isready -U posthog']
+            interval: 5s
+            timeout: 5s
+        volumes:
+            - ./docker/postgres-init-scripts:/docker-entrypoint-initdb.d
+
+    redis:
+        image: redis:6.2.7-alpine
+        restart: on-failure
+        command: redis-server --maxmemory-policy allkeys-lru --maxmemory 200mb
+        healthcheck:
+            test: ['CMD', 'redis-cli', 'ping']
+            interval: 3s
+            timeout: 10s
+            retries: 10
+
+    redis7:
+        image: redis:7.2-alpine
+        restart: on-failure
+        command: redis-server --maxmemory-policy allkeys-lru --maxmemory 200mb
+        healthcheck:
+            test: ['CMD', 'redis-cli', 'ping']
+            interval: 3s
+            timeout: 10s
+            retries: 10
+
+    clickhouse:
+        #
+        # Note: please keep the default version in sync across
+        #       `posthog` and the `charts-clickhouse` repos
+        #
+        image: ${CLICKHOUSE_SERVER_IMAGE:-clickhouse/clickhouse-server:24.8.7.41}
+        restart: on-failure
+
+    zookeeper:
+        image: zookeeper:3.7.0
+        restart: on-failure
+
+    kafka:
+        image: ghcr.io/posthog/kafka-container:v2.8.2
+        restart: on-failure
+        environment:
+            KAFKA_BROKER_ID: 1001
+            KAFKA_CFG_RESERVED_BROKER_MAX_ID: 1001
+            KAFKA_CFG_LISTENERS: PLAINTEXT://:9092
+            KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+            KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+            ALLOW_PLAINTEXT_LISTENER: 'true'
+        healthcheck:
+            test: kafka-cluster.sh cluster-id --bootstrap-server localhost:9092 || exit 1
+            interval: 3s
+            timeout: 10s
+            retries: 10
+
+    kafka_ui:
+        image: provectuslabs/kafka-ui:latest
+        restart: on-failure
+        environment:
+            KAFKA_CLUSTERS_0_NAME: local
+            KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+            DYNAMIC_CONFIG_ENABLED: 'true'
+
+    objectstorage:
+        image: minio/minio:RELEASE.2022-06-25T15-50-16Z
+        restart: on-failure
+        environment:
+            MINIO_ROOT_USER: object_storage_root_user
+            MINIO_ROOT_PASSWORD: object_storage_root_password
+        entrypoint: sh
+        command: -c 'mkdir -p /data/posthog && minio server --address ":19000" --console-address ":19001" /data' # create the 'posthog' bucket before starting the service
+
+    maildev:
+        image: maildev/maildev:2.0.5
+        restart: on-failure
+
+    flower:
+        image: mher/flower:2.0.0
+        restart: on-failure
+        environment:
+            FLOWER_PORT: 5555
+            CELERY_BROKER_URL: redis://redis:6379
+
+    worker: &worker
+        command: ./bin/docker-worker-celery --with-scheduler
+        restart: on-failure
+        environment: &worker_env
+            DISABLE_SECURE_SSL_REDIRECT: 'true'
+            IS_BEHIND_PROXY: 'true'
+            DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
+            CLICKHOUSE_HOST: 'clickhouse'
+            CLICKHOUSE_DATABASE: 'posthog'
+            CLICKHOUSE_SECURE: 'false'
+            CLICKHOUSE_VERIFY: 'false'
+            KAFKA_HOSTS: 'kafka'
+            REDIS_URL: 'redis://redis:6379/'
+            PGHOST: db
+            PGUSER: posthog
+            PGPASSWORD: posthog
+            DEPLOYMENT: hobby
+
+    web:
+        <<: *worker
+        command: ./bin/start-backend & ./bin/start-frontend
+        restart: on-failure
+
+    capture:
+        image: ghcr.io/posthog/posthog/capture:master
+        build:
+            context: rust/
+            args:
+                BIN: capture
+        restart: on-failure
+        environment:
+            ADDRESS: '0.0.0.0:3000'
+            KAFKA_TOPIC: 'events_plugin_ingestion'
+            KAFKA_HOSTS: 'kafka:9092'
+            REDIS_URL: 'redis://redis:6379/'
+            CAPTURE_MODE: events
+
+    replay-capture:
+        image: ghcr.io/posthog/posthog/capture:master
+        build:
+            context: rust/
+            args:
+                BIN: capture
+        restart: on-failure
+        environment:
+            ADDRESS: '0.0.0.0:3000'
+            KAFKA_TOPIC: 'session_recording_snapshot_item_events'
+            KAFKA_HOSTS: 'kafka:9092'
+            REDIS_URL: 'redis://redis:6379/'
+            CAPTURE_MODE: recordings
+
+    property-defs-rs:
+        image: ghcr.io/posthog/posthog/property-defs-rs:master
+        build:
+            context: rust/
+            args:
+                BIN: property-defs-rs
+        restart: on-failure
+        environment:
+            DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
+            KAFKA_HOSTS: 'kafka:9092'
+            SKIP_WRITES: 'false'
+            SKIP_READS: 'false'
+            FILTER_MODE: 'opt-out'
+
+    feature-flags:
+        image: ghcr.io/posthog/posthog/feature-flags:master
+        build:
+            context: rust/
+            args:
+                BIN: feature-flags
+        restart: on-failure
+        volumes:
+            - ./share:/share
+        environment:
+            WRITE_DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
+            READ_DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
+            MAXMIND_DB_PATH: '/share/GeoLite2-City.mmdb'
+            REDIS_URL: 'redis://redis:6379/'
+            ADDRESS: '0.0.0.0:3001'
+            SKIP_WRITES: 'false'
+            SKIP_READS: 'false'
+
+    plugins:
+        command: ./bin/plugin-server --no-restart-loop
+        restart: on-failure
+        environment:
+            DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
+            KAFKA_HOSTS: 'kafka:9092'
+            REDIS_URL: 'redis://redis:6379/'
+            CLICKHOUSE_HOST: 'clickhouse'
+            CLICKHOUSE_DATABASE: 'posthog'
+            CLICKHOUSE_SECURE: 'false'
+            CLICKHOUSE_VERIFY: 'false'
+
+    livestream:
+        image: 'ghcr.io/posthog/livestream:main'
+        restart: on-failure
+        depends_on:
+            kafka:
+                condition: service_started
+
+    migrate:
+        <<: *worker
+        command: sh -c "
+            python manage.py migrate
+            && python manage.py migrate_clickhouse
+            && python manage.py run_async_migrations
+            "
+        restart: 'no'
+        deploy:
+            replicas: 0
+
+    asyncmigrationscheck:
+        <<: *worker
+        command: python manage.py run_async_migrations --check
+        restart: 'no'
+        deploy:
+            replicas: 0
+        environment:
+            <<: *worker_env
+            SKIP_ASYNC_MIGRATIONS_SETUP: 0
+
+    # Temporal containers
+    elasticsearch:
+        environment:
+            - cluster.routing.allocation.disk.threshold_enabled=true
+            - cluster.routing.allocation.disk.watermark.low=512mb
+            - cluster.routing.allocation.disk.watermark.high=256mb
+            - cluster.routing.allocation.disk.watermark.flood_stage=128mb
+            - discovery.type=single-node
+            - ES_JAVA_OPTS=-Xms256m -Xmx256m
+            - xpack.security.enabled=false
+        image: elasticsearch:7.16.2
+        expose:
+            - 9200
+        volumes:
+            - /var/lib/elasticsearch/data
+    temporal:
+        restart: on-failure
+        environment:
+            - DB=postgresql
+            - DB_PORT=5432
+            - POSTGRES_USER=posthog
+            - POSTGRES_PWD=posthog
+            - POSTGRES_SEEDS=db
+            - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+            - ENABLE_ES=true
+            - ES_SEEDS=elasticsearch
+            - ES_VERSION=v7
+        image: temporalio/auto-setup:1.20.0
+        ports:
+            - 7233:7233
+        labels:
+            kompose.volume.type: configMap
+        volumes:
+            - ./docker/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig
+        depends_on:
+            db:
+                condition: service_healthy
+            elasticsearch:
+                condition: service_started
+
+    temporal-admin-tools:
+        environment:
+            - TEMPORAL_CLI_ADDRESS=temporal:7233
+        image: temporalio/admin-tools:1.20.0
+        stdin_open: true
+        tty: true
+    temporal-ui:
+        environment:
+            - TEMPORAL_ADDRESS=temporal:7233
+            - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+            - TEMPORAL_CSRF_COOKIE_INSECURE=true
+        image: temporalio/ui:2.31.2
+        ports:
+            - 8081:8080
+    temporal-django-worker:
+        <<: *worker
+        command: ./bin/temporal-django-worker
+        restart: on-failure
+        environment:
+            <<: *worker_env
+            TEMPORAL_HOST: temporal
+
+    cyclotron-fetch:
+        image: ghcr.io/posthog/posthog/cyclotron-fetch:master
+        build:
+            context: rust/
+            args:
+                BIN: cyclotron-fetch
+        restart: on-failure
+        environment:
+            DATABASE_URL: 'postgres://posthog:posthog@db:5432/cyclotron'
+            KAFKA_HOSTS: 'kafka:9092'
+            KAFKA_TOPIC: 'clickhouse_app_metrics2'
+            WORKER_ID: 'default_worker_id'
+            JOB_POLL_INTERVAL: '1s'
+            MAX_CONCURRENT_JOBS: '10'
+            DEBUG: '1'
+            RUST_LOG: 'info'
+        depends_on:
+            db:
+                condition: service_healthy
+            kafka:
+                condition: service_started
+
+    cyclotron-janitor:
+        image: ghcr.io/posthog/posthog/cyclotron-janitor:master
+        build:
+            context: rust/
+            args:
+                BIN: cyclotron-janitor
+        restart: on-failure
+        environment:
+            DATABASE_URL: 'postgres://posthog:posthog@db:5432/cyclotron'
+            KAFKA_HOSTS: 'kafka:9092'
+            KAFKA_TOPIC: 'clickhouse_app_metrics2'
+        depends_on:
+            db:
+                condition: service_healthy
+            kafka:
+                condition: service_started

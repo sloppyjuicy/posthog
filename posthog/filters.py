@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple, TypeVar, Union
+from typing import Optional, TypeVar, Union
 
 from django.db import models
 from django.db.models import Q
@@ -19,7 +19,7 @@ class TermSearchFilterBackend(filters.BaseFilterBackend):
     # The URL query parameter used for the search.
     search_param = settings.api_settings.SEARCH_PARAM
 
-    def get_search_fields(self, view: APIView) -> Optional[List[str]]:
+    def get_search_fields(self, view: APIView) -> Optional[list[str]]:
         """
         Search fields are obtained from the view.
         """
@@ -33,7 +33,12 @@ class TermSearchFilterBackend(filters.BaseFilterBackend):
         terms = terms.replace("\x00", "")  # strip null characters
         return list(filter(None, terms.split(" ")))
 
-    def filter_queryset(self, request: Request, queryset: Union[QuerySet[_MT], RawQuerySet], view: APIView):
+    def filter_queryset(
+        self,
+        request: Request,
+        queryset: Union[QuerySet[_MT], RawQuerySet],
+        view: APIView,
+    ):
         if isinstance(queryset, RawQuerySet):
             return queryset
 
@@ -44,16 +49,20 @@ class TermSearchFilterBackend(filters.BaseFilterBackend):
             return queryset
 
         term_filter = Q()
-        for term_idx, search_term in enumerate(search_terms):
+        for _term_idx, search_term in enumerate(search_terms):
             search_filter_query = Q()
-            for idx, search_field in enumerate(search_fields):
+            for _idx, search_field in enumerate(search_fields):
                 search_filter_query = search_filter_query | Q(**{f"{search_field}__icontains": search_term})
             term_filter = term_filter & search_filter_query
 
         return queryset.filter(term_filter)
 
 
-def term_search_filter_sql(search_fields: List[str], search_terms: Optional[str] = "") -> Tuple[str, dict]:
+def term_search_filter_sql(
+    search_fields: list[str],
+    search_terms: Optional[str] = "",
+    search_extra: Optional[str] = "",
+) -> tuple[str, dict]:
     if not search_fields or not search_terms:
         return "", {}
 
@@ -70,6 +79,6 @@ def term_search_filter_sql(search_fields: List[str], search_terms: Optional[str]
         term_filter.append(f"({' OR '.join(search_filter_query)})")
 
     if term_filter:
-        return f"AND ({' AND '.join(term_filter)})", kwargs
+        return f"AND (({' AND '.join(term_filter)}) {search_extra})", kwargs
     else:
         return "", {}

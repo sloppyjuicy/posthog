@@ -1,93 +1,86 @@
-import React, { CSSProperties, useEffect } from 'react'
-import { useValues, BindLogic, useActions } from 'kea'
-import { propertyFilterLogic } from './propertyFilterLogic'
-import 'scenes/actions/Actions.scss'
-import { AnyPropertyFilter } from '~/types'
-import { PathItemSelector } from './components/PathItemSelector'
-import { Button, Row } from 'antd'
-import { PlusCircleOutlined } from '@ant-design/icons'
-import { FilterButton } from './components/PropertyFilterButton'
-import { CloseButton } from '../CloseButton'
-import { TaxonomicFilterGroupType } from '../TaxonomicFilter/types'
-import { SimpleOption } from '../TaxonomicFilter/groups'
+import { IconPlusSmall } from '@posthog/icons'
+import { LemonButton } from '@posthog/lemon-ui'
+import { BindLogic, useActions, useValues } from 'kea'
 import { objectsEqual } from 'lib/utils'
+import { CSSProperties, useEffect } from 'react'
+
+import { AnyPropertyFilter, EmptyPropertyFilter, PropertyFilterType, PropertyOperator } from '~/types'
+
+import { SimpleOption, TaxonomicFilterGroupType } from '../TaxonomicFilter/types'
+import { PathItemSelector } from './components/PathItemSelector'
+import { PropertyFilterButton } from './components/PropertyFilterButton'
+import { propertyFilterLogic } from './propertyFilterLogic'
 
 interface PropertyFiltersProps {
     endpoint?: string | null
     propertyFilters?: AnyPropertyFilter[] | null
-    onChange?: null | ((filters: AnyPropertyFilter[]) => void)
+    onChange: (filters: AnyPropertyFilter[]) => void
     pageKey: string
     style?: CSSProperties
-    groupTypes?: TaxonomicFilterGroupType[]
+    taxonomicGroupTypes: TaxonomicFilterGroupType[]
     wildcardOptions?: SimpleOption[]
 }
 
 export function PathItemFilters({
-    propertyFilters = null,
-    onChange = null,
+    propertyFilters,
+    onChange,
     pageKey,
-    style = {},
-    groupTypes,
+    taxonomicGroupTypes,
     wildcardOptions,
 }: PropertyFiltersProps): JSX.Element {
-    const logicProps = { propertyFilters, onChange, pageKey, urlOverride: 'exclude_events' }
-    const { filters } = useValues(propertyFilterLogic(logicProps))
+    const logicProps = { propertyFilters, onChange, pageKey }
+    const { filtersWithNew } = useValues(propertyFilterLogic(logicProps))
     const { setFilter, remove, setFilters } = useActions(propertyFilterLogic(logicProps))
 
     useEffect(() => {
-        if (propertyFilters && !objectsEqual(propertyFilters, filters)) {
-            setFilters([...propertyFilters, {}])
+        if (propertyFilters && !objectsEqual(propertyFilters, filtersWithNew)) {
+            setFilters([...propertyFilters, {} as EmptyPropertyFilter])
         }
     }, [propertyFilters])
 
     return (
-        <div className="mb" style={style}>
-            <BindLogic logic={propertyFilterLogic} props={logicProps}>
-                {filters?.length &&
-                    filters.map((filter, index) => {
-                        return (
-                            <div key={index} style={{ margin: '0.25rem 0', padding: '0.25rem 0' }}>
-                                <PathItemSelector
-                                    pathItem={filter.value as string | undefined}
-                                    onChange={(pathItem) => setFilter(index, pathItem, pathItem, null, 'event')}
-                                    index={index}
-                                    groupTypes={groupTypes}
-                                    wildcardOptions={wildcardOptions}
+        <BindLogic logic={propertyFilterLogic} props={logicProps}>
+            {filtersWithNew?.map((filter: AnyPropertyFilter, index: number) => {
+                return (
+                    <div key={index} className="mb-2">
+                        <PathItemSelector
+                            pathItem={filter.value as string | undefined}
+                            onChange={(pathItem) =>
+                                setFilter(index, {
+                                    key: pathItem,
+                                    value: pathItem,
+                                    type: PropertyFilterType.Event,
+                                    operator: PropertyOperator.Exact,
+                                })
+                            }
+                            index={index}
+                            taxonomicGroupTypes={taxonomicGroupTypes}
+                            wildcardOptions={wildcardOptions}
+                        >
+                            {!filter.value ? (
+                                <LemonButton
+                                    className="new-prop-filter"
+                                    data-attr={'new-prop-filter-' + pageKey}
+                                    type="secondary"
+                                    icon={<IconPlusSmall />}
+                                    sideIcon={null}
                                 >
-                                    {!filter.value ? (
-                                        <Button
-                                            className="new-prop-filter"
-                                            data-attr={'new-prop-filter-' + pageKey}
-                                            type="link"
-                                            style={{ paddingLeft: 0 }}
-                                            icon={<PlusCircleOutlined />}
-                                        >
-                                            Add exclusion
-                                        </Button>
-                                    ) : (
-                                        <Row align="middle">
-                                            <FilterButton>{filter.value as string}</FilterButton>
-                                            {!!Object.keys(filters[index]).length && (
-                                                <CloseButton
-                                                    onClick={(e: Event) => {
-                                                        remove(index)
-                                                        e.stopPropagation()
-                                                    }}
-                                                    style={{
-                                                        cursor: 'pointer',
-                                                        float: 'none',
-                                                        paddingLeft: 8,
-                                                        alignSelf: 'center',
-                                                    }}
-                                                />
-                                            )}
-                                        </Row>
-                                    )}
-                                </PathItemSelector>
-                            </div>
-                        )
-                    })}
-            </BindLogic>
-        </div>
+                                    Add exclusion
+                                </LemonButton>
+                            ) : (
+                                <PropertyFilterButton
+                                    item={filter}
+                                    onClose={() => {
+                                        remove(index)
+                                    }}
+                                >
+                                    {filter.value.toString()}
+                                </PropertyFilterButton>
+                            )}
+                        </PathItemSelector>
+                    </div>
+                )
+            })}
+        </BindLogic>
     )
 }

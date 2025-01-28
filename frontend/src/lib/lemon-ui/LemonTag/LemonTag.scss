@@ -1,0 +1,111 @@
+.LemonTag {
+    display: inline-flex;
+    gap: 0.125rem;
+    align-items: center;
+    padding: 0.125rem 0.25rem;
+    font-size: 0.75rem;
+    font-weight: var(--font-medium);
+    line-height: 1rem;
+    color: var(--text-3000);
+    white-space: nowrap;
+    background: var(--border);
+    border-radius: var(--radius-sm);
+
+    &.LemonTag--normal {
+        font-weight: normal;
+    }
+
+    &:not(.LemonTag--breakdown) {
+        padding: 0.075rem 0.25rem;
+        font-size: 0.6875rem;
+        background: none;
+        border-style: solid;
+        border-width: 1px;
+        border-radius: var(--radius-sm);
+    }
+
+    &.LemonTag--primary {
+        color: var(--accent-primary);
+        background: none;
+        border-color: var(--accent-primary);
+    }
+
+    &.LemonTag--option {
+        color: var(--accent-primary);
+        background-color: var(--accent-3000);
+    }
+
+    &.LemonTag--highlight {
+        color: var(--accent-primary);
+        background: none;
+        border-color: var(--accent-primary);
+    }
+
+    &.LemonTag--warning {
+        color: var(--warning);
+        background-color: none;
+        border-color: var(--warning);
+    }
+
+    &.LemonTag--danger {
+        color: var(--danger);
+        background: none;
+        border-color: var(--danger);
+    }
+
+    &.LemonTag--success {
+        color: var(--success);
+        background: none;
+        border-color: var(--success);
+    }
+
+    &.LemonTag--completion {
+        color: var(--purple);
+        background: none;
+        border-color: var(--purple);
+    }
+
+    &.LemonTag--caution {
+        color: var(--danger-lighter);
+        background: none;
+        border-color: var(--danger-lighter);
+    }
+
+    &.LemonTag--muted {
+        color: var(--muted);
+        background-color: var(--accent-3000);
+    }
+
+    &.LemonTag--none {
+        background: none;
+    }
+
+    &.LemonTag--breakdown {
+        padding: 8px 12px;
+        font-size: 14px;
+        font-weight: 400;
+        line-height: 16px;
+        color: var(--primary-alt);
+        vertical-align: bottom;
+        background-color: var(--accent-primary-highlight);
+        border-radius: 40px;
+    }
+
+    &.LemonTag--size-small {
+        padding: 0 0.1875rem;
+        font-size: 0.625rem;
+        line-height: 0.875rem;
+    }
+
+    .LemonTag__icon {
+        display: flex;
+        margin-right: 0.125rem;
+        font-size: 0.875rem;
+    }
+
+    .LemonTag__right-button {
+        min-height: 1.5rem !important;
+        padding: 0.125rem !important;
+        margin-left: 0.25rem;
+    }
+}

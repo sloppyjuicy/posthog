@@ -1,0 +1,36 @@
+.ActionFilter {
+    > * + *,
+    ul > li + li {
+        margin-top: 0.5rem;
+    }
+
+    .ActionFilterRow-filters {
+        padding: 0.5rem 0;
+    }
+
+    &.ActionFilter--bordered {
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+
+        .ActionFilterRow {
+            margin-top: 0;
+
+            .ActionFilterRow-content {
+                padding: 1rem;
+                margin-bottom: 0;
+                border-bottom: 1px solid var(--border);
+            }
+        }
+
+        .ActionFilter-footer {
+            padding: 0.5rem;
+            margin-top: 0;
+        }
+
+        .ActionFilterRow-filters {
+            padding: 0.5rem;
+            background-color: var(--bg-3000);
+            border-bottom: 1px solid var(--border);
+        }
+    }
+}

@@ -5,13 +5,14 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0126_fix_funnels_insights_links"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name="dashboard", name="filters", field=django.contrib.postgres.fields.jsonb.JSONField(default=dict),
+            model_name="dashboard",
+            name="filters",
+            field=django.contrib.postgres.fields.jsonb.JSONField(default=dict),
         ),
     ]

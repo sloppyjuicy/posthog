@@ -1,17 +1,21 @@
 import sys
-from typing import Dict, List, Optional
+from typing import Optional
 
 import lxml
 import toronado
+from celery import shared_task
 from django.conf import settings
 from django.core import exceptions, mail
+from django.core.mail.backends.smtp import EmailBackend
 from django.db import transaction
 from django.template.loader import get_template
 from django.utils import timezone
+from django.utils.module_loading import import_string
 from sentry_sdk import capture_exception
 
-from posthog.celery import app
+from posthog.models.instance_setting import get_instance_setting
 from posthog.models.messaging import MessagingRecord
+from posthog.tasks.utils import CeleryQueue
 
 
 def inline_css(value: str) -> str:
@@ -32,18 +36,27 @@ def is_email_available(with_absolute_urls: bool = False) -> bool:
     Emails with absolute URLs can't be sent if SITE_URL is unset.
     """
     return (
-        settings.EMAIL_ENABLED
-        and bool(settings.EMAIL_HOST)
+        get_instance_setting("EMAIL_ENABLED")
+        and bool(get_instance_setting("EMAIL_HOST"))
         and (not with_absolute_urls or settings.SITE_URL is not None)
     )
 
 
-@app.task(ignore_result=True, max_retries=3)
+EMAIL_TASK_KWARGS = {
+    "queue": CeleryQueue.EMAIL.value,
+    "ignore_result": True,
+    "autoretry_for": (Exception,),
+    "max_retries": 3,
+    "retry_backoff": True,
+}
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
 def _send_email(
     campaign_key: str,
-    to: List[Dict[str, str]],
+    to: list[dict[str, str]],
     subject: str,
-    headers: Dict,
+    headers: dict,
     txt_body: str = "",
     html_body: str = "",
     reply_to: Optional[str] = None,
@@ -52,11 +65,10 @@ def _send_email(
     Sends built email message asynchronously.
     """
 
-    messages: List = []
-    records: List = []
+    messages: list = []
+    records: list = []
 
     with transaction.atomic():
-
         for dest in to:
             record, _ = MessagingRecord.objects.get_or_create(raw_email=dest["raw_email"], campaign_key=campaign_key)
 
@@ -68,11 +80,12 @@ def _send_email(
                 continue
 
             records.append(record)
-            reply_to = reply_to or settings.EMAIL_REPLY_TO
+            reply_to = reply_to or get_instance_setting("EMAIL_REPLY_TO")
 
             email_message = mail.EmailMultiAlternatives(
                 subject=subject,
                 body=txt_body,
+                from_email=get_instance_setting("EMAIL_DEFAULT_FROM"),
                 to=[dest["recipient"]],
                 headers=headers,
                 reply_to=[reply_to] if reply_to else None,
@@ -83,7 +96,15 @@ def _send_email(
 
         connection = None
         try:
-            connection = mail.get_connection()
+            klass = import_string(settings.EMAIL_BACKEND) if settings.EMAIL_BACKEND else EmailBackend
+            connection = klass(
+                host=get_instance_setting("EMAIL_HOST"),
+                port=get_instance_setting("EMAIL_PORT"),
+                username=get_instance_setting("EMAIL_HOST_USER"),
+                password=get_instance_setting("EMAIL_HOST_PASSWORD"),
+                use_tls=get_instance_setting("EMAIL_USE_TLS"),
+                use_ssl=get_instance_setting("EMAIL_USE_SSL"),
+            )
             connection.open()
             connection.send_messages(messages)
 
@@ -101,7 +122,11 @@ def _send_email(
             try:
                 connection.close()  # type: ignore
             except Exception as err:
-                print("Could not close email connection (this can be ignored):", err, file=sys.stderr)
+                print(
+                    "Could not close email connection (this can be ignored):",
+                    err,
+                    file=sys.stderr,
+                )
 
 
 class EmailMessage:
@@ -110,12 +135,17 @@ class EmailMessage:
         campaign_key: str,
         subject: str,
         template_name: str,
-        template_context: Optional[Dict] = None,
-        headers: Optional[Dict] = None,
+        template_context: Optional[dict] = None,
+        headers: Optional[dict] = None,
         reply_to: Optional[str] = None,
     ):
+        if template_context is None:
+            template_context = {}
         if not is_email_available():
-            raise exceptions.ImproperlyConfigured("Email is not enabled in this instance.",)
+            raise exceptions.ImproperlyConfigured("Email is not enabled in this instance.")
+
+        if "utm_tags" not in template_context:
+            template_context.update({"utm_tags": f"utm_source=posthog&utm_medium=email&utm_campaign={template_name}"})
 
         self.campaign_key = campaign_key
         self.subject = subject
@@ -123,7 +153,7 @@ class EmailMessage:
         self.html_body = inline_css(template.render(template_context))
         self.txt_body = ""
         self.headers = headers if headers else {}
-        self.to: List[Dict[str, str]] = []
+        self.to: list[dict[str, str]] = []
         self.reply_to = reply_to
 
     def add_recipient(self, email: str, name: Optional[str] = None) -> None:

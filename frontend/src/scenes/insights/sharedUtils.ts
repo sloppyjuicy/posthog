@@ -1,6 +1,17 @@
-// This is separate from utils.ts because here we don't include `funnelLogic`, `retentionTableLogic`, etc
+// This is separate from utils.ts because here we don't include `funnelLogic`, `retentionLogic`, etc
 
-import { FilterType, InsightLogicProps, InsightType, ViewType } from '~/types'
+import {
+    ChartDisplayType,
+    FilterType,
+    FunnelsFilterType,
+    InsightLogicProps,
+    InsightType,
+    LifecycleFilterType,
+    PathsFilterType,
+    RetentionFilterType,
+    StickinessFilterType,
+    TrendsFilterType,
+} from '~/types'
 
 /**
  * Get a key function for InsightLogicProps.
@@ -10,30 +21,55 @@ import { FilterType, InsightLogicProps, InsightType, ViewType } from '~/types'
  * @param sceneKey
  */
 export const keyForInsightLogicProps =
-    (defaultKey = 'new', sceneKey = 'scene') =>
-    (props: InsightLogicProps): string | number => {
+    (defaultKey = 'new') =>
+    (props: InsightLogicProps): string => {
         if (!('dashboardItemId' in props)) {
             throw new Error('Must init with dashboardItemId, even if undefined')
         }
-        return props.syncWithUrl ? sceneKey : props.dashboardItemId || defaultKey
+        return props.dashboardItemId
+            ? `${props.dashboardItemId}${props.dashboardId ? `/on-dashboard-${props.dashboardId}` : ''}`
+            : defaultKey
     }
 
-export function filterTrendsClientSideParams(filters: Partial<FilterType>): Partial<FilterType> {
-    const {
-        people_day: _skip_this_one, // eslint-disable-line
-        people_action: _skip_this_too, // eslint-disable-line
-        stickiness_days: __and_this, // eslint-disable-line
-        ...newFilters
-    } = filters
+export function filterTrendsClientSideParams(
+    filters: Partial<TrendsFilterType & StickinessFilterType>
+): Partial<TrendsFilterType & StickinessFilterType> {
+    const { stickiness_days: ___discard, ...newFilters } = filters
 
+    // "compare against previous" doesn't make a lot of sense for area charts.
+    // since we want to preserve the `compare` setting for switching to
+    // other display types, we simply overwrite it here.
+    if (isAreaChartDisplay(filters)) {
+        newFilters.compare = false
+    }
     return newFilters
 }
 
-export function isTrendsInsight(insight?: ViewType | InsightType): boolean {
-    return (
-        insight === ViewType.TRENDS ||
-        insight === ViewType.LIFECYCLE ||
-        insight === ViewType.STICKINESS ||
-        insight === ViewType.SESSIONS
-    )
+export function isTrendsFilter(filters?: Partial<FilterType>): filters is Partial<TrendsFilterType> {
+    return filters?.insight === InsightType.TRENDS || (!!filters && !filters.insight)
+}
+export function isFunnelsFilter(filters?: Partial<FilterType>): filters is Partial<FunnelsFilterType> {
+    return filters?.insight === InsightType.FUNNELS
+}
+export function isRetentionFilter(filters?: Partial<FilterType>): filters is Partial<RetentionFilterType> {
+    return filters?.insight === InsightType.RETENTION
+}
+export function isStickinessFilter(filters?: Partial<FilterType>): filters is Partial<StickinessFilterType> {
+    return filters?.insight === InsightType.STICKINESS
+}
+export function isLifecycleFilter(filters?: Partial<FilterType>): filters is Partial<LifecycleFilterType> {
+    return filters?.insight === InsightType.LIFECYCLE
+}
+export function isPathsFilter(filters?: Partial<FilterType>): filters is Partial<PathsFilterType> {
+    return filters?.insight === InsightType.PATHS
+}
+
+export function isFilterWithDisplay(
+    filters: Partial<FilterType>
+): filters is Partial<TrendsFilterType> | Partial<StickinessFilterType> {
+    return isTrendsFilter(filters) || isStickinessFilter(filters)
+}
+
+export function isAreaChartDisplay(filters?: Partial<FilterType>): boolean {
+    return isTrendsFilter(filters) && filters.display === ChartDisplayType.ActionsAreaGraph
 }

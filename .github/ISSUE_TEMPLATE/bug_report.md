@@ -9,9 +9,7 @@ labels: bug
 *Please describe.*  
 *If this affects the front-end, screenshots would be of great help.*  
 
-## Expected behavior
-
-
+*If you are on PostHog Cloud it would be really valuable if you can share any links where the problem occurs. This speeds up our ability to troubleshoot tremendously.* 
 
 ## How to reproduce
 
@@ -21,9 +19,10 @@ labels: bug
 
 ## Environment
 
-- [ ] PostHog Cloud
-- [ ] self-hosted PostHog (ClickHouse-based), version/commit: _please provide_
-- [ ] self-hosted PostHog (Postgres-based, legacy), version/commit: _please provide_
+- [ ] PostHog Cloud US, project ID: [please provide from https://us.posthog.com/settings/project-details#variables]
+- [ ] PostHog Cloud EU, project ID: [please provide from https://eu.posthog.com/settings/project-details#variables]
+- [ ] PostHog Hobby self-hosted with `docker compose`, version/commit: [please provide]
+- [ ] PostHog self-hosted with Kubernetes (deprecated, see ["Sunsetting Kubernetes support"](https://posthog.com/blog/sunsetting-helm-support-posthog)), version/commit: [please provide]
 
 ## Additional context
 

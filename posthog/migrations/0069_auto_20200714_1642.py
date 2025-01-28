@@ -5,7 +5,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0068_auto_20200629_1322"),
     ]
@@ -17,7 +16,9 @@ class Migration(migrations.Migration):
             field=models.DateTimeField(blank=True, default=django.utils.timezone.now),
         ),
         migrations.AddField(
-            model_name="event", name="created_at", field=models.DateTimeField(auto_now_add=True, null=True),
+            model_name="event",
+            name="created_at",
+            field=models.DateTimeField(auto_now_add=True, null=True),
         ),
         migrations.AlterField(
             model_name="user",

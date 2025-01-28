@@ -1,4 +1,3 @@
-export * from './ActionsPie'
+export * from './ActionsHorizontalBar'
 export * from './ActionsLineGraph'
-export * from './ActionsTable'
-export * from './ActionsBarValueGraph'
+export * from './ActionsPie'

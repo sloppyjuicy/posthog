@@ -1,10 +1,19 @@
-@import '~/vars';
 .dated-highlight {
-    color: $text_muted;
+    padding: 0.125rem 0.25rem;
     margin-right: 4px;
-    padding: 2px 4px;
-    border: 1px solid $border_light;
-    background-color: white;
-    border-radius: $radius;
+    color: var(--muted);
     white-space: nowrap;
+    background-color: var(--bg-light);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius);
+}
+
+.date-display-dates {
+    white-space: nowrap;
+
+    .secondary-date {
+        margin-left: 2px;
+        font-weight: normal;
+        color: var(--muted-alt);
+    }
 }

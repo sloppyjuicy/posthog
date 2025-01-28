@@ -1,13 +1,36 @@
+import { DecoratorFunction } from '@storybook/types'
 import { rest, setupWorker } from 'msw'
 
-// Default handlers ensure no request is unhandled by msw
-export const worker = setupWorker(
-    // For /e/ let's just return a 200, we're not interested in mocking this any further
-    rest.post('/e/', (_, res, ctx) => res(ctx.status(200))),
+import { handlers } from '~/mocks/handlers'
+import { Mocks, mocksToHandlers } from '~/mocks/utils'
 
-    // For everything else, require something explicit to be set
-    rest.get('/api/*', (_, res, ctx) => res(ctx.status(500), ctx.text('No route registered'))),
-    rest.post('/api/*', (_, res, ctx) => res(ctx.status(500), ctx.text('No route registered'))),
-    rest.put('/api/*', (_, res, ctx) => res(ctx.status(500), ctx.text('No route registered'))),
-    rest.delete('/api/*', (_, res, ctx) => res(ctx.status(500), ctx.text('No route registered')))
-)
+// Default handlers ensure no request is unhandled by msw
+export const worker = setupWorker(...handlers)
+
+export const useStorybookMocks = (mocks: Mocks): void => worker.use(...mocksToHandlers(mocks))
+
+export const mswDecorator = (mocks: Mocks): DecoratorFunction<any> => {
+    return function StoryMock(Story, { parameters }): JSX.Element {
+        // merge the default mocks provided in `preview.tsx` with any provided by the story
+        // allow the story to override defaults
+        const mergedMocks: Mocks = {}
+        for (const restMethod of Object.keys(rest)) {
+            mergedMocks[restMethod] = {}
+            // Ensure trailing slashes to avoid default handlers accidentally overshadowing story mocks
+            for (const [path, handler] of Object.entries(parameters.msw?.mocks?.[restMethod] || {})) {
+                const cleanedPath = path.replace(/\/?$/, '/')
+                mergedMocks[restMethod][cleanedPath] = handler
+            }
+            for (const [path, handler] of Object.entries(mocks?.[restMethod] || {})) {
+                const cleanedPath = path.replace(/\/?$/, '/')
+                mergedMocks[restMethod][cleanedPath] = handler
+            }
+        }
+        useStorybookMocks(mergedMocks)
+        return <Story />
+    }
+}
+
+export const setFeatureFlags = (featureFlags: string[]): void => {
+    ;(window as any).POSTHOG_APP_CONTEXT.persisted_feature_flags = featureFlags
+}

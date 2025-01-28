@@ -1,15 +1,22 @@
-import random
+import datetime
 import secrets
 import string
 import uuid
 from collections import defaultdict, namedtuple
-from time import time
-from typing import Any, Callable, Dict, Optional, TypeVar
-
-from django.db import IntegrityError, models, transaction
+from contextlib import contextmanager
+from time import time, time_ns
+from typing import TYPE_CHECKING, Any, Optional, TypeVar, Union
+from collections.abc import Callable, Iterator
+from django.db import IntegrityError, connections, models, transaction
+from django.db.backends.utils import CursorWrapper
+from django.db.backends.ddl_references import Statement
+from django.db.models.constraints import BaseConstraint
 from django.utils.text import slugify
 
 from posthog.constants import MAX_SLUG_LENGTH
+
+if TYPE_CHECKING:
+    from random import Random
 
 T = TypeVar("T")
 
@@ -17,7 +24,12 @@ BASE62 = string.digits + string.ascii_letters  # All lowercase ASCII letters + a
 
 
 class UUIDT(uuid.UUID):
-    """UUID (mostly) sortable by generation time.
+    """
+    Deprecated, you probably want to use UUIDv7 instead. As of May 2024 the latest RFC with the UUIv7 spec is at
+    Proposed Standard (see RFC9562 https://www.rfc-editor.org/rfc/rfc9562#name-uuid-version-7). This class was written
+    well before that, is still in use in PostHog, but should not be used for new columns / models / features / etc.
+
+    UUID (mostly) sortable by generation time.
 
     This doesn't adhere to any official UUID version spec, but it is superior as a primary key:
     to incremented integers (as they can reveal sensitive business information about usage volumes and patterns),
@@ -36,17 +48,30 @@ class UUIDT(uuid.UUID):
     (https://blog.twitter.com/engineering/en_us/a/2010/announcing-snowflake.html).
     """
 
-    current_series_per_ms: Dict[int, int] = defaultdict(int)
+    current_series_per_ms: dict[int, int] = defaultdict(int)
 
-    def __init__(self, unix_time_ms: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        unix_time_ms: Optional[int] = None,
+        uuid_str: Optional[str] = None,
+        *,
+        seeded_random: Optional["Random"] = None,
+    ) -> None:
+        if uuid_str and self.is_valid_uuid(uuid_str):
+            super().__init__(uuid_str)
+            return
+
         if unix_time_ms is None:
             unix_time_ms = int(time() * 1000)
         time_component = unix_time_ms.to_bytes(6, "big", signed=False)  # 48 bits for time, WILL FAIL in 10 895 CE
         series_component = self.get_series(unix_time_ms).to_bytes(2, "big", signed=False)  # 16 bits for series
-        random_component = secrets.token_bytes(8)  # 64 bits for random gibberish
-        bytes = time_component + series_component + random_component
-        assert len(bytes) == 16
-        super().__init__(bytes=bytes)
+        if seeded_random is not None:
+            random_component = bytes(seeded_random.getrandbits(8) for _ in range(8))  # 64 bits for random gibberish
+        else:
+            random_component = secrets.token_bytes(8)  # 64 bits for random gibberish
+        input_bytes = time_component + series_component + random_component
+        assert len(input_bytes) == 16
+        super().__init__(bytes=input_bytes)
 
     @classmethod
     def get_series(cls, unix_time_ms: int) -> int:
@@ -61,7 +86,7 @@ class UUIDT(uuid.UUID):
 
     @classmethod
     def is_valid_uuid(cls, candidate: Any) -> bool:
-        if type(candidate) != str:
+        if not isinstance(candidate, str):
             return False
         hex = candidate.replace("urn:", "").replace("uuid:", "")
         hex = hex.strip("{}").replace("-", "")
@@ -70,27 +95,93 @@ class UUIDT(uuid.UUID):
         return 0 <= int(hex, 16) < 1 << 128
 
 
-class UUIDModel(models.Model):
-    """Base Django Model with default autoincremented ID field replaced with UUIDT."""
+# Delete this when we can use the version from the stdlib directly, see https://github.com/python/cpython/issues/102461
+def uuid7(unix_ms_time: Optional[Union[int, str]] = None, random: Optional[Union["Random", int]] = None) -> uuid.UUID:
+    # timestamp part
+    unix_ms_time_int: int
+    if isinstance(unix_ms_time, str):
+        # parse the ISO format string, use the timestamp from that
+        date = datetime.datetime.fromisoformat(unix_ms_time)
+        unix_ms_time_int = int(date.timestamp() * 1000)
+    elif unix_ms_time is None:
+        # use the current system time
+        unix_ms_time_int = time_ns() // (10**6)
+    else:
+        # use the provided timestamp directly
+        unix_ms_time_int = unix_ms_time
+
+    # random part
+    if isinstance(random, int):
+        # use the integer directly as the random component
+        rand_a = random & 0x0FFF
+        rand_b = random >> 12 & 0x03FFFFFFFFFFFFFFF
+    elif random is not None:
+        # use the provided random generator
+        rand_a = random.getrandbits(12)
+        rand_b = random.getrandbits(56)
+    else:
+        # use the system random generator
+        rand_bytes = int.from_bytes(secrets.token_bytes(10), byteorder="little")
+        rand_a = rand_bytes & 0x0FFF
+        rand_b = (rand_bytes >> 12) & 0x03FFFFFFFFFFFFFFF
+
+    # fixed constants
+    ver = 7
+    var = 0b10
+
+    # construct the UUID int
+    uuid_int = (unix_ms_time_int & 0x0FFFFFFFFFFFF) << 80
+    uuid_int |= ver << 76
+    uuid_int |= rand_a << 64
+    uuid_int |= var << 62
+    uuid_int |= rand_b
+    return uuid.UUID(int=uuid_int)
+
+
+class CreatedMetaFields(models.Model):
+    created_by = models.ForeignKey("posthog.User", on_delete=models.SET_NULL, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         abstract = True
 
+
+class UpdatedMetaFields(models.Model):
+    updated_at = models.DateTimeField(auto_now=True, null=True, blank=True)
+
+    class Meta:
+        abstract = True
+
+
+class DeletedMetaFields(models.Model):
+    deleted = models.BooleanField(null=True, blank=True, default=False)
+    deleted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        abstract = True
+
+
+class UUIDModel(models.Model):
+    """Base Django Model with default autoincremented ID field replaced with UUIDT."""
+
     id: models.UUIDField = models.UUIDField(primary_key=True, default=UUIDT, editable=False)
+
+    class Meta:
+        abstract = True
 
 
 class UUIDClassicModel(models.Model):
     """Base Django Model with default autoincremented ID field kept and a UUIDT field added."""
 
+    uuid = models.UUIDField(unique=True, default=UUIDT, editable=False)
+
     class Meta:
         abstract = True
-
-    uuid: models.UUIDField = models.UUIDField(unique=True, default=UUIDT, editable=False)
 
 
 def sane_repr(*attrs: str, include_id=True) -> Callable[[object], str]:
     if "id" not in attrs and "pk" not in attrs and include_id:
-        attrs = ("id",) + attrs
+        attrs = ("id", *attrs)
 
     def _repr(self):
         pairs = (f"{attr}={repr(getattr(self, attr))}" for attr in attrs)
@@ -120,7 +211,10 @@ def generate_random_token_project() -> str:
 
 
 def generate_random_token_personal() -> str:
-    return "phx_" + generate_random_token()  # "x" standing for nothing in particular
+    # We want 32 bytes of entropy (https://docs.python.org/3/library/secrets.html#how-many-bytes-should-tokens-use).
+    # Note that we store the last 4 characters of a personal API key in plain text in the database, so that users
+    # can recognize their keys in the UI. This means we need 3 bytes of extra entropy. Ultimately, we want 35 bytes.
+    return "phx_" + generate_random_token(35)  # "x" standing for nothing in particular
 
 
 def int_to_base(number: int, base: int) -> str:
@@ -152,7 +246,7 @@ class LowercaseSlugField(models.SlugField):
 
 def generate_random_short_suffix():
     """Return a 4 letter suffix made up random ASCII letters, useful for disambiguation of duplicates."""
-    return "".join(random.choice(string.ascii_letters) for _ in range(4))
+    return "".join(secrets.choice(string.ascii_letters) for _ in range(4))
 
 
 def create_with_slug(create_func: Callable[..., T], default_slug: str = "", *args, **kwargs) -> T:
@@ -170,3 +264,83 @@ def create_with_slug(create_func: Callable[..., T], default_slug: str = "", *arg
         except IntegrityError:
             continue
     raise Exception("Could not create a model instance with slug in 10 tries!")
+
+
+def get_deferred_field_set_for_model(
+    model: type[models.Model],
+    fields_not_deferred: Optional[set[str]] = None,
+    field_prefix: str = "",
+) -> set[str]:
+    """Return a set of field names to be deferred for a given model. Used with `.defer()` after `select_related`
+
+    Why? `select_related` fetches the entire related objects - not allowing you to specify which fields
+    you want from the related objects. Often, we only want a few fields from the related object in addition to the entire
+    initial object. As a result, you can't use `.only()`. This is a helper function to make it easier to use `.defer()` in this case.
+    Example of how it's used is:
+
+    `Project.objects.select_related("team").defer(*get_deferred_field_set_for_model(Team, {"name"}, "team__"))`
+
+    For more info, see: https://code.djangoproject.com/ticket/29072
+
+    Parameters:
+        model: the model to get deferred fields for
+        fields_not_deferred: the models fields to exclude from the deferred field set
+        field_prefix: a prefix to add to the field names e.g. ("team__organization__") to work in the query set
+    """
+    if fields_not_deferred is None:
+        fields_not_deferred = set()
+    return {f"{field_prefix}{x.name}" for x in model._meta.fields if x.name not in fields_not_deferred}
+
+
+class UniqueConstraintByExpression(BaseConstraint):
+    def __init__(self, *, name: str, expression: str, concurrently=True):
+        self.name = name
+        self.expression = expression
+        self.concurrently = concurrently
+
+    def constraint_sql(self, model, schema_editor):
+        schema_editor.deferred_sql.append(str(self.create_sql(model, schema_editor, table_creation=True)))
+        return None
+
+    def create_sql(self, model, schema_editor, table_creation=False):
+        table = model._meta.db_table
+        return Statement(
+            f"""
+            CREATE UNIQUE INDEX {'CONCURRENTLY' if self.concurrently and not table_creation else ''} %(name)s
+            ON %(table)s
+            %(expression)s
+            """,
+            name=self.name,
+            table=table,
+            expression=self.expression,
+        )
+
+    def remove_sql(self, model, schema_editor):
+        return Statement(
+            f"""
+            DROP INDEX IF EXISTS %(name)s
+            """,
+            name=self.name,
+        )
+
+    def deconstruct(self):
+        path, args, kwargs = super().deconstruct()
+        kwargs["expression"] = self.expression
+        kwargs["concurrently"] = self.concurrently
+        return path, args, kwargs
+
+    def __eq__(self, other):
+        if isinstance(other, UniqueConstraintByExpression):
+            return self.name == other.name and self.expression == other.expression
+        return super().__eq__(other)
+
+
+@contextmanager
+def execute_with_timeout(timeout: int, database: str = "default") -> Iterator[CursorWrapper]:
+    """
+    Sets a transaction local timeout for the current transaction.
+    """
+    with transaction.atomic(using=database):
+        with connections[database].cursor() as cursor:
+            cursor.execute("SET LOCAL statement_timeout = %s", [timeout])
+            yield cursor

@@ -13,3 +13,10 @@ frontend/dist/
 .yalc
 .python-version
 storybook-static
+dist/
+node_modules/
+pnpm-lock.yaml
+posthog/templates/email/*
+common/hogvm/typescript/src/stl/bytecode.ts
+rust/
+livestream/

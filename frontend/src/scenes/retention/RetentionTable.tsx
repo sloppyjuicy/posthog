@@ -1,246 +1,132 @@
-import React, { useState, useEffect } from 'react'
-import { useValues, useActions } from 'kea'
-import { Table, Modal, Button, Spin } from 'antd'
-import { percentage } from 'lib/utils'
-import { Link } from 'lib/components/Link'
-import { retentionTableLogic } from './retentionTableLogic'
-import { Tooltip } from 'lib/components/Tooltip'
-import {
-    RetentionTablePayload,
-    RetentionTablePeoplePayload,
-    RetentionTableAppearanceType,
-} from 'scenes/retention/types'
-
 import './RetentionTable.scss'
-import dayjs from 'dayjs'
-import utc from 'dayjs/plugin/utc'
-dayjs.extend(utc)
 
-import { ColumnsType } from 'antd/lib/table'
 import clsx from 'clsx'
+import { mean } from 'd3'
+import { useActions, useValues } from 'kea'
+import { Tooltip } from 'lib/lemon-ui/Tooltip'
+import { gradateColor, range } from 'lib/utils'
 import { insightLogic } from 'scenes/insights/insightLogic'
 
-export function RetentionTable({ dashboardItemId = null }: { dashboardItemId?: number | null }): JSX.Element | null {
+import { retentionModalLogic } from './retentionModalLogic'
+import { retentionTableLogic } from './retentionTableLogic'
+
+export function RetentionTable({ inSharedMode = false }: { inSharedMode?: boolean }): JSX.Element | null {
     const { insightProps } = useValues(insightLogic)
-    const logic = retentionTableLogic(insightProps)
-    const {
-        results: _results,
-        resultsLoading,
-        peopleLoading,
-        people: _people,
-        loadingMore,
-        filters: { period, date_to },
-    } = useValues(logic)
-    const results = _results as RetentionTablePayload[]
-    const people = _people as RetentionTablePeoplePayload
-
-    const { loadPeople, loadMorePeople } = useActions(logic)
-    const [modalVisible, setModalVisible] = useState(false)
-    const [selectedRow, selectRow] = useState(0)
-    const [isLatestPeriod, setIsLatestPeriod] = useState(false)
-
-    useEffect(() => {
-        setIsLatestPeriod(periodIsLatest(date_to || null, period || null))
-    }, [date_to, period])
-    const columns: ColumnsType<Record<string, any>> = [
-        {
-            title: 'Date',
-            key: 'date',
-            render: (row) =>
-                period === 'Hour' ? dayjs(row.date).format('MMM D, h A') : dayjs.utc(row.date).format('MMM D'),
-            align: 'center',
-        },
-        {
-            title: 'Cohort Size',
-            key: 'users',
-            render: (row) => row.values[0]['count'],
-            align: 'center',
-        },
-    ]
-
-    if (!resultsLoading && results) {
-        if (results.length === 0) {
-            return null
-        }
-        results[0].values.forEach((_: any, dayIndex: number) => {
-            columns.push({
-                title: results[dayIndex].label,
-                key: `day::${dayIndex}`,
-                render: (row) => {
-                    if (dayIndex >= row.values.length) {
-                        return ''
-                    }
-                    return renderPercentage(
-                        row.values[dayIndex]['count'],
-                        row.values[0]['count'],
-                        isLatestPeriod && dayIndex === row.values.length - 1,
-                        dayIndex === 0
-                    )
-                },
-            })
-        })
-    }
-
-    function dismissModal(): void {
-        setModalVisible(false)
-    }
+    const { tableHeaders, tableRows, isLatestPeriod, hideSizeColumn, retentionVizOptions, theme, retentionFilter } =
+        useValues(retentionTableLogic(insightProps))
+    const { openModal } = useActions(retentionModalLogic(insightProps))
+    const backgroundColor = theme?.['preset-1'] || '#000000' // Default to black if no color found
+    const backgroundColorMean = theme?.['preset-2'] || '#000000' // Default to black if no color found
+    const showMean = retentionFilter?.showMean || false
 
     return (
-        <>
-            <Table
-                data-attr="retention-table"
-                size="small"
-                className="retention-table"
-                pagination={{ pageSize: 99999, hideOnSinglePage: true }}
-                rowClassName={dashboardItemId ? '' : 'cursor-pointer'}
-                dataSource={results}
-                columns={columns}
-                rowKey="date"
-                loading={resultsLoading}
-                onRow={(_, rowIndex: number | undefined) => ({
-                    onClick: () => {
-                        if (!dashboardItemId && rowIndex !== undefined) {
-                            loadPeople(rowIndex)
-                            setModalVisible(true)
-                            selectRow(rowIndex)
-                        }
-                    },
-                })}
-            />
-            {results && (
-                <Modal
-                    visible={modalVisible}
-                    closable={true}
-                    onCancel={dismissModal}
-                    footer={<Button onClick={dismissModal}>Close</Button>}
-                    style={{
-                        top: 20,
-                        minWidth: results[selectedRow]?.values[0]?.count === 0 ? '10%' : '90%',
-                        fontSize: 16,
-                    }}
-                    title={results[selectedRow] ? dayjs(results[selectedRow].date).format('MMMM D, YYYY') : ''}
-                >
-                    {results && !peopleLoading ? (
-                        <div>
-                            {results[selectedRow]?.values[0]?.count === 0 ? (
-                                <span>No persons during this period.</span>
-                            ) : (
-                                <div>
-                                    <table className="table-bordered full-width">
-                                        <tbody>
-                                            <tr>
-                                                <th />
-                                                {results &&
-                                                    results
-                                                        .slice(0, results[selectedRow]?.values.length)
-                                                        .map((data, index) => <th key={index}>{data.label}</th>)}
-                                            </tr>
-                                            <tr>
-                                                <td>user_id</td>
-                                                {results &&
-                                                    results[selectedRow]?.values.map((data: any, index: number) => (
-                                                        <td key={index}>
-                                                            {data.count}&nbsp;{' '}
-                                                            {data.count > 0 && (
-                                                                <span>
-                                                                    (
-                                                                    {percentage(
-                                                                        data.count /
-                                                                            results[selectedRow]?.values[0]['count']
-                                                                    )}
-                                                                    )
-                                                                </span>
-                                                            )}
-                                                        </td>
-                                                    ))}
-                                            </tr>
-                                            {people.result &&
-                                                people.result.map((personAppearances: RetentionTableAppearanceType) => (
-                                                    <tr key={personAppearances.person.id}>
-                                                        <td className="text-overflow" style={{ minWidth: 200 }}>
-                                                            <Link
-                                                                to={`/person/${encodeURIComponent(
-                                                                    personAppearances.person.distinct_ids[0]
-                                                                )}`}
-                                                                data-attr="retention-person-link"
-                                                            >
-                                                                {personAppearances.person.name}
-                                                            </Link>
-                                                        </td>
-                                                        {personAppearances.appearances.map(
-                                                            (appearance: number, index: number) => {
-                                                                return (
-                                                                    <td
-                                                                        key={index}
-                                                                        className={
-                                                                            appearance
-                                                                                ? 'retention-success'
-                                                                                : 'retention-dropped'
-                                                                        }
-                                                                    />
-                                                                )
-                                                            }
-                                                        )}
-                                                    </tr>
-                                                ))}
-                                        </tbody>
-                                    </table>
-                                    <div
-                                        style={{
-                                            margin: '1rem',
-                                            textAlign: 'center',
-                                        }}
-                                    >
-                                        {people.next ? (
-                                            <Button
-                                                type="primary"
-                                                onClick={() => loadMorePeople()}
-                                                loading={loadingMore}
-                                            >
-                                                Load more people
-                                            </Button>
-                                        ) : null}
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-                    ) : (
-                        <Spin />
-                    )}
-                </Modal>
-            )}
-        </>
+        <table
+            className={clsx('RetentionTable', { 'RetentionTable--small-layout': retentionVizOptions?.useSmallLayout })}
+            data-attr="retention-table"
+            // eslint-disable-next-line react/forbid-dom-props
+            style={
+                {
+                    '--retention-table-color': backgroundColor,
+                } as React.CSSProperties
+            }
+        >
+            <tbody>
+                <tr>
+                    {tableHeaders.map((heading) => (
+                        <th key={heading}>{heading}</th>
+                    ))}
+                </tr>
+
+                {showMean && tableRows.length > 0 ? (
+                    <tr className="border-b" key={-1}>
+                        {range(0, tableRows[0].length).map((columnIndex) => (
+                            <td key={columnIndex} className="pb-2">
+                                {columnIndex <= (hideSizeColumn ? 0 : 1) ? (
+                                    columnIndex == 0 ? (
+                                        <span className="RetentionTable__TextTab">Mean</span>
+                                    ) : null
+                                ) : (
+                                    <CohortDay
+                                        percentage={
+                                            mean(
+                                                tableRows.map((row) => {
+                                                    // Stop before the last item in a row, which is an incomplete time period
+                                                    if (
+                                                        (columnIndex >= row.length - 1 && isLatestPeriod) ||
+                                                        !row[columnIndex]
+                                                    ) {
+                                                        return null
+                                                    }
+                                                    return row[columnIndex].percentage
+                                                })
+                                            ) || 0
+                                        }
+                                        latest={isLatestPeriod && columnIndex == tableRows[0].length - 1}
+                                        clickable={false}
+                                        backgroundColor={backgroundColorMean}
+                                    />
+                                )}
+                            </td>
+                        ))}
+                    </tr>
+                ) : undefined}
+
+                {tableRows.map((row, rowIndex) => (
+                    <tr
+                        key={rowIndex}
+                        onClick={() => {
+                            if (!inSharedMode) {
+                                openModal(rowIndex)
+                            }
+                        }}
+                    >
+                        {row.map((column, columnIndex) => (
+                            <td key={columnIndex} className={clsx({ 'pt-2': rowIndex === 0 && showMean })}>
+                                {columnIndex <= (hideSizeColumn ? 0 : 1) ? (
+                                    <span className="RetentionTable__TextTab">{column}</span>
+                                ) : (
+                                    <CohortDay
+                                        percentage={column.percentage}
+                                        clickable={true}
+                                        latest={isLatestPeriod && columnIndex === row.length - 1}
+                                        backgroundColor={backgroundColor}
+                                    />
+                                )}
+                            </td>
+                        ))}
+                    </tr>
+                ))}
+            </tbody>
+        </table>
     )
 }
 
-const renderPercentage = (value: number, total: number, latest = false, periodZero = false): JSX.Element => {
-    const _percentage = total > 0 ? (100.0 * value) / total : 0
-    const percentageBasisForColor = periodZero ? 100 : _percentage // So that Period 0 is always shown consistently
-    const backgroundColor = `hsl(212, 63%, ${30 + (100 - percentageBasisForColor) * 0.65}%)`
-    const color = percentageBasisForColor >= 65 ? 'hsl(0, 0%, 80%)' : undefined
+function CohortDay({
+    percentage,
+    latest,
+    clickable,
+    backgroundColor,
+}: {
+    percentage: number
+    latest: boolean
+    clickable: boolean
+    backgroundColor: string
+}): JSX.Element {
+    const backgroundColorSaturation = percentage / 100
+    const saturatedBackgroundColor = gradateColor(backgroundColor, backgroundColorSaturation, 0.1)
+    const textColor = backgroundColorSaturation > 0.4 ? '#fff' : 'var(--text-3000)' // Ensure text contrast
 
     const numberCell = (
-        <div style={{ backgroundColor, color }} className={clsx('percentage-cell', { 'period-in-progress': latest })}>
-            {_percentage.toFixed(1)}%{latest && '*'}
+        <div
+            className={clsx('RetentionTable__Tab', {
+                'RetentionTable__Tab--clickable': clickable,
+                'RetentionTable__Tab--period': latest,
+            })}
+            // eslint-disable-next-line react/forbid-dom-props
+            style={!latest ? { backgroundColor: saturatedBackgroundColor, color: textColor } : undefined}
+        >
+            {percentage.toFixed(1)}%
         </div>
     )
     return latest ? <Tooltip title="Period in progress">{numberCell}</Tooltip> : numberCell
-}
-
-const periodIsLatest = (date_to: string | null, period: string | null): boolean => {
-    if (!date_to || !period) {
-        return true
-    }
-
-    const curr = dayjs(date_to)
-    if (
-        (period == 'Hour' && curr.isSame(dayjs(), 'hour')) ||
-        (period == 'Day' && curr.isSame(dayjs(), 'day')) ||
-        (period == 'Week' && curr.isSame(dayjs(), 'week')) ||
-        (period == 'Month' && curr.isSame(dayjs(), 'month'))
-    ) {
-        return true
-    } else {
-        return false
-    }
 }

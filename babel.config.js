@@ -2,10 +2,9 @@
 module.exports = {
     plugins: [
         '@babel/plugin-transform-runtime',
-        '@babel/plugin-transform-react-jsx',
-        ['@babel/plugin-proposal-class-properties', { loose: true }],
-        ['@babel/plugin-proposal-private-property-in-object', { loose: true }],
-        ['babel-plugin-kea', { path: './frontend/src' }],
+        '@babel/plugin-transform-class-properties',
+        '@babel/plugin-transform-private-property-in-object',
+        '@babel/plugin-transform-nullish-coalescing-operator',
     ],
     presets: [
         [
@@ -13,6 +12,13 @@ module.exports = {
             {
                 useBuiltIns: 'usage',
                 corejs: 3,
+                targets: 'defaults', // browserlist's defaults - https://github.com/browserslist/browserslist#full-list
+            },
+        ],
+        [
+            '@babel/preset-react',
+            {
+                runtime: 'automatic',
             },
         ],
         '@babel/typescript',

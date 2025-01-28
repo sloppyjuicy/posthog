@@ -3,7 +3,6 @@
     "distinct_id": "kOyAmTq2McfCD5XvqwjKf8m6GVecm9uN0L0ypEoRN50",
     "first_name": "Jane",
     "email": "test@posthog.com",
-    "email_opt_in": true,
     "anonymize_data": false,
     "toolbar_mode": "toolbar",
     "has_password": true,
@@ -14,7 +13,7 @@
         "uuid": "01787e47-55d7-0000-6976-b893a03aaba8",
         "organization": "01787e47-5558-0000-bae1-6bc513b42abe",
         "api_token": "dtrwW0uEC7LwVx64RmZmqog_XjU0nXWuEK1d1ZpjteQ",
-        "name": "HogFlix Demo App",
+        "name": "Hogflix Demo App",
         "completed_snippet_onboarding": true,
         "ingested_event": true,
         "is_demo": true,
@@ -26,19 +25,6 @@
         "created_at": "2021-03-29T13:58:27.416616Z",
         "updated_at": "2021-03-29T13:58:57.067131Z",
         "membership_level": 15,
-        "personalization": {
-            "role": "engineer",
-            "products": ["web", "website"],
-            "technical": "technical"
-        },
-        "setup": {
-            "is_active": true,
-            "current_section": 1,
-            "any_project_ingested_events": false,
-            "any_project_completed_snippet_onboarding": false,
-            "non_demo_team_id": null,
-            "has_invited_team_members": true
-        },
         "plugins_access_level": 9,
         "teams": [
             {
@@ -46,14 +32,19 @@
                 "uuid": "01787e47-55d7-0000-6976-b893a03aaba8",
                 "organization": "01787e47-5558-0000-bae1-6bc513b42abe",
                 "api_token": "dtrwW0uEC7LwVx64RmZmqog_XjU0nXWuEK1d1ZpjteQ",
-                "name": "HogFlix Demo App",
+                "name": "Hogflix Demo App",
                 "completed_snippet_onboarding": true,
                 "ingested_event": true,
                 "is_demo": true,
                 "timezone": "UTC"
             }
         ],
-        "available_features": []
+        "available_product_features": []
     },
-    "organizations": [{ "id": "01787e47-5558-0000-bae1-6bc513b42abe", "name": "Hogflix Movies" }]
+    "organizations": [
+        {
+            "id": "01787e47-5558-0000-bae1-6bc513b42abe",
+            "name": "Hogflix Movies"
+        }
+    ]
 }

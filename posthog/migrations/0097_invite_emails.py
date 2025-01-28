@@ -4,13 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0096_plugins"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name="organizationinvite", name="emailing_attempt_made", field=models.BooleanField(default=False),
+            model_name="organizationinvite",
+            name="emailing_attempt_made",
+            field=models.BooleanField(default=False),
         ),
     ]

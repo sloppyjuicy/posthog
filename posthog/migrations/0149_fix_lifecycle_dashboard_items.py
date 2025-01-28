@@ -11,11 +11,10 @@ def update_lifecycle(apps, _):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0148_merge_20210506_0823"),
     ]
 
     operations = [
-        migrations.RunPython(update_lifecycle, migrations.RunPython.noop),
+        migrations.RunPython(update_lifecycle, migrations.RunPython.noop, elidable=True),
     ]

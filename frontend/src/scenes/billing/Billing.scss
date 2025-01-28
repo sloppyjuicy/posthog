@@ -1,36 +1,32 @@
-@import '~/vars';
+.BillingPlan {
+    flex-grow: 1;
+    max-width: 500px;
 
-.billing-page {
-    .plan-description {
+    .BillingPlan__description {
         ol,
         ul {
-            margin-top: $default_spacing;
             padding-left: 0;
-            list-style: none;
+            margin-top: 1rem;
             text-align: center;
+            list-style: none;
+
             li {
+                margin-bottom: 1rem;
                 line-height: 1.2rem;
-                margin-bottom: $default_spacing;
             }
+
             .disclaimer {
+                padding-left: 1px;
                 font-size: 10px;
                 font-weight: bold;
                 vertical-align: top;
-                padding-left: 1px;
             }
         }
 
         .disclaimer-details {
+            margin-top: 1rem;
             font-size: 0.75rem;
-            color: $text_muted;
-            margin-top: $default_spacing;
+            color: var(--muted);
         }
-    }
-
-    .bill-amount {
-        margin-top: $default_spacing / 2;
-        font-size: 1.2rem;
-        font-weight: bold;
-        text-align: center;
     }
 }

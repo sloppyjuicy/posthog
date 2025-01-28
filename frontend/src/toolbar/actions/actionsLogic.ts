@@ -1,25 +1,29 @@
-import { kea } from 'kea'
-import { toolbarLogic } from '~/toolbar/toolbarLogic'
-import { encodeParams } from 'kea-router'
-import { actionsLogicType } from './actionsLogicType'
+import Fuse from 'fuse.js'
+import { actions, kea, path, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+import { permanentlyMount } from 'lib/utils/kea-logic-builders'
+
+import { toolbarConfigLogic, toolbarFetch } from '~/toolbar/toolbarConfigLogic'
 import { ActionType } from '~/types'
 
-export const actionsLogic = kea<actionsLogicType>({
-    loaders: ({ values }) => ({
+import type { actionsLogicType } from './actionsLogicType'
+
+export const actionsLogic = kea<actionsLogicType>([
+    path(['toolbar', 'actions', 'actionsLogic']),
+    actions({
+        setSearchTerm: (searchTerm: string) => ({ searchTerm }),
+    }),
+    loaders(({ values }) => ({
         allActions: [
             [] as ActionType[],
             {
-                // eslint-disable-next-line
+                // eslint-disable-next-line @typescript-eslint/no-unused-vars
                 getActions: async (_ = null, breakpoint: () => void) => {
-                    const params = {
-                        temporary_token: toolbarLogic.values.temporaryToken,
-                    }
-                    const url = `${toolbarLogic.values.apiURL}/api/action/${encodeParams(params, '?')}`
-                    const response = await fetch(url)
+                    const response = await toolbarFetch('/api/projects/@current/actions/')
                     const results = await response.json()
 
                     if (response.status === 403) {
-                        toolbarLogic.actions.authenticate()
+                        toolbarConfigLogic.actions.authenticate()
                         return []
                     }
 
@@ -39,16 +43,31 @@ export const actionsLogic = kea<actionsLogicType>({
                 },
             },
         ],
-    }),
-
-    selectors: {
-        sortedActions: [
-            (s) => [s.allActions],
-            (allActions) =>
-                [...allActions].sort((a, b) =>
-                    (a.name ?? 'Untitled').localeCompare(b.name ?? 'Untitled')
-                ) as ActionType[],
+    })),
+    reducers({
+        searchTerm: [
+            '',
+            {
+                setSearchTerm: (_, { searchTerm }) => searchTerm,
+            },
         ],
-        actionCount: [(s) => [s.sortedActions], (sortedActions) => sortedActions.length],
-    },
-})
+    }),
+    selectors({
+        sortedActions: [
+            (s) => [s.allActions, s.searchTerm],
+            (allActions, searchTerm) => {
+                const filteredActions = searchTerm
+                    ? new Fuse(allActions, {
+                          threshold: 0.3,
+                          keys: ['name'],
+                      })
+                          .search(searchTerm)
+                          .map(({ item }) => item)
+                    : allActions
+                return [...filteredActions].sort((a, b) => (a.name ?? 'Untitled').localeCompare(b.name ?? 'Untitled'))
+            },
+        ],
+        actionCount: [(s) => [s.allActions], (allActions) => allActions.length],
+    }),
+    permanentlyMount(),
+])

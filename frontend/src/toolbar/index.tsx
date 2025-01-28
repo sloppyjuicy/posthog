@@ -1,40 +1,33 @@
-import 'react-toastify/dist/ReactToastify.css'
 import '~/styles'
-import '~/toolbar/styles.scss'
+import './styles.scss'
 
-import React from 'react'
-import ReactDOM from 'react-dom'
-import Simmer from '@posthog/simmerjs'
-import { getContext } from 'kea'
-import { Provider } from 'react-redux'
+import type { PostHog } from 'posthog-js'
+import { createRoot } from 'react-dom/client'
+
 import { initKea } from '~/initKea'
 import { ToolbarApp } from '~/toolbar/ToolbarApp'
-import { EditorProps } from '~/types'
-
-initKea()
-;(window as any)['simmer'] = new Simmer(window, { depth: 8 })
-;(window as any)['ph_load_editor'] = function (editorParams: EditorProps) {
+import { ToolbarParams } from '~/types'
+;(window as any)['ph_load_toolbar'] = function (toolbarParams: ToolbarParams, posthog: PostHog) {
+    initKea()
     const container = document.createElement('div')
+    const root = createRoot(container)
+
     document.body.appendChild(container)
 
-    ReactDOM.render(
-        <Provider store={getContext().store}>
-            <ToolbarApp
-                {...editorParams}
-                actionId={
-                    typeof editorParams.actionId === 'string' ? parseInt(editorParams.actionId) : editorParams.actionId
-                }
-                jsURL={editorParams.jsURL || editorParams.apiURL}
-            />
-        </Provider>,
-        container
+    if (!posthog) {
+        console.warn(
+            '⚠️⚠️⚠️ Loaded toolbar via old version of posthog-js that does not support feature flags. Please upgrade! ⚠️⚠️⚠️'
+        )
+    }
+
+    root.render(
+        <ToolbarApp
+            {...toolbarParams}
+            actionId={parseInt(String(toolbarParams.actionId))}
+            experimentId={parseInt(String(toolbarParams.experimentId))}
+            posthog={posthog}
+        />
     )
 }
-
-// Expose `window.getToolbarReduxState()` to make snapshots to storybook easy
-if (typeof window !== 'undefined') {
-    // Disabled in production to prevent leaking secret data, personal API keys, etc
-    if (process.env.NODE_ENV === 'development') {
-        ;(window as any).getToolbarReduxState = () => getContext().store.getState()
-    }
-}
+/** @deprecated, use "ph_load_toolbar" instead */
+;(window as any)['ph_load_editor'] = (window as any)['ph_load_toolbar']

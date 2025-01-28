@@ -1,26 +1,40 @@
 import './Funnel.scss'
+
 import { useValues } from 'kea'
-import React from 'react'
-import { ChartParams, FunnelVizType } from '~/types'
-import { FunnelBarGraph } from './FunnelBarGraph'
-import { FunnelHistogram } from './FunnelHistogram'
-import { funnelLogic } from './funnelLogic'
+import { FunnelLayout } from 'lib/constants'
 import { FunnelLineGraph } from 'scenes/funnels/FunnelLineGraph'
 import { insightLogic } from 'scenes/insights/insightLogic'
 
-export function Funnel(props: Omit<ChartParams, 'filters'>): JSX.Element | null {
+import { ChartParams, FunnelVizType } from '~/types'
+
+import { FunnelBarHorizontal } from './FunnelBarHorizontal/FunnelBarHorizontal'
+import { FunnelBarVertical } from './FunnelBarVertical/FunnelBarVertical'
+import { funnelDataLogic } from './funnelDataLogic'
+import { FunnelHistogram } from './FunnelHistogram'
+
+export function Funnel(props: ChartParams): JSX.Element {
     const { insightProps } = useValues(insightLogic)
-    const { filters } = useValues(funnelLogic(insightProps))
-    const { funnel_viz_type } = filters
+    const { funnelsFilter } = useValues(funnelDataLogic(insightProps))
+    const { funnelVizType, layout } = funnelsFilter || {}
 
-    // Funnel Viz
-    if (funnel_viz_type == FunnelVizType.Trends) {
-        return <FunnelLineGraph {...props} />
+    let viz: JSX.Element | null = null
+    if (funnelVizType == FunnelVizType.Trends) {
+        viz = <FunnelLineGraph {...props} />
+    } else if (funnelVizType == FunnelVizType.TimeToConvert) {
+        viz = <FunnelHistogram />
+    } else if ((layout || FunnelLayout.vertical) === FunnelLayout.vertical) {
+        viz = <FunnelBarVertical {...props} />
+    } else {
+        viz = <FunnelBarHorizontal {...props} />
     }
 
-    if (funnel_viz_type == FunnelVizType.TimeToConvert) {
-        return <FunnelHistogram />
-    }
-
-    return <FunnelBarGraph {...props} />
+    return (
+        <div
+            className={`FunnelInsight FunnelInsight--type-${funnelVizType?.toLowerCase()}${
+                funnelVizType === FunnelVizType.Steps ? '-' + (layout ?? FunnelLayout.vertical) : ''
+            }`}
+        >
+            {viz}
+        </div>
+    )
 }

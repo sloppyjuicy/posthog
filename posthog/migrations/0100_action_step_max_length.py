@@ -4,19 +4,24 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0099_plugin_attachment"),
     ]
 
     operations = [
         migrations.AlterField(
-            model_name="actionstep", name="href", field=models.CharField(blank=True, max_length=65535, null=True),
+            model_name="actionstep",
+            name="href",
+            field=models.CharField(blank=True, max_length=65535, null=True),
         ),
         migrations.AlterField(
-            model_name="actionstep", name="selector", field=models.CharField(blank=True, max_length=65535, null=True),
+            model_name="actionstep",
+            name="selector",
+            field=models.CharField(blank=True, max_length=65535, null=True),
         ),
         migrations.AlterField(
-            model_name="actionstep", name="url", field=models.CharField(blank=True, max_length=65535, null=True),
+            model_name="actionstep",
+            name="url",
+            field=models.CharField(blank=True, max_length=65535, null=True),
         ),
     ]

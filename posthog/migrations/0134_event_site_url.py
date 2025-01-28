@@ -4,13 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0133_plugins_access_control"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name="event", name="site_url", field=models.CharField(blank=True, max_length=200, null=True),
+            model_name="event",
+            name="site_url",
+            field=models.CharField(blank=True, max_length=200, null=True),
         ),
     ]

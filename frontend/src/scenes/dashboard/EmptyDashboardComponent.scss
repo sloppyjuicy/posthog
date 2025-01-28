@@ -1,0 +1,37 @@
+@import '../../styles/mixins';
+
+.EmptyDashboard {
+    position: relative;
+    margin-top: 1rem;
+
+    .EmptyDashboard__fade {
+        position: relative;
+        height: 150px;
+        margin-top: 1rem;
+        overflow: hidden;
+
+        &::after {
+            --bg-light: var(--bg-3000); // Make the fade blend in with the 3000 background smoothly
+
+            width: 100%;
+            height: 150px;
+
+            @extend %mixin-gradient-overlay;
+        }
+    }
+
+    .EmptyDashboard__cta {
+        position: absolute;
+        top: 16px;
+        left: 50%;
+        z-index: var(--z-content-overlay);
+        width: 360px;
+        max-width: calc(100% - 32px);
+        padding: 1.5rem;
+        background: var(--bg-light);
+        border-width: 1px;
+        border-radius: var(--radius);
+        box-shadow: var(--shadow-elevation-3000);
+        transform: translateX(-50%);
+    }
+}

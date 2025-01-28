@@ -4,13 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0046_event_names_properties_to_team"),
     ]
 
     operations = [
         migrations.AlterField(
-            model_name="user", name="email_opt_in", field=models.BooleanField(blank=True, default=False, null=True),
+            model_name="user",
+            name="email_opt_in",
+            field=models.BooleanField(blank=True, default=False, null=True),
         ),
     ]

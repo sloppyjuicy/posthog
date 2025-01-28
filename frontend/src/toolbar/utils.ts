@@ -1,18 +1,17 @@
-import Simmer, { Simmer as SimmerType } from '@posthog/simmerjs'
+import { finder } from '@medv/finder'
+import { CLICK_TARGET_SELECTOR, CLICK_TARGETS, escapeRegex, TAGS_TO_IGNORE } from 'lib/actionUtils'
 import { cssEscape } from 'lib/utils/cssEscape'
-import { ActionStepType, ActionStepUrlMatching, ElementType } from '~/types'
-import { ActionStepForm, BoxColor } from '~/toolbar/types'
 import { querySelectorAllDeep } from 'query-selector-shadow-dom'
-import { toolbarLogic } from '~/toolbar/toolbarLogic'
-import { encodeParams } from 'kea-router'
+import { CSSProperties } from 'react'
 
-// these plus any element with cursor:pointer will be click targets
-const CLICK_TARGET_SELECTOR = `a, button, input, select, textarea, label`
+import { ActionStepForm, ElementRect } from '~/toolbar/types'
+import { ActionStepType } from '~/types'
 
-// always ignore the following
-const TAGS_TO_IGNORE = ['html', 'body', 'meta', 'head', 'script', 'link', 'style']
+import { ActionStepPropertyKey } from './actions/ActionStep'
 
-let simmer: SimmerType
+export const TOOLBAR_ID = '__POSTHOG_TOOLBAR__'
+export const TOOLBAR_CONTAINER_CLASS = 'toolbar-global-fade-container'
+export const LOCALSTORAGE_KEY = '_postHogToolbarParams'
 
 export function getSafeText(el: HTMLElement): string {
     if (!el.childNodes || !el.childNodes.length) {
@@ -36,71 +35,49 @@ export function elementToQuery(element: HTMLElement, dataAttributes: string[]): 
     if (!element) {
         return
     }
-    if (!simmer) {
-        simmer = new Simmer(window, { depth: 8, dataAttributes })
+
+    for (const { name, value } of Array.from(element.attributes)) {
+        if (!dataAttributes.includes(name)) {
+            continue
+        }
+
+        const selector = `[${cssEscape(name)}="${cssEscape(value)}"]`
+        if (querySelectorAllDeep(selector).length == 1) {
+            return selector
+        }
     }
 
-    // Turn tags into lower cases
-    return simmer(element)?.replace(/(^[A-Z\-]+| [A-Z\-]+)/g, (d: string) => d.toLowerCase())
+    try {
+        return finder(element, {
+            tagName: (name) => !TAGS_TO_IGNORE.includes(name),
+            seedMinLength: 5, // include several selectors e.g. prefer .project-homepage > .project-header > .project-title over .project-title
+            attr: (name) => {
+                // preference to data attributes if they exist
+                // that aren't in the PostHog preferred list - they were returned early above
+                return name.startsWith('data-')
+            },
+        })
+    } catch (error) {
+        console.warn('Error while trying to find a selector for element', element, error)
+        return undefined
+    }
 }
 
 export function elementToActionStep(element: HTMLElement, dataAttributes: string[]): ActionStepType {
     const query = elementToQuery(element, dataAttributes)
-    const tagName = element.tagName.toLowerCase()
 
     return {
         event: '$autocapture',
-        tag_name: tagName,
         href: element.getAttribute('href') || '',
-        name: element.getAttribute('name') || '',
         text: getSafeText(element) || '',
         selector: query || '',
         url: window.location.protocol + '//' + window.location.host + window.location.pathname,
-        url_matching: ActionStepUrlMatching.Exact,
+        url_matching: 'exact',
     }
 }
 
-export function elementToSelector(element: ElementType): string {
-    let selector = ''
-    if (element.tag_name) {
-        selector += cssEscape(element.tag_name)
-    }
-    if (element.attributes?.['attr__data-attr']) {
-        selector += `[data-attr="${element.attributes['attr__data-attr']}"]`
-        return selector
-    }
-    if (element.attr_id) {
-        selector += `#${cssEscape(element.attr_id)}`
-        return selector
-    }
-    if (element.attr_class) {
-        selector += element.attr_class
-            .filter((a) => a)
-            .map((a) => `.${cssEscape(a)}`)
-            .join('')
-    }
-    if (element.href && element.tag_name === 'a') {
-        selector += `[href="${cssEscape(element.href)}"]`
-    }
-    if (element.nth_child) {
-        selector += `:nth-child(${parseInt(element.nth_child as any)})`
-    }
-    if (element.nth_of_type) {
-        selector += `:nth-of-type(${parseInt(element.nth_of_type as any)})`
-    }
-    return selector
-}
-
-export function getToolbarElement(): HTMLElement | null {
-    return window.document.getElementById('__POSTHOG_TOOLBAR__') || null
-}
-
-export function getShadowRoot(): ShadowRoot | null {
-    return getToolbarElement()?.shadowRoot || null
-}
-
-export function getShadowRootPopupContainer(): HTMLElement {
-    return getShadowRoot() as unknown as HTMLElement
+export function getToolbarRootElement(): HTMLElement | null {
+    return window.document.getElementById(TOOLBAR_ID) || null
 }
 
 export function hasCursorPointer(element: HTMLElement): boolean {
@@ -119,12 +96,13 @@ export function getParent(element: HTMLElement): HTMLElement | null {
     return null
 }
 
-export function trimElement(element: HTMLElement): HTMLElement | null {
+export function trimElement(element: HTMLElement, selector?: string): HTMLElement | null {
+    const target_selector = selector || CLICK_TARGET_SELECTOR
     if (!element) {
         return null
     }
-    const toolbarElement = getToolbarElement()
-    if (toolbarElement && isParentOf(element, toolbarElement)) {
+    const rootElement = getToolbarRootElement()
+    if (rootElement && isParentOf(element, rootElement)) {
         return null
     }
 
@@ -147,7 +125,7 @@ export function trimElement(element: HTMLElement): HTMLElement | null {
         }
 
         // return when we find a click target
-        if (loopElement.matches?.(CLICK_TARGET_SELECTOR)) {
+        if (loopElement.matches?.(target_selector)) {
             return loopElement
         }
 
@@ -169,15 +147,18 @@ export function inBounds(min: number, value: number, max: number): number {
     return Math.max(min, Math.min(max, value))
 }
 
-export function getAllClickTargets(startNode: Document | HTMLElement | ShadowRoot = document): HTMLElement[] {
-    const elements = startNode.querySelectorAll(CLICK_TARGET_SELECTOR) as unknown as HTMLElement[]
+export function getAllClickTargets(
+    startNode: Document | HTMLElement | ShadowRoot = document,
+    selector?: string
+): HTMLElement[] {
+    const targetSelector = selector || CLICK_TARGET_SELECTOR
+    const elements = startNode.querySelectorAll(targetSelector) as unknown as HTMLElement[]
 
     const allElements = [...(startNode.querySelectorAll('*') as unknown as HTMLElement[])]
-    const clickTags = CLICK_TARGET_SELECTOR.split(',').map((c) => c.trim())
 
     // loop through all elements and getComputedStyle
     const pointerElements = allElements.filter((el) => {
-        if (clickTags.indexOf(el.tagName.toLowerCase()) >= 0) {
+        if (CLICK_TARGETS.indexOf(el.tagName.toLowerCase()) >= 0) {
             return false
         }
         const compStyles = window.getComputedStyle(el)
@@ -185,11 +166,11 @@ export function getAllClickTargets(startNode: Document | HTMLElement | ShadowRoo
     })
 
     const shadowElements = allElements
-        .filter((el) => el.shadowRoot && el.getAttribute('id') !== '__POSTHOG_TOOLBAR__')
-        .map((el: HTMLElement) => (el.shadowRoot ? getAllClickTargets(el.shadowRoot) : []))
+        .filter((el) => el.shadowRoot && el.getAttribute('id') !== TOOLBAR_ID)
+        .map((el: HTMLElement) => (el.shadowRoot ? getAllClickTargets(el.shadowRoot, targetSelector) : []))
         .reduce((a, b) => [...a, ...b], [])
     const selectedElements = [...elements, ...pointerElements, ...shadowElements]
-        .map((e) => trimElement(e))
+        .map((e) => trimElement(e, targetSelector))
         .filter((e) => e)
     const uniqueElements = Array.from(new Set(selectedElements)) as HTMLElement[]
 
@@ -210,7 +191,6 @@ export function stepMatchesHref(step: ActionStepType, href: string): boolean {
 }
 
 function matchRuleShort(str: string, rule: string): boolean {
-    const escapeRegex = (strng: string): string => strng.replace(/([.*+?^=!:${}()|[\]/\\])/g, '\\$1')
     return new RegExp('^' + rule.split('%').map(escapeRegex).join('.*') + '$').test(str)
 }
 
@@ -250,7 +230,7 @@ export function getElementForStep(step: ActionStepForm, allElements?: HTMLElemen
     try {
         elements = [...(querySelectorAllDeep(selector || '*', document, allElements) as unknown as HTMLElement[])]
     } catch (e) {
-        console.error('Can not use selector:', selector)
+        console.error('Cannot use selector:', selector, '. with exception: ', e)
         return null
     }
 
@@ -274,31 +254,30 @@ export function getElementForStep(step: ActionStepForm, allElements?: HTMLElemen
     return null
 }
 
-export function getBoxColors(color: 'blue' | 'red' | 'green', hover = false, opacity = 0.2): BoxColor | undefined {
+export function getBoxColors(color: 'blue' | 'red' | 'green', hover = false, opacity = 0.2): CSSProperties | undefined {
     if (color === 'blue') {
         return {
             backgroundBlendMode: 'multiply',
             background: `hsla(240, 90%, 58%, ${opacity})`,
-            boxShadow: `hsla(240, 90%, 27%, 0.5) 0px 3px 10px ${hover ? 4 : 2}px`,
+            boxShadow: `hsla(240, 90%, 27%, 0.2) 0px 3px 10px ${hover ? 4 : 0}px`,
+            outline: `hsla(240, 90%, 58%, 0.5) solid 1px`,
         }
     }
     if (color === 'red') {
         return {
             backgroundBlendMode: 'multiply',
             background: `hsla(4, 90%, 58%, ${opacity})`,
-            boxShadow: `hsla(4, 90%, 27%, 0.8) 0px 3px 10px ${hover ? 4 : 2}px`,
-        }
-    }
-    if (color === 'green') {
-        return {
-            backgroundBlendMode: 'multiply',
-            background: `hsla(97, 90%, 58%, ${opacity})`,
-            boxShadow: `hsla(97, 90%, 27%, 0.8) 0px 3px 10px ${hover ? 4 : 2}px`,
+            boxShadow: `hsla(4, 90%, 27%, 0.2) 0px 3px 10px ${hover ? 5 : 0}px`,
+            outline: `hsla(4, 90%, 58%, 0.5) solid 1px`,
         }
     }
 }
 
-export function actionStepToAntdForm(step: ActionStepType, isNew = false): ActionStepForm {
+export function actionStepToActionStepFormItem(
+    step: ActionStepType,
+    isNew = false,
+    includedPropertyKeys?: ActionStepPropertyKey[]
+): ActionStepForm {
     if (!step) {
         return {}
     }
@@ -314,58 +293,49 @@ export function actionStepToAntdForm(step: ActionStepType, isNew = false): Actio
                 ...step,
                 href_selected: true,
                 selector_selected: hasSelector,
-                text_selected: false,
-                url_selected: false,
+                text_selected: includedPropertyKeys?.includes('text') || false,
+                url_selected: includedPropertyKeys?.includes('url') || false,
             }
         } else if (step.tag_name === 'button') {
             return {
                 ...step,
                 text_selected: true,
                 selector_selected: hasSelector,
-                href_selected: false,
-                url_selected: false,
+                href_selected: includedPropertyKeys?.includes('href') || false,
+                url_selected: includedPropertyKeys?.includes('url') || false,
             }
-        } else {
-            return {
-                ...step,
-                selector_selected: hasSelector,
-                text_selected: false,
-                url_selected: false,
-                href_selected: false,
-            }
+        }
+        return {
+            ...step,
+            selector_selected: hasSelector,
+            text_selected: includedPropertyKeys?.includes('text') || false,
+            url_selected: includedPropertyKeys?.includes('url') || false,
+            href_selected: includedPropertyKeys?.includes('href') || false,
         }
     }
 
-    const newStep = {
+    return {
         ...step,
-        url_matching: step.url_matching || ActionStepUrlMatching.Exact,
+        url_matching: step.url_matching || 'exact',
         href_selected: typeof step.href !== 'undefined' && step.href !== null,
         text_selected: typeof step.text !== 'undefined' && step.text !== null,
         selector_selected: typeof step.selector !== 'undefined' && step.selector !== null,
         url_selected: typeof step.url !== 'undefined' && step.url !== null,
     }
-
-    return newStep
 }
 
 export function stepToDatabaseFormat(step: ActionStepForm): ActionStepType {
     const { href_selected, text_selected, selector_selected, url_selected, ...rest } = step
-    const newStep = {
+    return {
         ...rest,
         href: href_selected ? rest.href || null : null,
         text: text_selected ? rest.text || null : null,
         selector: selector_selected ? rest.selector || null : null,
         url: url_selected ? rest.url || null : null,
     }
-    return newStep
 }
 
-export function clearSessionToolbarToken(): void {
-    window.sessionStorage?.removeItem('_postHogEditorParams')
-    window.localStorage?.removeItem('_postHogEditorParams')
-}
-
-export function getRectForElement(element: HTMLElement): DOMRect {
+export function getRectForElement(element: HTMLElement): ElementRect {
     const elements = [elementToAreaRect(element)]
 
     let loopElement = element
@@ -387,12 +357,47 @@ export function getRectForElement(element: HTMLElement): DOMRect {
     return maxRect
 }
 
-function elementToAreaRect(element: HTMLElement): { element: HTMLElement; rect: DOMRect; area: number } {
-    const rect = element.getBoundingClientRect()
+export const getZoomLevel = (el: HTMLElement): number[] => {
+    const zooms: number[] = []
+    const getZoom = (el: HTMLElement): void => {
+        const zoom = window.getComputedStyle(el).getPropertyValue('zoom')
+        const rzoom = zoom ? parseFloat(zoom) : 1
+        if (rzoom !== 1) {
+            zooms.push(rzoom)
+        }
+        if (el.parentElement?.parentElement) {
+            getZoom(el.parentElement)
+        }
+    }
+    getZoom(el)
+    zooms.reverse()
+    return zooms
+}
+export const getRect = (el: HTMLElement): ElementRect => {
+    if (!el) {
+        return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 }
+    }
+    const rect = el?.getBoundingClientRect()
+    const zooms = getZoomLevel(el)
+    const rectWithZoom: ElementRect = {
+        bottom: zooms.reduce((a, b) => a * b, rect.bottom),
+        height: zooms.reduce((a, b) => a * b, rect.height),
+        left: zooms.reduce((a, b) => a * b, rect.left),
+        right: zooms.reduce((a, b) => a * b, rect.right),
+        top: zooms.reduce((a, b) => a * b, rect.top),
+        width: zooms.reduce((a, b) => a * b, rect.width),
+        x: zooms.reduce((a, b) => a * b, rect.x),
+        y: zooms.reduce((a, b) => a * b, rect.y),
+    }
+    return rectWithZoom
+}
+
+function elementToAreaRect(element: HTMLElement): { element: HTMLElement; rect: ElementRect; area: number } {
+    const rect = getRect(element)
     return {
         element,
         rect,
-        area: rect.width * rect.height,
+        area: (rect.width ?? 0) * (rect.height ?? 0),
     }
 }
 
@@ -401,35 +406,4 @@ export function getHeatMapHue(count: number, maxCount: number): number {
         return 60
     }
     return 60 - (count / maxCount) * 40
-}
-
-export async function toolbarFetch(
-    url: string,
-    method: string = 'GET',
-    payload?: Record<string, any>
-): Promise<Response> {
-    const params = { temporary_token: toolbarLogic.values.temporaryToken }
-    const fullUrl = `${toolbarLogic.values.apiURL}${url}${encodeParams(params, '?')}`
-
-    const payloadData = payload
-        ? {
-              body: JSON.stringify(payload),
-              headers: {
-                  'Content-Type': 'application/json',
-              },
-          }
-        : {}
-
-    const response = await fetch(fullUrl, {
-        method,
-        ...payloadData,
-    })
-    if (response.status === 403) {
-        const responseData = await response.json()
-        // Do not try to authenticate if the user has no project access altogether
-        if (responseData.detail !== "You don't have access to the project.") {
-            toolbarLogic.actions.authenticate()
-        }
-    }
-    return response
 }

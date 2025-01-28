@@ -1,58 +1,45 @@
-import React from 'react'
-import { Select } from 'antd'
-import { useValues } from 'kea'
 import { PropertyKeyInfo } from 'lib/components/PropertyKeyInfo'
-import { eventDefinitionsModel } from '~/models/eventDefinitionsModel'
+import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { TaxonomicPopover } from 'lib/components/TaxonomicPopover/TaxonomicPopover'
 
-interface EventNameInterface {
+interface LemonEventNamePropsWithoutAllEvents {
     value: string
     onChange: (value: string) => void
-    isActionStep?: boolean
+    disabled?: boolean
+    placeholder?: string
+    /** By default "All events" is not allowed. */
+    allEventsOption?: never
 }
-
-export function EventName({ value, onChange, isActionStep = false }: EventNameInterface): JSX.Element {
-    const { eventNamesGrouped } = useValues(eventDefinitionsModel)
-
+interface LemonEventNamePropsWithAllEvents {
+    value: string | null
+    onChange: (value: string | null) => void
+    disabled?: boolean
+    placeholder?: string
+    /** Allow "All events", in either explicit option item form, or clear button form. */
+    allEventsOption: 'explicit' | 'clear'
+}
+export function LemonEventName({
+    value,
+    onChange,
+    disabled,
+    placeholder = 'Select an event',
+    allEventsOption,
+}: LemonEventNamePropsWithAllEvents | LemonEventNamePropsWithoutAllEvents): JSX.Element {
     return (
-        <span>
-            <Select
-                showSearch
-                allowClear
-                style={{ width: '100%' }}
-                onChange={onChange}
-                filterOption={(input, option) => option?.value?.toLowerCase().indexOf(input.toLowerCase()) >= 0}
-                disabled={isActionStep && eventNamesGrouped[0].options.length === 0}
-                value={value || undefined}
-                placeholder="All events"
-                data-attr="event-name-box"
-            >
-                {eventNamesGrouped.map((typeGroup) => {
-                    if (typeGroup.options.length > 0) {
-                        return (
-                            <Select.OptGroup key={typeGroup.label} label={typeGroup.label}>
-                                {typeGroup.options.map((item, index) => (
-                                    <Select.Option key={item.value} value={item.value} data-attr={'prop-val-' + index}>
-                                        <PropertyKeyInfo value={item.label ?? item.value} />
-                                    </Select.Option>
-                                ))}
-                            </Select.OptGroup>
-                        )
-                    }
-                })}
-            </Select>
-            {isActionStep && (
-                <>
-                    <br />
-
-                    <small>
-                        {eventNamesGrouped[0].options.length === 0 && "You haven't sent any custom events."}{' '}
-                        <a href="https://posthog.com/docs/libraries" target="_blank" rel="noopener noreferrer">
-                            See documentation
-                        </a>{' '}
-                        on how to send custom events in lots of languages.
-                    </small>
-                </>
-            )}
-        </span>
+        <TaxonomicPopover
+            groupType={TaxonomicFilterGroupType.Events}
+            onChange={onChange}
+            disabled={disabled}
+            value={value as string}
+            type="secondary"
+            placeholder={placeholder}
+            data-attr="event-name-box"
+            renderValue={(v) =>
+                v !== null ? <PropertyKeyInfo value={v} disablePopover type={TaxonomicFilterGroupType.Events} /> : null
+            }
+            allowClear={allEventsOption === 'clear'}
+            excludedProperties={allEventsOption !== 'explicit' ? { events: [null] } : undefined}
+            size="small"
+        />
     )
 }

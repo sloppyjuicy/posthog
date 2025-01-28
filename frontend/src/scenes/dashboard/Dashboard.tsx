@@ -1,57 +1,82 @@
-import React from 'react'
-import { SceneLoading } from 'lib/utils'
-import { BindLogic, useActions, useValues } from 'kea'
-import { dashboardLogic } from 'scenes/dashboard/dashboardLogic'
-import { DashboardHeader } from 'scenes/dashboard/DashboardHeader'
-import { DashboardItems } from 'scenes/dashboard/DashboardItems'
-import { dashboardsModel } from '~/models/dashboardsModel'
-import { DateFilter } from 'lib/components/DateFilter/DateFilter'
-import { CalendarOutlined } from '@ant-design/icons'
-import './Dashboard.scss'
-import { useKeyboardHotkeys } from '../../lib/hooks/useKeyboardHotkeys'
-import { DashboardMode } from '../../types'
-import { DashboardEventSource } from '../../lib/utils/eventUsageLogic'
-import { TZIndicator } from 'lib/components/TimezoneAware'
-import { EmptyDashboardComponent } from './EmptyDashboardComponent'
+import { LemonButton } from '@posthog/lemon-ui'
+import { BindLogic, useActions, useMountedLogic, useValues } from 'kea'
+import { AccessDenied } from 'lib/components/AccessDenied'
 import { NotFound } from 'lib/components/NotFound'
+import { useKeyboardHotkeys } from 'lib/hooks/useKeyboardHotkeys'
+import { DashboardEventSource } from 'lib/utils/eventUsageLogic'
+import { useEffect } from 'react'
+import { DashboardEditBar } from 'scenes/dashboard/DashboardEditBar'
+import { DashboardItems } from 'scenes/dashboard/DashboardItems'
+import { dashboardLogic, DashboardLogicProps } from 'scenes/dashboard/dashboardLogic'
 import { DashboardReloadAction, LastRefreshText } from 'scenes/dashboard/DashboardReloadAction'
+import { dataThemeLogic } from 'scenes/dataThemeLogic'
+import { InsightErrorState } from 'scenes/insights/EmptyStates'
+import { SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
 
-interface Props {
+import { VariablesForDashboard } from '~/queries/nodes/DataVisualization/Components/Variables/Variables'
+import { DashboardMode, DashboardPlacement, DashboardType, DataColorThemeModel, QueryBasedInsightModel } from '~/types'
+
+import { DashboardHeader } from './DashboardHeader'
+import { EmptyDashboardComponent } from './EmptyDashboardComponent'
+
+interface DashboardProps {
     id?: string
-    shareToken?: string
-    internal?: boolean
+    dashboard?: DashboardType<QueryBasedInsightModel>
+    placement?: DashboardPlacement
+    themes?: DataColorThemeModel[]
 }
 
-export function Dashboard({ id, shareToken, internal }: Props): JSX.Element {
+export const scene: SceneExport = {
+    component: DashboardScene,
+    logic: dashboardLogic,
+    paramsToProps: ({ params: { id, placement } }: { params: DashboardProps }): DashboardLogicProps => ({
+        id: parseInt(id as string),
+        placement,
+    }),
+}
+
+export function Dashboard({ id, dashboard, placement, themes }: DashboardProps = {}): JSX.Element {
+    useMountedLogic(dataThemeLogic({ themes }))
+
     return (
-        <BindLogic logic={dashboardLogic} props={{ id: id ? parseInt(id) : undefined, shareToken, internal }}>
-            <DashboardView />
+        <BindLogic logic={dashboardLogic} props={{ id: parseInt(id as string), placement, dashboard }}>
+            <DashboardScene />
         </BindLogic>
     )
 }
 
-function DashboardView(): JSX.Element {
+function DashboardScene(): JSX.Element {
     const {
+        placement,
         dashboard,
-        allItemsLoading: loadingFirstTime,
-        items,
-        filters: dashboardFilters,
+        canEditDashboard,
+        tiles,
+        itemsLoading,
         dashboardMode,
+        dashboardFailedToLoad,
+        accessDeniedToDashboard,
     } = useValues(dashboardLogic)
-    const { dashboardsLoading } = useValues(dashboardsModel)
-    const { setDashboardMode, addGraph, setDates } = useActions(dashboardLogic)
+    const { setDashboardMode, reportDashboardViewed, abortAnyRunningQuery } = useActions(dashboardLogic)
+
+    useEffect(() => {
+        reportDashboardViewed()
+        return () => {
+            // request cancellation of any running queries when this component is no longer in the dom
+            abortAnyRunningQuery()
+        }
+    }, [])
 
     useKeyboardHotkeys(
-        dashboardMode === DashboardMode.Public || dashboardMode === DashboardMode.Internal
-            ? {}
-            : {
+        placement == DashboardPlacement.Dashboard
+            ? {
                   e: {
                       action: () =>
                           setDashboardMode(
                               dashboardMode === DashboardMode.Edit ? null : DashboardMode.Edit,
                               DashboardEventSource.Hotkey
                           ),
-                      disabled: dashboardMode !== null && dashboardMode !== DashboardMode.Edit,
+                      disabled: !canEditDashboard || (dashboardMode !== null && dashboardMode !== DashboardMode.Edit),
                   },
                   f: {
                       action: () =>
@@ -61,75 +86,65 @@ function DashboardView(): JSX.Element {
                           ),
                       disabled: dashboardMode !== null && dashboardMode !== DashboardMode.Fullscreen,
                   },
-                  k: {
-                      action: () =>
-                          setDashboardMode(
-                              dashboardMode === DashboardMode.Sharing ? null : DashboardMode.Sharing,
-                              DashboardEventSource.Hotkey
-                          ),
-                      disabled: dashboardMode !== null && dashboardMode !== DashboardMode.Sharing,
-                  },
-                  n: {
-                      action: () => addGraph(),
-                      disabled: dashboardMode !== null && dashboardMode !== DashboardMode.Edit,
-                  },
                   escape: {
                       // Exit edit mode with Esc. Full screen mode is also exited with Esc, but this behavior is native to the browser.
                       action: () => setDashboardMode(null, DashboardEventSource.Hotkey),
                       disabled: dashboardMode !== DashboardMode.Edit,
                   },
-              },
-        [setDashboardMode, dashboardMode]
+              }
+            : {},
+        [setDashboardMode, dashboardMode, placement]
     )
 
-    if (dashboardsLoading || loadingFirstTime) {
-        return <SceneLoading />
+    if (!dashboard && !itemsLoading && !dashboardFailedToLoad) {
+        return <NotFound object="dashboard" />
     }
 
-    if (!dashboard) {
-        return <NotFound object="dashboard" />
+    if (accessDeniedToDashboard) {
+        return <AccessDenied object="dashboard" />
     }
 
     return (
         <div className="dashboard">
-            {dashboardMode !== DashboardMode.Public && dashboardMode !== DashboardMode.Internal && <DashboardHeader />}
-            {items && items.length ? (
-                <div>
-                    <div className="dashboard-items-actions">
-                        <div className="left-item">
-                            {dashboardMode === DashboardMode.Public ? <LastRefreshText /> : <DashboardReloadAction />}
-                        </div>
+            {placement == DashboardPlacement.Dashboard && <DashboardHeader />}
 
-                        {dashboardMode !== DashboardMode.Public && (
-                            <div
-                                className="right-item"
-                                style={{
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'flex-end',
-                                }}
-                            >
-                                <TZIndicator style={{ marginRight: 8, fontWeight: 'bold' }} />
-                                <DateFilter
-                                    defaultValue="Custom"
-                                    showCustom
-                                    dateFrom={dashboardFilters?.date_from ?? undefined}
-                                    dateTo={dashboardFilters?.date_to ?? undefined}
-                                    onChange={setDates}
-                                    makeLabel={(key) => (
-                                        <>
-                                            <CalendarOutlined />
-                                            <span className="hide-when-small"> {key}</span>
-                                        </>
-                                    )}
-                                />
+            {dashboardFailedToLoad ? (
+                <InsightErrorState title="There was an error loading this dashboard" />
+            ) : !tiles || tiles.length === 0 ? (
+                <EmptyDashboardComponent loading={itemsLoading} canEdit={canEditDashboard} />
+            ) : (
+                <div>
+                    <div className="flex gap-2 items-start justify-between flex-wrap">
+                        {![
+                            DashboardPlacement.Public,
+                            DashboardPlacement.Export,
+                            DashboardPlacement.FeatureFlag,
+                        ].includes(placement) &&
+                            dashboard && <DashboardEditBar />}
+                        {placement === DashboardPlacement.FeatureFlag && dashboard?.id && (
+                            <LemonButton type="secondary" size="small" to={urls.dashboard(dashboard.id)}>
+                                Edit dashboard
+                            </LemonButton>
+                        )}
+                        {placement !== DashboardPlacement.Export && (
+                            <div className="flex shrink-0 space-x-4 dashoard-items-actions">
+                                <div
+                                    className={`left-item ${
+                                        placement === DashboardPlacement.Public ? 'text-right' : ''
+                                    }`}
+                                >
+                                    {[DashboardPlacement.Public].includes(placement) ? (
+                                        <LastRefreshText />
+                                    ) : !(dashboardMode === DashboardMode.Edit) ? (
+                                        <DashboardReloadAction />
+                                    ) : null}
+                                </div>
                             </div>
                         )}
                     </div>
+                    <VariablesForDashboard />
                     <DashboardItems />
                 </div>
-            ) : (
-                <EmptyDashboardComponent />
             )}
         </div>
     )

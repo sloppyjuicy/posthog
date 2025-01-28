@@ -4,7 +4,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0027_move_elements_to_group"),
     ]
@@ -14,7 +13,9 @@ class Migration(migrations.Migration):
             model_name="actionstep",
             name="url_matching",
             field=models.CharField(
-                choices=[("exact", "exact"), ("contains", "contains")], default="contains", max_length=400,
+                choices=[("exact", "exact"), ("contains", "contains")],
+                default="contains",
+                max_length=400,
             ),
         ),
     ]

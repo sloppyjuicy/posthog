@@ -1,55 +1,57 @@
-from ee.clickhouse.materialized_columns import materialize
-from ee.clickhouse.materialized_columns.analyze import Query, TeamManager, analyze
-from ee.clickhouse.util import ClickhouseTestMixin
-from posthog.models import Person, PropertyDefinition
-from posthog.test.base import BaseTest
+from posthog.test.base import BaseTest, ClickhouseTestMixin
+from posthog.client import sync_execute
+from ee.clickhouse.materialized_columns.analyze import materialize_properties_task
+
+from unittest.mock import patch, call
 
 
 class TestMaterializedColumnsAnalyze(ClickhouseTestMixin, BaseTest):
-    def setUp(self):
-        super().setUp()
-        self.DUMMY_QUERIES = [
-            (
-                f"SELECT JSONExtractString(properties, 'event_prop') FROM events WHERE team_id = {self.team.pk} AND trim(BOTH '\"' FROM JSONExtractRaw(properties, 'another_prop')",
-                6723,
-            ),
-            (f"SELECT JSONExtractString(properties, 'person_prop') FROM person WHERE team_id = {self.team.pk}", 9723),
+    @patch("ee.clickhouse.materialized_columns.analyze.materialize")
+    @patch("ee.clickhouse.materialized_columns.analyze.backfill_materialized_columns")
+    def test_mat_columns(self, patch_backfill, patch_materialize):
+        sync_execute("SYSTEM FLUSH LOGS")
+        sync_execute("TRUNCATE TABLE system.query_log")
+
+        queries_to_insert = [
+            "SELECT * FROM events WHERE JSONExtractRaw(properties, \\'materialize_me\\')",
+            "SELECT * FROM events WHERE JSONExtractRaw(properties, \\'materialize_me\\')",
+            "SELECT * FROM events WHERE JSONExtractRaw(properties, \\'materialize_me2\\')",
+            "SELECT * FROM events WHERE JSONExtractRaw(`e`.properties, \\'materialize_me3\\')",
+            "SELECT * FROM events WHERE JSONExtractRaw(person_properties, \\'materialize_person_prop\\')",
+            "SELECT * FROM groups WHERE JSONExtractRaw(group.group_properties, \\'materialize_person_prop\\')",  # this should not appear
+            "SELECT * FROM groups WHERE JSONExtractRaw(group.group_properties, \\'nested\\', \\'property\\')",  # this should not appear
         ]
 
-        # Create property definitions
-        PropertyDefinition.objects.create(team=self.team, name="event_prop")
-        PropertyDefinition.objects.create(team=self.team, name="another_prop")
-
-        Person.objects.create(
-            team_id=self.team.pk,
-            distinct_ids=["2"],
-            properties={"person_prop": "something", "$another_prop": "something"},
-        )
-
-    def test_query_class(self):
-        with self.settings(MATERIALIZE_COLUMNS_MINIMUM_QUERY_TIME=3000):
-            event_query = Query(*self.DUMMY_QUERIES[0])
-            person_query = Query(*self.DUMMY_QUERIES[1])
-
-            self.assertTrue(event_query.is_valid)
-            self.assertTrue(person_query.is_valid)
-
-            self.assertEqual(event_query.team_id, str(self.team.pk))
-            self.assertEqual(person_query.team_id, str(self.team.pk))
-
-            self.assertEqual(
-                list(event_query.properties(TeamManager())), [("events", "event_prop"), ("events", "another_prop")]
+        for query in queries_to_insert:
+            sync_execute(
+                """
+            INSERT INTO system.query_log (
+                query,
+                query_start_time,
+                type,
+                is_initial_query,
+                log_comment,
+                exception_code,
+                read_bytes,
+                read_rows
+            ) VALUES (
+                '{query}',
+                now(),
+                3,
+                1,
+                '{log_comment}',
+                159,
+                40000000000,
+                10000000
             )
-            self.assertEqual(list(person_query.properties(TeamManager())), [("person", "person_prop")])
-            self.assertEqual(event_query.cost, 4)
-            self.assertEqual(person_query.cost, 7)
-
-    def test_query_class_edge_cases(self):
-        invalid_query = Query("SELECT * FROM events WHERE team_id = -1", 100)
-        self.assertFalse(invalid_query.is_valid)
-        self.assertIsNone(invalid_query.team_id)
-
-        query_with_unknown_property = Query(
-            f"SELECT JSONExtractString(properties, '$unknown_prop') FROM events WHERE team_id = {self.team.pk}", 0
+            """.format(query=query, log_comment='{"team_id": 2}')
+            )
+        materialize_properties_task()
+        patch_materialize.assert_has_calls(
+            [
+                call("events", "materialize_me", table_column="properties", is_nullable=False),
+                call("events", "materialize_me2", table_column="properties", is_nullable=False),
+                call("events", "materialize_person_prop", table_column="person_properties", is_nullable=False),
+                call("events", "materialize_me3", table_column="properties", is_nullable=False),
+            ]
         )
-        self.assertEqual(list(query_with_unknown_property.properties(TeamManager())), [])

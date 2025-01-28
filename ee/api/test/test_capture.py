@@ -1,17 +1,18 @@
 import json
-from typing import Any
+
+from django.http import HttpResponse
+from django.test.client import Client
+from kafka.errors import NoBrokersAvailable
+from rest_framework import status
+from typing import Any, Optional
 from unittest.mock import patch
 
-from django.http.request import HttpRequest
-from django.test.client import Client
-from rest_framework import status
-
-from ee.kafka_client.topics import KAFKA_EVENTS_PLUGIN_INGESTION
-from posthog.api.utils import get_team
+from ee.billing.quota_limiting import QuotaResource
+from posthog.settings.data_stores import KAFKA_EVENTS_PLUGIN_INGESTION
 from posthog.test.base import APIBaseTest
 
 
-def mocked_get_team_from_token(_: Any) -> None:
+def mocked_get_ingest_context_from_token(_: Any) -> None:
     raise Exception("test exception")
 
 
@@ -20,15 +21,80 @@ class TestCaptureAPI(APIBaseTest):
         super().setUp()
         self.client = Client()
 
-    @patch("ee.kafka_client.client._KafkaProducer.produce")
+    def _send_event(self, expected_status_code: int = status.HTTP_200_OK) -> HttpResponse:
+        event_response = self.client.post(
+            "/e/",
+            data={
+                "data": json.dumps(
+                    [
+                        {"event": "beep", "properties": {"distinct_id": "eeee", "token": self.team.api_token}},
+                        {"event": "boop", "properties": {"distinct_id": "aaaa", "token": self.team.api_token}},
+                    ]
+                ),
+                "api_key": self.team.api_token,
+            },
+        )
+        assert event_response.status_code == expected_status_code
+        return event_response
+
+    def _send_session_recording_event(
+        self,
+        number_of_events=1,
+        event_data: Optional[dict] = None,
+        snapshot_source=3,
+        snapshot_type=1,
+        session_id="abc123",
+        window_id="def456",
+        distinct_id="ghi789",
+        timestamp=1658516991883,
+        expected_status_code: int = status.HTTP_200_OK,
+    ) -> tuple[dict, HttpResponse]:
+        if event_data is None:
+            event_data = {}
+
+        event = {
+            "event": "$snapshot",
+            "properties": {
+                "$snapshot_data": {
+                    "type": snapshot_type,
+                    "data": {"source": snapshot_source, "data": event_data},
+                    "timestamp": timestamp,
+                },
+                "$session_id": session_id,
+                "$window_id": window_id,
+                "distinct_id": distinct_id,
+            },
+            "offset": 1993,
+        }
+
+        capture_recording_response = self.client.post(
+            "/s/", data={"data": json.dumps([event for _ in range(number_of_events)]), "api_key": self.team.api_token}
+        )
+        assert capture_recording_response.status_code == expected_status_code
+
+        return event, capture_recording_response
+
+    @patch("posthog.kafka_client.client._KafkaProducer.produce")
     def test_produce_to_kafka(self, kafka_produce):
         response = self.client.post(
             "/track/",
             {
                 "data": json.dumps(
                     [
-                        {"event": "event1", "properties": {"distinct_id": "id1", "token": self.team.api_token,},},
-                        {"event": "event2", "properties": {"distinct_id": "id2", "token": self.team.api_token,},},
+                        {
+                            "event": "event1",
+                            "properties": {
+                                "distinct_id": "id1",
+                                "token": self.team.api_token,
+                            },
+                        },
+                        {
+                            "event": "event2",
+                            "properties": {
+                                "distinct_id": "id2",
+                                "token": self.team.api_token,
+                            },
+                        },
                     ]
                 ),
                 "api_key": self.team.api_token,
@@ -56,76 +122,188 @@ class TestCaptureAPI(APIBaseTest):
         self.assertEqual(event2_data["properties"]["distinct_id"], "id2")
 
         # Make sure we're producing data correctly in the way the plugin server expects
-        self.assertEquals(type(kafka_produce_call1["data"]["distinct_id"]), str)
-        self.assertEquals(type(kafka_produce_call2["data"]["distinct_id"]), str)
+        self.assertEqual(type(kafka_produce_call1["data"]["distinct_id"]), str)
+        self.assertEqual(type(kafka_produce_call2["data"]["distinct_id"]), str)
 
         self.assertIn(type(kafka_produce_call1["data"]["ip"]), [str, type(None)])
         self.assertIn(type(kafka_produce_call2["data"]["ip"]), [str, type(None)])
 
-        self.assertEquals(type(kafka_produce_call1["data"]["site_url"]), str)
-        self.assertEquals(type(kafka_produce_call2["data"]["site_url"]), str)
+        self.assertEqual(type(kafka_produce_call1["data"]["site_url"]), str)
+        self.assertEqual(type(kafka_produce_call2["data"]["site_url"]), str)
 
-        self.assertEquals(type(kafka_produce_call1["data"]["team_id"]), int)
-        self.assertEquals(type(kafka_produce_call2["data"]["team_id"]), int)
+        self.assertEqual(type(kafka_produce_call1["data"]["token"]), str)
+        self.assertEqual(type(kafka_produce_call2["data"]["token"]), str)
 
-        self.assertEquals(type(kafka_produce_call1["data"]["sent_at"]), str)
-        self.assertEquals(type(kafka_produce_call2["data"]["sent_at"]), str)
+        self.assertEqual(type(kafka_produce_call1["data"]["sent_at"]), str)
+        self.assertEqual(type(kafka_produce_call2["data"]["sent_at"]), str)
 
-        self.assertEquals(type(event1_data["properties"]), dict)
-        self.assertEquals(type(event2_data["properties"]), dict)
+        self.assertEqual(type(event1_data["properties"]), dict)
+        self.assertEqual(type(event2_data["properties"]), dict)
 
-        self.assertEquals(type(kafka_produce_call1["data"]["uuid"]), str)
-        self.assertEquals(type(kafka_produce_call2["data"]["uuid"]), str)
+        self.assertEqual(type(kafka_produce_call1["data"]["uuid"]), str)
+        self.assertEqual(type(kafka_produce_call2["data"]["uuid"]), str)
 
-    @patch("posthog.models.Team.objects.get_team_from_token", side_effect=mocked_get_team_from_token)
-    @patch("posthog.api.capture.log_event_to_dead_letter_queue")
-    def test_unable_to_fetch_team(self, log_event_to_dead_letter_queue, _):
-        # In this situation we won't ingest the events, we'll add them to the dead letter queue
-
-        self.client.post(
+    @patch("posthog.kafka_client.client._KafkaProducer.produce")
+    def test_capture_event_with_uuid_in_payload(self, kafka_produce):
+        response = self.client.post(
             "/track/",
             {
                 "data": json.dumps(
                     [
-                        {"event": "event1", "properties": {"distinct_id": "eeee", "token": self.team.api_token,},},
-                        {"event": "event2", "properties": {"distinct_id": "aaaa", "token": self.team.api_token,},},
+                        {
+                            "event": "event1",
+                            "uuid": "017d37c1-f285-0000-0e8b-e02d131925dc",
+                            "properties": {
+                                "distinct_id": "id1",
+                                "token": self.team.api_token,
+                            },
+                        }
                     ]
                 ),
                 "api_key": self.team.api_token,
             },
         )
 
-        self.assertEqual(log_event_to_dead_letter_queue.call_count, 2)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        log_event_to_dead_letter_queue_call1 = log_event_to_dead_letter_queue.call_args_list[0].args
-        log_event_to_dead_letter_queue_call2 = log_event_to_dead_letter_queue.call_args_list[1].args
+        kafka_produce_call = kafka_produce.call_args_list[0].kwargs
+        event_data = json.loads(kafka_produce_call["data"]["data"])
 
-        self.assertEqual(type(log_event_to_dead_letter_queue_call1[0]), list)  # event
-        self.assertEqual(type(log_event_to_dead_letter_queue_call2[0]), list)  # event
+        self.assertEqual(event_data["event"], "event1")
+        self.assertEqual(kafka_produce_call["data"]["uuid"], "017d37c1-f285-0000-0e8b-e02d131925dc")
 
-        self.assertEqual(log_event_to_dead_letter_queue_call1[1], "event1")  # event_name
-        self.assertEqual(log_event_to_dead_letter_queue_call2[1], "event2")  # event_name
+    @patch("posthog.kafka_client.client._KafkaProducer.produce")
+    def test_kafka_connection_error(self, kafka_produce):
+        kafka_produce.side_effect = NoBrokersAvailable()
+        response = self.client.post(
+            "/capture/",
+            {
+                "data": json.dumps(
+                    [
+                        {
+                            "event": "event1",
+                            "properties": {
+                                "distinct_id": "id1",
+                                "token": self.team.api_token,
+                            },
+                        }
+                    ]
+                ),
+                "api_key": self.team.api_token,
+            },
+        )
 
-        self.assertEqual(type(log_event_to_dead_letter_queue_call1[2]), dict)  # event
-        self.assertEqual(type(log_event_to_dead_letter_queue_call2[2]), dict)  # event
-
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
         self.assertEqual(
-            log_event_to_dead_letter_queue_call1[3],
-            "Unable to fetch team from Postgres. Error: Exception('test exception')",
-        )  # error_message
+            response.json(),
+            {
+                "type": "server_error",
+                "code": "server_error",
+                "detail": "Unable to store event. Please try again. If you are the owner of this app you can check the logs for further details.",
+                "attr": None,
+            },
+        )
 
+    @patch("posthog.kafka_client.client._KafkaProducer.produce")
+    def test_partition_key_override(self, kafka_produce):
+        default_partition_key = f"{self.team.api_token}:id1"
+
+        response = self.client.post(
+            "/capture/",
+            {
+                "data": json.dumps(
+                    [
+                        {
+                            "event": "event1",
+                            "properties": {
+                                "distinct_id": "id1",
+                                "token": self.team.api_token,
+                            },
+                        }
+                    ]
+                ),
+                "api_key": self.team.api_token,
+            },
+        )
+
+        # By default we use (the hash of) <team_id:distinct_id> as the partition key
+        kafka_produce_call = kafka_produce.call_args_list[0].kwargs
         self.assertEqual(
-            log_event_to_dead_letter_queue_call2[3],
-            "Unable to fetch team from Postgres. Error: Exception('test exception')",
-        )  # error_message
+            kafka_produce_call["key"],
+            default_partition_key,
+        )
 
-        self.assertEqual(log_event_to_dead_letter_queue_call1[4], "django_server_capture_endpoint")  # error_location
-        self.assertEqual(log_event_to_dead_letter_queue_call2[4], "django_server_capture_endpoint")  # error_location
+        # Setting up an override via EVENT_PARTITION_KEYS_TO_OVERRIDE should cause us to pass None
+        # as the key when producing to Kafka, leading to random partitioning
+        with self.settings(EVENT_PARTITION_KEYS_TO_OVERRIDE=[default_partition_key]):
+            response = self.client.post(
+                "/capture/",
+                {
+                    "data": json.dumps(
+                        [
+                            {
+                                "event": "event1",
+                                "properties": {
+                                    "distinct_id": "id1",
+                                    "token": self.team.api_token,
+                                },
+                            }
+                        ]
+                    ),
+                    "api_key": self.team.api_token,
+                },
+            )
 
-    # unit test the underlying util that handles the DB being down
-    @patch("posthog.models.Team.objects.get_team_from_token", side_effect=mocked_get_team_from_token)
-    def test_determine_team_from_request_data_ch(self, _):
-        team, db_error, _ = get_team(HttpRequest(), {}, "")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.assertEqual(team, None)
-        self.assertEqual(db_error, "Exception('test exception')")
+            kafka_produce_call = kafka_produce.call_args_list[1].kwargs
+            self.assertEqual(kafka_produce_call["key"], None)
+
+    @patch("ee.billing.quota_limiting.list_limited_team_attributes")
+    @patch("posthog.kafka_client.client._KafkaProducer.produce")
+    def test_quota_limited_recordings_return_retry_after_header_when_enabled(
+        self, _kafka_produce, _fake_token_limiting
+    ) -> None:
+        with self.settings(QUOTA_LIMITING_ENABLED=True, RECORDINGS_QUOTA_LIMITING_RESPONSES_SAMPLE_RATE=1):
+
+            def fake_limiter(*args, **kwargs):
+                return [self.team.api_token] if args[0] == QuotaResource.RECORDINGS else []
+
+            _fake_token_limiting.side_effect = fake_limiter
+
+            _, response = self._send_session_recording_event()
+            # it is three hours to midnight
+            json_data = json.loads(response.content.decode("utf-8"))
+            assert json_data.get("quota_limited", None) == ["recordings"]
+
+    @patch("ee.billing.quota_limiting.list_limited_team_attributes")
+    @patch("posthog.kafka_client.client._KafkaProducer.produce")
+    def test_quota_limited_recordings_do_not_return_retry_after_header_when_disabled(
+        self, _kafka_produce, _fake_token_limiting
+    ) -> None:
+        with self.settings(QUOTA_LIMITING_ENABLED=True, RECORDINGS_QUOTA_LIMITING_RESPONSES_SAMPLE_RATE=0):
+
+            def fake_limiter(*args, **kwargs):
+                return [self.team.api_token] if args[0] == QuotaResource.RECORDINGS else []
+
+            _fake_token_limiting.side_effect = fake_limiter
+
+            _, response = self._send_session_recording_event()
+            # it is three hours to midnight
+            json_data = json.loads(response.content.decode("utf-8"))
+            assert "quota_limited" not in json_data
+
+    @patch("ee.billing.quota_limiting.list_limited_team_attributes")
+    @patch("posthog.kafka_client.client._KafkaProducer.produce")
+    def test_quota_limited_events_do_not_return_retry_after_header(self, _kafka_produce, _fake_token_limiting) -> None:
+        with self.settings(QUOTA_LIMITING_ENABLED=True):
+
+            def fake_limiter(*args, **kwargs):
+                return [self.team.api_token] if args[0] == QuotaResource.RECORDINGS else []
+
+            _fake_token_limiting.side_effect = fake_limiter
+
+            response = self._send_event()
+
+            json_data = json.loads(response.content.decode("utf-8"))
+            assert "quota_limited" not in json_data

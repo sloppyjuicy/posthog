@@ -1,28 +1,51 @@
-from typing import Any, Callable, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
+from collections.abc import Callable
 
-from django.db.models.functions.datetime import TruncDay, TruncHour, TruncMinute, TruncMonth, TruncWeek
+from django.db.models.functions.datetime import (
+    TruncDay,
+    TruncHour,
+    TruncMonth,
+    TruncWeek,
+)
 from rest_framework.exceptions import ValidationError
 from rest_framework.request import Request
 
-from posthog.models.filters.base_filter import BaseFilter
-from posthog.models.filters.mixins.common import (
+from posthog.constants import INSIGHT_STICKINESS
+
+from .base_filter import BaseFilter
+from .mixins.common import (
+    ClientQueryIdMixin,
     CompareMixin,
     EntitiesMixin,
+    EntityIdMixin,
+    EntityMathMixin,
+    EntityOrderMixin,
+    EntityTypeMixin,
     FilterTestAccountsMixin,
     InsightMixin,
+    LimitMixin,
     OffsetMixin,
+    SampleMixin,
+    SearchMixin,
     ShownAsMixin,
 )
-from posthog.models.filters.mixins.property import PropertyMixin
-from posthog.models.filters.mixins.simplify import SimplifyFilterMixin
-from posthog.models.filters.mixins.stickiness import SelectedIntervalMixin, TotalIntervalsDerivedMixin
-from posthog.models.team import Team
+from .mixins.property import PropertyMixin
+from .mixins.simplify import SimplifyFilterMixin
+from .mixins.stickiness import SelectedIntervalMixin, TotalIntervalsDerivedMixin
+
+if TYPE_CHECKING:
+    from posthog.models.team import Team
 
 
 class StickinessFilter(
     TotalIntervalsDerivedMixin,
     EntitiesMixin,
+    EntityIdMixin,
+    EntityTypeMixin,
+    EntityOrderMixin,
+    EntityMathMixin,
     SelectedIntervalMixin,
+    SearchMixin,
     PropertyMixin,
     FilterTestAccountsMixin,
     OffsetMixin,
@@ -30,26 +53,33 @@ class StickinessFilter(
     ShownAsMixin,
     InsightMixin,
     SimplifyFilterMixin,
+    LimitMixin,
+    ClientQueryIdMixin,
+    SampleMixin,
     BaseFilter,
 ):
-    get_earliest_timestamp: Callable
-    team: Team
+    get_earliest_timestamp: Optional[Callable]
+    team: "Team"
 
-    def __init__(self, data: Optional[Dict[str, Any]] = None, request: Optional[Request] = None, **kwargs) -> None:
+    def __init__(
+        self,
+        data: Optional[dict[str, Any]] = None,
+        request: Optional[Request] = None,
+        **kwargs,
+    ) -> None:
+        if data:
+            data["insight"] = INSIGHT_STICKINESS
+        else:
+            data = {"insight": INSIGHT_STICKINESS}
         super().__init__(data, request, **kwargs)
         team: Optional[Team] = kwargs.get("team", None)
         if not team:
             raise ValidationError("Team must be provided to stickiness filter")
         self.team = team
-        get_earliest_timestamp: Optional[Callable] = kwargs.get("get_earliest_timestamp", None)
-        if not get_earliest_timestamp:
-            raise ValidationError("Callable must be provided when date filtering is all time")
-        self.get_earliest_timestamp = get_earliest_timestamp  # type: ignore
+        self.get_earliest_timestamp = kwargs.get("get_earliest_timestamp", None)
 
-    def trunc_func(self, field_name: str) -> Union[TruncMinute, TruncHour, TruncDay, TruncWeek, TruncMonth]:
-        if self.interval == "minute":
-            return TruncMinute(field_name)
-        elif self.interval == "hour":
+    def trunc_func(self, field_name: str) -> Union[TruncHour, TruncDay, TruncWeek, TruncMonth]:
+        if self.interval == "hour":
             return TruncHour(field_name)
         elif self.interval == "day":
             return TruncDay(field_name)

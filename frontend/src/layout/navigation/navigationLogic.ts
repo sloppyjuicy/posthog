@@ -1,94 +1,87 @@
-import { kea } from 'kea'
+import { actions, connect, kea, listeners, path, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+import { windowValues } from 'kea-window-values'
 import api from 'lib/api'
-import { systemStatusLogic } from 'scenes/instance/SystemStatus/systemStatusLogic'
-import { navigationLogicType } from './navigationLogicType'
-import { SystemStatus } from '~/types'
-import { organizationLogic } from 'scenes/organizationLogic'
-import dayjs from 'dayjs'
+import { apiStatusLogic } from 'lib/logic/apiStatusLogic'
 import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
-import { preflightLogic } from 'scenes/PreflightCheck/logic'
+import { membersLogic } from 'scenes/organization/membersLogic'
+import { organizationLogic } from 'scenes/organizationLogic'
+import { preflightLogic } from 'scenes/PreflightCheck/preflightLogic'
+import { sceneLogic } from 'scenes/sceneLogic'
 import { teamLogic } from 'scenes/teamLogic'
+import { userLogic } from 'scenes/userLogic'
 
-type WarningType =
-    | 'welcome'
-    | 'incomplete_setup_on_demo_project'
-    | 'incomplete_setup_on_real_project'
+import type { navigationLogicType } from './navigationLogicType'
+
+export type ProjectNoticeVariant =
     | 'demo_project'
     | 'real_project_with_no_events'
-    | null
+    | 'invite_teammates'
+    | 'unverified_email'
+    | 'is_impersonated'
+    | 'internet_connection_issue'
 
-export const navigationLogic = kea<navigationLogicType<WarningType>>({
-    actions: {
-        setMenuCollapsed: (collapsed: boolean) => ({ collapsed }),
-        collapseMenu: () => {},
-        setSystemStatus: (status: SystemStatus) => ({ status }),
-        setChangelogModalOpen: (isOpen: boolean) => ({ isOpen }),
-        setToolbarModalOpen: (isOpen: boolean) => ({ isOpen }),
-        setPinnedDashboardsVisible: (visible: boolean) => ({ visible }),
-        setInviteMembersModalOpen: (isOpen: boolean) => ({ isOpen }),
-        setHotkeyNavigationEngaged: (hotkeyNavigationEngaged: boolean) => ({ hotkeyNavigationEngaged }),
-        setProjectModalShown: (isShown: boolean) => ({ isShown }),
-        setOrganizationModalShown: (isShown: boolean) => ({ isShown }),
-    },
-    reducers: {
-        menuCollapsed: [
-            typeof window !== 'undefined' && window.innerWidth <= 991,
+export const navigationLogic = kea<navigationLogicType>([
+    path(['layout', 'navigation', 'navigationLogic']),
+    connect(() => ({
+        values: [sceneLogic, ['sceneConfig'], membersLogic, ['memberCount']],
+        actions: [eventUsageLogic, ['reportProjectNoticeDismissed']],
+    })),
+    actions({
+        openAccountPopover: true,
+        closeAccountPopover: true,
+        toggleAccountPopover: true,
+        toggleProjectSwitcher: true,
+        hideProjectSwitcher: true,
+        closeProjectNotice: (projectNoticeVariant: ProjectNoticeVariant) => ({ projectNoticeVariant }),
+    }),
+    loaders({
+        navigationStatus: [
+            { system_status_ok: true, async_migrations_ok: true } as {
+                system_status_ok: boolean
+                async_migrations_ok: boolean
+            },
             {
-                setMenuCollapsed: (_, { collapsed }) => collapsed,
+                loadNavigationStatus: async () => {
+                    return await api.get('api/instance_settings')
+                },
             },
         ],
-        changelogModalOpen: [
+    }),
+    windowValues(() => ({
+        fullscreen: (window: Window) => !!window.document.fullscreenElement,
+        mobileLayout: (window: Window) => window.innerWidth < 992, // Sync width threshold with Sass variable $lg!
+    })),
+    reducers({
+        isAccountPopoverOpen: [
             false,
             {
-                setChangelogModalOpen: (_, { isOpen }) => isOpen,
+                openAccountPopover: () => true,
+                closeAccountPopover: () => false,
+                toggleAccountPopover: (state) => !state,
             },
         ],
-        toolbarModalOpen: [
+        isProjectSwitcherShown: [
             false,
             {
-                setToolbarModalOpen: (_, { isOpen }) => isOpen,
+                toggleProjectSwitcher: (state) => !state,
+                hideProjectSwitcher: () => false,
             },
         ],
-        inviteMembersModalOpen: [
-            false,
+        projectNoticesAcknowledged: [
+            {} as Record<ProjectNoticeVariant, boolean>,
+            { persist: true },
             {
-                setInviteMembersModalOpen: (_, { isOpen }) => isOpen,
+                closeProjectNotice: (state, { projectNoticeVariant }) => ({ ...state, [projectNoticeVariant]: true }),
             },
         ],
-        pinnedDashboardsVisible: [
-            false,
-            {
-                setPinnedDashboardsVisible: (_, { visible }) => visible,
-            },
-        ],
-        hotkeyNavigationEngaged: [
-            false,
-            {
-                setHotkeyNavigationEngaged: (_, { hotkeyNavigationEngaged }) => hotkeyNavigationEngaged,
-            },
-        ],
-        projectModalShown: [
-            false,
-            {
-                setProjectModalShown: (_, { isShown }) => isShown,
-            },
-        ],
-        organizationModalShown: [
-            false,
-            {
-                setOrganizationModalShown: (_, { isShown }) => isShown,
-            },
-        ],
-    },
-    selectors: {
-        systemStatus: [
-            () => [
-                systemStatusLogic.selectors.overview,
-                systemStatusLogic.selectors.systemStatusLoading,
-                preflightLogic.selectors.siteUrlMisconfigured,
-            ],
-            (statusMetrics, statusLoading, siteUrlMisconfigured) => {
-                if (statusLoading) {
+    }),
+    selectors({
+        systemStatusHealthy: [
+            (s) => [s.navigationStatus, preflightLogic.selectors.siteUrlMisconfigured],
+            (status, siteUrlMisconfigured) => {
+                // On cloud non staff users don't have status metrics to review
+                if (preflightLogic.values.preflight?.cloud && !userLogic.values.user?.is_staff) {
                     return true
                 }
 
@@ -96,84 +89,61 @@ export const navigationLogic = kea<navigationLogicType<WarningType>>({
                     return false
                 }
 
-                const aliveMetrics = ['redis_alive', 'db_alive', 'plugin_sever_alive']
-                let aliveSignals = 0
-                for (const metric of statusMetrics) {
-                    if (metric.key && aliveMetrics.includes(metric.key) && metric.value) {
-                        aliveSignals = aliveSignals + 1
-                    }
-                    if (aliveSignals >= aliveMetrics.length) {
-                        return true
-                    }
-                }
-                return false
+                return status.system_status_ok
             },
         ],
-        updateAvailable: [
-            (selectors) => [
-                selectors.latestVersion,
-                selectors.latestVersionLoading,
+        asyncMigrationsOk: [(s) => [s.navigationStatus], (status) => status.async_migrations_ok],
+        projectNoticeVariant: [
+            (s) => [
+                organizationLogic.selectors.currentOrganization,
+                teamLogic.selectors.currentTeam,
                 preflightLogic.selectors.preflight,
+                userLogic.selectors.user,
+                s.memberCount,
+                apiStatusLogic.selectors.internetConnectionIssue,
+                s.projectNoticesAcknowledged,
             ],
-            (latestVersion, latestVersionLoading, preflight) => {
-                // Always latest version in multitenancy
-                return !latestVersionLoading && !preflight?.cloud && latestVersion !== preflight?.posthog_version
-            },
-        ],
-        demoWarning: [
-            () => [organizationLogic.selectors.currentOrganization, teamLogic.selectors.currentTeam],
-            (organization, currentTeam): WarningType => {
+            (
+                organization,
+                currentTeam,
+                preflight,
+                user,
+                memberCount,
+                internetConnectionIssue,
+                projectNoticesAcknowledged
+            ): ProjectNoticeVariant | null => {
                 if (!organization) {
                     return null
                 }
 
-                if (
-                    organization.setup.is_active &&
-                    dayjs(organization.created_at) >= dayjs().subtract(1, 'days') &&
-                    currentTeam?.is_demo
-                ) {
-                    return 'welcome'
-                } else if (organization.setup.is_active && currentTeam?.is_demo) {
-                    return 'incomplete_setup_on_demo_project'
-                } else if (organization.setup.is_active) {
-                    return 'incomplete_setup_on_real_project'
-                } else if (currentTeam?.is_demo) {
+                if (internetConnectionIssue) {
+                    return 'internet_connection_issue'
+                } else if (user?.is_impersonated) {
+                    return 'is_impersonated'
+                } else if (currentTeam?.is_demo && !preflight?.demo) {
+                    // If the project is a demo one, show a project-level warning
+                    // Don't show this project-level warning in the PostHog demo environemnt though,
+                    // as then Announcement is shown instance-wide
                     return 'demo_project'
-                } else if (currentTeam && !currentTeam.ingested_event) {
+                } else if (!user?.is_email_verified && !user?.has_social_auth && preflight?.email_service_available) {
+                    return 'unverified_email'
+                } else if (
+                    !projectNoticesAcknowledged['real_project_with_no_events'] &&
+                    currentTeam &&
+                    !currentTeam.ingested_event
+                ) {
                     return 'real_project_with_no_events'
+                } else if (!projectNoticesAcknowledged['invite_teammates'] && memberCount === 1) {
+                    return 'invite_teammates'
                 }
+
                 return null
             },
         ],
-    },
-    loaders: {
-        latestVersion: [
-            null as string | null,
-            {
-                loadLatestVersion: async () => {
-                    const versions = await api.get('https://update.posthog.com/versions')
-                    return versions[0].version
-                },
-            },
-        ],
-    },
-    listeners: ({ values, actions }) => ({
-        collapseMenu: () => {
-            if (!values.menuCollapsed && window.innerWidth <= 991) {
-                actions.setMenuCollapsed(true)
-            }
-        },
-        setHotkeyNavigationEngaged: async ({ hotkeyNavigationEngaged }, breakpoint) => {
-            if (hotkeyNavigationEngaged) {
-                eventUsageLogic.actions.reportHotkeyNavigation('global', 'g')
-                await breakpoint(3000)
-                actions.setHotkeyNavigationEngaged(false)
-            }
-        },
     }),
-    events: ({ actions }) => ({
-        afterMount: () => {
-            actions.loadLatestVersion()
+    listeners(({ actions }) => ({
+        closeProjectNotice: ({ projectNoticeVariant }) => {
+            actions.reportProjectNoticeDismissed(projectNoticeVariant)
         },
-    }),
-})
+    })),
+])

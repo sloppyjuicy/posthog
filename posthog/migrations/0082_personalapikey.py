@@ -9,7 +9,6 @@ import posthog.models.utils
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0081_person_is_identified"),
     ]
@@ -31,7 +30,10 @@ class Migration(migrations.Migration):
                 (
                     "value",
                     models.CharField(
-                        default=posthog.models.utils.generate_random_token, editable=False, max_length=50, unique=True,
+                        default=posthog.models.utils.generate_random_token,
+                        editable=False,
+                        max_length=50,
+                        unique=True,
                     ),
                 ),
                 ("created_at", models.DateTimeField(default=django.utils.timezone.now)),

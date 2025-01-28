@@ -1,32 +1,33 @@
-import json
-from typing import Any, Dict, Optional
-
-from rest_framework import request
-from rest_framework.exceptions import ValidationError
-
-from posthog.constants import PROPERTIES
-from posthog.models.filters.base_filter import BaseFilter
-from posthog.models.filters.mixins.common import (
+from .base_filter import BaseFilter
+from .mixins.common import (
     BreakdownMixin,
-    BreakdownTypeMixin,
     BreakdownValueMixin,
+    ClientQueryIdMixin,
     CompareMixin,
     DateMixin,
     DisplayDerivedMixin,
+    DistinctIdMixin,
+    EmailMixin,
     EntitiesMixin,
     EntityIdMixin,
+    EntityMathMixin,
+    EntityOrderMixin,
     EntityTypeMixin,
     FilterTestAccountsMixin,
     FormulaMixin,
+    IncludeRecordingsMixin,
     InsightMixin,
-    IntervalMixin,
     LimitMixin,
     OffsetMixin,
+    SampleMixin,
+    SearchMixin,
     SelectorMixin,
-    SessionMixin,
     ShownAsMixin,
+    SmoothingIntervalsMixin,
+    UpdatedAfterMixin,
 )
-from posthog.models.filters.mixins.funnel import (
+from .mixins.funnel import (
+    FunnelCorrelationActorsMixin,
     FunnelCorrelationMixin,
     FunnelFromToStepsMixin,
     FunnelLayoutMixin,
@@ -37,27 +38,31 @@ from posthog.models.filters.mixins.funnel import (
     FunnelWindowDaysMixin,
     FunnelWindowMixin,
     HistogramMixin,
+    FunnelHogQLAggregationMixin,
 )
-from posthog.models.filters.mixins.property import PropertyMixin
-from posthog.models.filters.mixins.simplify import SimplifyFilterMixin
+from .mixins.groups import GroupsAggregationMixin
+from .mixins.interval import IntervalMixin
+from .mixins.property import PropertyMixin
+from .mixins.simplify import SimplifyFilterMixin
 
 
 class Filter(
     PropertyMixin,
     IntervalMixin,
+    SmoothingIntervalsMixin,
     EntitiesMixin,
     EntityIdMixin,
     EntityTypeMixin,
+    EntityMathMixin,
+    EntityOrderMixin,
     DisplayDerivedMixin,
     SelectorMixin,
     ShownAsMixin,
     BreakdownMixin,
-    BreakdownTypeMixin,
+    CompareMixin,
     BreakdownValueMixin,
     FilterTestAccountsMixin,
-    CompareMixin,
     InsightMixin,
-    SessionMixin,
     OffsetMixin,
     LimitMixin,
     DateMixin,
@@ -69,10 +74,20 @@ class Filter(
     FunnelTrendsPersonsMixin,
     FunnelPersonsStepBreakdownMixin,
     FunnelLayoutMixin,
+    FunnelHogQLAggregationMixin,
     FunnelTypeMixin,
     HistogramMixin,
+    GroupsAggregationMixin,
     FunnelCorrelationMixin,
+    FunnelCorrelationActorsMixin,
     SimplifyFilterMixin,
+    IncludeRecordingsMixin,
+    SearchMixin,
+    DistinctIdMixin,
+    EmailMixin,
+    UpdatedAfterMixin,
+    ClientQueryIdMixin,
+    SampleMixin,
     BaseFilter,
 ):
     """
@@ -81,34 +96,4 @@ class Filter(
     This class just allows for stronger typing of this object.
     """
 
-    funnel_id: Optional[int] = None
-    _data: Dict
-
-    def __init__(
-        self, data: Optional[Dict[str, Any]] = None, request: Optional[request.Request] = None, **kwargs
-    ) -> None:
-        if request:
-            properties = {}
-            if request.GET.get(PROPERTIES):
-                try:
-                    properties = json.loads(request.GET[PROPERTIES])
-                except json.decoder.JSONDecodeError:
-                    raise ValidationError("Properties are unparsable!")
-            elif request.data and request.data.get(PROPERTIES):
-                properties = request.data[PROPERTIES]
-
-            data = {
-                **request.GET.dict(),
-                **request.data,
-                **(data if data else {}),
-                **({PROPERTIES: properties}),
-            }
-        elif not data:
-            raise ValueError("You need to define either a data dict or a request")
-
-        self._data = data
-        self.kwargs = kwargs
-
-        if "team" in kwargs and not self.is_simplified:
-            simplified_filter = self.simplify(kwargs["team"])
-            self._data = simplified_filter._data
+    pass

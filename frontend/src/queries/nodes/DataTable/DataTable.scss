@@ -1,0 +1,28 @@
+.DataTable {
+    td {
+        max-width: 20rem;
+    }
+
+    .DataTable__row--highlight_once {
+        animation: DataTable__highlight 2000ms ease-out;
+    }
+
+    .DataTable__row--category_row {
+        height: 2rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: var(--muted);
+        text-align: center;
+        background-color: var(--bg-3000);
+    }
+
+    @keyframes DataTable__highlight {
+        0% {
+            background-color: var(--mark);
+        }
+
+        100% {
+            background-color: initial;
+        }
+    }
+}

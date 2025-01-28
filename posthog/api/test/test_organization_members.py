@@ -1,21 +1,40 @@
+from unittest.mock import call, patch
+
 from rest_framework import status
 
 from posthog.models.organization import Organization, OrganizationMembership
 from posthog.models.user import User
-from posthog.test.base import APIBaseTest
+from posthog.test.base import APIBaseTest, QueryMatchingTest
 
 
-class TestOrganizationMembersAPI(APIBaseTest):
+class TestOrganizationMembersAPI(APIBaseTest, QueryMatchingTest):
     def test_list_organization_members(self):
+        User.objects.create_and_join(self.organization, "1@posthog.com", None)
+        User.objects.create_and_join(self.organization, "2@posthog.com", None, is_active=False)
 
         response = self.client.get("/api/organizations/@current/members/")
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
         response_data = response.json()["results"]
-        self.assertEqual(len(response_data), self.organization.members.count())
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
         instance = OrganizationMembership.objects.get(id=response_data[0]["id"])
+        # self.user + first created user should be counted, second created user shouldn't as they're deactivated
+        self.assertEqual(len(response_data), 2)
         self.assertEqual(response_data[0]["user"]["uuid"], str(instance.user.uuid))
         self.assertEqual(response_data[0]["user"]["first_name"], instance.user.first_name)
+
+    # def test_list_organization_members_is_not_nplus1(self):
+    #     self.user.totpdevice_set.create(name="default", key=random_hex(), digits=6)  # type: ignore
+    #     with self.assertNumQueries(9), snapshot_postgres_queries_context(self):
+    #         response = self.client.get("/api/organizations/@current/members/")
+
+    #     assert len(response.json()["results"]) == 1
+
+    #     User.objects.create_and_join(self.organization, "1@posthog.com", None)
+
+    #     with self.assertNumQueries(9), snapshot_postgres_queries_context(self):
+    #         response = self.client.get("/api/organizations/@current/members/")
+
+    #     assert len(response.json()["results"]) == 2
 
     def test_cant_list_members_for_an_alien_organization(self):
         org = Organization.objects.create(name="Alien Org")
@@ -31,7 +50,9 @@ class TestOrganizationMembersAPI(APIBaseTest):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(response.json(), self.permission_denied_response())
 
-    def test_delete_organization_member(self):
+    @patch("posthoganalytics.capture")
+    @patch("posthog.models.user.User.update_billing_organization_users")
+    def test_delete_organization_member(self, mock_update_billing_organization_users, mock_capture):
         user = User.objects.create_and_join(self.organization, "test@x.com", None, "X")
         membership_queryset = OrganizationMembership.objects.filter(user=user, organization=self.organization)
         self.assertTrue(membership_queryset.exists())
@@ -46,21 +67,61 @@ class TestOrganizationMembersAPI(APIBaseTest):
         self.assertEqual(response.status_code, 204)
         self.assertFalse(membership_queryset.exists(), False)
 
-    def test_leave_organization(self):
+        mock_capture.assert_called_with(
+            self.user.distinct_id,  # requesting user
+            "organization member removed",
+            properties={
+                "removed_member_id": user.distinct_id,
+                "removed_by_id": self.user.distinct_id,
+                "organization_id": self.organization.id,
+                "organization_name": self.organization.name,
+                "removal_type": "removed_by_other",
+            },
+            groups={"instance": "http://localhost:8010", "organization": str(self.organization.id)},
+        )
+        assert mock_update_billing_organization_users.call_count == 2
+        assert mock_update_billing_organization_users.call_args_list == [
+            call(self.organization),
+            call(self.organization),
+        ]
+
+    @patch("posthoganalytics.capture")
+    @patch("posthog.models.user.User.update_billing_organization_users")
+    def test_leave_organization(self, mock_update_billing_organization_users, mock_capture):
         membership_queryset = OrganizationMembership.objects.filter(user=self.user, organization=self.organization)
         self.assertEqual(membership_queryset.count(), 1)
         response = self.client.delete(f"/api/organizations/@current/members/{self.user.uuid}/")
         self.assertEqual(response.status_code, 204)
         self.assertEqual(membership_queryset.count(), 0)
 
-    def test_change_organization_member_level(self):
+        mock_capture.assert_called_with(
+            self.user.distinct_id,
+            "organization member removed",
+            properties={
+                "removed_member_id": self.user.distinct_id,
+                "removed_by_id": self.user.distinct_id,
+                "organization_id": self.organization.id,
+                "organization_name": self.organization.name,
+                "removal_type": "self_removal",
+            },
+            groups={"instance": "http://localhost:8010", "organization": str(self.organization.id)},
+        )
+
+        assert mock_update_billing_organization_users.call_count == 1
+        assert mock_update_billing_organization_users.call_args_list == [
+            call(self.organization),
+        ]
+
+    @patch("posthog.models.user.User.update_billing_organization_users")
+    def test_change_organization_member_level(self, mock_update_billing_organization_users):
         self.organization_membership.level = OrganizationMembership.Level.OWNER
         self.organization_membership.save()
         user = User.objects.create_user("test@x.com", None, "X")
         membership = OrganizationMembership.objects.create(user=user, organization=self.organization)
         self.assertEqual(membership.level, OrganizationMembership.Level.MEMBER)
         response = self.client.patch(
-            f"/api/organizations/@current/members/{user.uuid}", {"level": OrganizationMembership.Level.ADMIN},
+            f"/api/organizations/@current/members/{user.uuid}",
+            {"level": OrganizationMembership.Level.ADMIN},
         )
         self.assertEqual(response.status_code, 200)
         updated_membership = OrganizationMembership.objects.get(user=user, organization=self.organization)
@@ -68,40 +129,60 @@ class TestOrganizationMembersAPI(APIBaseTest):
         response_data = response.json()
         response_data.pop("joined_at")
         response_data.pop("updated_at")
+        response_data.pop("last_login")
         self.assertDictEqual(
             response_data,
             {
                 "id": str(updated_membership.id),
+                "is_2fa_enabled": False,
+                "has_social_auth": False,
                 "user": {
                     "id": user.id,
                     "uuid": str(user.uuid),
                     "distinct_id": str(user.distinct_id),
                     "first_name": user.first_name,
+                    "last_name": user.last_name,
                     "email": user.email,
+                    "is_email_verified": None,
+                    "hedgehog_config": None,
+                    "role_at_organization": None,
                 },
                 "level": OrganizationMembership.Level.ADMIN.value,
             },
         )
+        assert mock_update_billing_organization_users.call_count == 1
+        assert mock_update_billing_organization_users.call_args_list == [
+            call(self.organization),
+        ]
 
-    def test_admin_can_promote_to_admin(self):
+    @patch("posthog.models.user.User.update_billing_organization_users")
+    def test_admin_can_promote_to_admin(self, mock_update_billing_organization_users):
         self.organization_membership.level = OrganizationMembership.Level.ADMIN
         self.organization_membership.save()
         user = User.objects.create_user("test@x.com", None, "X")
         membership = OrganizationMembership.objects.create(user=user, organization=self.organization)
         self.assertEqual(membership.level, OrganizationMembership.Level.MEMBER)
         response = self.client.patch(
-            f"/api/organizations/@current/members/{user.uuid}", {"level": OrganizationMembership.Level.ADMIN},
+            f"/api/organizations/@current/members/{user.uuid}",
+            {"level": OrganizationMembership.Level.ADMIN},
         )
         self.assertEqual(response.status_code, 200)
         updated_membership = OrganizationMembership.objects.get(user=user, organization=self.organization)
         self.assertEqual(updated_membership.level, OrganizationMembership.Level.ADMIN)
 
-    def test_change_organization_member_level_requires_admin(self):
+        assert mock_update_billing_organization_users.call_count == 1
+        assert mock_update_billing_organization_users.call_args_list == [
+            call(self.organization),
+        ]
+
+    @patch("posthog.models.user.User.update_billing_organization_users")
+    def test_change_organization_member_level_requires_admin(self, mock_update_billing_organization_users):
         user = User.objects.create_user("test@x.com", None, "X")
         membership = OrganizationMembership.objects.create(user=user, organization=self.organization)
         self.assertEqual(membership.level, OrganizationMembership.Level.MEMBER)
         response = self.client.patch(
-            f"/api/organizations/@current/members/{user.uuid}/", {"level": OrganizationMembership.Level.ADMIN},
+            f"/api/organizations/@current/members/{user.uuid}/",
+            {"level": OrganizationMembership.Level.ADMIN},
         )
 
         updated_membership = OrganizationMembership.objects.get(user=user, organization=self.organization)
@@ -117,11 +198,14 @@ class TestOrganizationMembersAPI(APIBaseTest):
         )
         self.assertEqual(response.status_code, 403)
 
+        assert mock_update_billing_organization_users.call_count == 0
+
     def test_cannot_change_own_organization_member_level(self):
         self.organization_membership.level = OrganizationMembership.Level.ADMIN
         self.organization_membership.save()
         response = self.client.patch(
-            f"/api/organizations/@current/members/{self.user.uuid}", {"level": OrganizationMembership.Level.MEMBER},
+            f"/api/organizations/@current/members/{self.user.uuid}",
+            {"level": OrganizationMembership.Level.MEMBER},
         )
         self.organization_membership.refresh_from_db()
         self.assertEqual(self.organization_membership.level, OrganizationMembership.Level.ADMIN)
@@ -136,7 +220,7 @@ class TestOrganizationMembersAPI(APIBaseTest):
         )
         self.assertEqual(response.status_code, 403)
 
-    def test_pass_ownership(self):
+    def test_add_another_owner(self):
         user = User.objects.create_user("test@x.com", None, "X")
         membership: OrganizationMembership = OrganizationMembership.objects.create(
             user=user, organization=self.organization
@@ -144,21 +228,22 @@ class TestOrganizationMembersAPI(APIBaseTest):
         self.organization_membership.level = OrganizationMembership.Level.OWNER
         self.organization_membership.save()
         response = self.client.patch(
-            f"/api/organizations/@current/members/{user.uuid}/", {"level": OrganizationMembership.Level.OWNER},
+            f"/api/organizations/@current/members/{user.uuid}/",
+            {"level": OrganizationMembership.Level.OWNER},
         )
         self.organization_membership.refresh_from_db()
         membership.refresh_from_db()
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.organization_membership.level, OrganizationMembership.Level.ADMIN)
+        self.assertEqual(self.organization_membership.level, OrganizationMembership.Level.OWNER)
         self.assertEqual(membership.level, OrganizationMembership.Level.OWNER)
         self.assertEqual(
             OrganizationMembership.objects.filter(
                 organization=self.organization, level=OrganizationMembership.Level.OWNER
             ).count(),
-            1,
+            2,
         )
 
-    def test_pass_ownership_only_if_owner(self):
+    def test_add_owner_only_if_owner(self):
         user = User.objects.create_user("test@x.com", None, "X")
         membership: OrganizationMembership = OrganizationMembership.objects.create(
             user=user, organization=self.organization
@@ -166,7 +251,8 @@ class TestOrganizationMembersAPI(APIBaseTest):
         self.organization_membership.level = OrganizationMembership.Level.ADMIN
         self.organization_membership.save()
         response = self.client.patch(
-            f"/api/organizations/@current/members/{user.uuid}/", {"level": OrganizationMembership.Level.OWNER},
+            f"/api/organizations/@current/members/{user.uuid}/",
+            {"level": OrganizationMembership.Level.OWNER},
         )
         self.organization_membership.refresh_from_db()
         membership.refresh_from_db()
@@ -175,10 +261,24 @@ class TestOrganizationMembersAPI(APIBaseTest):
             {
                 "attr": None,
                 "code": "permission_denied",
-                "detail": "You can only pass on organization ownership if you're its owner.",
+                "detail": "You can only make another member owner if you're this organization's owner.",
                 "type": "authentication_error",
             },
         )
         self.assertEqual(response.status_code, 403)
         self.assertEqual(self.organization_membership.level, OrganizationMembership.Level.ADMIN)
         self.assertEqual(membership.level, OrganizationMembership.Level.MEMBER)
+
+    def test_list_organization_members_filter_by_email(self):
+        # Create additional users
+        user1 = User.objects.create_and_join(self.organization, "specific@posthog.com", None)
+        User.objects.create_and_join(self.organization, "another@posthog.com", None)
+
+        # Test filtering by email
+        response = self.client.get("/api/organizations/@current/members/?email=specific@posthog.com")
+        response_data = response.json()["results"]
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response_data), 1)
+        self.assertEqual(response_data[0]["user"]["email"], "specific@posthog.com")
+        self.assertEqual(response_data[0]["user"]["uuid"], str(user1.uuid))

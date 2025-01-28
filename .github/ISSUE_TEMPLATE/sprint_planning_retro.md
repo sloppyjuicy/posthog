@@ -7,42 +7,28 @@ title: Sprint 1.n.0 m/2 - Jan 1 to Jan 12
 
 # Global Sprint Planning
 
-## Retro: Status of Outcomes from Previous Sprint
+## 3 things that might take us down
 
 1.
 2.
 3.
-4.
-5.
 
-## Retro: What can we do better next sprint?
+## Urgent incident follow-ups
 
-1.
-2.
-3.
-4.
-5.
-
-## Plan: Proposed Goals for Next Sprint 
-
-Each goal should have a single owner. Owner can only be an engineer.
-
-1.
-2.
-3.
-4.
-5.
+https://github.com/orgs/PostHog/projects/103/views/2
 
 # Team sprint planning
 
 For your team sprint planning copy this template into a comment below for each team.
 
 ```
-Team ___
+# Team ___
+
+**Support hero:** ___
 
 ## Retro
 
-<!-- Talk about what went well, what didn't go well and any actions to improve next time -->
+<!-- Grab the high and low priority items from last time and add whether that item was completed or not -->
 
 - 
 
@@ -52,9 +38,10 @@ Team ___
 
 - Item 1. prioritised/deprioritise
 
-## Planning
+## OKR
 
-<!-- Each item should have a single owner. Owner can only be an engineer. -->
+1. OKR, status (red/yellow/green) and action points if yellow/red
+
 
 ### High priority
 

@@ -1,119 +1,135 @@
-import React from 'react'
-import { BindLogic, useActions, useValues } from 'kea'
-import { PersonModal } from './PersonModal'
-import {
-    ACTIONS_LINE_GRAPH_LINEAR,
-    ACTIONS_LINE_GRAPH_CUMULATIVE,
-    ACTIONS_TABLE,
-    ACTIONS_PIE_CHART,
-    ACTIONS_BAR_CHART,
-    ACTIONS_BAR_CHART_VALUE,
-} from 'lib/constants'
-
-import { ActionsPie, ActionsLineGraph, ActionsBarValueGraph, ActionsTable } from './viz'
-import { SaveCohortModal } from './SaveCohortModal'
-import { trendsLogic } from './trendsLogic'
-import { ViewType } from '~/types'
-import { InsightsTable } from 'scenes/insights/InsightsTable'
-import { Button } from 'antd'
-import { personsModalLogic } from './personsModalLogic'
-import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { LemonButton } from '@posthog/lemon-ui'
+import { useActions, useValues } from 'kea'
 import { insightLogic } from 'scenes/insights/insightLogic'
+import { insightSceneLogic } from 'scenes/insights/insightSceneLogic'
+import { BoldNumber } from 'scenes/insights/views/BoldNumber'
+import { InsightsTable } from 'scenes/insights/views/InsightsTable/InsightsTable'
+import { WorldMap } from 'scenes/insights/views/WorldMap'
+
+import { QueryContext } from '~/queries/types'
+import { ChartDisplayType, InsightType, ItemMode } from '~/types'
+
+import { trendsDataLogic } from './trendsDataLogic'
+import { ActionsHorizontalBar, ActionsLineGraph, ActionsPie } from './viz'
 
 interface Props {
-    view: ViewType
+    view: InsightType
+    context?: QueryContext
+    embedded?: boolean
+    inSharedMode?: boolean
 }
 
-export function TrendInsight({ view }: Props): JSX.Element {
-    const { insightProps } = useValues(insightLogic)
-    const { cohortModalVisible } = useValues(personsModalLogic)
-    const { setCohortModalVisible } = useActions(personsModalLogic)
-    const { filters: _filters, loadMoreBreakdownUrl, breakdownValuesLoading } = useValues(trendsLogic(insightProps))
-    const { loadMoreBreakdownValues } = useActions(trendsLogic(insightProps))
-    const { showingPeople } = useValues(personsModalLogic)
-    const { saveCohortWithFilters } = useActions(personsModalLogic)
-    const { reportCohortCreatedFromPersonModal } = useActions(eventUsageLogic)
+export function TrendInsight({ view, context, embedded, inSharedMode }: Props): JSX.Element {
+    const { insightMode } = useValues(insightSceneLogic)
+    const { insightProps, showPersonsModal: insightLogicShowPersonsModal } = useValues(insightLogic)
+    const showPersonsModal = insightLogicShowPersonsModal && !inSharedMode
+
+    const { display, series, breakdownFilter, hasBreakdownMore, breakdownValuesLoading } = useValues(
+        trendsDataLogic(insightProps)
+    )
+    const { updateBreakdownFilter } = useActions(trendsDataLogic(insightProps))
+
     const renderViz = (): JSX.Element | undefined => {
         if (
-            !_filters.display ||
-            _filters.display === ACTIONS_LINE_GRAPH_LINEAR ||
-            _filters.display === ACTIONS_LINE_GRAPH_CUMULATIVE ||
-            _filters.display === ACTIONS_BAR_CHART
+            !display ||
+            display === ChartDisplayType.ActionsLineGraph ||
+            display === ChartDisplayType.ActionsLineGraphCumulative ||
+            display === ChartDisplayType.ActionsAreaGraph ||
+            display === ChartDisplayType.ActionsBar
         ) {
-            return <ActionsLineGraph filters={_filters} />
-        }
-        if (_filters.display === ACTIONS_TABLE) {
-            if (view === ViewType.SESSIONS && _filters.session === 'dist') {
-                return <ActionsTable filters={_filters} />
-            }
             return (
-                <BindLogic logic={trendsLogic} props={{ dashboardItemId: null, view, filters: null }}>
-                    <InsightsTable isLegend={false} showTotalCount={view !== ViewType.SESSIONS} />
-                </BindLogic>
+                <ActionsLineGraph
+                    showPersonsModal={showPersonsModal}
+                    context={context}
+                    inCardView={embedded}
+                    inSharedMode={inSharedMode}
+                />
             )
         }
-        if (_filters.display === ACTIONS_PIE_CHART) {
-            return <ActionsPie filters={_filters} />
+        if (display === ChartDisplayType.BoldNumber) {
+            return (
+                <BoldNumber
+                    showPersonsModal={showPersonsModal}
+                    context={context}
+                    inCardView={embedded}
+                    inSharedMode={inSharedMode}
+                />
+            )
         }
-        if (_filters.display === ACTIONS_BAR_CHART_VALUE) {
-            return <ActionsBarValueGraph filters={_filters} />
+        if (display === ChartDisplayType.ActionsTable) {
+            const ActionsTable = InsightsTable
+            return (
+                <ActionsTable
+                    embedded
+                    filterKey={`trends_${view}`}
+                    canEditSeriesNameInline={insightMode === ItemMode.Edit}
+                    isMainInsightView={true}
+                />
+            )
+        }
+        if (display === ChartDisplayType.ActionsPie) {
+            return (
+                <ActionsPie
+                    showPersonsModal={showPersonsModal}
+                    context={context}
+                    inCardView={embedded}
+                    inSharedMode={inSharedMode}
+                />
+            )
+        }
+        if (display === ChartDisplayType.ActionsBarValue) {
+            return (
+                <ActionsHorizontalBar
+                    showPersonsModal={showPersonsModal}
+                    context={context}
+                    inCardView={embedded}
+                    inSharedMode={inSharedMode}
+                />
+            )
+        }
+        if (display === ChartDisplayType.WorldMap) {
+            return (
+                <WorldMap
+                    showPersonsModal={showPersonsModal}
+                    context={context}
+                    inCardView={embedded}
+                    inSharedMode={inSharedMode}
+                />
+            )
         }
     }
 
     return (
         <>
-            {(_filters.actions || _filters.events || _filters.session) && (
-                <div
-                    style={{
-                        minHeight: 'calc(90vh - 16rem)',
-                        position: 'relative',
-                    }}
-                >
+            {series && (
+                <div className={embedded ? 'InsightCard__viz' : `TrendsInsight TrendsInsight--${display}`}>
                     {renderViz()}
                 </div>
             )}
-            {_filters.breakdown && (
-                <div className="mt text-center">
-                    {loadMoreBreakdownUrl ? (
-                        <>
-                            <div className="text-muted mb">
-                                For readability, <b>not all breakdown values are displayed</b>. Click below to load
-                                them.
-                            </div>
-                            <div>
-                                <Button
-                                    style={{ textAlign: 'center' }}
-                                    onClick={loadMoreBreakdownValues}
-                                    loading={breakdownValuesLoading}
-                                >
-                                    Load more breakdown values
-                                </Button>
-                            </div>
-                        </>
-                    ) : (
-                        <span className="text-muted">
-                            Showing <b>all breakdown values</b>
-                        </span>
-                    )}
-                </div>
-            )}
-            <PersonModal
-                visible={showingPeople && !cohortModalVisible}
-                view={view}
-                filters={_filters}
-                onSaveCohort={() => {
-                    setCohortModalVisible(true)
-                }}
-            />
-            <SaveCohortModal
-                visible={cohortModalVisible}
-                onOk={(title: string) => {
-                    saveCohortWithFilters(title, _filters)
-                    setCohortModalVisible(false)
-                    reportCohortCreatedFromPersonModal(_filters)
-                }}
-                onCancel={() => setCohortModalVisible(false)}
-            />
+            {!embedded &&
+                display !== ChartDisplayType.WorldMap && // the world map doesn't need this cta
+                breakdownFilter &&
+                hasBreakdownMore && (
+                    <div className="p-4">
+                        <div className="text-muted">
+                            Breakdown limited to {breakdownFilter.breakdown_limit || 25} - more available
+                            <LemonButton
+                                onClick={() =>
+                                    updateBreakdownFilter({
+                                        ...breakdownFilter,
+                                        breakdown_limit: (breakdownFilter.breakdown_limit || 25) * 2,
+                                    })
+                                }
+                                loading={breakdownValuesLoading}
+                                size="xsmall"
+                                type="secondary"
+                                className="inline-block ml-2"
+                            >
+                                Set to {(breakdownFilter.breakdown_limit || 25) * 2}
+                            </LemonButton>
+                        </div>
+                    </div>
+                )}
         </>
     )
 }

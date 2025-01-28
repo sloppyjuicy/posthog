@@ -1,16 +1,16 @@
 import hashlib
 import json
-from typing import Any, Dict, List
+from typing import Any
 
 from django.db import models, transaction
 from django.forms.models import model_to_dict
 
-from .element import Element
-from .team import Team
+from posthog.models.element import Element
+from posthog.models.team import Team
 
 
-def hash_elements(elements: List) -> str:
-    elements_list: List[Dict] = []
+def hash_elements(elements: list) -> str:
+    elements_list: list[dict] = []
     for element in elements:
         el_dict = model_to_dict(element)
         [el_dict.pop(key) for key in ["event", "id", "group"]]
@@ -30,20 +30,21 @@ class ElementGroupManager(models.Manager):
                     group = super().create(*args, **kwargs)
             except:
                 return ElementGroup.objects.get(
-                    hash=kwargs["hash"], team_id=kwargs["team"].pk if kwargs.get("team") else kwargs["team_id"],
+                    hash=kwargs["hash"],
+                    team_id=kwargs["team"].pk if kwargs.get("team") else kwargs["team_id"],
                 )
-            for index, element in enumerate(elements):
+            for element in elements:
                 element.group = group
-                setattr(element, "pk", None)
+                element.pk = None
             Element.objects.bulk_create(elements)
             return group
 
 
 class ElementGroup(models.Model):
-    class Meta:
-        constraints = [models.UniqueConstraint(fields=["team", "hash"], name="unique hash for each team")]
-
-    team: models.ForeignKey = models.ForeignKey(Team, on_delete=models.CASCADE)
-    hash: models.CharField = models.CharField(max_length=400, null=True, blank=True)
+    team = models.ForeignKey(Team, on_delete=models.CASCADE)
+    hash = models.CharField(max_length=400, null=True, blank=True)
 
     objects = ElementGroupManager()
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["team", "hash"], name="unique hash for each team")]

@@ -1,0 +1,11 @@
+.EditorFilterGroup {
+    .EditorFilterGroup__title {
+        display: none;
+    }
+
+    .EditorFilterGroup__content {
+        > * + * {
+            margin-top: 1rem;
+        }
+    }
+}

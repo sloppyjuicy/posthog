@@ -1,7 +1,8 @@
-import posthog from 'posthog-js'
-import * as Sentry from '@sentry/browser'
+import * as Sentry from '@sentry/react'
+import { FEATURE_FLAGS } from 'lib/constants'
+import posthog, { PostHogConfig } from 'posthog-js'
 
-const configWithSentry = (config: posthog.Config): posthog.Config => {
+const configWithSentry = (config: Partial<PostHogConfig>): Partial<PostHogConfig> => {
     if ((window as any).SENTRY_DSN) {
         config.on_xhr_error = (failedRequest: XMLHttpRequest) => {
             const status = failedRequest.status
@@ -20,33 +21,76 @@ export function loadPostHogJS(): void {
         posthog.init(
             window.JS_POSTHOG_API_KEY,
             configWithSentry({
+                opt_out_useragent_filter: window.location.hostname === 'localhost', // we ARE a bot when running in localhost, so we need to enable this opt-out
                 api_host: window.JS_POSTHOG_HOST,
-                // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-                // @ts-ignore
-                _capture_metrics: true,
+                ui_host: window.JS_POSTHOG_UI_HOST,
                 rageclick: true,
-                debug: window.JS_POSTHOG_SELF_CAPTURE,
-            })
-        )
-        // Make sure we have access to the object in window for debugging
-        window.posthog = posthog
-    } else {
-        posthog.init(
-            'fake token',
-            configWithSentry({
-                autocapture: false,
-                loaded: function (ph) {
-                    ph.opt_out_capturing()
+                persistence: 'localStorage+cookie',
+                bootstrap: window.POSTHOG_USER_IDENTITY_WITH_FLAGS ? window.POSTHOG_USER_IDENTITY_WITH_FLAGS : {},
+                opt_in_site_apps: true,
+                api_transport: 'fetch',
+                loaded: (loadedInstance) => {
+                    if (loadedInstance.sessionRecording) {
+                        loadedInstance.sessionRecording._forceAllowLocalhostNetworkCapture = true
+                    }
+
+                    if (window.IMPERSONATED_SESSION) {
+                        loadedInstance.sessionManager?.resetSessionId()
+                        loadedInstance.opt_out_capturing()
+                    } else {
+                        loadedInstance.opt_in_capturing()
+                    }
+
+                    const Cypress = (window as any).Cypress
+
+                    if (Cypress) {
+                        Object.entries(Cypress.env()).forEach(([key, value]) => {
+                            if (key.startsWith('POSTHOG_PROPERTY_')) {
+                                loadedInstance.register_for_session({
+                                    [key.replace('POSTHOG_PROPERTY_', 'E2E_TESTING_').toLowerCase()]: value,
+                                })
+                            }
+                        })
+                    }
+
+                    // This is a helpful flag to set to automatically reset the recording session on load for testing multiple recordings
+                    const shouldResetSessionOnLoad = loadedInstance.getFeatureFlag(FEATURE_FLAGS.SESSION_RESET_ON_LOAD)
+                    if (shouldResetSessionOnLoad) {
+                        loadedInstance.sessionManager?.resetSessionId()
+                    }
+
+                    // Make sure we have access to the object in window for debugging
+                    window.posthog = loadedInstance
                 },
+                scroll_root_selector: ['main', 'html'],
+                autocapture: {
+                    capture_copied_text: true,
+                },
+                capture_performance: { web_vitals: true },
+                person_profiles: 'always',
+                __preview_remote_config: true,
+
+                // Helper to capture events for assertions in Cypress
+                _onCapture: (window as any)._cypress_posthog_captures
+                    ? (_, event) => (window as any)._cypress_posthog_captures.push(event)
+                    : undefined,
             })
         )
+    } else {
+        posthog.init('fake token', {
+            autocapture: false,
+            loaded: function (ph) {
+                ph.opt_out_capturing()
+            },
+        })
     }
 
-    if ((window as any).SENTRY_DSN) {
+    if (window.SENTRY_DSN) {
         Sentry.init({
-            dsn: (window as any).SENTRY_DSN,
-            ...(window.location.host.indexOf('app.posthog.com') > -1 && {
-                integrations: [new posthog.SentryIntegration(posthog, 'posthog', 1899813)],
+            dsn: window.SENTRY_DSN,
+            environment: window.SENTRY_ENVIRONMENT,
+            ...(location.host.includes('posthog.com') && {
+                integrations: [new posthog.SentryIntegration(posthog, 'posthog', 1899813, undefined, '*')],
             }),
         })
     }

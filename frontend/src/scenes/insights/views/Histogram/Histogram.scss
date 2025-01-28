@@ -1,0 +1,82 @@
+@import '../../../../styles/mixins';
+
+.dashboard-wrapper {
+    width: 100%;
+    height: calc(100% - 2rem);
+}
+
+.histogram-container {
+    display: flex;
+
+    svg {
+        margin-right: 1rem;
+        margin-left: 1rem;
+
+        /*
+         * Axis
+         */
+        g#y-axis {
+            .domain {
+                stroke: var(--funnel-axis);
+            }
+        }
+
+        g#x-axis {
+            .domain {
+                stroke: var(--funnel-axis);
+            }
+
+            .tick {
+                color: var(--funnel-axis);
+            }
+        }
+
+        g#x-axis,
+        g#y-axis {
+            text {
+                font-family: var(--font-sans);
+                font-size: 0.75rem;
+                font-weight: 500;
+                fill: var(--text-3000);
+            }
+        }
+
+        /*
+         * Grid
+         */
+        g#y-gridlines {
+            stroke-dasharray: 4, 2;
+
+            g.tick:not(:first-child) {
+                color: var(--funnel-grid);
+            }
+
+            .domain,
+            g.tick:nth-of-type(1) {
+                display: none; // hide axis line
+            }
+        }
+
+        /*
+         * Bars
+         */
+        g#bars {
+            fill: var(--histogram-fill);
+        }
+
+        g#labels {
+            text.bar-label {
+                font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+
+                // same as chart-js
+                font-size: 12px;
+                font-weight: normal;
+                fill: var(--white);
+
+                &.outside {
+                    fill: #0f0f0f;
+                }
+            }
+        }
+    }
+}

@@ -1,11 +1,13 @@
 .taxonomic-infinite-list {
+    flex-grow: 1;
     min-height: 200px;
 
     &.empty-infinite-list {
-        width: 100%;
         display: flex;
         align-items: center;
         justify-content: center;
+        width: 100%;
+
         .no-infinite-results {
             color: #666;
         }
@@ -15,26 +17,65 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        color: #2d2d2d;
         padding: 4px 12px;
+        color: var(--text-3000);
         cursor: pointer;
         border: none;
-        white-space: nowrap;
-        overflow-x: auto;
+
+        .taxonomic-list-row-contents {
+            display: flex;
+            align-items: center;
+            user-select: none;
+
+            .taxonomic-list-row-contents-icon {
+                display: flex;
+                justify-content: center;
+                min-width: 30px;
+                margin-right: 4px;
+                margin-left: -4px;
+                font-size: 1.25rem;
+
+                svg.taxonomy-icon {
+                    flex-shrink: 0;
+                    vertical-align: middle;
+
+                    &.taxonomy-icon-muted {
+                        color: var(--muted-alt);
+                    }
+
+                    &.taxonomy-icon-verified {
+                        color: var(--success);
+                    }
+
+                    &.taxonomy-icon-built-in {
+                        color: var(--accent-primary);
+                    }
+                }
+            }
+        }
+
+        & > div {
+            max-width: 100%;
+
+            & > span {
+                max-width: 100%;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+        }
 
         &.hover {
-            background: rgba(0, 0, 0, 0.1);
+            background-color: var(--bg-3000);
+            border-radius: var(--radius);
         }
 
         &.selected {
             font-weight: bold;
         }
 
-        &.skeleton-row {
-            // center-align this antd skeleton
-            .ant-skeleton-paragraph {
-                margin-bottom: 0;
-            }
+        &.expand-row {
+            color: var(--accent-primary);
         }
     }
 }

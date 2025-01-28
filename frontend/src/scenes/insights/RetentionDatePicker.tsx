@@ -1,38 +1,37 @@
-import React from 'react'
-import dayjs from 'dayjs'
-import dayjsGenerateConfig from 'rc-picker/lib/generate/dayjs'
-import generatePicker from 'antd/es/date-picker/generatePicker'
+import { LemonCalendarSelectInput } from '@posthog/lemon-ui'
 import { useActions, useValues } from 'kea'
-import { retentionTableLogic } from 'scenes/retention/retentionTableLogic'
-import { CalendarOutlined } from '@ant-design/icons'
-import { Tooltip } from 'lib/components/Tooltip'
+import { dayjs } from 'lib/dayjs'
 import { insightLogic } from 'scenes/insights/insightLogic'
-
-const DatePicker = generatePicker<dayjs.Dayjs>(dayjsGenerateConfig)
+import { insightVizDataLogic } from 'scenes/insights/insightVizDataLogic'
 
 export function RetentionDatePicker(): JSX.Element {
     const { insightProps } = useValues(insightLogic)
-    const { filters } = useValues(retentionTableLogic(insightProps))
-    const { setFilters } = useActions(retentionTableLogic(insightProps))
-    const yearSuffix = filters.date_to && dayjs(filters.date_to).year() !== dayjs().year() ? ', YYYY' : ''
+    const { dateRange, retentionFilter } = useValues(insightVizDataLogic(insightProps))
+    const { updateDateRange } = useActions(insightVizDataLogic(insightProps))
+
+    const period = retentionFilter?.period
+    const date_to = dateRange?.date_to
+
+    const yearSuffix = date_to && dayjs(date_to).year() !== dayjs().year() ? ', YYYY' : ''
+
     return (
-        <>
-            <Tooltip title="Cohorts up to this end date">
-                <span style={{ maxWidth: 100, display: 'inline-flex', alignItems: 'center' }}>
-                    <CalendarOutlined />
-                    <DatePicker
-                        showTime={filters.period === 'Hour'}
-                        use12Hours
-                        format={filters.period === 'Hour' ? `MMM D${yearSuffix}, h a` : `MMM D${yearSuffix}`}
-                        value={filters.date_to ? dayjs(filters.date_to) : undefined}
-                        onChange={(date_to) => setFilters({ date_to: date_to && dayjs(date_to).toISOString() })}
-                        allowClear
-                        placeholder="Today"
-                        className="retention-date-picker"
-                        suffixIcon={null}
-                    />
-                </span>
-            </Tooltip>
-        </>
+        <span className="flex inline-flex items-center pl-2">
+            <LemonCalendarSelectInput
+                value={date_to ? dayjs(date_to) : undefined}
+                onChange={(date_to) => {
+                    updateDateRange({ date_to: date_to && dayjs(date_to).toISOString() })
+                }}
+                granularity={period === 'Hour' ? 'hour' : 'day'}
+                placeholder="Today"
+                clearable
+                buttonProps={{
+                    tooltip: 'Cohorts up to this end date',
+                    type: 'secondary',
+                    sideIcon: null,
+                    size: 'small',
+                }}
+                format={period === 'Hour' ? `MMM D${yearSuffix}, h A` : `MMM D${yearSuffix}`}
+            />
+        </span>
     )
 }

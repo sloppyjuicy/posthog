@@ -1,15 +1,16 @@
-import React from 'react'
-import { ComponentStory, ComponentMeta } from '@storybook/react'
+import { Meta, StoryFn, StoryObj } from '@storybook/react'
 
 import { PropertyKeyInfo } from './PropertyKeyInfo'
+import { TaxonomicFilterGroupType } from './TaxonomicFilter/types'
 
-export default {
-    title: 'PostHog/Components/PropertyKeyInfo',
+type Story = StoryObj<typeof PropertyKeyInfo>
+const meta: Meta<typeof PropertyKeyInfo> = {
+    title: 'Components/Property Key Info',
     component: PropertyKeyInfo,
-    parameters: { options: { showPanel: true } },
-} as ComponentMeta<typeof PropertyKeyInfo>
+}
+export default meta
 
-const Template: ComponentStory<typeof PropertyKeyInfo> = (args) => {
+const Template: StoryFn<typeof PropertyKeyInfo> = (args) => {
     return args.value ? (
         <PropertyKeyInfo {...args} />
     ) : (
@@ -21,6 +22,9 @@ const Template: ComponentStory<typeof PropertyKeyInfo> = (args) => {
                 <PropertyKeyInfo {...args} value="$feature/some-feature-key" />
             </div>
             <div>
+                <PropertyKeyInfo {...args} value="langfuse trace" />
+            </div>
+            <div>
                 <PropertyKeyInfo {...args} value="$country" />
             </div>
             <div>
@@ -30,10 +34,10 @@ const Template: ComponentStory<typeof PropertyKeyInfo> = (args) => {
     )
 }
 
-export const Primary = Template.bind({})
-Primary.args = {
+export const PropertyKeyInfo_: Story = Template.bind({})
+PropertyKeyInfo_.args = {
     value: undefined,
-    type: 'event',
+    type: TaxonomicFilterGroupType.EventProperties,
     tooltipPlacement: undefined,
     disablePopover: false,
     disableIcon: false,

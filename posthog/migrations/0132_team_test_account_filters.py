@@ -22,7 +22,7 @@ class GenericEmails:
     """
 
     def __init__(self):
-        with open(get_absolute_path("../helpers/generic_emails.txt"), "r") as f:
+        with open(get_absolute_path("../helpers/generic_emails.txt")) as f:
             self.emails = {x.rstrip(): True for x in f}
 
     def is_generic(self, email: str) -> bool:
@@ -40,7 +40,12 @@ def forward(apps, schema_editor):
             {
                 "key": "$host",
                 "operator": "is_not",
-                "value": ["localhost:8000", "localhost:5000", "127.0.0.1:8000", "127.0.0.1:3000"],
+                "value": [
+                    "localhost:8000",
+                    "localhost:5000",
+                    "127.0.0.1:8000",
+                    "127.0.0.1:3000",
+                ],
             },
         ]
         if team.organization:
@@ -51,7 +56,12 @@ def forward(apps, schema_editor):
                 example_email = re.search(r"@[\w.]+", example_emails[0])
                 if example_email:
                     filters += [
-                        {"key": "email", "operator": "not_icontains", "value": example_email.group(), "type": "person"},
+                        {
+                            "key": "email",
+                            "operator": "not_icontains",
+                            "value": example_email.group(),
+                            "type": "person",
+                        },
                     ]
         team.test_account_filters = filters
         team.save()
@@ -62,7 +72,6 @@ def reverse(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0131_add_plugins_updated_created_at"),
     ]
@@ -73,5 +82,5 @@ class Migration(migrations.Migration):
             name="test_account_filters",
             field=django.contrib.postgres.fields.jsonb.JSONField(default=list),
         ),
-        migrations.RunPython(forward, reverse),
+        migrations.RunPython(forward, reverse, elidable=True),
     ]

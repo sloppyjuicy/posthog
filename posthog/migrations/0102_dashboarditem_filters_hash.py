@@ -15,7 +15,7 @@ def forward(apps, schema_editor):
     DashboardItem = apps.get_model("posthog", "DashboardItem")
     for item in DashboardItem.objects.filter(filters__isnull=False, dashboard__isnull=False).exclude(filters={}):
         filter = Filter(data=item.filters)
-        item.filters_hash = generate_cache_key("{}_{}".format(filter.toJSON(), item.team_id))
+        item.filters_hash = generate_cache_key(f"{filter.toJSON()}_{item.team_id}")
         item.save()
 
 
@@ -24,7 +24,6 @@ def reverse(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0101_org_owners"),
     ]
@@ -35,5 +34,5 @@ class Migration(migrations.Migration):
             name="filters_hash",
             field=models.CharField(blank=True, max_length=400, null=True),
         ),
-        migrations.RunPython(forward, reverse),
+        migrations.RunPython(forward, reverse, elidable=True),
     ]

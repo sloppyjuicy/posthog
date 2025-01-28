@@ -4,11 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0104_auto_20201208_1052"),
     ]
 
     operations = [
-        migrations.AddField(model_name="cohort", name="errors_calculating", field=models.IntegerField(default=0),),
+        migrations.AddField(
+            model_name="cohort",
+            name="errors_calculating",
+            field=models.IntegerField(default=0),
+        ),
     ]

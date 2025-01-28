@@ -26,7 +26,6 @@ def backwards(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0049_delete_funnelstep"),
     ]
@@ -35,7 +34,15 @@ class Migration(migrations.Migration):
         migrations.CreateModel(
             name="Dashboard",
             fields=[
-                ("id", models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID",),),
+                (
+                    "id",
+                    models.AutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
                 ("name", models.CharField(blank=True, max_length=400, null=True)),
                 ("pinned", models.BooleanField(default=False)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
@@ -49,22 +56,36 @@ class Migration(migrations.Migration):
                         to=settings.AUTH_USER_MODEL,
                     ),
                 ),
-                ("team", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to="posthog.Team"),),
+                (
+                    "team",
+                    models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to="posthog.Team"),
+                ),
             ],
         ),
         migrations.AddField(
             model_name="dashboarditem",
             name="dashboard",
             field=models.ForeignKey(
-                null=True, on_delete=django.db.models.deletion.CASCADE, related_name="items", to="posthog.Dashboard",
+                null=True,
+                on_delete=django.db.models.deletion.CASCADE,
+                related_name="items",
+                to="posthog.Dashboard",
             ),
         ),
-        migrations.RunPython(forwards, reverse_code=backwards, hints={"target_db": "default"}),
+        migrations.RunPython(
+            forwards,
+            reverse_code=backwards,
+            hints={"target_db": "default"},
+            elidable=True,
+        ),
         migrations.AlterField(
             model_name="dashboarditem",
             name="dashboard",
             field=models.ForeignKey(
-                null=False, on_delete=django.db.models.deletion.CASCADE, related_name="items", to="posthog.Dashboard",
+                null=False,
+                on_delete=django.db.models.deletion.CASCADE,
+                related_name="items",
+                to="posthog.Dashboard",
             ),
         ),
     ]

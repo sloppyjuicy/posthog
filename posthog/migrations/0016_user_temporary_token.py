@@ -4,13 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0015_actionstep_event"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name="user", name="temporary_token", field=models.CharField(blank=True, max_length=200, null=True),
+            model_name="user",
+            name="temporary_token",
+            field=models.CharField(blank=True, max_length=200, null=True),
         ),
     ]

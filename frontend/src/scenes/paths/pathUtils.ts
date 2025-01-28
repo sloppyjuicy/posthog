@@ -1,5 +1,7 @@
 import { RGBColor } from 'd3'
-import { FilterType, FunnelPathType } from '~/types'
+
+import { FunnelPathsFilter, PathsFilter } from '~/queries/schema'
+import { FunnelPathType } from '~/types'
 
 export interface PathTargetLink {
     average_conversion_time: number
@@ -99,6 +101,9 @@ export function pageUrl(d: PathNodeData, display?: boolean): string {
     try {
         const url = new URL(name)
         name = incomingDomains.length !== 1 ? url.href.replace(/(^\w+:|^)\/\//, '') : url.pathname + url.search
+        if (url.hash?.includes('/')) {
+            name += url.hash
+        }
     } catch {
         // discard if invalid url
     }
@@ -109,23 +114,22 @@ export function pageUrl(d: PathNodeData, display?: boolean): string {
         : name
 }
 
-export const isSelectedPathStartOrEnd = (filter: Partial<FilterType>, pathItemCard: PathNodeData): boolean => {
+export const isSelectedPathStartOrEnd = (
+    pathsFilter: PathsFilter,
+    funnelPathsFilter: FunnelPathsFilter,
+    pathItemCard: PathNodeData
+): boolean => {
     const cardName = pageUrl(pathItemCard)
     const isPathStart = pathItemCard.targetLinks.length === 0
     const isPathEnd = pathItemCard.sourceLinks.length === 0
+    const { startPoint, endPoint } = pathsFilter
+    const { funnelPathType, funnelSource, funnelStep } = funnelPathsFilter || {}
+
     return (
-        (filter.start_point === cardName && isPathStart) ||
-        (filter.end_point === cardName && isPathEnd) ||
-        (filter.funnel_paths === FunnelPathType.between &&
-            ((cardName === filter.funnel_filter?.events[filter.funnel_filter.funnel_step - 1].name && isPathEnd) ||
-                (cardName === filter.funnel_filter?.events[filter.funnel_filter.funnel_step - 2].name && isPathStart)))
+        (startPoint === cardName && isPathStart) ||
+        (endPoint === cardName && isPathEnd) ||
+        (funnelPathType === FunnelPathType.between &&
+            ((cardName === funnelSource?.series[funnelStep! - 1].name && isPathEnd) ||
+                (cardName === funnelSource?.series[funnelStep! - 2].name && isPathStart)))
     )
-}
-
-export const getDropOffValue = (pathItemCard: PathNodeData): number => {
-    return pathItemCard.value - pathItemCard.sourceLinks.reduce((prev, curr) => prev + curr.value, 0)
-}
-
-export const getContinuingValue = (sourceLinks: PathTargetLink[]): number => {
-    return sourceLinks.reduce((prev, curr) => prev + curr.value, 0)
 }

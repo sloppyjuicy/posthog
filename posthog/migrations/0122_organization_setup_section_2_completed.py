@@ -4,13 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0121_person_email_index"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name="organization", name="setup_section_2_completed", field=models.BooleanField(default=True),
+            model_name="organization",
+            name="setup_section_2_completed",
+            field=models.BooleanField(default=True),
         ),
     ]

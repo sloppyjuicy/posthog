@@ -1,201 +1,38 @@
-@import '~/vars';
-
-.dashboard-item {
-    display: block;
-    background: white;
-    height: 100%;
-    padding: 0;
-    position: relative;
-    box-shadow: 0 8px 10px rgba(0, 0, 0, 0.1);
-    border-radius: 5px;
-    overflow: hidden;
-    z-index: 3;
-
-    &.react-draggable-dragging {
-        box-shadow: 0 20px 20px rgba(0, 0, 0, 0.3);
-    }
-
-    .dashboard-item-container {
-        display: flex;
-        flex-direction: column;
-        width: 100%;
-        height: 100%;
-    }
-
-    .dashboard-item-header {
-        padding: 15px 15px 7px 15px;
-        height: 52px;
-        width: 100%;
-        display: flex;
-        justify-content: space-between;
-
-        .dashboard-item-title {
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-            padding-right: 5px;
-            a {
-                font-size: 14px;
-                letter-spacing: 0.5px;
-                color: hsla(210, 26%, 16%, 1);
-                &:hover {
-                    text-decoration: underline;
-                }
-            }
-        }
-        .dashboard-item-settings {
-            white-space: nowrap;
-        }
-    }
-    .dashboard-item-content {
-        height: 100%;
-        margin: 8px 15px 15px 15px;
-        overflow: hidden;
-        flex-grow: 1;
-        position: relative;
-        .graph-container {
-            padding-bottom: 10px;
-            width: 100%;
-            height: 100%;
-        }
-
-        &.FunnelViz {
-            // Funnels can exceed container's dimensions and must support scrolling
-            overflow: auto;
-        }
-    }
-    .dashboard-item-container.table .dashboard-item-content {
-        overflow: auto;
-    }
-
-    // sync this with lib/colors.js
-
-    .loading-overlay {
-        background: transparent;
-    }
-
-    &.blue {
-        --item-background: hsl(212, 63%, 40%);
-        --item-darker: hsl(212, 63%, 35%);
-        --item-darkest: hsl(212, 63%, 30%);
-        --item-lighter: hsl(212, 63%, 60%);
-        --item-primary: hsl(202, 100%, 83%);
-    }
-
-    &.purple {
-        --item-background: hsl(249, 46%, 51%);
-        --item-darker: hsl(249, 46%, 46%);
-        --item-darkest: hsl(249, 46%, 41%);
-        --item-lighter: hsl(249, 46%, 65%);
-        --item-primary: hsl(284, 84%, 83%);
-    }
-
-    &.green {
-        --item-background: hsl(145, 60%, 34%);
-        --item-darker: hsl(145, 60%, 29%);
-        --item-darkest: hsl(145, 60%, 24%);
-        --item-lighter: hsl(145, 60%, 50%);
-        --item-primary: hsl(112, 87%, 81%);
-    }
-
-    &.black {
-        --item-background: hsl(0, 0%, 14%);
-        --item-darker: hsl(0, 0%, 9%);
-        --item-darkest: hsl(0, 0%, 4%);
-        --item-lighter: hsl(0, 0%, 40%);
-        --item-primary: hsl(228, 100%, 77%);
-    }
-
-    &.blue,
-    &.purple,
-    &.green,
-    &.black {
-        .loading-overlay {
-            filter: brightness(300%);
-        }
-        color: white;
-        background: var(--item-background);
-        .dashboard-item-header .dashboard-item-title a {
-            color: white;
-        }
-        .dashboard-item-header .dashboard-item-settings *:not(a) .anticon {
-            color: rgba(255, 255, 255, 0.8);
-            background: var(--item-darker);
-            &:hover {
-                background: var(--item-darkest);
-            }
-        }
-
-        h1 {
-            color: rgba(255, 255, 255, 0.9);
-        }
-
-        .ant-table {
-            background: none;
-            table {
-                color: white;
-                tr td,
-                tr th {
-                    color: white;
-                    background: rgba(255, 255, 255, 0.1);
-                    border-top-color: rgba(255, 255, 255, 0.2);
-                    border-bottom-color: rgba(255, 255, 255, 0.2);
-                }
-                tr th {
-                    background: rgba(255, 255, 255, 0.2);
-                }
-            }
-        }
-    }
-
-    .insight-empty-state {
-        display: flex;
-        height: 100%;
-        align-items: center;
-
-        .illustration-main,
-        .ant-btn {
-            display: none;
-        }
-
-        h2 {
-            font-size: 1.1rem !important;
-        }
-
-        span,
-        p,
-        a {
-            font-size: 0.9rem !important;
-            line-height: 1.2rem;
-        }
-    }
+.dashboard-items-wrapper {
+    width: 100%; // This provides the width for the dashboard items grid
+    margin-top: 1rem;
 }
 
 .react-grid-layout {
     position: relative;
-    transition: height 200ms ease;
-    margin-bottom: 50px;
+    margin-bottom: 2rem;
+    transition: height 100ms ease;
 
     /* remove initial loading animation, animations are only needed in edit mode */
     &.dashboard-view-mode .react-grid-item {
-        transition: none;
+        transition: border-color 100ms ease;
     }
 }
-.react-grid-item {
-    transition: all 200ms ease;
-    transition-property: left, top;
-}
+
 .react-grid-item.cssTransforms {
     transition-property: transform;
 }
+
 .react-grid-item.resizing {
     z-index: 1;
     will-change: width, height;
 }
 
+.react-grid-item.react-draggable .CardMeta,
+.react-grid-item.react-draggable .TextCard__body {
+    // .CardMeta is the draggable handle of insight cards. Text cards are draggable as a whole
+    cursor: move;
+    user-select: none; // Prevent accidental text selection while dragging
+}
+
 .react-grid-item.react-draggable-dragging {
+    z-index: 105;
     transition: none;
-    z-index: 3;
     will-change: transform;
 }
 
@@ -204,172 +41,49 @@
 }
 
 .react-grid-item.react-grid-placeholder {
-    background: rgba(0, 0, 0, 0.15);
-    filter: blur(6px);
-    border-radius: 5px;
-    transition-duration: 100ms;
+    position: relative;
     z-index: 2;
+    max-width: 100%;
     user-select: none;
+    border: 1px solid var(--accent-primary);
+    border-radius: var(--radius);
+    outline: 1px solid var(--accent-primary);
+    transition: 100ms ease;
 }
+
 .react-resizable-hide > .react-resizable-handle {
     display: none;
 }
+
 .react-grid-item {
+    transition: all 100ms ease;
+    transition-property: left, top;
+
     & > .react-resizable-handle {
         position: absolute;
-        width: 40px;
-        height: 40px;
-        bottom: -10px;
-        right: -10px;
-        cursor: se-resize;
+        right: -0.5rem;
+        bottom: -0.5rem;
         z-index: 10;
+        width: 2rem;
+        height: 2rem;
+        cursor: se-resize;
     }
+
     & > .react-resizable-handle.react-resizable-handle-se {
         cursor: se-resize;
     }
+
     & > .react-resizable-handle.react-resizable-handle-e {
         top: 0;
-        bottom: 30px;
-        width: 25px;
+        bottom: 2rem;
         height: auto;
         cursor: ew-resize;
     }
+
     & > .react-resizable-handle.react-resizable-handle-s {
+        right: 2rem;
         left: 0;
-        right: 30px;
-        height: 25px;
         width: auto;
         cursor: ns-resize;
-    }
-}
-.react-grid-layout.layout.dashboard-edit-mode.wobbly .react-grid-item {
-    & > .react-resizable-handle {
-        width: 40px;
-        height: 40px;
-    }
-    & > .react-resizable-handle.react-resizable-handle-e {
-        top: 0;
-        bottom: 30px;
-        height: auto;
-    }
-    & > .react-resizable-handle.react-resizable-handle-s {
-        left: 0;
-        right: 30px;
-        width: auto;
-    }
-}
-.react-grid-layout.layout.dashboard-edit-mode .dashboard-item {
-    table {
-        cursor: auto;
-    }
-}
-.react-grid-layout.layout.dashboard-edit-mode.wobbly {
-    margin-bottom: 200px;
-    will-change: transform;
-
-    .dashboard-item {
-        cursor: move;
-        will-change: transform;
-        .dashboard-item-header,
-        .dashboard-item-content {
-            pointer-events: none;
-        }
-    }
-
-    .dashboard-item:nth-child(7n) {
-        animation-delay: -0.75s;
-        animation-duration: 0.25s;
-    }
-
-    .dashboard-item:nth-child(7n + 1) {
-        animation-delay: -0.5s;
-        animation-duration: 0.3s;
-    }
-
-    .dashboard-item:nth-child(7n + 2) {
-        animation-delay: -0.05s;
-        animation-duration: 0.27s;
-    }
-
-    .dashboard-item:nth-child(7n + 3) {
-        animation-delay: -0.2s;
-        animation-duration: 0.33s;
-    }
-
-    .dashboard-item:nth-child(7n + 4) {
-        animation-delay: -0.31s;
-        animation-duration: 0.24s;
-    }
-
-    .dashboard-item:nth-child(7n + 5) {
-        animation-delay: -0.15s;
-        animation-duration: 0.25s;
-    }
-
-    .dashboard-item:nth-child(7n + 6) {
-        animation-delay: -0.2s;
-        animation-duration: 0.22s;
-    }
-
-    .dashboard-item-wrapper:nth-child(2n) .dashboard-item {
-        animation-name: keyframes1;
-        animation-iteration-count: infinite;
-        transform-origin: 50% 10%;
-    }
-
-    .dashboard-item-wrapper:nth-child(2n-1) .dashboard-item {
-        animation-name: keyframes2;
-        animation-iteration-count: infinite;
-        animation-direction: alternate;
-        transform-origin: 30% 5%;
-    }
-
-    @keyframes keyframes1 {
-        0% {
-            transform: rotate(-0.2deg);
-            animation-timing-function: ease-in;
-        }
-
-        50% {
-            transform: rotate(0.2deg);
-            animation-timing-function: ease-out;
-        }
-    }
-
-    @keyframes keyframes2 {
-        0% {
-            transform: rotate(0.2deg);
-            animation-timing-function: ease-in;
-        }
-
-        50% {
-            transform: rotate(-0.2deg);
-            animation-timing-function: ease-out;
-        }
-    }
-}
-
-.Toastify .drag-items-toast {
-    @media (max-width: 480px) {
-        border-radius: 0;
-    }
-}
-
-// All dropdowns must be below top navigation
-.ant-dropdown {
-    z-index: 700;
-}
-
-.dive-btn {
-    margin-right: 0.5rem;
-
-    &.dive-btn-dive {
-        border-color: $primary;
-        color: $primary;
-
-        &:hover {
-            border-color: darken($primary, 30%);
-            color: darken($primary, 30%);
-        }
     }
 }

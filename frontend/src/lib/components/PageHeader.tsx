@@ -1,27 +1,33 @@
-import { Row } from 'antd'
-import React from 'react'
+import clsx from 'clsx'
+import { useValues } from 'kea'
+import { WithinPageHeaderContext } from 'lib/lemon-ui/LemonButton/LemonButton'
+import { createPortal } from 'react-dom'
+import { DraggableToNotebookProps } from 'scenes/notebooks/AddToNotebook/DraggableToNotebook'
+
+import { breadcrumbsLogic } from '~/layout/navigation/Breadcrumbs/breadcrumbsLogic'
 
 interface PageHeaderProps {
-    title: string | JSX.Element
-    caption?: string | JSX.Element
+    caption?: string | JSX.Element | null | false
     buttons?: JSX.Element | false
-    style?: React.CSSProperties
+    tabbedPage?: boolean // Whether the page has tabs for secondary navigation
+    delimited?: boolean
+    notebookProps?: Pick<DraggableToNotebookProps, 'href' | 'node' | 'properties'>
 }
 
-export function PageHeader({ title, caption, buttons, style }: PageHeaderProps): JSX.Element {
-    const row = (
-        <Row className="page-title-row" justify={buttons ? 'space-between' : 'start'} align="middle" style={style}>
-            <h1 className="page-title">{title}</h1>
-            {buttons}
-        </Row>
-    )
-    return caption ? (
+export function PageHeader({ caption, buttons, tabbedPage }: PageHeaderProps): JSX.Element | null {
+    const { actionsContainer } = useValues(breadcrumbsLogic)
+
+    return (
         <>
-            {row}
-            <div className="page-caption">{caption}</div>
+            {buttons &&
+                actionsContainer &&
+                createPortal(
+                    <WithinPageHeaderContext.Provider value={true}>{buttons}</WithinPageHeaderContext.Provider>,
+                    actionsContainer
+                )}
+
+            {caption && <div className={clsx('page-caption', tabbedPage && 'tabbed')}>{caption}</div>}
         </>
-    ) : (
-        row
     )
 }
 
@@ -32,9 +38,9 @@ interface SubtitleProps {
 
 export function Subtitle({ subtitle, buttons }: SubtitleProps): JSX.Element {
     return (
-        <Row className="subtitle-row" justify={buttons ? 'space-between' : 'start'} align="middle">
+        <div className={clsx('flex mt-5 items-center', buttons ? 'justify-between' : 'justify-start')}>
             <h2 className="subtitle">{subtitle}</h2>
             {buttons}
-        </Row>
+        </div>
     )
 }

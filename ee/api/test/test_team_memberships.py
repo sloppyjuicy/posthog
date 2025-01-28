@@ -25,7 +25,10 @@ class TestTeamMembershipsAPI(APILicensedTest):
         response_data = response.json()
 
         self.assertDictContainsSubset(
-            {"effective_level": ExplicitTeamMembership.Level.MEMBER, "level": ExplicitTeamMembership.Level.MEMBER,},
+            {
+                "effective_level": ExplicitTeamMembership.Level.MEMBER,
+                "level": ExplicitTeamMembership.Level.MEMBER,
+            },
             response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -44,7 +47,10 @@ class TestTeamMembershipsAPI(APILicensedTest):
         response_data = response.json()
 
         self.assertDictContainsSubset(
-            {"effective_level": ExplicitTeamMembership.Level.MEMBER, "level": ExplicitTeamMembership.Level.MEMBER,},
+            {
+                "effective_level": ExplicitTeamMembership.Level.MEMBER,
+                "level": ExplicitTeamMembership.Level.MEMBER,
+            },
             response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -63,7 +69,8 @@ class TestTeamMembershipsAPI(APILicensedTest):
         response_data = response.json()
 
         self.assertDictEqual(
-            self.permission_denied_response("You don't have sufficient permissions in the project."), response_data
+            self.permission_denied_response("You don't have sufficient permissions in the project."),
+            response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
@@ -79,7 +86,8 @@ class TestTeamMembershipsAPI(APILicensedTest):
         response_data = response.json()
 
         self.assertDictEqual(
-            self.permission_denied_response("You don't have sufficient permissions in the project."), response_data
+            self.permission_denied_response("You don't have sufficient permissions in the project."),
+            response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
@@ -95,7 +103,8 @@ class TestTeamMembershipsAPI(APILicensedTest):
         response_data = response.json()
 
         self.assertDictEqual(
-            self.permission_denied_response("You can't explicitly add yourself to projects."), response_data
+            self.permission_denied_response("You can't explicitly add yourself to projects."),
+            response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
@@ -105,7 +114,9 @@ class TestTeamMembershipsAPI(APILicensedTest):
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
         self.organization_membership.save()
         ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.MEMBER
+            team=self.team,
+            parent_membership=self.organization_membership,
+            level=ExplicitTeamMembership.Level.MEMBER,
         )
 
         new_user: User = User.objects.create_and_join(self.organization, "rookie@posthog.com", None)
@@ -116,7 +127,8 @@ class TestTeamMembershipsAPI(APILicensedTest):
         response_data = response.json()
 
         self.assertDictEqual(
-            self.permission_denied_response("You don't have sufficient permissions in the project."), response_data
+            self.permission_denied_response("You don't have sufficient permissions in the project."),
+            response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
@@ -126,7 +138,9 @@ class TestTeamMembershipsAPI(APILicensedTest):
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
         self.organization_membership.save()
         ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.ADMIN
+            team=self.team,
+            parent_membership=self.organization_membership,
+            level=ExplicitTeamMembership.Level.ADMIN,
         )
 
         self.assertEqual(self.team.explicit_memberships.count(), 1)
@@ -137,7 +151,10 @@ class TestTeamMembershipsAPI(APILicensedTest):
         response_data = response.json()
 
         self.assertDictContainsSubset(
-            {"effective_level": ExplicitTeamMembership.Level.MEMBER, "level": ExplicitTeamMembership.Level.MEMBER,},
+            {
+                "effective_level": ExplicitTeamMembership.Level.MEMBER,
+                "level": ExplicitTeamMembership.Level.MEMBER,
+            },
             response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -148,7 +165,9 @@ class TestTeamMembershipsAPI(APILicensedTest):
         self.organization_membership.level = OrganizationMembership.Level.ADMIN
         self.organization_membership.save()
         ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.MEMBER
+            team=self.team,
+            parent_membership=self.organization_membership,
+            level=ExplicitTeamMembership.Level.MEMBER,
         )
 
         new_user: User = User.objects.create_and_join(self.organization, "rookie@posthog.com", None)
@@ -157,7 +176,10 @@ class TestTeamMembershipsAPI(APILicensedTest):
         response_data = response.json()
 
         self.assertDictContainsSubset(
-            {"effective_level": ExplicitTeamMembership.Level.MEMBER, "level": ExplicitTeamMembership.Level.MEMBER,},
+            {
+                "effective_level": ExplicitTeamMembership.Level.MEMBER,
+                "level": ExplicitTeamMembership.Level.MEMBER,
+            },
             response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -175,7 +197,10 @@ class TestTeamMembershipsAPI(APILicensedTest):
         response_data = response.json()
 
         self.assertDictContainsSubset(
-            {"effective_level": ExplicitTeamMembership.Level.ADMIN, "level": ExplicitTeamMembership.Level.ADMIN,},
+            {
+                "effective_level": ExplicitTeamMembership.Level.ADMIN,
+                "level": ExplicitTeamMembership.Level.ADMIN,
+            },
             response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -184,7 +209,9 @@ class TestTeamMembershipsAPI(APILicensedTest):
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
         self.organization_membership.save()
         ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.MEMBER
+            team=self.team,
+            parent_membership=self.organization_membership,
+            level=ExplicitTeamMembership.Level.MEMBER,
         )
 
         new_user: User = User.objects.create_and_join(self.organization, "rookie@posthog.com", None)
@@ -196,7 +223,8 @@ class TestTeamMembershipsAPI(APILicensedTest):
         response_data = response.json()
 
         self.assertDictEqual(
-            self.permission_denied_response("You don't have sufficient permissions in the project."), response_data
+            self.permission_denied_response("You don't have sufficient permissions in the project."),
+            response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
@@ -204,7 +232,9 @@ class TestTeamMembershipsAPI(APILicensedTest):
         self.organization_membership.level = OrganizationMembership.Level.ADMIN
         self.organization_membership.save()
         ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.ADMIN
+            team=self.team,
+            parent_membership=self.organization_membership,
+            level=ExplicitTeamMembership.Level.ADMIN,
         )
 
         new_user: User = User.objects.create_and_join(self.organization, "rookie@posthog.com", None)
@@ -216,7 +246,10 @@ class TestTeamMembershipsAPI(APILicensedTest):
         response_data = response.json()
 
         self.assertDictContainsSubset(
-            {"effective_level": ExplicitTeamMembership.Level.ADMIN, "level": ExplicitTeamMembership.Level.ADMIN,},
+            {
+                "effective_level": ExplicitTeamMembership.Level.ADMIN,
+                "level": ExplicitTeamMembership.Level.ADMIN,
+            },
             response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -226,15 +259,19 @@ class TestTeamMembershipsAPI(APILicensedTest):
         self.organization_membership.save()
         another_team = Team.objects.create(organization=self.organization, access_control=True)
 
-        new_user: User = User.objects.create_and_join(
-            self.organization, "rookie@posthog.com", None,
-        )
+        new_user: User = User.objects.create_and_join(self.organization, "rookie@posthog.com", None)
 
-        response = self.client.post(f"/api/projects/{another_team.id}/explicit_members/", {"user_uuid": new_user.uuid})
+        response = self.client.post(
+            f"/api/projects/{another_team.id}/explicit_members/",
+            {"user_uuid": new_user.uuid},
+        )
         response_data = response.json()
 
         self.assertDictContainsSubset(
-            {"effective_level": ExplicitTeamMembership.Level.MEMBER, "level": ExplicitTeamMembership.Level.MEMBER,},
+            {
+                "effective_level": ExplicitTeamMembership.Level.MEMBER,
+                "level": ExplicitTeamMembership.Level.MEMBER,
+            },
             response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -246,11 +283,15 @@ class TestTeamMembershipsAPI(APILicensedTest):
             "Acme", "mallory@acme.com", None, team_fields={"access_control": True}
         )
 
-        response = self.client.post(f"/api/projects/{new_team.id}/explicit_members/", {"user_uuid": new_user.uuid,})
+        response = self.client.post(
+            f"/api/projects/{new_team.id}/explicit_members/",
+            {"user_uuid": new_user.uuid},
+        )
         response_data = response.json()
 
         self.assertDictEqual(
-            self.permission_denied_response("You don't have sufficient permissions in the project."), response_data
+            self.permission_denied_response("You don't have sufficient permissions in the project."),
+            response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
@@ -259,11 +300,12 @@ class TestTeamMembershipsAPI(APILicensedTest):
         self.organization_membership.save()
         _, new_team, new_user = User.objects.bootstrap("Acme", "mallory@acme.com", None)
 
-        response = self.client.post(f"/api/projects/@current/explicit_members/", {"user_uuid": new_user.uuid,})
+        response = self.client.post(f"/api/projects/@current/explicit_members/", {"user_uuid": new_user.uuid})
         response_data = response.json()
 
         self.assertDictEqual(
-            self.permission_denied_response("You both need to belong to the same organization."), response_data
+            self.permission_denied_response("You both need to belong to the same organization."),
+            response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
@@ -272,7 +314,7 @@ class TestTeamMembershipsAPI(APILicensedTest):
         self.organization_membership.save()
         new_user: User = User.objects.create_and_join(self.organization, "rookie@posthog.com", None)
 
-        response = self.client.post(f"/api/projects/2137/explicit_members/", {"user_uuid": new_user.uuid,})
+        response = self.client.post(f"/api/projects/2137/explicit_members/", {"user_uuid": new_user.uuid})
         response_data = response.json()
 
         self.assertDictEqual(self.not_found_response("Project not found."), response_data)
@@ -286,17 +328,19 @@ class TestTeamMembershipsAPI(APILicensedTest):
         new_org_membership: OrganizationMembership = OrganizationMembership.objects.get(
             user=new_user, organization=self.organization
         )
-        new_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=new_org_membership
-        )
+        ExplicitTeamMembership.objects.create(team=self.team, parent_membership=new_org_membership)
 
         response = self.client.patch(
-            f"/api/projects/@current/explicit_members/{new_user.uuid}", {"level": ExplicitTeamMembership.Level.ADMIN}
+            f"/api/projects/@current/explicit_members/{new_user.uuid}",
+            {"level": ExplicitTeamMembership.Level.ADMIN},
         )
         response_data = response.json()
 
         self.assertDictContainsSubset(
-            {"effective_level": ExplicitTeamMembership.Level.ADMIN, "level": ExplicitTeamMembership.Level.ADMIN,},
+            {
+                "effective_level": ExplicitTeamMembership.Level.ADMIN,
+                "level": ExplicitTeamMembership.Level.ADMIN,
+            },
             response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -309,59 +353,67 @@ class TestTeamMembershipsAPI(APILicensedTest):
         new_org_membership: OrganizationMembership = OrganizationMembership.objects.get(
             user=new_user, organization=self.organization
         )
-        new_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=new_org_membership
-        )
+        ExplicitTeamMembership.objects.create(team=self.team, parent_membership=new_org_membership)
 
         response = self.client.patch(
-            f"/api/projects/@current/explicit_members/{new_user.uuid}", {"level": ExplicitTeamMembership.Level.ADMIN}
+            f"/api/projects/@current/explicit_members/{new_user.uuid}",
+            {"level": ExplicitTeamMembership.Level.ADMIN},
         )
         response_data = response.json()
 
         self.assertDictEqual(
-            self.permission_denied_response("You don't have sufficient permissions in the project."), response_data,
+            self.permission_denied_response("You don't have sufficient permissions in the project."),
+            response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_demote_yourself_as_org_member_and_project_admin_forbidden(self):
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
         self.organization_membership.save()
-        self_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.ADMIN
+        ExplicitTeamMembership.objects.create(
+            team=self.team,
+            parent_membership=self.organization_membership,
+            level=ExplicitTeamMembership.Level.ADMIN,
         )
 
         response = self.client.patch(
-            f"/api/projects/@current/explicit_members/{self.user.uuid}", {"level": ExplicitTeamMembership.Level.MEMBER}
+            f"/api/projects/@current/explicit_members/{self.user.uuid}",
+            {"level": ExplicitTeamMembership.Level.MEMBER},
         )
         response_data = response.json()
 
         self.assertDictEqual(
-            self.permission_denied_response("You can't set your own access level."), response_data,
+            self.permission_denied_response("You can't set your own access level."),
+            response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_set_level_of_member_to_admin_as_org_member_but_project_admin_allowed(self):
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
         self.organization_membership.save()
-        self_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.ADMIN
+        ExplicitTeamMembership.objects.create(
+            team=self.team,
+            parent_membership=self.organization_membership,
+            level=ExplicitTeamMembership.Level.ADMIN,
         )
 
         new_user: User = User.objects.create_and_join(self.organization, "rookie@posthog.com", None)
         new_org_membership: OrganizationMembership = OrganizationMembership.objects.get(
             user=new_user, organization=self.organization
         )
-        new_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=new_org_membership
-        )
+        ExplicitTeamMembership.objects.create(team=self.team, parent_membership=new_org_membership)
 
         response = self.client.patch(
-            f"/api/projects/@current/explicit_members/{new_user.uuid}", {"level": ExplicitTeamMembership.Level.ADMIN}
+            f"/api/projects/@current/explicit_members/{new_user.uuid}",
+            {"level": ExplicitTeamMembership.Level.ADMIN},
         )
         response_data = response.json()
 
         self.assertDictContainsSubset(
-            {"effective_level": ExplicitTeamMembership.Level.ADMIN, "level": ExplicitTeamMembership.Level.ADMIN,},
+            {
+                "effective_level": ExplicitTeamMembership.Level.ADMIN,
+                "level": ExplicitTeamMembership.Level.ADMIN,
+            },
             response_data,
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -374,9 +426,7 @@ class TestTeamMembershipsAPI(APILicensedTest):
         new_org_membership: OrganizationMembership = OrganizationMembership.objects.get(
             user=new_user, organization=self.organization
         )
-        new_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=new_org_membership
-        )
+        ExplicitTeamMembership.objects.create(team=self.team, parent_membership=new_org_membership)
 
         response = self.client.delete(f"/api/projects/@current/explicit_members/{new_user.uuid}")
 
@@ -390,9 +440,7 @@ class TestTeamMembershipsAPI(APILicensedTest):
         new_org_membership: OrganizationMembership = OrganizationMembership.objects.get(
             user=new_user, organization=self.organization
         )
-        new_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=new_org_membership
-        )
+        ExplicitTeamMembership.objects.create(team=self.team, parent_membership=new_org_membership)
 
         response = self.client.delete(f"/api/projects/@current/explicit_members/{new_user.uuid}")
 
@@ -401,17 +449,17 @@ class TestTeamMembershipsAPI(APILicensedTest):
     def test_remove_member_as_org_member_but_project_admin_allowed(self):
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
         self.organization_membership.save()
-        self_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.ADMIN
+        ExplicitTeamMembership.objects.create(
+            team=self.team,
+            parent_membership=self.organization_membership,
+            level=ExplicitTeamMembership.Level.ADMIN,
         )
 
         new_user: User = User.objects.create_and_join(self.organization, "rookie@posthog.com", None)
         new_org_membership: OrganizationMembership = OrganizationMembership.objects.get(
             user=new_user, organization=self.organization
         )
-        new_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=new_org_membership
-        )
+        ExplicitTeamMembership.objects.create(team=self.team, parent_membership=new_org_membership)
 
         response = self.client.delete(f"/api/projects/@current/explicit_members/{new_user.uuid}")
 
@@ -430,8 +478,7 @@ class TestTeamMembershipsAPI(APILicensedTest):
 
         self.assertDictEqual(
             self.validation_error_response(
-                "Explicit members can only be accessed for projects with project-based permissioning enabled.",
-                attr="non_field_errors",
+                "Explicit members can only be accessed for projects with project-based permissioning enabled."
             ),
             response_data,
         )
@@ -441,8 +488,10 @@ class TestTeamMembershipsAPI(APILicensedTest):
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
         self.organization_membership.save()
 
-        explicit_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.ADMIN
+        ExplicitTeamMembership.objects.create(
+            team=self.team,
+            parent_membership=self.organization_membership,
+            level=ExplicitTeamMembership.Level.ADMIN,
         )
 
         response = self.client.delete(f"/api/projects/@current/explicit_members/{self.user.uuid}")
@@ -452,8 +501,10 @@ class TestTeamMembershipsAPI(APILicensedTest):
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
         self.organization_membership.save()
 
-        explicit_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.MEMBER
+        ExplicitTeamMembership.objects.create(
+            team=self.team,
+            parent_membership=self.organization_membership,
+            level=ExplicitTeamMembership.Level.MEMBER,
         )
 
         response = self.client.delete(f"/api/projects/@current/explicit_members/{self.user.uuid}")
@@ -468,3 +519,32 @@ class TestTeamMembershipsAPI(APILicensedTest):
 
         response = self.client.delete(f"/api/projects/@current/explicit_members/{self.user.uuid}")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_set_current_project_no_access(self):
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+        ExplicitTeamMembership.objects.create(
+            team=self.team,
+            parent_membership=self.organization_membership,
+            level=ExplicitTeamMembership.Level.ADMIN,
+        )
+        Team.objects.create(organization=self.organization)
+
+        new_user: User = User.objects.create_and_join(self.organization, "rookie@posthog.com", None)
+
+        self.assertEqual(self.team.explicit_memberships.count(), 1)
+
+        self.client.force_login(new_user)
+        response = self.client.patch("/api/users/@me/", {"set_current_team": self.team.pk})
+        self.maxDiff = None
+        response_data = response.json()
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.content)
+        self.assertEqual("does_not_exist", response_data["code"], response_data)
+
+        self.assertEqual(self.team.explicit_memberships.count(), 1)
+
+        # If user is admin, allow change
+        OrganizationMembership.objects.filter(user=new_user).update(level=OrganizationMembership.Level.ADMIN)
+        response = self.client.patch("/api/users/@me/", {"set_current_team": self.team.pk})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
