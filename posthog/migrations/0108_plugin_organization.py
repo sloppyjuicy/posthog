@@ -11,7 +11,6 @@ def set_plugin_organization(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0107_plugin_source"),
     ]
@@ -30,7 +29,7 @@ class Migration(migrations.Migration):
             ),
             preserve_default=False,
         ),
-        migrations.RunPython(set_plugin_organization, migrations.RunPython.noop),
+        migrations.RunPython(set_plugin_organization, migrations.RunPython.noop, elidable=True),
         migrations.AlterField(
             model_name="plugin",
             name="organization",

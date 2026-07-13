@@ -1,0 +1,6 @@
+{
+    "disabledLabels": ["no-greptile"],
+    "customContext": {
+        "files": ["AGENTS.md"]
+    }
+}

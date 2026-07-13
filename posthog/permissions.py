@@ -1,18 +1,50 @@
+import os
+import time
 from typing import Optional, cast
 
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.db.models import Model
-from rest_framework.permissions import SAFE_METHODS, BasePermission
-from rest_framework.request import Request
 
+import posthoganalytics
+from loginas.utils import is_impersonated_session
+from rest_framework.exceptions import AuthenticationFailed, NotFound, PermissionDenied
+from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAdminUser
+from rest_framework.request import Request
+from rest_framework.views import APIView
+from rest_framework.viewsets import ViewSet
+
+from posthog.auth import (
+    IDJagAccessTokenAuthentication,
+    OAuthAccessTokenAuthentication,
+    PersonalAPIKeyAuthentication,
+    ProjectSecretAPIKeyAuthentication,
+    SessionAuthentication,
+    SharingAccessTokenAuthentication,
+    SharingPasswordProtectedAuthentication,
+    TeamSecretTokenAuthentication,
+)
+from posthog.cloud_utils import is_cloud
 from posthog.constants import AvailableFeature
+from posthog.exceptions import Conflict, EnterpriseFeatureException, PaidFeatureException
 from posthog.models import Organization, OrganizationMembership, Team, User
+from posthog.rbac.user_access_control import AccessControlLevel, UserAccessControl, ordered_access_levels
+from posthog.scopes import INTERNAL_API_SCOPE_OBJECTS, APIScopeObject, APIScopeObjectOrNotSupported
+from posthog.session.reauth import sensitive_action_reference, step_up_required
 from posthog.utils import get_can_create_org
 
-CREATE_METHODS = ["POST", "PUT"]
+CREATE_ACTIONS = ["create", "update"]
 
 
-def extract_organization(object: Model) -> Organization:
+def extract_organization(object: Model, view: ViewSet) -> Organization:
+    # This is set as part of the TeamAndOrgViewSetMixin to allow models that are not directly related to an organization
+    organization_id_rewrite = getattr(view, "filter_rewrite_rules", {}).get("organization_id")
+    if organization_id_rewrite:
+        for part in organization_id_rewrite.split("__"):
+            if part == "organization_id":
+                break
+            object = getattr(object, part)
+
     if isinstance(object, Organization):
         return object
     try:
@@ -24,7 +56,10 @@ def extract_organization(object: Model) -> Organization:
             try:
                 return object.project.organization  # type: ignore
             except AttributeError:
-                pass
+                try:
+                    return object.user.organization  # type: ignore
+                except AttributeError:
+                    pass
     raise ValueError("Object not compatible with organization-based permissions!")
 
 
@@ -33,14 +68,14 @@ def get_organization_from_view(view) -> Organization:
         organization = view.organization
         if isinstance(organization, Organization):
             return organization
-    except (KeyError, AttributeError):
+    except (KeyError, AttributeError, AssertionError):
         pass
 
     try:
         organization = view.team.organization
         if isinstance(organization, Organization):
             return organization
-    except (KeyError, AttributeError):
+    except (KeyError, AttributeError, AssertionError):
         pass
 
     raise ValueError("View not compatible with organization-based permissions!")
@@ -51,8 +86,8 @@ class CanCreateOrg(BasePermission):
 
     message = "New organizations cannot be created in this instance. Contact your administrator if you think this is a mistake."
 
-    def has_permission(self, *args, **kwargs) -> bool:
-        return get_can_create_org()
+    def has_permission(self, request, *args, **kwargs) -> bool:
+        return get_can_create_org(request.user)
 
 
 class SingleTenancyOrAdmin(BasePermission):
@@ -63,27 +98,7 @@ class SingleTenancyOrAdmin(BasePermission):
     message = "You are not an admin."
 
     def has_permission(self, request, view):
-        return not settings.MULTI_TENANCY or request.user.is_staff
-
-
-class ProjectMembershipNecessaryPermissions(BasePermission):
-    """Require organization and project membership to access endpoint."""
-
-    message = "You don't belong to any organization that has a project."
-
-    # TODO: Remove this permission class once legacy_team_compatibility setting is removed
-    def has_object_permission(self, request: Request, view, object) -> bool:
-        return request.user.is_authenticated and request.user.team is not None
-
-
-class OrganizationMembershipNecessaryPermissions(BasePermission):
-    """Require organization membership to access endpoint."""
-
-    message = "You don't belong to any organization."
-
-    # TODO: Remove this permission class once legacy_team_compatibility setting is removed
-    def has_object_permission(self, request: Request, view, object) -> bool:
-        return request.user.is_authenticated and request.user.organization is not None
+        return not is_cloud() or request.user.is_staff
 
 
 class OrganizationMemberPermissions(BasePermission):
@@ -100,11 +115,27 @@ class OrganizationMemberPermissions(BasePermission):
 
         organization = get_organization_from_view(view)
 
+        # TODO: Optimize this - we can get it from view.user_access_control
         return OrganizationMembership.objects.filter(user=cast(User, request.user), organization=organization).exists()
 
     def has_object_permission(self, request: Request, view, object: Model) -> bool:
-        organization = extract_organization(object)
+        organization = extract_organization(object, view)
+
+        # TODO: Optimize this - we can get it from view.user_access_control
         return OrganizationMembership.objects.filter(user=cast(User, request.user), organization=organization).exists()
+
+
+class UserNoOrgMembershipDeletePermission(BasePermission):
+    """
+    Disallow DELETE on a User if they have any organization memberships.
+    """
+
+    message = "Cannot delete user with organization memberships."
+
+    def has_object_permission(self, request, view, obj):
+        if request.method == "DELETE" and OrganizationMembership.objects.filter(user=obj).exists():
+            raise Conflict(self.message)
+        return True
 
 
 class OrganizationAdminWritePermissions(BasePermission):
@@ -117,44 +148,66 @@ class OrganizationAdminWritePermissions(BasePermission):
     message = "Your organization access level is insufficient."
 
     def has_permission(self, request: Request, view) -> bool:
+        if request.method in SAFE_METHODS:
+            return True
 
-        # When request is not creating or listing an `Organization`, an object exists, delegate to `has_object_permission`
-        if view.basename == "organizations" and view.action not in ["list", "create"]:
+        # When request is not creating (or listing) an `Organization`, an object exists, delegate to `has_object_permission`
+        if view.basename == "organizations" and view.action not in ["create"]:
             return True
 
         # TODO: Optimize so that this computation is only done once, on `OrganizationMemberPermissions`
         organization = get_organization_from_view(view)
 
-        return (
-            OrganizationMembership.objects.get(user=cast(User, request.user), organization=organization).level
-            >= OrganizationMembership.Level.ADMIN
-        )
+        try:
+            membership = OrganizationMembership.objects.get(user=cast(User, request.user), organization=organization)
+        except OrganizationMembership.DoesNotExist:
+            raise NotFound("Organization not found.")
+
+        return membership.level >= OrganizationMembership.Level.ADMIN
 
     def has_object_permission(self, request: Request, view, object: Model) -> bool:
-
         if request.method in SAFE_METHODS:
             return True
 
         # TODO: Optimize so that this computation is only done once, on `OrganizationMemberPermissions`
-        organization = extract_organization(object)
+        organization = extract_organization(object, view)
 
-        return (
-            OrganizationMembership.objects.get(user=cast(User, request.user), organization=organization).level
-            >= OrganizationMembership.Level.ADMIN
-        )
+        try:
+            membership = OrganizationMembership.objects.get(user=cast(User, request.user), organization=organization)
+        except OrganizationMembership.DoesNotExist:
+            raise NotFound("Organization not found.")
+
+        return membership.level >= OrganizationMembership.Level.ADMIN
 
 
-class OrganizationAdminAnyPermissions(BasePermission):
-    """Require organization admin level to change and also read object."""
+class OrganizationAdminReadPermissions(BasePermission):
+    """
+    Require organization admin or owner level for ALL access, including reads.
+    Unlike `OrganizationAdminWritePermissions`, this does not allow plain members read access.
+    Must always be used **after** `OrganizationMemberPermissions` (which is always required).
+    """
 
     message = "Your organization access level is insufficient."
 
+    def has_permission(self, request: Request, view) -> bool:
+        organization = get_organization_from_view(view)
+
+        try:
+            membership = OrganizationMembership.objects.get(user=cast(User, request.user), organization=organization)
+        except OrganizationMembership.DoesNotExist:
+            raise NotFound("Organization not found.")
+
+        return membership.level >= OrganizationMembership.Level.ADMIN
+
     def has_object_permission(self, request: Request, view, object: Model) -> bool:
-        organization = extract_organization(object)
-        return (
-            OrganizationMembership.objects.get(user=cast(User, request.user), organization=organization).level
-            >= OrganizationMembership.Level.ADMIN
-        )
+        organization = extract_organization(object, view)
+
+        try:
+            membership = OrganizationMembership.objects.get(user=cast(User, request.user), organization=organization)
+        except OrganizationMembership.DoesNotExist:
+            raise NotFound("Organization not found.")
+
+        return membership.level >= OrganizationMembership.Level.ADMIN
 
 
 class TeamMemberAccessPermission(BasePermission):
@@ -163,12 +216,50 @@ class TeamMemberAccessPermission(BasePermission):
     message = "You don't have access to the project."
 
     def has_permission(self, request, view) -> bool:
+        if is_authenticated_via_project_secret_api_key(request):
+            psak = request.successful_authenticator.project_secret_api_key
+            try:
+                return view.team.id == psak.team_id
+            except (AttributeError, KeyError, Team.DoesNotExist):
+                return False
+
+        if is_authenticated_via_team_secret_token(request):
+            return True
+
         try:
-            team = view.team
+            view.team  # noqa: B018
         except Team.DoesNotExist:
             return True  # This will be handled as a 404 in the viewset
-        requesting_level = team.get_effective_membership_level(cast(User, request.user))
+
+        # NOTE: The naming here is confusing - "current_team" refers to the team that the user_permissions was initialized with
+        # - not the "current_team" property of the user
+        requesting_level = view.user_permissions.current_team.effective_membership_level
         return requesting_level is not None
+
+
+def is_authenticated_via_team_secret_token(request: Request) -> bool:
+    return isinstance(request.successful_authenticator, TeamSecretTokenAuthentication)
+
+
+def is_authenticated_via_project_secret_api_key(request: Request) -> bool:
+    return isinstance(request.successful_authenticator, ProjectSecretAPIKeyAuthentication)
+
+
+def is_service_auth(request: Request) -> bool:
+    return is_authenticated_via_team_secret_token(request) or is_authenticated_via_project_secret_api_key(request)
+
+
+def _is_request_for_team_secret_token_secured_endpoint(request: Request) -> bool:
+    return bool(
+        request.resolver_match
+        and request.resolver_match.view_name
+        in {
+            "featureflag-local-evaluation",
+            "project_feature_flags-remote-config",
+            "project_feature_flags-local-evaluation",
+            "project_live_debugger_breakpoints-active-breakpoints",
+        }
+    )
 
 
 class TeamMemberLightManagementPermission(BasePermission):
@@ -181,14 +272,10 @@ class TeamMemberLightManagementPermission(BasePermission):
 
     def has_permission(self, request, view) -> bool:
         try:
-            if request.resolver_match.url_name.startswith("team-"):
-                # /projects/ endpoint handling
-                team = view.get_object()
-            else:
-                team = view.team
+            team = view.team
         except Team.DoesNotExist:
             return True  # This will be handled as a 404 in the viewset
-        requesting_level = team.get_effective_membership_level(cast(User, request.user))
+        requesting_level = view.user_permissions.team(team).effective_membership_level
         if requesting_level is None:
             return False
         minimum_level = (
@@ -206,8 +293,7 @@ class TeamMemberStrictManagementPermission(BasePermission):
     message = "You don't have sufficient permissions in the project."
 
     def has_permission(self, request, view) -> bool:
-        team = view.team
-        requesting_level = team.get_effective_membership_level(cast(User, request.user))
+        requesting_level = view.user_permissions.current_team.effective_membership_level
         if requesting_level is None:
             return False
         minimum_level = (
@@ -216,3 +302,711 @@ class TeamMemberStrictManagementPermission(BasePermission):
             else OrganizationMembership.Level.ADMIN
         )
         return requesting_level >= minimum_level
+
+
+class TeamMemberAdminManagementPermission(BasePermission):
+    """
+    Require at least admin effective project access level for ALL methods, including reads.
+    """
+
+    message = "You don't have sufficient permissions in the project."
+
+    def has_permission(self, request, view) -> bool:
+        requesting_level = view.user_permissions.current_team.effective_membership_level
+        if requesting_level is None:
+            return False
+        return requesting_level >= OrganizationMembership.Level.ADMIN
+
+
+class IsStaffUser(IsAdminUser):
+    message = "You are not a staff user, contact your instance admin."
+
+
+class IsStaffUserOrImpersonating(BasePermission):
+    """
+    Allows access to staff users or staff users impersonating other users.
+    """
+
+    message = "You are not a staff user, contact your instance admin."
+
+    def has_permission(self, request: Request, view: APIView) -> bool:
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and (request.user.is_staff or is_impersonated_session(request))
+        )
+
+
+class PremiumFeaturePermission(BasePermission):
+    """
+    Requires the user to have proper permission for the feature.
+    Permission class requires a user in context, should generally be used in conjunction with IsAuthenticated.
+
+    Two modes via view attributes:
+    - `premium_feature`: always enforced, raises EnterpriseFeatureException when missing.
+    - `premium_feature_on_cloud`: only enforced on Cloud, raises PaidFeatureException when missing.
+      Self-hosted instances are not gated.
+
+    Exactly one of the two attributes must be set on the view.
+
+    Staff impersonating a customer (`is_impersonated_session`) bypass the feature check
+    so PostHog support can debug paid features for non-paying orgs. Plain staff sessions
+    are not bypassed — staff must actively start an impersonation session, which is
+    audit-logged via the `loginas` flow.
+    """
+
+    def has_permission(self, request: Request, view: APIView) -> bool:
+        cloud_only_feature = getattr(view, "premium_feature_on_cloud", None)
+        always_feature = getattr(view, "premium_feature", None)
+
+        assert bool(cloud_only_feature) != bool(always_feature), (
+            "this permission class requires exactly one of `premium_feature` or `premium_feature_on_cloud` to be set in the view."
+        )
+
+        if cloud_only_feature:
+            if not is_cloud():
+                return True
+            feature = cloud_only_feature
+        else:
+            feature = always_feature
+
+        if is_impersonated_session(request):
+            return True
+
+        try:
+            organization = get_organization_from_view(view)
+        except ValueError:
+            return True
+
+        if not organization.is_feature_available(feature):
+            if cloud_only_feature:
+                raise PaidFeatureException(feature)
+            raise EnterpriseFeatureException(feature)
+
+        return True
+
+
+class SharingTokenPermission(BasePermission):
+    """
+    Validates an authenticated SharingToken against the current request.
+    """
+
+    def has_object_permission(self, request, view, object) -> bool:
+        if not isinstance(
+            request.successful_authenticator, SharingAccessTokenAuthentication | SharingPasswordProtectedAuthentication
+        ):
+            raise ValueError(
+                "SharingTokenPermission only works if SharingAccessTokenAuthentication or SharingPasswordProtectedAuthentication succeeded"
+            )
+        return request.successful_authenticator.sharing_configuration.can_access_object(object)
+
+    def has_permission(self, request, view) -> bool:
+        assert hasattr(view, "sharing_enabled_actions"), (
+            "SharingTokenPermission requires the `sharing_enabled_actions` attribute to be set in the view"
+        )
+
+        if isinstance(
+            request.successful_authenticator, SharingAccessTokenAuthentication | SharingPasswordProtectedAuthentication
+        ):
+            try:
+                view.team  # noqa: B018
+                if request.successful_authenticator.sharing_configuration.team != view.team:
+                    return False
+            except NotFound:
+                return False
+
+            return view.action in view.sharing_enabled_actions
+
+        return False
+
+
+class TimeSensitiveActionPermission(BasePermission):
+    """
+    Validates that the authenticated session is not older than the allowed time for the action.
+    """
+
+    message = "This action requires you to be recently authenticated."
+    code = "sensitive_action_required_reauth"
+
+    def has_permission(self, request, view) -> bool:
+        if not isinstance(request.successful_authenticator, SessionAuthentication):
+            return True
+
+        exclude_actions = getattr(view, "time_sensitive_exclude_actions", [])
+        if getattr(view, "action", None) in exclude_actions:
+            return True
+
+        # Reads never require re-auth.
+        if getattr(view, "time_sensitive_allow_safe_methods", True) and request.method in SAFE_METHODS:
+            return True
+
+        # A risk-driven step-up blocks every non-safe action until the user re-authenticates,
+        # including the field/action allow-lists below — those only relax the time-based freshness
+        # window for a normally-aged session, not an anomalous one.
+        if step_up_required(request.session):
+            return False
+
+        allow_if_only_fields = getattr(view, "time_sensitive_allow_if_only_fields", None)
+        if allow_if_only_fields and request.method not in SAFE_METHODS:
+            data = getattr(request, "data", None)
+            data_keys: set[str] = set()
+            if data is not None and hasattr(data, "keys"):
+                data_keys = {str(key) for key in data.keys()}
+
+            if data_keys and data_keys.issubset(set(allow_if_only_fields)):
+                return True
+
+        allow_actions = getattr(view, "time_sensitive_allow_actions", None)
+        if allow_actions and view.action in allow_actions:
+            return True
+
+        reference = sensitive_action_reference(request.session)
+        if reference is None:
+            # This should always be covered by the middleware but just in case
+            return False
+
+        if time.time() - reference > settings.SESSION_SENSITIVE_ACTIONS_AGE:
+            return False
+
+        return True
+
+
+class ScopeBasePermission(BasePermission):
+    """
+    Base class for shared functionality between APIScopePermission and AccessControlPermission
+    """
+
+    write_actions: list[str] = ["create", "update", "partial_update", "patch", "destroy"]
+    read_actions: list[str] = ["list", "retrieve"]
+    scope_object_read_actions: list[str] = []
+    scope_object_write_actions: list[str] = []
+    psak_allowed_actions: list[str] = []
+
+    def _get_scope_object(self, request, view) -> APIScopeObjectOrNotSupported:
+        if not getattr(view, "scope_object", None):
+            raise ImproperlyConfigured("APIScopePermission requires the view to define the scope_object attribute.")
+
+        return view.scope_object
+
+    def _get_action(self, request, view) -> str:
+        # TRICKY: DRF doesn't have an action for non-detail level "patch" calls which we use sometimes
+        if not view.action:
+            if request.method == "PATCH" and not view.detail:
+                return "patch"
+        return view.action
+
+    def _get_required_scopes(self, request, view) -> Optional[list[str]]:
+        # If required_scopes is set on the view method then use that
+        # Otherwise use the scope_object and derive the required scope from the action
+        if getattr(view, "required_scopes", None):
+            return view.required_scopes
+
+        # If the view has a dangerously_get_required_scopes method then use that
+        # If it returns None then we will use the default behavior
+        if hasattr(view, "dangerously_get_required_scopes"):
+            required_scopes = view.dangerously_get_required_scopes(request, view)
+            if required_scopes:
+                return required_scopes
+
+        scope_object = self._get_scope_object(request, view)
+
+        if scope_object == "INTERNAL":
+            return None
+
+        action = self._get_action(request, view)
+        read_actions = getattr(view, "scope_object_read_actions", self.read_actions)
+        write_actions = getattr(view, "scope_object_write_actions", self.write_actions)
+
+        if action in write_actions:
+            return [f"{scope_object}:write"]
+        elif action in read_actions or request.method == "OPTIONS":
+            return [f"{scope_object}:read"]
+
+        return None
+
+
+def get_authenticator_scopes(authenticator) -> list[str] | None:
+    """The API scopes carried by a scoped-token authenticator, or None for session and
+    other non-token auth. Single source of truth for the token->scopes mapping, shared by
+    APIScopePermission and cross-resource scope checks so the two cannot drift — if they
+    did, one path could grant access while the other skipped its check."""
+    if isinstance(authenticator, PersonalAPIKeyAuthentication):
+        return list(authenticator.personal_api_key.scopes or [])
+    if isinstance(authenticator, OAuthAccessTokenAuthentication):
+        # OAuth tokens store scopes as a space-separated string.
+        return str(authenticator.access_token.scope or "").split()
+    if isinstance(authenticator, IDJagAccessTokenAuthentication):
+        return list(authenticator.scopes or [])
+    if isinstance(authenticator, ProjectSecretAPIKeyAuthentication):
+        return list(authenticator.project_secret_api_key.scopes or [])
+    return None
+
+
+class APIScopePermission(ScopeBasePermission):
+    """
+    The request is via an API key or OAuth token and the user has the appropriate scopes.
+
+    This permission requires that the view has a "scope" attribute which is the base scope required for the action.
+    E.g. scope="insight" for a view that requires "insight:read" or "insight:write" for the relevant actions.
+
+    Actions can override this default scope by setting the `required_scopes` attribute on the view method.
+
+    """
+
+    def has_permission(self, request, view) -> bool:
+        # NOTE: We do this first to error out quickly if the view is missing the required attribute
+        # Helps devs remember to add it.
+        self._get_scope_object(request, view)
+
+        # API Scopes apply to PersonalAPIKeyAuthentication and OAuthAccessTokenAuthentication
+
+        authenticator = request.successful_authenticator
+        is_psak = isinstance(authenticator, ProjectSecretAPIKeyAuthentication)
+
+        key_scopes = get_authenticator_scopes(authenticator)
+
+        if key_scopes is None:
+            # Session (and other non-token) auth normally bypasses API-scope checks — scopes
+            # are a PAK/OAuth concept; logged-in users are gated by team membership + access
+            # control instead. But INTERNAL scope objects are a programmatic-only security
+            # boundary (e.g. `signal_scout_internal:write`, the sandbox-only scout write scope)
+            # and must be unreachable via session auth — otherwise any logged-in team member
+            # could bypass the boundary (e.g. write durable scout scratchpad that is read
+            # verbatim into the scout's prompt). Mirror the internal-scope guard applied to the
+            # `*` wildcard below.
+            session_required_scopes = self._get_required_scopes(request, view) or []
+            session_required_objects = {s.split(":", 1)[0] for s in session_required_scopes}
+            if not session_required_objects.isdisjoint(INTERNAL_API_SCOPE_OBJECTS):
+                self.message = "This action requires a programmatic token carrying an internal scope"
+                return False
+            return True
+
+        # Token auth: per-type preconditions the shared scope extractor doesn't cover.
+        if isinstance(authenticator, OAuthAccessTokenAuthentication) and not key_scopes:
+            self.message = "OAuth token has no scopes and cannot access this resource"
+            return False
+        if isinstance(authenticator, IDJagAccessTokenAuthentication) and not key_scopes:
+            self.message = "ID-JAG access token has no scopes and cannot access this resource"
+            return False
+        if is_psak:
+            psak_allowed_actions = getattr(view, "psak_allowed_actions", self.psak_allowed_actions)
+            if self._get_action(request, view) not in psak_allowed_actions:
+                self.message = "This action does not support project secret API key access"
+                return False
+
+        required_scopes = self._get_required_scopes(request, view)
+
+        if not required_scopes:
+            self.message = "This action does not support personal API key access"
+            return False
+
+        if is_psak:
+            self._check_project_secret_api_key_team(request, view)
+        else:
+            self.check_team_and_org_permissions(request, view)
+
+        # `*` is the "Full access to all scopes" consent option; INTERNAL viewsets
+        # are programmatic-only and must not be reachable via user-consented tokens.
+        # Also fall through when *any* required_scope on this action targets an
+        # INTERNAL_API_SCOPE_OBJECTS object (e.g. `signal_scout_internal:write` on
+        # a viewset whose own `scope_object` is the public sibling like `signal_scout`).
+        # Those scope objects are intentionally not selectable in the consent UI, and
+        # `*` must not be a backdoor past that.
+        scope_object = self._get_scope_object(request, view)
+        required_scope_objects = {s.split(":", 1)[0] for s in required_scopes}
+        action_targets_internal = not required_scope_objects.isdisjoint(INTERNAL_API_SCOPE_OBJECTS)
+        if "*" in key_scopes and scope_object != "INTERNAL" and not action_targets_internal:
+            return True
+
+        for required_scope in required_scopes:
+            valid_scopes = [required_scope]
+
+            # For all valid scopes with :read we also add :write
+            if required_scope.endswith(":read"):
+                valid_scopes.append(required_scope.replace(":read", ":write"))
+
+            if not any(scope in key_scopes for scope in valid_scopes):
+                self.message = f"API key missing required scope '{required_scope}'"
+                return False
+
+        return True
+
+    def _check_project_secret_api_key_team(self, request, view) -> None:
+        psak = request.successful_authenticator.project_secret_api_key
+        try:
+            team_id = view.team.id
+        except (AttributeError, KeyError, Team.DoesNotExist):
+            raise PermissionDenied("Project secret API keys are only supported on project-based endpoints.")
+
+        if team_id != psak.team_id:
+            raise PermissionDenied(f"API key does not have access to the requested project: ID {team_id}.")
+
+    def check_team_and_org_permissions(self, request, view) -> None:
+        scope_object = self._get_scope_object(request, view)
+
+        # Guard runs above the `user` early return so the misconfig still trips
+        # if someone sets the flag on a `scope_object = "user"` viewset.
+        skip_team_and_org = getattr(view, "dangerously_skip_scoped_team_enforcement", False)
+        if skip_team_and_org and scope_object != "INTERNAL":
+            raise RuntimeError(
+                f"`dangerously_skip_scoped_team_enforcement = True` is only allowed on viewsets with "
+                f"`scope_object = 'INTERNAL'`; {type(view).__name__} declares `scope_object = {scope_object!r}`."
+            )
+
+        if scope_object == "user":
+            return  # The /api/users/@me/ endpoint is exempt from team and org scoping
+
+        self._check_organization_personal_api_key_restrictions(request, view)
+
+        if isinstance(request.successful_authenticator, OAuthAccessTokenAuthentication):
+            scoped_organizations = request.successful_authenticator.access_token.scoped_organizations
+            scoped_teams = request.successful_authenticator.access_token.scoped_teams
+        elif isinstance(request.successful_authenticator, PersonalAPIKeyAuthentication):
+            scoped_organizations = request.successful_authenticator.personal_api_key.scoped_organizations
+            scoped_teams = request.successful_authenticator.personal_api_key.scoped_teams
+        elif isinstance(request.successful_authenticator, IDJagAccessTokenAuthentication):
+            # ID-JAG access tokens are bound to the specific PostHog Organization
+            # whose OrganizationDomain pinned the trusted IdP — carried in the
+            # `org_id` claim. Pin `scoped_organizations` to that single org so
+            # the token cannot reach other orgs the resolved user happens to
+            # be a member of (cross-org confused-deputy defense).
+            scoped_organizations = [request.successful_authenticator.organization_id]
+            scoped_teams = None
+        else:
+            raise ValueError("Unexpected authentication type")
+
+        if scoped_teams and not skip_team_and_org:
+            # Views that aren't project-nested but still need to accept
+            # scoped_teams tokens can set `dangerously_skip_scoped_team_enforcement = True`
+            # and take on responsibility for their own per-team access. The
+            # flag is only honored on `scope_object = "INTERNAL"` views —
+            # anywhere else it's a config error and we fail loudly.
+            try:
+                team = view.team
+                if team.id not in scoped_teams:
+                    raise PermissionDenied(f"API key does not have access to the requested project: ID {team.id}.")
+            except (KeyError, AttributeError):
+                raise PermissionDenied("API keys with scoped projects are only supported on project-based endpoints.")
+
+        if scoped_organizations and not skip_team_and_org:
+            # The flag also opts out of org enforcement — INTERNAL views aren't
+            # org-nested today, but adding nesting later must revisit the flag.
+            try:
+                organization = get_organization_from_view(view)
+                if str(organization.id) not in scoped_organizations:
+                    raise PermissionDenied(
+                        f"API key does not have access to the requested organization: ID {organization.id}."
+                    )
+            except ValueError:
+                # Indicates this is not an organization scoped view
+                pass
+
+    def _check_organization_personal_api_key_restrictions(self, request, view) -> None:
+        """
+        Check if the organization being accessed allows personal API keys.
+        Admins can always use personal API keys regardless of the organization setting.
+        """
+        # Only applies to personal API keys — OAuth tokens are exempt.
+        if not isinstance(request.successful_authenticator, PersonalAPIKeyAuthentication):
+            return
+
+        try:
+            org = get_organization_from_view(view)
+        except ValueError:
+            # Indicates this is not an organization scoped view
+            return
+
+        if not org.is_feature_available(AvailableFeature.ORGANIZATION_SECURITY_SETTINGS):
+            return
+
+        try:
+            membership = OrganizationMembership.objects.get(user=cast(User, request.user), organization=org)
+
+            if not org.members_can_use_personal_api_keys and membership.level < OrganizationMembership.Level.ADMIN:
+                raise PermissionDenied(
+                    f"Organization '{org.name}' does not allow using personal API keys. "
+                    f"Contact an admin to enable personal API keys for this organization."
+                )
+        except OrganizationMembership.DoesNotExist:
+            return
+
+
+class AccessControlPermission(ScopeBasePermission):
+    """
+    Unified permissions access - controls access to any object based on the user's access controls
+    """
+
+    def _get_user_access_control(self, request, view) -> UserAccessControl:
+        return view.user_access_control
+
+    def _get_required_access_level(self, request, view) -> Optional[AccessControlLevel]:
+        resource = self._get_scope_object(request, view)
+        required_scopes = self._get_required_scopes(request, view)
+
+        if resource == "INTERNAL":
+            return None
+
+        ordered_access_levels_list = ordered_access_levels(resource)
+        # For project and organization, the last two levels are the read and write levels
+        # For other resources, since we have the manager level, the last three levels are the read, write, and manager levels
+        if resource in ["project", "organization"]:
+            READ_LEVEL = ordered_access_levels_list[-2]
+            WRITE_LEVEL = ordered_access_levels_list[-1]
+        else:
+            READ_LEVEL = ordered_access_levels_list[-3]
+            WRITE_LEVEL = ordered_access_levels_list[-2]
+
+        if not required_scopes:
+            return READ_LEVEL if request.method in SAFE_METHODS else WRITE_LEVEL
+
+        # TODO: This is definitely not right - we need to more safely map the scopes to access levels relevant to the object
+        for scope in required_scopes:
+            if scope.endswith(":write"):
+                return WRITE_LEVEL
+
+        return READ_LEVEL
+
+    def has_object_permission(self, request, view, object) -> bool:
+        # At this level we are checking an individual resource - this could be a project or a lower level item like a Dashboard
+
+        # Service credentials (TST, PSAK) are synthetic users UserAccessControl can't evaluate.
+        # They're gated by API scope + project membership, so scopes grant project-wide access
+        # within that resource type and object-level RBAC restrictions don't apply.
+        if is_service_auth(request):
+            return True
+
+        # NOTE: If the object is a Team then we shortcircuit here and create a UAC
+        # Reason being that there is a loop from view.user_access_control -> view.team -> view.user_access_control
+        if isinstance(object, Team):
+            uac = UserAccessControl(user=request.user, team=object)
+        else:
+            uac = self._get_user_access_control(request, view)
+
+        if not uac:
+            # If the view doesn't have a user_access_control then it is not supported by this permission scheme
+            return True
+
+        required_level = self._get_required_access_level(request, view)
+
+        if not required_level:
+            return True
+
+        has_access = uac.check_access_level_for_object(object, required_level=required_level)
+
+        if not has_access:
+            self.message = f"You do not have {required_level} access to this resource."
+            return False
+
+        return True
+
+    def has_permission(self, request, view) -> bool:
+        # At this level we are checking that the user can generically access the resource kind.
+        # Primarily we are checking the user's access to the parent resource type (i.e. project, organization)
+        # as well as enforcing any global restrictions (e.g. generically only editing of a flag is allowed)
+
+        if is_service_auth(request):
+            return True
+
+        # Check if the endpoint requires a current team to be set on the user
+        if hasattr(view, "param_derived_from_user_current_team"):
+            if view.param_derived_from_user_current_team in ("team_id", "project_id"):
+                if request.user.current_team_id is None:
+                    raise AuthenticationFailed("This endpoint requires a current project to be set on your account.")
+
+        uac = self._get_user_access_control(request, view)
+        scope_object = self._get_scope_object(request, view)
+        required_level = self._get_required_access_level(request, view)
+
+        team: Team
+
+        try:
+            team = view.team
+        except (ValueError, KeyError):
+            # TODO: Change this to a super specific exception...
+            # TODO: Does this means its okay because there is no team level thing?
+            return True
+
+        # NOTE: This isn't perfect as it will only optimize for endpoints where the pk matches the obj.id
+        # We can't load the actual object as get_object in turn calls the permissions check
+        pk = view.kwargs.get("pk")
+        uac.preload_access_levels(team=team, resource=cast(APIScopeObject, scope_object), resource_id=pk)
+
+        is_member = uac.check_access_level_for_object(team, required_level="member")
+
+        if not is_member:
+            self.message = f"You don't have access to the project."
+            return False
+
+        # If the API doesn't have a scope object or a required level for accessing then we can simply allow access
+        # as it isn't under access control
+        if scope_object == "INTERNAL" or not required_level:
+            return True
+
+        # TODO: Scope object should probably be applied against the `required_scopes` attribute
+        has_access = uac.check_access_level_for_resource(scope_object, required_level=required_level)
+        if has_access:
+            return True
+        elif view.action == "create":
+            # If the user has no access to the resource level, but is trying to create a new object, we should block it
+            # Specific object access isn't relevant here as we are trying to create a new object
+            self.message = f"You do not have {required_level} access to this resource."
+            return False
+
+        # Check if they have specific access to any objects of this resource type
+        # This handles the case where a user has "none" access to the resource level
+        # but has been granted access to specific objects within that resource type
+        has_specific_access = uac.has_any_specific_access_for_resource(scope_object, required_level=required_level)
+        if has_specific_access:
+            return True
+
+        self.message = f"You do not have {required_level} access to this resource."
+        return False
+
+
+_raw = os.environ.get("POSTHOG_FEATURE_FLAGS_FORCE_ENABLED", "")
+_FORCE_ENABLED_FLAGS: frozenset[str] = frozenset(f.strip() for f in _raw.split(",") if f.strip())
+
+
+class PostHogFeatureFlagPermission(BasePermission):
+    def has_permission(self, request, view) -> bool:
+        user = cast(User, request.user)
+        organization = get_organization_from_view(view)
+        flag = getattr(view, "posthog_feature_flag", None)
+
+        config = {}
+
+        if not flag:
+            raise ImproperlyConfigured(
+                "PostHogFeatureFlagPermission requires the view to define the posthog_feature_flag attribute."
+            )
+
+        if isinstance(flag, str):
+            config[flag] = ["*"]
+        else:
+            config = flag
+
+        for required_flag, actions in config.items():
+            if "*" in actions or view.action in actions:
+                if required_flag in _FORCE_ENABLED_FLAGS:
+                    return True
+
+                org_id = str(organization.id)
+                groups: dict[str, str] = {"organization": org_id}
+                group_properties: dict[str, dict[str, str]] = {"organization": {"id": org_id}}
+                # Match in-app flag evaluation: posthog-js often has project (team) context; server-only org
+                # groups miss per-environment rollouts (e.g. logs-settings-drop-rules for project 2 only).
+                try:
+                    team_for_flag = view.team
+                except (ValueError, KeyError, AttributeError):
+                    team_for_flag = None
+                if team_for_flag is not None:
+                    project_id = str(team_for_flag.id)
+                    groups["project"] = project_id
+                    group_properties["project"] = {"id": project_id}
+
+                enabled = posthoganalytics.feature_enabled(
+                    required_flag,
+                    str(user.distinct_id),
+                    groups=groups,
+                    group_properties=group_properties,
+                    only_evaluate_locally=False,
+                    send_feature_flag_events=False,
+                )
+
+                if enabled:
+                    return True
+                self.message = (
+                    f"This action requires feature flag {required_flag!r} to be enabled for your organization."
+                )
+                return False
+
+        return True
+
+
+class TeamSecretTokenPermission(BasePermission):
+    """
+    Controls access to the local_evaluation and remote_config endpoints when authenticated via
+    the legacy team-level Team.secret_api_token (see TeamSecretTokenAuthentication).
+
+    Also validates that the authenticated team matches the resolved team (analogous to
+    TeamMemberAccessPermission for personal keys).
+    """
+
+    def has_permission(self, request, view) -> bool:
+        if not isinstance(request.successful_authenticator, TeamSecretTokenAuthentication):
+            return True
+
+        # Check that the endpoint is allowed for team secret tokens
+        if not _is_request_for_team_secret_token_secured_endpoint(request):
+            return False
+
+        # Check team consistency: authenticated team must match resolved team
+        # This prevents cross-team access when project_api_key is provided in request body
+        authenticated_team = request.user.team  # From TeamSecretTokenUser
+        try:
+            resolved_team = view.team  # From routing logic (may use project_api_key override)
+        except (AttributeError, KeyError, Team.DoesNotExist):
+            # If team resolution fails, let it be handled as a 404 in the viewset
+            return True
+
+        return authenticated_team.id == resolved_team.id
+
+
+class UserCanInvitePermission(BasePermission):
+    """
+    Only allows Admins+, and Members if members_can_invite flag is True
+    """
+
+    def has_permission(self, request: Request, view) -> bool:
+        try:
+            organization = get_organization_from_view(view)
+        except ValueError:
+            return True
+
+        org_invite_settings_available = organization.is_feature_available(AvailableFeature.ORGANIZATION_INVITE_SETTINGS)
+
+        if not org_invite_settings_available:
+            return True
+
+        try:
+            membership = OrganizationMembership.objects.get(user=cast(User, request.user), organization=organization)
+        except OrganizationMembership.DoesNotExist:
+            raise NotFound("Organization not found.")
+
+        members_can_invite = bool(organization.members_can_invite)
+        user_is_admin = membership.level >= OrganizationMembership.Level.ADMIN
+
+        if user_is_admin:
+            return True
+
+        return members_can_invite
+
+
+class UserCanCreateProjectPermission(BasePermission):
+    """
+    Only allows Admins+, and Members if the members_can_create_projects org setting is True
+    AND the organization has the entitlement to configure it. Without the entitlement this
+    behaves exactly like the admin-write permission (members blocked), regardless of the toggle.
+    """
+
+    message = "You need to be an organization admin or above to create new projects."
+
+    def has_permission(self, request: Request, view) -> bool:
+        try:
+            organization = get_organization_from_view(view)
+        except ValueError:
+            return True
+
+        try:
+            membership = OrganizationMembership.objects.get(user=cast(User, request.user), organization=organization)
+        except OrganizationMembership.DoesNotExist:
+            raise NotFound("Organization not found.")
+
+        if membership.level >= OrganizationMembership.Level.ADMIN:
+            return True
+
+        # Gated behind the org invite-settings entitlement for now (will move to a dedicated feature later).
+        if not organization.is_feature_available(AvailableFeature.ORGANIZATION_INVITE_SETTINGS):
+            return False
+
+        return bool(organization.members_can_create_projects)

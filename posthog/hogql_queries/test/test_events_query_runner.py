@@ -1,0 +1,1344 @@
+from datetime import datetime
+from typing import Any, cast
+
+from freezegun import freeze_time
+from posthog.test.base import (
+    APIBaseTest,
+    ClickhouseTestMixin,
+    _create_event,
+    _create_person,
+    also_test_with_different_timezones,
+    flush_persons_and_events,
+    snapshot_clickhouse_queries,
+)
+
+from parameterized import parameterized
+
+from posthog.schema import (
+    CachedEventsQueryResponse,
+    EventMetadataPropertyFilter,
+    EventPropertyFilter,
+    EventsQuery,
+    EventsQueryActionStep,
+    PropertyOperator,
+)
+
+from posthog.hogql import ast
+from posthog.hogql.ast import CompareOperationOp
+
+from posthog.hogql_queries.events_query_runner import EventsQueryRunner
+from posthog.models import Element, Organization, OrganizationMembership, PropertyDefinition, Team
+from posthog.models.person.util import get_person_by_distinct_id
+
+from products.access_control.backend.models.property_access_control import PropertyAccessControl
+from products.access_control.backend.property_access_control import PropertyAccessLevel
+
+
+class TestEventsQueryRunner(ClickhouseTestMixin, APIBaseTest):
+    maxDiff = None
+
+    def _create_events(self, data: list[tuple[str, str, Any]], event="$pageview"):
+        person_result = []
+        distinct_ids_handled = set()
+        for distinct_id, timestamp, event_properties in data:
+            with freeze_time(timestamp):
+                if distinct_id not in distinct_ids_handled:
+                    person_result.append(
+                        _create_person(
+                            team_id=self.team.pk,
+                            distinct_ids=[distinct_id],
+                            properties={
+                                "name": distinct_id,
+                            },
+                        )
+                    )
+                    distinct_ids_handled.add(distinct_id)
+                _create_event(
+                    team=self.team,
+                    event=event,
+                    distinct_id=distinct_id,
+                    timestamp=timestamp,
+                    properties=event_properties,
+                )
+        return person_result
+
+    def _create_boolean_field_test_events(self):
+        self._create_events(
+            data=[
+                (
+                    "p_true",
+                    "2020-01-11T12:00:01Z",
+                    {"boolean_field": True},
+                ),
+                (
+                    "p_false",
+                    "2020-01-11T12:00:02Z",
+                    {"boolean_field": False},
+                ),
+                (
+                    "p_notset",
+                    "2020-01-11T12:00:04Z",
+                    {},
+                ),
+                (
+                    "p_null",
+                    "2020-01-11T12:00:04Z",
+                    {"boolean_field": None},
+                ),
+            ]
+        )
+
+    def _run_boolean_field_query(self, filter: EventPropertyFilter):
+        with freeze_time("2020-01-11T12:01:00"):
+            query = EventsQuery(
+                after="-24h",
+                event="$pageview",
+                kind="EventsQuery",
+                orderBy=["timestamp ASC"],
+                select=["*"],
+                properties=[filter],
+            )
+
+            runner = EventsQueryRunner(query=query, team=self.team)
+            response = runner.run()
+            assert isinstance(response, CachedEventsQueryResponse)
+            results = response.results
+            return results
+
+    def test_is_not_set_boolean(self):
+        # see https://github.com/PostHog/posthog/issues/18030
+        self._create_boolean_field_test_events()
+        results = self._run_boolean_field_query(
+            EventPropertyFilter(
+                type="event",
+                key="boolean_field",
+                operator=PropertyOperator.IS_NOT_SET,
+                value=PropertyOperator.IS_NOT_SET,
+            )
+        )
+
+        self.assertEqual({"p_notset", "p_null"}, {row[0]["distinct_id"] for row in results})
+
+    def test_is_set_boolean(self):
+        self._create_boolean_field_test_events()
+
+        results = self._run_boolean_field_query(
+            EventPropertyFilter(
+                type="event",
+                key="boolean_field",
+                operator=PropertyOperator.IS_SET,
+                value=PropertyOperator.IS_SET,
+            )
+        )
+
+        self.assertEqual({"p_true", "p_false"}, {row[0]["distinct_id"] for row in results})
+
+    def test_person_id_expands_to_distinct_ids(self):
+        _create_person(
+            team_id=self.team.pk,
+            distinct_ids=["id1", "id2"],
+        )
+        flush_persons_and_events()
+        person = get_person_by_distinct_id(self.team.pk, "id1")
+        assert person is not None
+        query = EventsQuery(kind="EventsQuery", select=["*"], personId=str(person.pk), orderBy=[])
+
+        # matching team
+        query_ast = EventsQueryRunner(query=query, team=self.team).to_query()
+        where_expr = cast(ast.CompareOperation, cast(ast.And, query_ast.where).exprs[0])
+        right_expr = cast(ast.Tuple, where_expr.right)
+        self.assertEqual(
+            [cast(ast.Constant, cast(ast.Call, x).args[0]).value for x in right_expr.exprs], ["id1", "id2"]
+        )
+
+        # another team
+        another_team = Team.objects.create(organization=Organization.objects.create())
+        query_ast = EventsQueryRunner(query=query, team=another_team).to_query()
+        where_expr = cast(ast.CompareOperation, cast(ast.And, query_ast.where).exprs[0])
+        right_expr = cast(ast.Tuple, where_expr.right)
+        self.assertEqual(right_expr.exprs, [])
+
+    def test_test_account_filters(self):
+        self.team.test_account_filters = [
+            {
+                "key": "email",
+                "type": "person",
+                "value": "posthog.com",
+                "operator": "not_icontains",
+            }
+        ]
+        self.team.save()
+        query = EventsQuery(kind="EventsQuery", select=["*"], filterTestAccounts=True, orderBy=[])
+        query_ast = EventsQueryRunner(query=query, team=self.team).to_query()
+        where_expr = cast(ast.CompareOperation, cast(ast.And, query_ast.where).exprs[0])
+        right_expr = cast(ast.Constant, where_expr.right)
+        self.assertEqual(right_expr.value, "%posthog.com%")
+        self.assertEqual(where_expr.op, CompareOperationOp.NotILike)
+
+    def test_big_int(self):
+        BIG_INT = 2**159 - 24
+        self._create_events(
+            data=[
+                (
+                    "p_null",
+                    "2020-01-11T12:00:04Z",
+                    {"boolean_field": None, "bigInt": BIG_INT},
+                ),
+            ]
+        )
+
+        flush_persons_and_events()
+
+        with freeze_time("2020-01-11T12:01:00"):
+            query = EventsQuery(
+                after="-24h",
+                event="$pageview",
+                kind="EventsQuery",
+                orderBy=["timestamp ASC"],
+                select=["*"],
+            )
+
+            runner = EventsQueryRunner(query=query, team=self.team)
+            response = runner.run()
+            assert isinstance(response, CachedEventsQueryResponse)
+            assert response.results[0][0]["properties"]["bigInt"] == float(BIG_INT)
+
+    def test_escaped_single_quotes_in_where_clause(self):
+        SINGLE_QUOTE = "I'm a string with a ' in it"
+        DOUBLE_QUOTE = 'I"m a string with a " in it'
+        self._create_events(
+            data=[
+                (
+                    "p_null",
+                    "2020-01-11T12:00:04Z",
+                    {"boolean_field": None, "arr_field": [SINGLE_QUOTE]},
+                ),
+                (
+                    "p_one",
+                    "2020-01-11T12:00:14Z",
+                    {"boolean_field": None, "arr_field": [DOUBLE_QUOTE]},
+                ),
+            ]
+        )
+
+        flush_persons_and_events()
+
+        with freeze_time("2020-01-11T12:01:00"):
+            query = EventsQuery(
+                after="-24h",
+                event="$pageview",
+                kind="EventsQuery",
+                where=[
+                    "has(JSONExtract(ifNull(properties.arr_field,'[]'),'Array(String)'), 'I\\'m a string with a \\' in it')"
+                ],
+                orderBy=["timestamp ASC"],
+                select=["*"],
+            )
+
+            runner = EventsQueryRunner(query=query, team=self.team)
+            response = runner.run()
+            assert isinstance(response, CachedEventsQueryResponse)
+            assert len(response.results) == 1
+            assert response.results[0][0]["properties"]["arr_field"] == [SINGLE_QUOTE]
+
+            query = EventsQuery(
+                after="-24h",
+                event="$pageview",
+                kind="EventsQuery",
+                where=[
+                    "has(JSONExtract(ifNull(properties.arr_field,'[]'),'Array(String)'), 'I\"m a string with a \" in it')"
+                ],
+                orderBy=["timestamp ASC"],
+                select=["*"],
+            )
+
+            runner = EventsQueryRunner(query=query, team=self.team)
+            response = runner.run()
+            assert isinstance(response, CachedEventsQueryResponse)
+            assert len(response.results) == 1
+            assert response.results[0][0]["properties"]["arr_field"] == [DOUBLE_QUOTE]
+
+    @also_test_with_different_timezones
+    @snapshot_clickhouse_queries
+    def test_absolute_date_range(self):
+        self._create_events(
+            data=[
+                (  # Event two hours BEFORE THE START of the day
+                    "p17",
+                    "2020-01-11T22:00:00",
+                    {},
+                ),
+                (  # Event one hour after the start of the day
+                    "p2",
+                    "2020-01-12T01:00:00",
+                    {},
+                ),
+                (  # Event right in the middle of the day
+                    "p3",
+                    "2020-01-12T12:00:00",
+                    {},
+                ),
+                (  # Event one hour before the end of the day
+                    "p1",
+                    "2020-01-12T23:00:00",
+                    {},
+                ),
+                (  # Event two hours AFTER THE END of the day
+                    "p3",
+                    "2020-01-13T02:00:00",
+                    {},
+                ),
+            ]
+        )
+
+        flush_persons_and_events()
+
+        query = EventsQuery(
+            after="2020-01-12",
+            before="2020-01-12T23:59:59",
+            event="$pageview",
+            kind="EventsQuery",
+            orderBy=["timestamp ASC"],
+            select=["*"],
+        )
+
+        runner = EventsQueryRunner(query=query, team=self.team)
+
+        response = runner.run()
+        assert isinstance(response, CachedEventsQueryResponse)
+        assert [row[0]["timestamp"] for row in response.results] == [
+            datetime(2020, 1, 12, 1, 0, 0, tzinfo=self.team.timezone_info),
+            datetime(2020, 1, 12, 12, 0, 0, tzinfo=self.team.timezone_info),
+            datetime(2020, 1, 12, 23, 0, 0, tzinfo=self.team.timezone_info),
+        ]
+
+    def test_event_metadata_filter(self):
+        self._create_events(
+            data=[
+                (
+                    "p17",
+                    "2020-01-11T22:00:00",
+                    {},
+                ),
+                (
+                    "p2",
+                    "2020-01-12T01:00:00",
+                    {},
+                ),
+                (
+                    "p3",
+                    "2020-01-12T12:00:00",
+                    {},
+                ),
+                (
+                    "p1",
+                    "2020-01-12T23:00:00",
+                    {},
+                ),
+                (
+                    "p3",
+                    "2020-01-13T02:00:00",
+                    {},
+                ),
+            ]
+        )
+
+        flush_persons_and_events()
+
+        with freeze_time("2020-01-11T12:01:00"):
+            query = EventsQuery(
+                after="2020-01-11",
+                before="2020-01-15",
+                event="$pageview",
+                kind="EventsQuery",
+                orderBy=["timestamp ASC"],
+                select=["*"],
+                properties=[
+                    EventMetadataPropertyFilter(
+                        type="event_metadata", operator="exact", key="distinct_id", value=["p3"]
+                    )
+                ],
+            )
+
+            runner = EventsQueryRunner(query=query, team=self.team)
+
+            response = runner.run()
+            assert isinstance(response, CachedEventsQueryResponse)
+            assert [row[0]["timestamp"] for row in response.results] == [
+                datetime(2020, 1, 12, 12, 0, 0, tzinfo=self.team.timezone_info),
+                datetime(2020, 1, 13, 2, 0, 0, tzinfo=self.team.timezone_info),
+            ]
+
+    @snapshot_clickhouse_queries
+    @freeze_time("2021-01-21")
+    def test_element_chain_property_filter(self):
+        # Create an event with 'div' in elements_chain
+        _create_event(
+            event="$autocapture",
+            team=self.team,
+            distinct_id="test_user",
+            properties={"attr": "has div"},
+            elements=[
+                Element(
+                    tag_name="a",
+                    href="/test-url",
+                    attr_class=["link"],
+                    text="Click me",
+                    attributes={},
+                    nth_child=1,
+                    nth_of_type=0,
+                ),
+                Element(
+                    tag_name="div",
+                    attr_class=["container"],
+                    attr_id="main-container",
+                    nth_child=0,
+                    nth_of_type=0,
+                ),
+                Element(
+                    tag_name="button",
+                    attr_class=["btn", "btn-primary"],
+                    text="Submit",
+                    nth_child=0,
+                    nth_of_type=0,
+                ),
+            ],
+        )
+
+        # Create an event without elements_chain
+        _create_event(
+            event="$autocapture",
+            team=self.team,
+            distinct_id="test_user",
+            properties={"attr": "no div"},
+            elements=[
+                Element(
+                    tag_name="a",
+                    href="/test-url",
+                    attr_class=["link"],
+                    text="Click me",
+                    attributes={},
+                    nth_child=1,
+                    nth_of_type=0,
+                ),
+                Element(
+                    tag_name="button",
+                    attr_class=["btn", "btn-primary"],
+                    text="Submit",
+                    nth_child=0,
+                    nth_of_type=0,
+                ),
+            ],
+        )
+
+        # Filter for events with a specific element text in the elements chain with $elements_chain not_icontains
+        query = EventsQuery(
+            after="-24h",
+            event="$autocapture",
+            kind="EventsQuery",
+            orderBy=["timestamp ASC"],
+            select=["*"],
+            properties=[
+                EventPropertyFilter(
+                    key="$elements_chain",
+                    value="div",
+                    operator=PropertyOperator.NOT_ICONTAINS,
+                    type="event",
+                )
+            ],
+        )
+
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+        assert isinstance(response, CachedEventsQueryResponse)
+        self.assertEqual(len(response.results), 1)
+        self.assertEqual(response.results[0][0]["properties"]["attr"], "no div")
+
+    @snapshot_clickhouse_queries
+    @freeze_time("2021-01-21")
+    def test_presorted_events_table(self):
+        self._create_events(
+            data=[
+                (
+                    "p1",
+                    "2020-01-20T12:00:04Z",
+                    {"some_prop": "a"},
+                ),
+                (
+                    "p2",
+                    "2020-01-20T12:00:14Z",
+                    {"some_prop": "b"},
+                ),
+            ]
+        )
+        self._create_events(
+            data=[
+                (
+                    "p3",
+                    "2020-01-20T12:00:04Z",
+                    {"some_prop": "a"},
+                ),
+            ],
+            event="$pageleave",
+        )
+        flush_persons_and_events()
+        query = EventsQuery(
+            after="-7d",
+            event="$pageview",
+            kind="EventsQuery",
+            orderBy=["timestamp ASC"],
+            select=["*"],
+            properties=[
+                EventPropertyFilter(
+                    key="some_prop",
+                    value="a",
+                    operator=PropertyOperator.EXACT,
+                    type="event",
+                )
+            ],
+        )
+
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+
+        assert isinstance(response, CachedEventsQueryResponse)
+
+    @snapshot_clickhouse_queries
+    @freeze_time("2021-01-21")
+    def test_presorted_events_table_order_by_event(self):
+        """Test presorted optimization when ordering by event column."""
+        self._create_events(data=[("p2", "2021-01-20T12:00:14Z", {})], event="beta_event")
+        self._create_events(data=[("p3", "2021-01-20T12:00:24Z", {})], event="gamma_event")
+        self._create_events(data=[("p1", "2021-01-20T12:00:04Z", {})], event="alpha_event")
+        flush_persons_and_events()
+
+        query = EventsQuery(
+            after="-7d",
+            kind="EventsQuery",
+            orderBy=["event ASC"],
+            select=["*"],
+            offset=0,
+        )
+
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+
+        assert isinstance(response, CachedEventsQueryResponse)
+        assert len(response.results) == 3
+        # Alphabetical order: alpha < beta < gamma (different from creation order)
+        assert response.results[0][0]["distinct_id"] == "p1"
+        assert response.results[1][0]["distinct_id"] == "p2"
+        assert response.results[2][0]["distinct_id"] == "p3"
+
+    @snapshot_clickhouse_queries
+    @freeze_time("2021-01-21")
+    def test_presorted_events_table_order_by_property(self):
+        """Test presorted optimization when ordering by property."""
+        self._create_events(
+            data=[
+                ("p2", "2021-01-20T12:00:14Z", {"priority": "medium"}),
+                ("p3", "2021-01-20T12:00:24Z", {"priority": "urgent"}),
+                ("p1", "2021-01-20T12:00:04Z", {"priority": "low"}),
+            ]
+        )
+        flush_persons_and_events()
+
+        query = EventsQuery(
+            after="-7d",
+            event="$pageview",
+            kind="EventsQuery",
+            orderBy=["properties.priority ASC"],
+            select=["*"],
+            offset=0,
+        )
+
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+
+        assert isinstance(response, CachedEventsQueryResponse)
+        assert len(response.results) == 3
+        # Alphabetical order: low < medium < urgent (different from creation order)
+        assert response.results[0][0]["distinct_id"] == "p1"
+        assert response.results[1][0]["distinct_id"] == "p2"
+        assert response.results[2][0]["distinct_id"] == "p3"
+
+    @snapshot_clickhouse_queries
+    @freeze_time("2021-01-21")
+    def test_presorted_events_table_multiple_order_by(self):
+        """Test presorted optimization with multiple ORDER BY clauses."""
+        self._create_events(
+            data=[
+                ("p2", "2021-01-20T12:00:14Z", {}),
+                ("p1", "2021-01-20T12:00:04Z", {}),
+                ("p3", "2021-01-20T12:00:24Z", {}),
+            ]
+        )
+        flush_persons_and_events()
+
+        query = EventsQuery(
+            after="-7d",
+            event="$pageview",
+            kind="EventsQuery",
+            orderBy=["timestamp DESC", "event ASC"],
+            select=["*"],
+            offset=0,
+        )
+
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+
+        assert isinstance(response, CachedEventsQueryResponse)
+        assert len(response.results) == 3
+        # timestamp DESC: p3 (12:00:24) > p2 (12:00:14) > p1 (12:00:04)
+        assert response.results[0][0]["distinct_id"] == "p3"
+        assert response.results[1][0]["distinct_id"] == "p2"
+        assert response.results[2][0]["distinct_id"] == "p1"
+
+    def test_select_person_column(self):
+        self._create_events(
+            [
+                ("id3", "2020-01-11T12:00:01Z", {"some": "thing"}),
+                ("id4", "2020-01-11T12:00:02Z", {"some": "other"}),
+            ]
+        )
+        flush_persons_and_events()
+
+        query = EventsQuery(
+            kind="EventsQuery",
+            select=["person"],
+            orderBy=["timestamp ASC"],
+        )
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+        assert isinstance(response, CachedEventsQueryResponse)
+        # Should return two rows, each with a person dict
+        for row in response.results:
+            person = row[0]
+            assert isinstance(person, dict)
+            assert person["properties"]["foo"] == "bar"
+            assert person["distinct_id"] in ["id1", "id2"]
+            assert "uuid" in person
+            assert "created_at" in person
+
+    def test_person_display_name_field(self):
+        # Default: no custom display name properties
+        _create_person(
+            team_id=self.team.pk,
+            distinct_ids=["id_email", "id_anon"],
+            properties={"email": "user@email.com", "name": "Test User"},
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_email",
+            properties={},
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_anon",
+            properties={},
+        )
+        flush_persons_and_events()
+
+        query = EventsQuery(
+            kind="EventsQuery",
+            select=["event", "person_display_name -- Person"],
+            orderBy=["timestamp ASC"],
+        )
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+        assert isinstance(response, CachedEventsQueryResponse)
+        # Should use default display name property (email)
+        display_names = [row[1]["display_name"] for row in response.results]
+        assert set(display_names) == {"user@email.com"}
+
+    def test_person_display_name_field_2(self):
+        _create_person(
+            team_id=self.team.pk,
+            distinct_ids=["id_email", "id_anon"],
+            properties={"email": "user@email.com", "name": "Test User"},
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_email",
+            properties={},
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_anon",
+            properties={},
+        )
+        flush_persons_and_events()
+
+        # Now set custom person_display_name_properties on team
+        self.team.person_display_name_properties = ["name"]
+        self.team.save()
+        self.team.refresh_from_db()
+        query = EventsQuery(
+            kind="EventsQuery",
+            select=["event", "person_display_name -- Person"],
+            orderBy=["timestamp ASC"],
+        )
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+        assert isinstance(response, CachedEventsQueryResponse)
+        display_names = [row[1]["display_name"] for row in response.results]
+        assert set(display_names) == {"Test User"}
+
+    def test_person_display_name_field_fallback(self):
+        _create_person(
+            team_id=self.team.pk,
+            distinct_ids=["id_email", "id_anon"],
+            properties={"email": "user@email.com", "name": "Test User"},
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_email",
+            properties={},
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_anon",
+            properties={},
+        )
+        flush_persons_and_events()
+
+        # If property is missing, fallback to distinct_id
+        self.team.person_display_name_properties = ["nonexistent"]
+        self.team.save()
+        self.team.refresh_from_db()
+        query = EventsQuery(
+            kind="EventsQuery",
+            select=["event", "person_display_name -- Person"],
+            orderBy=["timestamp ASC"],
+        )
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+        assert isinstance(response, CachedEventsQueryResponse)
+        display_names = [row[1]["display_name"] for row in response.results]
+        assert set(display_names) == {"id_email", "id_anon"}
+
+    @parameterized.expand(
+        [
+            (
+                "empty_first_prop_falls_through",
+                ["name", "email"],
+                {"name": "", "email": "user@email.com"},
+                "user@email.com",
+            ),
+            ("all_props_empty_falls_back_to_distinct_id", ["name", "email"], {"name": "", "email": ""}, "id_email"),
+            (
+                "non_empty_value_still_wins",
+                ["name", "email"],
+                {"name": "Test User", "email": "user@email.com"},
+                "Test User",
+            ),
+        ]
+    )
+    def test_person_display_name_field_empty_string_fallthrough(
+        self, _name, display_name_properties, person_properties, expected_display_name
+    ):
+        # An empty-string property should fall through to the next configured property,
+        # the same way a missing property does.
+        _create_person(
+            team_id=self.team.pk,
+            distinct_ids=["id_email"],
+            properties=person_properties,
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_email",
+            properties={},
+        )
+        flush_persons_and_events()
+
+        self.team.person_display_name_properties = display_name_properties
+        self.team.save()
+        self.team.refresh_from_db()
+        query = EventsQuery(
+            kind="EventsQuery",
+            select=["event", "person_display_name -- Person"],
+            orderBy=["timestamp ASC"],
+        )
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+        assert isinstance(response, CachedEventsQueryResponse)
+        display_names = [row[1]["display_name"] for row in response.results]
+        assert set(display_names) == {expected_display_name}
+
+    def test_person_display_name_field_with_spaces_in_property_name(self):
+        _create_person(
+            team_id=self.team.pk,
+            distinct_ids=["id_spaced"],
+            properties={"email": "user@email.com", "Property With Spaces": "Test User With Spaces"},
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_spaced",
+            properties={},
+        )
+        flush_persons_and_events()
+
+        # Configure the team to use the property with spaces as display name
+        self.team.person_display_name_properties = ["Property With Spaces"]
+        self.team.save()
+        self.team.refresh_from_db()
+
+        query = EventsQuery(
+            kind="EventsQuery",
+            select=["event", "person_display_name -- Person"],
+            orderBy=["timestamp ASC"],
+        )
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+        assert isinstance(response, CachedEventsQueryResponse)
+        display_names = [row[1]["display_name"] for row in response.results]
+        assert set(display_names) == {"Test User With Spaces"}
+
+    def test_virtual_property(self):
+        _create_person(
+            team_id=self.team.pk,
+            distinct_ids=["id_spaced"],
+            properties={
+                "email": "user@email.com",
+                "Property With Spaces": "Test User With Spaces",
+                "$initial_utm_source": "facebook",
+            },
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_spaced",
+            properties={"utm_source": "facebook"},
+        )
+        flush_persons_and_events()
+
+        # Configure the team to use the property with spaces as display name
+        self.team.person_display_name_properties = ["Property With Spaces"]
+        self.team.save()
+        self.team.refresh_from_db()
+
+        query = EventsQuery(
+            kind="EventsQuery",
+            select=["event", "person_display_name -- Person", "person.properties.$virt_initial_channel_type"],
+            orderBy=["timestamp ASC"],
+        )
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+        assert isinstance(response, CachedEventsQueryResponse)
+        assert response.results[0][2] == "Organic Social"
+
+    def test_orderby_person_display_name_field(self):
+        _create_person(
+            team_id=self.team.pk,
+            distinct_ids=["id_email", "id_anon"],
+            properties={"email": "user@email.com", "name": "Test User"},
+        )
+        _create_person(
+            team_id=self.team.pk,
+            distinct_ids=["id_email_2", "id_anon_2"],
+            properties={"email": "user2@email.com", "name": "Test User 2"},
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_email",
+            properties={},
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_email_2",
+            properties={},
+        )
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_email_2",
+            properties={},
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="id_anon",
+            properties={},
+        )
+        flush_persons_and_events()
+
+        query = EventsQuery(
+            kind="EventsQuery",
+            select=["event", "person_display_name -- Person"],
+            orderBy=["person_display_name -- Person  DESC"],
+        )
+        runner = EventsQueryRunner(query=query, team=self.team)
+        response = runner.run()
+        assert isinstance(response, CachedEventsQueryResponse)
+        # Should use default display name property (email)
+        display_names = [row[1]["display_name"] for row in response.results]
+        assert display_names[0] == "user@email.com"
+
+    def test_presorted_pagination_does_not_double_offset(self):
+        self._create_events(
+            data=[
+                ("p1", "2020-01-11T12:00:01Z", {"idx": 1}),
+                ("p1", "2020-01-11T12:00:02Z", {"idx": 2}),
+                ("p1", "2020-01-11T12:00:03Z", {"idx": 3}),
+                ("p1", "2020-01-11T12:00:04Z", {"idx": 4}),
+                ("p1", "2020-01-11T12:00:05Z", {"idx": 5}),
+            ]
+        )
+
+        all_results = []
+        for offset in (0, 2, 4):
+            with freeze_time("2020-01-12"):
+                query = EventsQuery(
+                    kind="EventsQuery",
+                    select=["properties.idx", "timestamp"],
+                    after="2020-01-10",
+                    before="2020-01-13",
+                    orderBy=["timestamp ASC"],
+                    limit=2,
+                    offset=offset,
+                )
+                runner = EventsQueryRunner(query=query, team=self.team)
+                response = runner.run()
+
+            assert isinstance(response, CachedEventsQueryResponse)
+            all_results.extend(response.results)
+
+        actual_indices = [row[0] for row in all_results]
+        self.assertEqual(actual_indices, ["1", "2", "3", "4", "5"])
+
+    def test_cursor_pagination_sets_before(self):
+        query = EventsQuery(
+            kind="EventsQuery",
+            select=["*"],
+            orderBy=["timestamp DESC"],
+            limit=10,
+        )
+        runner = EventsQueryRunner(query=query, team=self.team)
+        runner.apply_pagination_cursor("2020-01-11T12:00:00+00:00")
+
+        self.assertEqual(runner.query.before, "2020-01-11T12:00:00+00:00")
+
+    def test_cursor_pagination_sets_after(self):
+        query = EventsQuery(
+            kind="EventsQuery",
+            select=["*"],
+            orderBy=["timestamp ASC"],
+            limit=10,
+        )
+        runner = EventsQueryRunner(query=query, team=self.team)
+        runner.apply_pagination_cursor("2020-01-11T12:00:00+00:00")
+
+        self.assertEqual(runner.query.after, "2020-01-11T12:00:00+00:00")
+
+    @also_test_with_different_timezones
+    @snapshot_clickhouse_queries
+    def test_cursor_pagination_multi_page_desc(self):
+        self._create_events(
+            data=[
+                ("p1", "2020-01-11T12:00:05Z", {"idx": "5"}),
+                ("p1", "2020-01-11T12:00:04Z", {"idx": "4"}),
+                ("p1", "2020-01-11T12:00:03Z", {"idx": "3"}),
+                ("p1", "2020-01-11T12:00:02Z", {"idx": "2"}),
+                ("p1", "2020-01-11T12:00:01Z", {"idx": "1"}),
+            ]
+        )
+
+        all_results = []
+        cursor = None
+        for _ in range(3):
+            with freeze_time("2020-01-12"):
+                query = EventsQuery(
+                    kind="EventsQuery",
+                    select=["properties.idx", "timestamp"],
+                    after="2020-01-10",
+                    orderBy=["timestamp DESC"],
+                    limit=2,
+                )
+                runner = EventsQueryRunner(query=query, team=self.team)
+                if cursor:
+                    runner.apply_pagination_cursor(cursor)
+                response = runner.run()
+
+            assert isinstance(response, CachedEventsQueryResponse)
+            all_results.extend(response.results)
+
+            if response.nextCursor:
+                cursor = response.nextCursor
+            else:
+                break
+
+        actual_indices = [row[0] for row in all_results]
+        self.assertEqual(actual_indices, ["5", "4", "3", "2", "1"])
+
+    @also_test_with_different_timezones
+    @snapshot_clickhouse_queries
+    def test_cursor_pagination_multi_page_asc(self):
+        self._create_events(
+            data=[
+                ("p1", "2020-01-11T12:00:01Z", {"idx": "1"}),
+                ("p1", "2020-01-11T12:00:02Z", {"idx": "2"}),
+                ("p1", "2020-01-11T12:00:03Z", {"idx": "3"}),
+                ("p1", "2020-01-11T12:00:04Z", {"idx": "4"}),
+                ("p1", "2020-01-11T12:00:05Z", {"idx": "5"}),
+            ]
+        )
+
+        all_results = []
+        cursor = None
+        for _ in range(3):
+            with freeze_time("2020-01-12"):
+                query = EventsQuery(
+                    kind="EventsQuery",
+                    select=["properties.idx", "timestamp"],
+                    after="2020-01-10",
+                    orderBy=["timestamp ASC"],
+                    limit=2,
+                )
+                runner = EventsQueryRunner(query=query, team=self.team)
+                if cursor:
+                    runner.apply_pagination_cursor(cursor)
+                response = runner.run()
+
+            assert isinstance(response, CachedEventsQueryResponse)
+            all_results.extend(response.results)
+
+            if response.nextCursor:
+                cursor = response.nextCursor
+            else:
+                break
+
+        actual_indices = [row[0] for row in all_results]
+        self.assertEqual(actual_indices, ["1", "2", "3", "4", "5"])
+
+    @also_test_with_different_timezones
+    @snapshot_clickhouse_queries
+    def test_cursor_not_returned_for_non_timestamp_order(self):
+        self._create_events(
+            data=[
+                ("p1", "2020-01-11T12:00:01Z", {"idx": "1"}),
+                ("p1", "2020-01-11T12:00:02Z", {"idx": "2"}),
+                ("p1", "2020-01-11T12:00:03Z", {"idx": "3"}),
+            ]
+        )
+
+        with freeze_time("2020-01-12"):
+            query = EventsQuery(
+                kind="EventsQuery",
+                select=["event", "timestamp"],
+                after="2020-01-10",
+                orderBy=["event ASC"],
+                limit=2,
+            )
+            runner = EventsQueryRunner(query=query, team=self.team)
+            response = runner.run()
+
+        assert isinstance(response, CachedEventsQueryResponse)
+        self.assertIsNone(response.nextCursor)
+
+    @also_test_with_different_timezones
+    @snapshot_clickhouse_queries
+    def test_cursor_not_returned_for_aggregation_query(self):
+        self._create_events(
+            data=[
+                ("p1", "2020-01-11T12:00:01Z", {}),
+                ("p2", "2020-01-11T12:00:02Z", {}),
+            ]
+        )
+
+        with freeze_time("2020-01-12"):
+            query = EventsQuery(
+                kind="EventsQuery",
+                select=["count()", "timestamp"],
+                after="2020-01-10",
+                limit=2,
+            )
+            runner = EventsQueryRunner(query=query, team=self.team)
+            response = runner.run()
+
+        assert isinstance(response, CachedEventsQueryResponse)
+        self.assertIsNone(response.nextCursor)
+
+    @also_test_with_different_timezones
+    @snapshot_clickhouse_queries
+    def test_cursor_with_star_select(self):
+        self._create_events(
+            data=[
+                ("p1", "2020-01-11T12:00:03Z", {}),
+                ("p1", "2020-01-11T12:00:02Z", {}),
+                ("p1", "2020-01-11T12:00:01Z", {}),
+            ]
+        )
+
+        with freeze_time("2020-01-12"):
+            query = EventsQuery(
+                kind="EventsQuery",
+                select=["*"],
+                after="2020-01-10",
+                orderBy=["timestamp DESC"],
+                limit=2,
+            )
+            runner = EventsQueryRunner(query=query, team=self.team)
+            response = runner.run()
+
+        assert isinstance(response, CachedEventsQueryResponse)
+        assert response.nextCursor is not None
+        self.assertEqual(datetime.fromisoformat(response.nextCursor), datetime.fromisoformat("2020-01-11T12:00:02Z"))
+
+    def test_action_steps_filters_events(self):
+        self._create_events(
+            data=[
+                ("p1", "2020-01-11T12:00:01Z", {"$current_url": "https://example.com/page"}),
+            ],
+            event="$pageview",
+        )
+        self._create_events(
+            data=[
+                ("p2", "2020-01-11T12:00:02Z", {}),
+            ],
+            event="custom_event",
+        )
+
+        with freeze_time("2020-01-12"):
+            query = EventsQuery(
+                kind="EventsQuery",
+                select=["*"],
+                after="2020-01-10",
+                actionSteps=[EventsQueryActionStep(event="$pageview")],
+            )
+            runner = EventsQueryRunner(query=query, team=self.team)
+            response = runner.run()
+
+        assert isinstance(response, CachedEventsQueryResponse)
+        self.assertEqual(len(response.results), 1)
+        self.assertEqual(response.results[0][0]["event"], "$pageview")
+
+    def _enable_property_access_control(self) -> None:
+        from posthog.constants import AvailableFeature
+
+        self.organization.available_product_features = [
+            {"name": AvailableFeature.PROPERTY_ACCESS_CONTROL, "key": AvailableFeature.PROPERTY_ACCESS_CONTROL}
+        ]
+        self.organization.save()
+
+    @freeze_time("2020-01-11T12:00:05Z")
+    def test_restricted_person_properties_stripped_from_person_column(self):
+        from posthog.models import PropertyDefinition
+
+        from products.access_control.backend.models.property_access_control import PropertyAccessControl
+        from products.access_control.backend.property_access_control import PropertyAccessLevel
+
+        self._enable_property_access_control()
+
+        _create_person(
+            team_id=self.team.pk,
+            distinct_ids=["p1"],
+            properties={"email": "secret@example.com", "name": "Test User"},
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="p1",
+            timestamp="2020-01-11T12:00:01Z",
+            properties={"$browser": "Chrome"},
+        )
+        flush_persons_and_events()
+
+        # restrict "email" person property
+        prop_def = PropertyDefinition.objects.create(
+            team=self.team,
+            name="email",
+            type=PropertyDefinition.Type.PERSON,
+        )
+        PropertyAccessControl.objects.create(
+            team=self.team,
+            property_definition=prop_def,
+            access_level=PropertyAccessLevel.NONE.value,
+        )
+
+        query = EventsQuery(select=["person"], after="2020-01-10")
+        runner = EventsQueryRunner(query=query, team=self.team, user=self.user)
+        response = runner.run()
+
+        assert isinstance(response, CachedEventsQueryResponse)
+        assert len(response.results) > 0
+        person_data = response.results[0][0]
+        assert "email" not in person_data["properties"]
+        assert "name" in person_data["properties"]
+
+    @freeze_time("2020-01-11T12:00:05Z")
+    def test_restricted_event_property_in_select_raises_error(self):
+        from posthog.hogql.errors import ResolutionError
+
+        from posthog.models import PropertyDefinition
+
+        from products.access_control.backend.models.property_access_control import PropertyAccessControl
+        from products.access_control.backend.property_access_control import PropertyAccessLevel
+
+        self._enable_property_access_control()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="p1",
+            timestamp="2020-01-11T12:00:01Z",
+            properties={"secret_field": "hidden"},
+        )
+        flush_persons_and_events()
+
+        prop_def = PropertyDefinition.objects.create(
+            team=self.team,
+            name="secret_field",
+            type=PropertyDefinition.Type.EVENT,
+        )
+        PropertyAccessControl.objects.create(
+            team=self.team,
+            property_definition=prop_def,
+            access_level=PropertyAccessLevel.NONE.value,
+        )
+
+        query = EventsQuery(select=["properties.secret_field"], after="2020-01-10")
+        runner = EventsQueryRunner(query=query, team=self.team, user=self.user)
+        with self.assertRaises(ResolutionError):
+            runner.run()
+
+    @freeze_time("2020-01-11T12:00:05Z")
+    def test_users_with_different_restrictions_get_different_cache_keys(self):
+        self._enable_property_access_control()
+
+        # create a second user in the same org
+        other_user = self._create_user("other@posthog.com")
+        OrganizationMembership.objects.get(user=other_user, organization=self.organization)
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="p1",
+            timestamp="2020-01-11T12:00:01Z",
+            properties={"secret_field": "hidden", "public_field": "visible"},
+        )
+        flush_persons_and_events()
+
+        prop_def = PropertyDefinition.objects.create(
+            team=self.team,
+            name="secret_field",
+            type=PropertyDefinition.Type.EVENT,
+        )
+        # default: no access
+        PropertyAccessControl.objects.create(
+            team=self.team,
+            property_definition=prop_def,
+            access_level=PropertyAccessLevel.NONE.value,
+        )
+        # self.user gets read_write override
+        PropertyAccessControl.objects.create(
+            team=self.team,
+            property_definition=prop_def,
+            access_level=PropertyAccessLevel.READ_WRITE.value,
+            organization_member=self.organization_membership,
+        )
+
+        query = EventsQuery(select=["event", "properties.public_field"], after="2020-01-10")
+
+        # the unrestricted user and the restricted user should get different cache keys
+        runner_unrestricted = EventsQueryRunner(query=query, team=self.team, user=self.user)
+        runner_restricted = EventsQueryRunner(query=query, team=self.team, user=other_user)
+
+        key_unrestricted = runner_unrestricted.get_cache_key()
+        key_restricted = runner_restricted.get_cache_key()
+
+        assert key_unrestricted != key_restricted, (
+            "Users with different property access restrictions must get different cache keys"
+        )
+
+    @freeze_time("2020-01-11T12:00:05Z")
+    def test_users_without_restrictions_share_cache_key(self):
+        # no property access control rules — both users should share the same cache key
+        other_user = self._create_user("other@posthog.com")
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="p1",
+            timestamp="2020-01-11T12:00:01Z",
+        )
+        flush_persons_and_events()
+
+        query = EventsQuery(select=["event"], after="2020-01-10")
+
+        runner_a = EventsQueryRunner(query=query, team=self.team, user=self.user)
+        runner_b = EventsQueryRunner(query=query, team=self.team, user=other_user)
+
+        assert runner_a.get_cache_key() == runner_b.get_cache_key(), (
+            "Users without property access restrictions should share the same cache key"
+        )
+
+    @freeze_time("2020-01-11T12:00:05Z")
+    def test_cached_results_not_served_across_restriction_boundaries(self):
+        from posthog.models import PropertyDefinition
+
+        from products.access_control.backend.models.property_access_control import PropertyAccessControl
+        from products.access_control.backend.property_access_control import PropertyAccessLevel
+
+        self._enable_property_access_control()
+
+        other_user = self._create_user("other@posthog.com")
+
+        _create_person(
+            team_id=self.team.pk,
+            distinct_ids=["p1"],
+            properties={"email": "secret@example.com", "name": "Test User"},
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="p1",
+            timestamp="2020-01-11T12:00:01Z",
+            properties={"public_field": "visible"},
+        )
+        flush_persons_and_events()
+
+        prop_def = PropertyDefinition.objects.create(
+            team=self.team,
+            name="email",
+            type=PropertyDefinition.Type.PERSON,
+        )
+        # default: no access
+        PropertyAccessControl.objects.create(
+            team=self.team,
+            property_definition=prop_def,
+            access_level=PropertyAccessLevel.NONE.value,
+        )
+        # self.user gets read_write override
+        PropertyAccessControl.objects.create(
+            team=self.team,
+            property_definition=prop_def,
+            access_level=PropertyAccessLevel.READ_WRITE.value,
+            organization_member=self.organization_membership,
+        )
+
+        query = EventsQuery(select=["person"], after="2020-01-10")
+
+        # run as unrestricted user first — results get cached
+        runner_unrestricted = EventsQueryRunner(query=query, team=self.team, user=self.user)
+        response_unrestricted = runner_unrestricted.run()
+        assert isinstance(response_unrestricted, CachedEventsQueryResponse)
+        person_unrestricted = response_unrestricted.results[0][0]
+        assert "email" in person_unrestricted["properties"]
+
+        # run as restricted user — should NOT get the cached unrestricted results
+        runner_restricted = EventsQueryRunner(query=query, team=self.team, user=other_user)
+        response_restricted = runner_restricted.run()
+        assert isinstance(response_restricted, CachedEventsQueryResponse)
+        person_restricted = response_restricted.results[0][0]
+        assert "email" not in person_restricted["properties"]

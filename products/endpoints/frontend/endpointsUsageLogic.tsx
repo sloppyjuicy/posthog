@@ -1,0 +1,311 @@
+import { actions, connect, kea, listeners, path, reducers, selectors } from 'kea'
+import { router, urlToAction } from 'kea-router'
+
+import { dayjs } from 'lib/dayjs'
+import { trackedActionToUrl } from 'lib/logic/scenes/trackedActionToUrl'
+import { dateStringToDayJs } from 'lib/utils/dateFilters'
+import { urls } from 'scenes/urls'
+
+import {
+    EndpointsUsageBreakdown,
+    EndpointsUsageOverviewQuery,
+    EndpointsUsageTableQuery,
+    EndpointsUsageTrendsQuery,
+    NodeKind,
+} from '~/queries/schema/schema-general'
+import { EndpointType, IntervalType } from '~/types'
+
+import { endpointsLogic } from './endpointsLogic'
+import type { endpointsUsageLogicType } from './endpointsUsageLogicType'
+
+export const INITIAL_DATE_FROM = '-7d'
+export const INITIAL_DATE_TO = null as string | null
+export const INITIAL_INTERVAL: IntervalType = 'day'
+
+export const endpointsUsageLogic = kea<endpointsUsageLogicType>([
+    path(['products', 'endpoints', 'frontend', 'endpointsUsageLogic']),
+    connect(() => ({
+        values: [endpointsLogic(), ['allEndpoints', 'allEndpointsLoading']],
+    })),
+
+    actions({
+        setDates: (dateFrom: string | null, dateTo: string | null) => ({ dateFrom, dateTo }),
+        setEndpointFilter: (endpointFilter: string[]) => ({ endpointFilter }),
+        setMaterializationType: (materializationType: 'materialized' | 'inline' | null) => ({ materializationType }),
+        setInterval: (interval: IntervalType) => ({ interval }),
+        setBreakdownBy: (breakdownBy: EndpointsUsageBreakdown | null) => ({ breakdownBy }),
+        refresh: true,
+        clearCooldown: true,
+    }),
+
+    reducers({
+        dateFilter: [
+            {
+                dateFrom: INITIAL_DATE_FROM,
+                dateTo: INITIAL_DATE_TO,
+            } as { dateFrom: string | null; dateTo: string | null },
+            {
+                setDates: (_, { dateFrom, dateTo }) => ({ dateFrom, dateTo }),
+            },
+        ],
+        endpointFilter: [
+            [] as string[],
+            {
+                setEndpointFilter: (_, { endpointFilter }) => endpointFilter,
+            },
+        ],
+        materializationType: [
+            null as 'materialized' | 'inline' | null,
+            {
+                setMaterializationType: (_, { materializationType }) => materializationType,
+            },
+        ],
+        interval: [
+            INITIAL_INTERVAL as IntervalType,
+            {
+                setInterval: (_, { interval }) => interval,
+            },
+        ],
+        breakdownBy: [
+            null as EndpointsUsageBreakdown | null,
+            {
+                setBreakdownBy: (_, { breakdownBy }) => breakdownBy,
+            },
+        ],
+        cooldownActive: [
+            false,
+            {
+                refresh: () => true,
+                clearCooldown: () => false,
+            },
+        ],
+        refreshKey: [
+            0,
+            {
+                refresh: (state) => state + 1,
+            },
+        ],
+    }),
+
+    selectors({
+        endpointNames: [
+            (s) => [s.allEndpoints],
+            (allEndpoints: EndpointType[]): string[] => allEndpoints.map((e) => e.name).sort(),
+        ],
+        activeEndpointNames: [
+            (s) => [s.endpointNames],
+            (endpointNames: string[]): Set<string> => new Set(endpointNames),
+        ],
+        endpointNamesLoading: [(s) => [s.allEndpointsLoading], (loading: boolean): boolean => loading],
+        canRefresh: [(s) => [s.cooldownActive], (cooldownActive: boolean): boolean => !cooldownActive],
+        dateRange: [
+            (s) => [s.dateFilter],
+            (dateFilter): { date_from: string | null; date_to: string | null } => {
+                const dateFromDayjs = dateStringToDayJs(dateFilter.dateFrom)
+                const dateToDayjs = dateFilter.dateTo ? dateStringToDayJs(dateFilter.dateTo) : null
+
+                return {
+                    date_from: dateFromDayjs?.format('YYYY-MM-DD') ?? dayjs().subtract(7, 'day').format('YYYY-MM-DD'),
+                    date_to: dateToDayjs?.format('YYYY-MM-DD') ?? null,
+                }
+            },
+        ],
+
+        overviewQuery: [
+            (s) => [s.dateRange, s.endpointFilter, s.materializationType],
+            (dateRange, endpointFilter, materializationType): EndpointsUsageOverviewQuery => ({
+                kind: NodeKind.EndpointsUsageOverviewQuery,
+                dateRange,
+                endpointNames: endpointFilter.length > 0 ? endpointFilter : undefined,
+                materializationType,
+                compareFilter: { compare: true },
+            }),
+        ],
+
+        requestsTrendsQuery: [
+            (s) => [s.dateRange, s.endpointFilter, s.materializationType, s.interval, s.breakdownBy],
+            (dateRange, endpointFilter, materializationType, interval, breakdownBy): EndpointsUsageTrendsQuery => ({
+                kind: NodeKind.EndpointsUsageTrendsQuery,
+                dateRange,
+                endpointNames: endpointFilter.length > 0 ? endpointFilter : undefined,
+                materializationType,
+                metric: 'requests',
+                interval,
+                breakdownBy: breakdownBy ?? undefined,
+            }),
+        ],
+
+        bytesReadTrendsQuery: [
+            (s) => [s.dateRange, s.endpointFilter, s.materializationType, s.interval, s.breakdownBy],
+            (dateRange, endpointFilter, materializationType, interval, breakdownBy): EndpointsUsageTrendsQuery => ({
+                kind: NodeKind.EndpointsUsageTrendsQuery,
+                dateRange,
+                endpointNames: endpointFilter.length > 0 ? endpointFilter : undefined,
+                materializationType,
+                metric: 'bytes_read',
+                interval,
+                breakdownBy: breakdownBy ?? undefined,
+            }),
+        ],
+
+        cpuSecondsTrendsQuery: [
+            (s) => [s.dateRange, s.endpointFilter, s.materializationType, s.interval, s.breakdownBy],
+            (dateRange, endpointFilter, materializationType, interval, breakdownBy): EndpointsUsageTrendsQuery => ({
+                kind: NodeKind.EndpointsUsageTrendsQuery,
+                dateRange,
+                endpointNames: endpointFilter.length > 0 ? endpointFilter : undefined,
+                materializationType,
+                metric: 'cpu_seconds',
+                interval,
+                breakdownBy: breakdownBy ?? undefined,
+            }),
+        ],
+
+        queryDurationTrendsQuery: [
+            (s) => [s.dateRange, s.endpointFilter, s.materializationType, s.interval, s.breakdownBy],
+            (dateRange, endpointFilter, materializationType, interval, breakdownBy): EndpointsUsageTrendsQuery => ({
+                kind: NodeKind.EndpointsUsageTrendsQuery,
+                dateRange,
+                endpointNames: endpointFilter.length > 0 ? endpointFilter : undefined,
+                materializationType,
+                metric: 'query_duration',
+                interval,
+                breakdownBy: breakdownBy ?? undefined,
+            }),
+        ],
+
+        errorRateTrendsQuery: [
+            (s) => [s.dateRange, s.endpointFilter, s.materializationType, s.interval, s.breakdownBy],
+            (dateRange, endpointFilter, materializationType, interval, breakdownBy): EndpointsUsageTrendsQuery => ({
+                kind: NodeKind.EndpointsUsageTrendsQuery,
+                dateRange,
+                endpointNames: endpointFilter.length > 0 ? endpointFilter : undefined,
+                materializationType,
+                metric: 'error_rate',
+                interval,
+                breakdownBy: breakdownBy ?? undefined,
+            }),
+        ],
+
+        endpointTableQuery: [
+            (s) => [s.dateRange, s.endpointFilter, s.materializationType],
+            (dateRange, endpointFilter, materializationType): EndpointsUsageTableQuery => ({
+                kind: NodeKind.EndpointsUsageTableQuery,
+                dateRange,
+                endpointNames: endpointFilter.length > 0 ? endpointFilter : undefined,
+                materializationType,
+                breakdownBy: EndpointsUsageBreakdown.Endpoint,
+                orderBy: ['requests', 'DESC'],
+                limit: 100,
+            }),
+        ],
+    }),
+
+    listeners(({ actions }) => ({
+        refresh: () => {
+            setTimeout(
+                () => {
+                    actions.clearCooldown()
+                },
+                15 * 60 * 1000
+            )
+        },
+    })),
+
+    trackedActionToUrl(({ values }) => {
+        const actionToUrl = ({
+            dateFilter = values.dateFilter,
+            endpointFilter = values.endpointFilter,
+            materializationType = values.materializationType,
+            interval = values.interval,
+            breakdownBy = values.breakdownBy,
+        }): [string, Record<string, any> | undefined, string | undefined] | undefined => {
+            const { dateFrom, dateTo } = dateFilter
+            const searchParams = { ...router.values.searchParams }
+
+            if (dateFrom !== INITIAL_DATE_FROM) {
+                searchParams.dateFrom = dateFrom
+            } else {
+                delete searchParams.dateFrom
+            }
+
+            if (dateTo !== INITIAL_DATE_TO) {
+                searchParams.dateTo = dateTo
+            } else {
+                delete searchParams.dateTo
+            }
+
+            if (endpointFilter.length > 0) {
+                searchParams.endpointFilter = endpointFilter.join(',')
+            } else {
+                delete searchParams.endpointFilter
+            }
+
+            if (materializationType !== null) {
+                searchParams.materializationType = materializationType
+            } else {
+                delete searchParams.materializationType
+            }
+
+            if (interval !== INITIAL_INTERVAL) {
+                searchParams.interval = interval
+            } else {
+                delete searchParams.interval
+            }
+
+            if (breakdownBy !== null) {
+                searchParams.breakdownBy = breakdownBy
+            } else {
+                delete searchParams.breakdownBy
+            }
+
+            return [router.values.location.pathname, searchParams, router.values.location.hash]
+        }
+
+        return {
+            setDates: actionToUrl,
+            setEndpointFilter: actionToUrl,
+            setMaterializationType: actionToUrl,
+            setInterval: actionToUrl,
+            setBreakdownBy: actionToUrl,
+        }
+    }),
+
+    urlToAction(({ actions, values }) => ({
+        [urls.endpoints()]: (_, searchParams) => {
+            if (searchParams.tab !== 'usage') {
+                return
+            }
+            const { dateFrom, dateTo, endpointFilter, materializationType, interval, breakdownBy } = searchParams
+
+            const nextDateFrom = dateFrom ?? INITIAL_DATE_FROM
+            const nextDateTo = dateTo ?? INITIAL_DATE_TO
+            if (nextDateFrom !== values.dateFilter.dateFrom || nextDateTo !== values.dateFilter.dateTo) {
+                actions.setDates(nextDateFrom, nextDateTo)
+            }
+
+            const nextEndpointFilter: string[] = endpointFilter ? endpointFilter.split(',') : []
+            if (
+                nextEndpointFilter.length !== values.endpointFilter.length ||
+                nextEndpointFilter.some((v: string, i: number) => v !== values.endpointFilter[i])
+            ) {
+                actions.setEndpointFilter(nextEndpointFilter)
+            }
+
+            const nextMaterializationType = materializationType ?? null
+            if (nextMaterializationType !== values.materializationType) {
+                actions.setMaterializationType(nextMaterializationType)
+            }
+
+            const nextInterval = interval ?? INITIAL_INTERVAL
+            if (nextInterval !== values.interval) {
+                actions.setInterval(nextInterval)
+            }
+
+            const nextBreakdownBy = breakdownBy ?? null
+            if (nextBreakdownBy !== values.breakdownBy) {
+                actions.setBreakdownBy(nextBreakdownBy)
+            }
+        },
+    })),
+])

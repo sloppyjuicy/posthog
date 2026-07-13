@@ -1,0 +1,244 @@
+import { actions, afterMount, connect, kea, listeners, path, props, reducers, selectors } from 'kea'
+import { subscriptions } from 'kea-subscriptions'
+
+import { objectsEqual } from 'lib/utils/objects'
+import { identifierToHuman } from 'lib/utils/strings'
+import { stripHTTP } from 'lib/utils/url'
+import { organizationLogic } from 'scenes/organizationLogic'
+import { preflightLogic } from 'scenes/PreflightCheck/preflightLogic'
+import { projectLogic } from 'scenes/projectLogic'
+import { sceneLogic } from 'scenes/sceneLogic'
+import { teamLogic } from 'scenes/teamLogic'
+import { userLogic } from 'scenes/userLogic'
+
+import { Breadcrumb, ProjectTreeRef } from '~/types'
+
+import type { breadcrumbsLogicType } from './breadcrumbsLogicType'
+
+export const breadcrumbsLogic = kea<breadcrumbsLogicType>([
+    path(['layout', 'navigation', 'Breadcrumbs', 'breadcrumbsLogic']),
+    props(
+        {} as {
+            hashParams: Record<string, any>
+        }
+    ),
+    connect(() => ({
+        values: [
+            preflightLogic,
+            ['preflight'],
+            sceneLogic,
+            ['sceneConfig', 'activeSceneId'],
+            userLogic,
+            ['user', 'otherOrganizations'],
+            organizationLogic,
+            ['currentOrganization'],
+            projectLogic,
+            ['currentProject'],
+            teamLogic,
+            ['currentTeam'],
+        ],
+    })),
+    actions({
+        setActionsContainer: (element: HTMLElement | null) => ({ element }),
+        tentativelyRename: (breadcrumbGlobalKey: string, tentativeName: string) => ({
+            breadcrumbGlobalKey,
+            tentativeName,
+        }),
+        finishRenaming: true,
+    }),
+    reducers({
+        actionsContainer: [
+            null as HTMLElement | null,
+            {
+                setActionsContainer: (_, { element }) => element,
+            },
+        ],
+        renameState: [
+            null as [breadcrumbGlobalKey: string, tentativeName: string] | null,
+            {
+                tentativelyRename: (_, { breadcrumbGlobalKey, tentativeName }) => [breadcrumbGlobalKey, tentativeName],
+                finishRenaming: () => null,
+            },
+        ],
+    }),
+    listeners(({ actions, values }) => ({
+        [sceneLogic.actionTypes.loadScene]: () => {
+            if (values.renameState) {
+                actions.finishRenaming() // Cancel renaming on navigation away
+            }
+        },
+    })),
+    selectors(() => ({
+        sceneBreadcrumbs: [
+            (s) => [
+                // We're effectively passing the selector through to the scene logic, and "recalculating"
+                // this every time it's rendered. Caching will happen within the scene's breadcrumb selector.
+                (state, props): Breadcrumb[] => {
+                    const activeSceneLogic = sceneLogic.selectors.activeSceneLogic(state, props)
+                    const activeSceneId = s.activeSceneId(state, props)
+
+                    if (activeSceneLogic && 'breadcrumbs' in activeSceneLogic.selectors) {
+                        try {
+                            const activeLoadedScene = sceneLogic.selectors.activeLoadedScene(state, props)
+                            return activeSceneLogic.selectors.breadcrumbs(state, {
+                                ...(activeLoadedScene?.paramsToProps?.(activeLoadedScene?.sceneParams) || props),
+                            })
+                        } catch {
+                            // If the breadcrumb selector fails, we'll just ignore it and return an empty array below
+                        }
+                    }
+
+                    if (activeSceneId) {
+                        const sceneConfig = s.sceneConfig(state, props)
+                        return [{ name: sceneConfig?.name ?? identifierToHuman(activeSceneId), key: activeSceneId }]
+                    }
+                    return []
+                },
+            ],
+            (crumbs): Breadcrumb[] => crumbs,
+            { resultEqualityCheck: objectsEqual },
+        ],
+        projectTreeRef: [
+            () => [
+                // Similar logic to the breadcrumbs above. This is used to find the object in the project tree.
+                (state, props): ProjectTreeRef | null => {
+                    const activeSceneLogic = sceneLogic.selectors.activeSceneLogic(state, props)
+                    if (activeSceneLogic && 'projectTreeRef' in activeSceneLogic.selectors) {
+                        try {
+                            const activeLoadedScene = sceneLogic.selectors.activeLoadedScene(state, props)
+                            return activeSceneLogic.selectors.projectTreeRef(state, {
+                                ...(activeLoadedScene?.paramsToProps?.(activeLoadedScene?.sceneParams) || props),
+                            })
+                        } catch {
+                            // If the breadcrumb selector fails, we'll just ignore it and return null below
+                        }
+                    }
+                    return null
+                },
+            ],
+            (ref: ProjectTreeRef | null): ProjectTreeRef | null => ref,
+            { resultEqualityCheck: objectsEqual },
+        ],
+        appBreadcrumbs: [
+            (s) => [s.preflight, s.sceneConfig, s.activeSceneId, s.user, s.currentProject, s.currentTeam],
+            (preflight, sceneConfig, activeSceneId, user, currentProject, currentTeam) => {
+                const breadcrumbs: Breadcrumb[] = []
+                if (!activeSceneId || !sceneConfig) {
+                    return breadcrumbs
+                }
+                // User
+                if (sceneConfig.personal) {
+                    if (!user) {
+                        return breadcrumbs
+                    }
+                    breadcrumbs.push({
+                        key: 'me',
+                        name: user.first_name,
+                    })
+                }
+                // Instance
+                if (sceneConfig.instanceLevel) {
+                    if (!preflight?.site_url) {
+                        return breadcrumbs
+                    }
+                    breadcrumbs.push({
+                        key: 'instance',
+                        name: stripHTTP(preflight.site_url),
+                    })
+                }
+                // Project
+                if (sceneConfig.projectBased) {
+                    if (!currentProject || !currentTeam) {
+                        return breadcrumbs
+                    }
+                    breadcrumbs.push({
+                        key: 'project',
+                        name: currentTeam.name,
+                        tag: null,
+                        isPopoverProject: true,
+                    })
+                }
+
+                return breadcrumbs
+            },
+        ],
+        sceneBreadcrumbKeys: [
+            (s) => [s.sceneBreadcrumbs],
+            (sceneBreadcrumbs): Breadcrumb['key'][] => sceneBreadcrumbs.map((breadcrumb) => breadcrumb.key),
+        ],
+        breadcrumbs: [
+            (s) => [s.appBreadcrumbs, s.sceneBreadcrumbs],
+            (appBreadcrumbs, sceneBreadcrumbs): Breadcrumb[] => {
+                return appBreadcrumbs.concat(sceneBreadcrumbs)
+            },
+        ],
+        firstBreadcrumb: [(s) => [s.breadcrumbs], (breadcrumbs) => breadcrumbs[0]],
+        tailBreadcrumbs: [
+            (s) => [s.breadcrumbs],
+            (breadcrumbs) => {
+                const tailBreadcrumbs = breadcrumbs.slice(1)
+                // Remove "path" from the last breadcrumb to disable its link
+                if (tailBreadcrumbs.length > 0) {
+                    delete tailBreadcrumbs[tailBreadcrumbs.length - 1].path
+                }
+                return tailBreadcrumbs
+            },
+        ],
+        sceneBreadcrumbsDisplayString: [
+            (s) => [s.sceneBreadcrumbs],
+            (sceneBreadcrumbs): string =>
+                sceneBreadcrumbs
+                    .filter((breadcrumb) => !!breadcrumb.name)
+                    .map((breadcrumb) => breadcrumb.name)
+                    .join(' / '),
+        ],
+        documentTitle: [
+            (s) => [s.sceneBreadcrumbs, s.preflight],
+            (sceneBreadcrumbs, preflight): string =>
+                [
+                    ...sceneBreadcrumbs
+                        .filter((breadcrumb) => !!breadcrumb.name)
+                        .map((breadcrumb) => breadcrumb.name)
+                        .reverse(),
+                    preflight?.demo ? 'PostHog Demo' : 'PostHog',
+                ].join(' • '),
+        ],
+    })),
+    afterMount(({ cache }) => {
+        cache.syncTitle = (): void => {
+            const isVisible = document.visibilityState === 'visible'
+            if (isVisible) {
+                cache.hasBeenVisible = true
+            }
+            if (cache.desiredTitle == null || document.title === cache.desiredTitle) {
+                return
+            }
+            // Chrome treats background title updates as a reason to keep a tab alive, so we
+            // defer syncing while hidden — except for a tab the user has never looked at yet
+            // (duplicated tab, restored session, cmd+click). That tab is still settling on its
+            // title and should reflect the scene so it's identifiable in the strip. The keepalive
+            // abuse case is a tab that was viewed then churns its title in the background, which
+            // this still defers.
+            if (isVisible || !cache.hasBeenVisible) {
+                document.title = cache.desiredTitle
+            }
+        }
+        cache.disposables.add(
+            () => {
+                document.addEventListener('visibilitychange', cache.syncTitle)
+                return () => document.removeEventListener('visibilitychange', cache.syncTitle)
+            },
+            'titleSync',
+            { pauseOnPageHidden: false }
+        )
+    }),
+    subscriptions(({ cache }) => ({
+        documentTitle: (documentTitle: string) => {
+            if (typeof document === 'undefined') {
+                return
+            }
+            cache.desiredTitle = documentTitle
+            cache.syncTitle?.()
+        },
+    })),
+])

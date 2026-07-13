@@ -1,0 +1,113 @@
+import { BindLogic, kea, path, props, selectors, useValues } from 'kea'
+
+import { LemonSkeleton } from '@posthog/lemon-ui'
+
+import { NotFound } from 'lib/components/NotFound'
+import { capitalizeFirstLetter } from 'lib/utils/strings'
+import { humanizeHogFunctionType } from 'scenes/hog-functions/hog-function-utils'
+import { HogFunctionTemplateList } from 'scenes/hog-functions/list/HogFunctionTemplateList'
+import { Scene, SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import { Breadcrumb } from '~/types'
+
+import { availableSourcesLogic } from 'products/data_warehouse/frontend/scenes/NewSourceScene/availableSourcesLogic'
+import { SourceCatalog } from 'products/data_warehouse/frontend/scenes/NewSourceScene/SourceCatalog'
+import { sourceWizardLogic } from 'products/data_warehouse/frontend/scenes/NewSourceScene/sourceWizardLogic'
+
+import type { dataPipelinesNewSceneLogicType } from './DataPipelinesNewSceneType'
+import { nonHogFunctionTemplatesLogic } from './utils/nonHogFunctionTemplatesLogic'
+
+export type DataPipelinesNewSceneKind = 'transformation' | 'destination' | 'source' | 'site_app'
+
+export type DataPipelinesNewSceneProps = {
+    kind: DataPipelinesNewSceneKind
+}
+
+export const dataPipelinesNewSceneLogic = kea<dataPipelinesNewSceneLogicType>([
+    props({} as DataPipelinesNewSceneProps),
+    path(() => ['scenes', 'data-pipelines', 'dataPipelinesNewSceneLogic']),
+    selectors({
+        logicProps: [() => [(_, props) => props], (props) => props],
+        breadcrumbs: [
+            () => [(_, props) => props],
+            ({ kind }: DataPipelinesNewSceneProps): Breadcrumb[] => {
+                const sceneMapping: Record<DataPipelinesNewSceneKind, { scene: Scene; url: () => string }> = {
+                    source: { scene: Scene.Sources, url: urls.sources },
+                    transformation: { scene: Scene.Transformations, url: urls.transformations },
+                    destination: { scene: Scene.Destinations, url: urls.destinations },
+                    site_app: { scene: Scene.WebScripts, url: urls.webScripts },
+                }
+
+                const mapping = sceneMapping[kind]
+
+                return [
+                    {
+                        key: mapping.scene,
+                        name: capitalizeFirstLetter(humanizeHogFunctionType(kind, true)),
+                        path: mapping.url(),
+                        iconType: 'data_pipeline',
+                    },
+                    {
+                        key: Scene.DataPipelinesNew,
+                        name: 'New ' + humanizeHogFunctionType(kind),
+                        iconType: 'data_pipeline',
+                    },
+                ]
+            },
+        ],
+    }),
+])
+
+export const scene: SceneExport = {
+    component: DataPipelinesNewScene,
+    logic: dataPipelinesNewSceneLogic,
+    paramsToProps: ({ params: { kind } }): (typeof dataPipelinesNewSceneLogic)['props'] => ({
+        kind: kind || 'site_app', // Default to 'site_app' for /apps/new route
+    }),
+}
+
+export function DataPipelinesNewScene(): JSX.Element {
+    const { logicProps } = useValues(dataPipelinesNewSceneLogic)
+    const { kind } = logicProps
+
+    const { availableSources, availableSourcesLoading } = useValues(availableSourcesLogic)
+    const { hogFunctionTemplatesBatchExports } = useValues(
+        nonHogFunctionTemplatesLogic({
+            availableSources: availableSources ?? {},
+        })
+    )
+
+    const humanizedKind = humanizeHogFunctionType(kind)
+
+    return (
+        <SceneContent className="pb-4">
+            <SceneTitleSection
+                name={`New ${humanizedKind}`}
+                resourceType={{
+                    type: 'data_pipeline',
+                }}
+            />
+
+            {kind === 'transformation' ? (
+                <HogFunctionTemplateList type="transformation" />
+            ) : kind === 'destination' ? (
+                <HogFunctionTemplateList type="destination" manualTemplates={hogFunctionTemplatesBatchExports} />
+            ) : kind === 'site_app' ? (
+                <HogFunctionTemplateList type="site_app" />
+            ) : kind === 'source' ? (
+                availableSourcesLoading || availableSources === null ? (
+                    <LemonSkeleton className="h-64" />
+                ) : (
+                    <BindLogic logic={sourceWizardLogic} props={{ availableSources }}>
+                        <SourceCatalog />
+                    </BindLogic>
+                )
+            ) : (
+                <NotFound object="Data pipeline new options" />
+            )}
+        </SceneContent>
+    )
+}

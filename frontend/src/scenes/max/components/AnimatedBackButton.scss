@@ -1,0 +1,12 @@
+.MaxBackButton {
+    width: 0;
+    opacity: 0;
+    transition:
+        width 100ms ease,
+        opacity 100ms ease;
+
+    &--visible {
+        width: 2.25rem;
+        opacity: 1;
+    }
+}

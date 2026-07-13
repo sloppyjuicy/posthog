@@ -1,0 +1,568 @@
+import { useValues } from 'kea'
+import { useState } from 'react'
+
+import { IconX } from '@posthog/icons'
+import { LemonButton, LemonInput, LemonInputSelect, LemonSegmentedButton, Link } from '@posthog/lemon-ui'
+
+import { AuthorizedUrlList } from 'lib/components/AuthorizedUrlList/AuthorizedUrlList'
+import { AuthorizedUrlListType } from 'lib/components/AuthorizedUrlList/authorizedUrlListLogic'
+import { OperandTag } from 'lib/components/PropertyFilters/components/OperandTag'
+import { DEFAULT_TAXONOMIC_GROUP_TYPES } from 'lib/components/PropertyFilters/components/TaxonomicPropertyFilter'
+import { PropertyFilters } from 'lib/components/PropertyFilters/PropertyFilters'
+import { URL_MATCHING_HINTS } from 'lib/components/UrlMatchingHints'
+import { IconOpenInApp } from 'lib/lemon-ui/icons'
+import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
+import { LemonLabel } from 'lib/lemon-ui/LemonLabel/LemonLabel'
+
+import { groupsModel } from '~/models/groupsModel'
+import {
+    ActionStepStringMatching,
+    ActionStepType,
+    AnyPropertyFilter,
+    PropertyFilterType,
+    PropertyOperator,
+} from '~/types'
+
+import {
+    SCREEN_NAME_MATCHING_LABEL,
+    SCREEN_NAME_PROPERTY,
+    type ScreenNameMatching,
+    isScreenNameFilter,
+} from '../utils/screenName'
+import { EventName } from './EventName'
+
+const learnMoreLink = 'https://posthog.com/docs/data/actions?utm_medium=in-product&utm_campaign=action-page'
+
+interface Props {
+    step: ActionStepType
+    actionId: number
+    isOnlyStep: boolean
+    index: number
+    identifier: string
+    disabledReason?: string
+    onDelete: () => void
+    onChange: (step: ActionStepType) => void
+}
+
+export function ActionStep({
+    step,
+    actionId,
+    isOnlyStep,
+    index,
+    identifier,
+    disabledReason,
+    onDelete,
+    onChange: sendStep,
+}: Props): JSX.Element {
+    const { groupsTaxonomicTypes } = useValues(groupsModel)
+
+    return (
+        <div className="bg-surface-primary rounded border p-3 relative">
+            {index > 0 && !(index % 2 === 0) && (
+                <div className="absolute top-1/2 -left-5">
+                    <OperandTag operand="or" className="bg-surface-primary" />
+                </div>
+            )}
+            <div className="deprecated-space-y-4">
+                <div className="flex items-center justify-between">
+                    <b>Match Group #{index + 1}</b>
+
+                    {!isOnlyStep && (
+                        <LemonButton
+                            className="absolute top-2 right-2"
+                            icon={<IconX />}
+                            size="small"
+                            aria-label="delete"
+                            onClick={onDelete}
+                            disabledReason={disabledReason}
+                        />
+                    )}
+                </div>
+                <TypeSwitcher step={step} sendStep={sendStep} disabledReason={disabledReason} />
+
+                {step.event === '$autocapture' && (
+                    <AutocaptureFields
+                        step={step}
+                        sendStep={sendStep}
+                        actionId={actionId}
+                        disabledReason={disabledReason}
+                    />
+                )}
+                {step.event !== undefined &&
+                    step.event !== '$autocapture' &&
+                    step.event !== '$pageview' &&
+                    step.event !== '$screen' && (
+                        <div className="flex flex-col gap-2">
+                            <LemonLabel>Event name</LemonLabel>
+                            <EventName
+                                value={step.event}
+                                onChange={(value) =>
+                                    sendStep({
+                                        ...step,
+                                        event: value,
+                                    })
+                                }
+                                placeholder="All events"
+                                allEventsOption="explicit"
+                                disabled={!!disabledReason}
+                            />
+
+                            <Link to="https://posthog.com/docs/libraries" target="_blank">
+                                See documentation
+                            </Link>
+                        </div>
+                    )}
+                {step.event === '$pageview' && (
+                    <div>
+                        <Option
+                            step={step}
+                            sendStep={sendStep}
+                            item="url"
+                            labelExtra={
+                                <StringMatchingSelection
+                                    field="url"
+                                    step={step}
+                                    sendStep={sendStep}
+                                    disabledReason={disabledReason}
+                                />
+                            }
+                            label="URL"
+                            disabledReason={disabledReason}
+                        />
+                        {step.url_matching && step.url_matching in URL_MATCHING_HINTS && (
+                            <small>{URL_MATCHING_HINTS[step.url_matching]}</small>
+                        )}
+                    </div>
+                )}
+                {step.event === '$screen' && (
+                    <ScreenNameField step={step} sendStep={sendStep} disabledReason={disabledReason} />
+                )}
+
+                <div className="mt-4 deprecated-space-y-2">
+                    <LemonLabel>Filters</LemonLabel>
+                    <PropertyFilters
+                        propertyFilters={
+                            step.event === '$screen'
+                                ? step.properties?.filter((p) => !isScreenNameFilter(p))
+                                : step.properties
+                        }
+                        pageKey={identifier}
+                        eventNames={step.event ? [step.event] : []}
+                        taxonomicGroupTypes={[...DEFAULT_TAXONOMIC_GROUP_TYPES, ...groupsTaxonomicTypes]}
+                        onChange={(properties) => {
+                            const screenNameFilter =
+                                step.event === '$screen'
+                                    ? (step.properties?.filter((p) => isScreenNameFilter(p)) ?? [])
+                                    : []
+                            sendStep({
+                                ...step,
+                                properties: [...screenNameFilter, ...(properties as [])] as AnyPropertyFilter[],
+                            })
+                        }}
+                        showConditionBadge
+                        disabledReason={disabledReason ?? undefined}
+                    />
+                </div>
+            </div>
+        </div>
+    )
+}
+
+function Option({
+    step,
+    sendStep,
+    item,
+    label,
+    placeholder = 'Specify a value to match on this',
+    caption,
+    labelExtra,
+    disabledReason,
+}: {
+    step: ActionStepType
+    sendStep: (stepToSend: ActionStepType) => void
+    item: keyof Pick<ActionStepType, 'href' | 'text' | 'selector' | 'url' | 'tag_name'>
+    label: JSX.Element | string
+    labelExtra?: JSX.Element | string
+    placeholder?: string
+    caption?: JSX.Element | string
+    disabledReason?: string
+}): JSX.Element {
+    const onOptionChange = (val: string): void => {
+        sendStep({
+            ...step,
+            [item]: val || null, // "" is a valid filter, we don't want it
+        })
+    }
+
+    return (
+        <div className="deprecated-space-y-1">
+            <div className="flex flex-wrap gap-1">
+                <LemonLabel>{label}</LemonLabel>
+                {labelExtra}
+            </div>
+            {caption && <div className="action-step-caption">{caption}</div>}
+            <LemonInput
+                data-attr="edit-action-url-input"
+                allowClear
+                onChange={onOptionChange}
+                value={step[item] || ''}
+                placeholder={placeholder}
+                disabledReason={disabledReason}
+            />
+        </div>
+    )
+}
+
+const AndSeparator = (): JSX.Element => {
+    return (
+        <div className="flex w-full justify-center">
+            <OperandTag operand="and" />
+        </div>
+    )
+}
+
+function AutocaptureFields({
+    step,
+    actionId,
+    sendStep,
+    disabledReason,
+}: {
+    step: ActionStepType
+    sendStep: (stepToSend: ActionStepType) => void
+    actionId: number
+    disabledReason?: string
+}): JSX.Element {
+    const onSelectElement = (): void => {
+        LemonDialog.open({
+            title: 'Select an element',
+            description: actionId
+                ? 'Choose the domain on which to edit this action'
+                : 'Choose the domain on which to create this action',
+            content: (
+                <>
+                    <AuthorizedUrlList actionId={actionId} type={AuthorizedUrlListType.TOOLBAR_URLS} />
+                </>
+            ),
+            primaryButton: {
+                children: 'Close',
+                type: 'secondary',
+            },
+        })
+    }
+    return (
+        <div className="deprecated-space-y-4">
+            <div className="flex items-center gap-2">
+                <LemonButton
+                    size="small"
+                    type="secondary"
+                    onClick={onSelectElement}
+                    sideIcon={<IconOpenInApp />}
+                    disabledReason={disabledReason}
+                >
+                    Select element on site
+                </LemonButton>
+                <Link to={`${learnMoreLink}#1-autocapture`} target="_blank">
+                    See documentation.
+                </Link>
+            </div>
+            <Option
+                step={step}
+                sendStep={sendStep}
+                item="text"
+                labelExtra={
+                    <StringMatchingSelection
+                        field="text"
+                        step={step}
+                        sendStep={sendStep}
+                        disabledReason={disabledReason}
+                    />
+                }
+                label="Element text"
+                disabledReason={disabledReason}
+            />
+            <AndSeparator />
+            <Option
+                step={step}
+                sendStep={sendStep}
+                item="href"
+                labelExtra={
+                    <StringMatchingSelection
+                        field="href"
+                        step={step}
+                        sendStep={sendStep}
+                        disabledReason={disabledReason}
+                    />
+                }
+                label="Element link target"
+                caption={
+                    <>
+                        Filtering by the <code>href</code> attribute. Only <code>{'<a/>'}</code> elements will be
+                        matched.
+                    </>
+                }
+                disabledReason={disabledReason}
+            />
+            {step['tag_name'] ? (
+                <>
+                    <AndSeparator />
+                    <Option
+                        step={step}
+                        sendStep={sendStep}
+                        item="tag_name"
+                        label="Element matches tag name"
+                        caption={
+                            <span>
+                                Filtering by the tag name of the element. This field is deprecated and superseded by the
+                                HTML selector below. We recommend adding the tag name to the HTML selector field
+                                instead. This field will disappear when cleared.
+                            </span>
+                        }
+                        disabledReason={disabledReason}
+                    />
+                </>
+            ) : undefined}
+            <AndSeparator />
+            <Option
+                step={step}
+                sendStep={sendStep}
+                item="selector"
+                label="Element matches HTML selector"
+                caption={
+                    <span>
+                        The selector can be a tag name, class, HTML attribute, or all of those combined. Example:{' '}
+                        <code>button[data-attr="signup"]</code>.{' '}
+                        <Link to={`${learnMoreLink}#matching-selectors`}>Learn more in Docs.</Link>
+                    </span>
+                }
+                disabledReason={disabledReason}
+            />
+            <AndSeparator />
+            <Option
+                step={step}
+                sendStep={sendStep}
+                item="url"
+                labelExtra={
+                    <StringMatchingSelection
+                        field="url"
+                        step={step}
+                        sendStep={sendStep}
+                        disabledReason={disabledReason}
+                    />
+                }
+                label="Page URL"
+                caption="The page on which the interaction occurred."
+                disabledReason={disabledReason}
+            />
+            {step?.url_matching && step.url_matching in URL_MATCHING_HINTS && (
+                <small>{URL_MATCHING_HINTS[step.url_matching]}</small>
+            )}
+        </div>
+    )
+}
+
+function TypeSwitcher({
+    step,
+    sendStep,
+    disabledReason,
+}: {
+    step: ActionStepType
+    sendStep: (stepToSend: ActionStepType) => void
+    disabledReason?: string
+}): JSX.Element {
+    const handleChange = (type: string): void => {
+        const overrides: Record<string, Partial<ActionStepType>> = {
+            $autocapture: { event: '$autocapture' },
+            event: { event: null },
+            $pageview: { event: '$pageview' },
+            $screen: { event: '$screen', url: null, url_matching: null },
+        }
+        if (type in overrides) {
+            sendStep({ ...step, ...overrides[type] })
+        }
+    }
+
+    return (
+        <div data-attr="action-type-switcher">
+            <LemonSegmentedButton
+                onChange={handleChange}
+                value={
+                    step.event === '$autocapture' ||
+                    step.event === '$pageview' ||
+                    step.event === '$screen' ||
+                    step.event === undefined
+                        ? step.event
+                        : 'event'
+                }
+                options={[
+                    {
+                        value: '$pageview',
+                        label: 'Pageview',
+                        'data-attr': 'action-type-pageview',
+                        disabledReason,
+                    },
+                    {
+                        value: '$autocapture',
+                        label: 'Autocapture',
+                        'data-attr': 'action-type-autocapture',
+                        disabledReason,
+                    },
+                    {
+                        value: '$screen',
+                        label: 'Mobile screen',
+                        tooltip: 'Screen views from mobile apps ($screen events sent by the mobile SDKs)',
+                        'data-attr': 'action-type-screen',
+                        disabledReason,
+                    },
+                    {
+                        value: 'event',
+                        label: 'Other events',
+                        'data-attr': 'action-type-other',
+                        disabledReason,
+                    },
+                ]}
+                fullWidth
+                size="small"
+            />
+        </div>
+    )
+}
+
+function ScreenNameField({
+    step,
+    sendStep,
+    disabledReason,
+}: {
+    step: ActionStepType
+    sendStep: (stepToSend: ActionStepType) => void
+    disabledReason?: string
+}): JSX.Element {
+    const existingFilter = step.properties?.find(isScreenNameFilter)
+    const rawValue = existingFilter && 'value' in existingFilter ? existingFilter.value : undefined
+    const screenNames: string[] =
+        rawValue == null || rawValue === '' ? [] : Array.isArray(rawValue) ? rawValue.map(String) : [String(rawValue)]
+    const filterOperator: ScreenNameMatching | undefined =
+        existingFilter && 'operator' in existingFilter ? (existingFilter.operator as ScreenNameMatching) : undefined
+
+    // Keep the selected operator even when the value is empty (an empty filter isn't persisted, so we can't
+    // read it back off the step) — otherwise picking "matches exactly" before typing would snap back to the default.
+    // Only seeded once: safe because this component remounts when the step's event type changes away from $screen.
+    const [operator, setOperator] = useState<ScreenNameMatching>(filterOperator ?? PropertyOperator.IContains)
+
+    // Only "matches exactly" supports multiple values (translated to an IN() query); the rest take a single string
+    const isMulti = operator === PropertyOperator.Exact
+    const singleValue = screenNames[0] ?? ''
+
+    const setFilter = (value: string | string[], op: ScreenNameMatching): void => {
+        const otherProperties = (step.properties || []).filter((p) => !isScreenNameFilter(p))
+        const isEmpty = Array.isArray(value) ? value.length === 0 : !value
+        if (isEmpty) {
+            sendStep({ ...step, properties: otherProperties })
+            return
+        }
+        sendStep({
+            ...step,
+            properties: [
+                ...otherProperties,
+                {
+                    key: SCREEN_NAME_PROPERTY,
+                    value,
+                    operator: op as PropertyOperator,
+                    type: PropertyFilterType.Event,
+                },
+            ],
+        })
+    }
+
+    const handleOperatorChange = (op: ScreenNameMatching): void => {
+        setOperator(op)
+        const nextValue = op === PropertyOperator.Exact ? screenNames : singleValue
+        setFilter(nextValue, op)
+    }
+
+    return (
+        <div className="deprecated-space-y-1">
+            <div className="flex flex-wrap gap-1">
+                <LemonLabel info="Matches the $screen_name property on $screen events sent by the mobile SDKs (iOS, Android, React Native, Flutter). This is the mobile equivalent of a pageview URL.">
+                    Screen name
+                </LemonLabel>
+                <div className="flex flex-1 justify-end">
+                    <LemonSegmentedButton
+                        onChange={(value) => handleOperatorChange(value as ScreenNameMatching)}
+                        value={operator}
+                        options={Object.entries(SCREEN_NAME_MATCHING_LABEL).map(([value, label]) => ({
+                            value,
+                            label,
+                            disabledReason,
+                        }))}
+                        size="xsmall"
+                    />
+                </div>
+            </div>
+            {isMulti ? (
+                <LemonInputSelect
+                    data-attr="edit-action-screen-name-input"
+                    mode="multiple"
+                    allowCustomValues
+                    value={screenNames}
+                    onChange={(vals) => setFilter(vals, operator)}
+                    placeholder="e.g. HomeScreen, Settings"
+                    disabled={!!disabledReason}
+                />
+            ) : (
+                <LemonInput
+                    data-attr="edit-action-screen-name-input"
+                    allowClear
+                    onChange={(val) => setFilter(val, operator)}
+                    value={singleValue}
+                    placeholder="e.g. HomeScreen"
+                    disabledReason={disabledReason}
+                />
+            )}
+        </div>
+    )
+}
+
+function StringMatchingSelection({
+    field,
+    step,
+    sendStep,
+    disabledReason,
+}: {
+    field: 'url' | 'text' | 'href'
+    step: ActionStepType
+    sendStep: (stepToSend: ActionStepType) => void
+    disabledReason?: string
+}): JSX.Element {
+    const key = `${field}_matching` as keyof ActionStepType
+    const handleURLMatchChange = (value: string): void => {
+        sendStep({ ...step, [key]: value })
+    }
+    const defaultValue: ActionStepStringMatching = field === 'url' ? 'contains' : 'exact'
+
+    return (
+        <div className="flex flex-1 justify-end">
+            <LemonSegmentedButton
+                onChange={handleURLMatchChange}
+                value={(step[key] as ActionStepStringMatching) || defaultValue}
+                options={[
+                    {
+                        value: 'exact',
+                        label: 'matches exactly',
+                        disabledReason,
+                    },
+                    {
+                        value: 'regex',
+                        label: 'matches regex',
+                        disabledReason,
+                    },
+                    {
+                        value: 'contains',
+                        label: 'contains',
+                        disabledReason,
+                    },
+                ]}
+                size="xsmall"
+            />
+        </div>
+    )
+}

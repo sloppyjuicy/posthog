@@ -1,9 +1,68 @@
 from unittest import mock
 
-from posthog.models import Organization, PluginConfig, Team, User
-from posthog.plugins.test.mock import mocked_plugin_requests_get
+from django.core.cache import cache
+from django.test import TestCase
+
+from parameterized import parameterized
+
+from posthog.schema import PersonsOnEventsMode
+
+from posthog.models import Organization, Team, User
+from posthog.models.instance_setting import override_instance_config
+from posthog.models.project import Project
+from posthog.models.team import get_team_in_cache, util
+from posthog.models.team.team import SessionRecordingRetentionPeriod
+
+from products.cohorts.backend.models.cohort import INTERNAL_TEST_USERS_COHORT_NAME, Cohort, CohortKind
+from products.dashboards.backend.models.dashboard import Dashboard
+from products.dashboards.backend.models.dashboard_tile import DashboardTile
 
 from .base import BaseTest
+
+util.can_enable_actor_on_events = True  # ty: ignore[invalid-assignment]
+
+
+class TestModelCache(TestCase):
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+
+    def test_save_updates_cache(self):
+        api_token = "test_token"
+        org = Organization.objects.create(name="org name")
+
+        initial_team = get_team_in_cache(api_token)
+        self.assertIsNone(initial_team)
+
+        team = Team.objects.create(
+            organization=org,
+            api_token=api_token,
+            test_account_filters=[],
+        )
+
+        cached_team = get_team_in_cache(api_token)
+        assert cached_team is not None
+        self.assertEqual(cached_team.session_recording_opt_in, False)
+        self.assertEqual(cached_team.api_token, api_token)
+        self.assertEqual(cached_team.uuid, str(team.uuid))
+        self.assertEqual(cached_team.id, team.id)
+        self.assertEqual(cached_team.name, "Default project")
+
+        team.name = "New name"
+        team.session_recording_opt_in = True
+        team.save()
+
+        cached_team = get_team_in_cache(api_token)
+        assert cached_team is not None
+        self.assertEqual(cached_team.session_recording_opt_in, True)
+        self.assertEqual(cached_team.api_token, api_token)
+        self.assertEqual(cached_team.uuid, str(team.uuid))
+        self.assertEqual(cached_team.id, team.id)
+        self.assertEqual(cached_team.name, "New name")
+
+        team.delete()
+        cached_team = get_team_in_cache(api_token)
+        assert cached_team is None
 
 
 class TestTeam(BaseTest):
@@ -11,46 +70,272 @@ class TestTeam(BaseTest):
         team: Team = Team.objects.create(name="New Team", organization=self.organization)
         self.assertEqual(team.timezone, "UTC")
         self.assertEqual(team.data_attributes, ["data-attr"])
+        self.assertEqual(team.autocapture_exceptions_opt_in, None)
+        self.assertEqual(team.autocapture_web_vitals_opt_in, None)
+        self.assertEqual(team.autocapture_web_vitals_allowed_metrics, None)
+        self.assertEqual(team.autocapture_exceptions_errors_to_ignore, None)
 
     def test_create_team_with_test_account_filters(self):
-        team = Team.objects.create_with_data(organization=self.organization)
+        team = Team.objects.create_with_data(initiating_user=self.user, organization=self.organization)
+
+        # An internal/test users cohort should be created
+        test_users_cohort = Cohort.objects.get(team=team, name=INTERNAL_TEST_USERS_COHORT_NAME)
+
+        self.assertEqual(test_users_cohort.kind, CohortKind.INTERNAL_TEST_USERS)
+
+        # Cohort should have $internal_or_test_user filter AND email domain filter (posthog.com is not generic)
         self.assertEqual(
-            team.test_account_filters,
-            [
-                {"key": "email", "value": "@posthog.com", "operator": "not_icontains", "type": "person"},
-                {
-                    "key": "$host",
-                    "operator": "is_not",
-                    "value": ["localhost:8000", "localhost:5000", "127.0.0.1:8000", "127.0.0.1:3000", "localhost:3000"],
-                },
-            ],
+            test_users_cohort.filters,
+            {
+                "properties": {
+                    "type": "OR",
+                    "values": [
+                        {
+                            "type": "AND",
+                            "values": [
+                                {
+                                    "key": "$internal_or_test_user",
+                                    "type": "person",
+                                    "value": [True],
+                                    "operator": "exact",
+                                }
+                            ],
+                        },
+                        {
+                            "type": "AND",
+                            "values": [
+                                {
+                                    "key": "email",
+                                    "type": "person",
+                                    "value": "@posthog.com",
+                                    "operator": "icontains",
+                                }
+                            ],
+                        },
+                    ],
+                }
+            },
         )
 
-        # test generic emails
+        # test_account_filters should reference the cohort with not_in
+        self.assertEqual(
+            team.test_account_filters,
+            [{"key": "id", "type": "cohort", "value": test_users_cohort.pk, "operator": "not_in"}],
+        )
+
+    def test_create_team_with_generic_email_skips_domain_filter(self):
         user = User.objects.create(email="test@gmail.com")
         organization = Organization.objects.create()
         organization.members.set([user])
-        team = Team.objects.create_with_data(organization=organization)
+        team = Team.objects.create_with_data(initiating_user=user, organization=organization)
+
+        # Cohort should only have $internal_or_test_user filter (no email domain for gmail.com)
+        test_users_cohort = Cohort.objects.get(team=team, name=INTERNAL_TEST_USERS_COHORT_NAME)
+        self.assertEqual(test_users_cohort.kind, CohortKind.INTERNAL_TEST_USERS)
         self.assertEqual(
-            team.test_account_filters,
-            [
-                {
-                    "key": "$host",
-                    "operator": "is_not",
-                    "value": ["localhost:8000", "localhost:5000", "127.0.0.1:8000", "127.0.0.1:3000", "localhost:3000"],
-                },
-            ],
+            test_users_cohort.filters,
+            {
+                "properties": {
+                    "type": "OR",
+                    "values": [
+                        {
+                            "type": "AND",
+                            "values": [
+                                {
+                                    "key": "$internal_or_test_user",
+                                    "type": "person",
+                                    "value": [True],
+                                    "operator": "exact",
+                                }
+                            ],
+                        },
+                    ],
+                }
+            },
         )
 
-    @mock.patch("requests.get", side_effect=mocked_plugin_requests_get)
-    def test_preinstalled_are_autoenabled(self, mock_get):
-        with self.settings(
-            MULTI_TENANCY=False, PLUGINS_PREINSTALLED_URLS=["https://github.com/PostHog/helloworldplugin/"]
-        ):
-            _, _, new_team = Organization.objects.bootstrap(
-                self.user, plugins_access_level=Organization.PluginsAccessLevel.INSTALL
-            )
+        # test_account_filters should still reference the cohort
+        self.assertEqual(
+            team.test_account_filters,
+            [{"key": "id", "type": "cohort", "value": test_users_cohort.pk, "operator": "not_in"}],
+        )
 
-        self.assertEqual(PluginConfig.objects.filter(team=new_team, enabled=True).count(), 1)
-        self.assertEqual(PluginConfig.objects.filter(team=new_team, enabled=True).get().plugin.name, "helloworldplugin")
-        self.assertEqual(mock_get.call_count, 2)
+    def test_create_team_sets_primary_dashboard(self):
+        team = Team.objects.create_with_data(initiating_user=self.user, organization=self.organization)
+        self.assertIsInstance(team.primary_dashboard, Dashboard)
+        assert team.primary_dashboard is not None
+        self.assertEqual(team.primary_dashboard.name, "Your starter dashboard")
+
+        # Ensure insights are created and linked (8 insight tiles + 5 text tiles + 3 button tiles)
+        self.assertEqual(DashboardTile.objects.filter(dashboard=team.primary_dashboard).count(), 16)
+
+    @mock.patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_team_on_cloud_uses_feature_flag_to_determine_person_on_events(self, mock_feature_enabled):
+        with self.is_cloud(True):
+            with override_instance_config("PERSON_ON_EVENTS_ENABLED", False):
+                team = Team.objects.create_with_data(initiating_user=self.user, organization=self.organization)
+                self.assertEqual(
+                    team.person_on_events_mode, PersonsOnEventsMode.PERSON_ID_OVERRIDE_PROPERTIES_ON_EVENTS
+                )
+                # called more than once when evaluating hogql
+                mock_feature_enabled.assert_called_with(
+                    "persons-on-events-v2-reads-enabled",
+                    str(team.uuid),
+                    groups={"organization": str(self.organization.id)},
+                    person_properties=None,
+                    group_properties={
+                        "organization": {
+                            "id": str(self.organization.id),
+                            "created_at": self.organization.created_at.isoformat(),
+                        }
+                    },
+                    only_evaluate_locally=True,
+                    send_feature_flag_events=False,
+                    disable_geoip=None,
+                    device_id=None,
+                )
+
+    @mock.patch("posthoganalytics.feature_enabled", return_value=False)
+    def test_team_on_self_hosted_uses_instance_setting_to_determine_person_on_events(self, mock_feature_enabled):
+        with self.is_cloud(False):
+            with override_instance_config("PERSON_ON_EVENTS_V2_ENABLED", True):
+                team = Team.objects.create_with_data(initiating_user=self.user, organization=self.organization)
+                self.assertEqual(
+                    team.person_on_events_mode, PersonsOnEventsMode.PERSON_ID_OVERRIDE_PROPERTIES_ON_EVENTS
+                )
+                for args_list in mock_feature_enabled.call_args_list:
+                    # It is ok if we check other feature flags, just not `persons-on-events-v2-reads-enabled`
+                    assert args_list[0][0] != "persons-on-events-v2-reads-enabled"
+
+            with override_instance_config("PERSON_ON_EVENTS_V2_ENABLED", False):
+                team = Team.objects.create_with_data(initiating_user=self.user, organization=self.organization)
+                self.assertEqual(team.person_on_events_mode, PersonsOnEventsMode.PERSON_ID_OVERRIDE_PROPERTIES_JOINED)
+                for args_list in mock_feature_enabled.call_args_list:
+                    # It is ok if we check other feature flags, just not `persons-on-events-v2-reads-enabled`
+                    assert args_list[0][0] != "persons-on-events-v2-reads-enabled"
+
+    def test_each_team_gets_project_with_default_name_and_same_id(self):
+        # Can be removed once environments are fully rolled out
+        team = Team.objects.create_with_data(initiating_user=self.user, organization=self.organization)
+
+        project = Project.objects.filter(id=team.id).first()
+
+        assert project is not None
+        self.assertEqual(project.name, "Default project")
+
+    def test_each_team_gets_project_with_custom_name_and_same_id(self):
+        # Can be removed once environments are fully rolled out
+        team = Team.objects.create_with_data(organization=self.organization, initiating_user=self.user, name="Hogflix")
+
+        project = Project.objects.filter(id=team.id).first()
+
+        assert project is not None
+        self.assertEqual(project.organization, team.organization)
+        self.assertEqual(project.name, "Hogflix")
+
+    @mock.patch("posthog.models.project.Project.objects.create", side_effect=Exception)
+    def test_team_not_created_if_project_creation_fails(self, mock_create):
+        # Can be removed once environments are fully rolled out
+        initial_team_count = Team.objects.count()
+        initial_project_count = Project.objects.count()
+
+        with self.assertRaises(Exception):
+            Team.objects.create_with_data(organization=self.organization, initiating_user=self.user, name="Hogflix")
+
+        self.assertEqual(Team.objects.count(), initial_team_count)
+        self.assertEqual(Project.objects.count(), initial_project_count)
+
+    def test_increment_id_sequence(self):
+        initial = Team.objects.increment_id_sequence()
+        subsequent = Team.objects.increment_id_sequence()
+
+        self.assertEqual(subsequent, initial + 1)
+
+    @parameterized.expand(
+        [
+            (None, {"recorder_script": "posthog-recorder"}),
+            ({"other_setting": "value"}, {"other_setting": "value", "recorder_script": "posthog-recorder"}),
+            ({"recorder_script": "custom-recorder"}, {"recorder_script": "custom-recorder"}),
+        ]
+    )
+    def test_create_team_sets_recorder_script_in_extra_settings(self, input_extra_settings, expected_extra_settings):
+        team = Team.objects.create_with_data(
+            initiating_user=self.user, organization=self.organization, extra_settings=input_extra_settings
+        )
+        self.assertEqual(team.extra_settings, expected_extra_settings)
+
+    @parameterized.expand(
+        [
+            ("self_hosted", False, "session_recording_retention_period", SessionRecordingRetentionPeriod.FIVE_YEARS),
+            ("cloud", True, "session_recording_retention_period", SessionRecordingRetentionPeriod.THIRTY_DAYS),
+        ]
+    )
+    def test_create_team_session_recording_defaults(self, _label, is_cloud, field, expected):
+        with self.is_cloud(is_cloud):
+            team = Team.objects.create_with_data(initiating_user=self.user, organization=self.organization)
+            assert getattr(team, field) == expected
+
+    @parameterized.expand(
+        [
+            ("Active users (last 30 days)",),
+            ("Daily active users (DAUs)",),
+            ("Weekly active users (WAUs)",),
+        ]
+    )
+    def test_default_dashboard_dau_wau_tiles_use_group_node(self, tile_name):
+        team = Team.objects.create_with_data(initiating_user=self.user, organization=self.organization)
+        tile = DashboardTile.objects.get(
+            dashboard=team.primary_dashboard,
+            insight__name=tile_name,
+        )
+        assert tile.insight is not None
+        assert tile.insight.query is not None
+        series = tile.insight.query["source"]["series"]
+        assert len(series) == 1
+        assert series[0]["kind"] == "GroupNode"
+        assert series[0]["operator"] == "OR"
+        assert series[0]["math"] == "dau"
+        assert {n["event"] for n in series[0]["nodes"]} == {"$pageview", "$screen"}
+
+    @parameterized.expand(
+        [
+            ("Sessions (last 7 days)", "TrendsQuery"),
+            ("Pageviews (last 7 days)", "TrendsQuery"),
+            ("Top referrers", "TrendsQuery"),
+            ("Retention", "RetentionQuery"),
+        ]
+    )
+    def test_default_dashboard_pageview_only_tiles(self, tile_name, expected_kind):
+        team = Team.objects.create_with_data(initiating_user=self.user, organization=self.organization)
+        tile = DashboardTile.objects.get(
+            dashboard=team.primary_dashboard,
+            insight__name=tile_name,
+        )
+        assert tile.insight is not None
+        assert tile.insight.query is not None
+        source = tile.insight.query["source"]
+        assert source["kind"] == expected_kind
+        assert "GroupNode" not in str(source)
+        assert "$pageview" in str(source)
+
+    def test_default_dashboard_funnel_tile_steps_through_pageview_to_autocapture(self):
+        team = Team.objects.create_with_data(initiating_user=self.user, organization=self.organization)
+        tile = DashboardTile.objects.get(
+            dashboard=team.primary_dashboard,
+            insight__name="Visit to interaction funnel",
+        )
+        assert tile.insight is not None
+        assert tile.insight.query is not None
+        source = tile.insight.query["source"]
+        assert source["kind"] == "FunnelsQuery"
+        assert [step["event"] for step in source["series"]] == ["$pageview", "$autocapture"]
+
+    def test_default_dashboard_button_tiles_link_to_related_products(self):
+        team = Team.objects.create_with_data(initiating_user=self.user, organization=self.organization)
+        button_tiles = DashboardTile.objects.filter(
+            dashboard=team.primary_dashboard,
+            button_tile__isnull=False,
+        ).select_related("button_tile")
+        assert button_tiles.count() == 3
+        urls = {tile.button_tile.url for tile in button_tiles if tile.button_tile is not None}
+        assert urls == {"/replay/home", "/web", "/activity/explore"}

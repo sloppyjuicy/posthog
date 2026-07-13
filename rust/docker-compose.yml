@@ -1,0 +1,128 @@
+version: '3'
+
+services:
+    kafka:
+        image: docker.io/redpandadata/redpanda:v25.1.9
+        restart: on-failure
+        command:
+            - redpanda
+            - start
+            - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+            - --advertise-kafka-addr internal://kafka:9092,external://localhost:19092
+            - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+            - --advertise-pandaproxy-addr internal://kafka:8082,external://localhost:18082
+            - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+            - --rpc-addr kafka:33145
+            - --advertise-rpc-addr kafka:33145
+            - --mode dev-container
+            - --smp 1
+            - --memory 1G
+            - --reserve-memory 200M
+            - --overprovisioned
+            - --set redpanda.empty_seed_starts_cluster=false
+            - --seeds kafka:33145
+            - --set redpanda.auto_create_topics_enabled=true
+            - --set redpanda.log_segment_size=16777216
+            - --set redpanda.retention_bytes=536870912
+        environment:
+            ALLOW_PLAINTEXT_LISTENER: 'true'
+            KAFKA_OPTS: -XX:-UseContainerSupport
+        ports:
+            - '127.0.0.1:9092:9092'
+        healthcheck:
+            test: curl -f http://localhost:9644/v1/status/ready || exit 1
+            interval: 5s
+            timeout: 15s
+            retries: 30
+            start_period: 60s
+
+    redis:
+        image: redis:6.2.7-alpine
+        restart: on-failure
+        command: redis-server --maxmemory-policy allkeys-lru --maxmemory 200mb
+        ports:
+            - '127.0.0.1:6379:6379'
+        healthcheck:
+            test: ['CMD', 'redis-cli', 'ping']
+            interval: 3s
+            timeout: 10s
+            retries: 10
+
+    objectstorage:
+        # SeaweedFS, S3-compatible object storage on objectstorage:19000.
+        # The bootstrap loop registers the canonical dev credentials plus an anonymous
+        # identity — SeaweedFS's POST-policy handler rejects presigned POST uploads when
+        # no identities exist. See docker-compose.base.yml `objectstorage` for full
+        # rationale (incl. the >= 4.05 Content-Encoding pin).
+        image: chrislusf/seaweedfs:4.29
+        restart: on-failure
+        ports:
+            - '127.0.0.1:19000:19000'
+            - '127.0.0.1:19001:19001'
+        entrypoint:
+            - /bin/sh
+            - -c
+            - |
+                (
+                    while true; do
+                        printf 's3.configure -access_key=object_storage_root_user -secret_key=object_storage_root_password -user=posthog -actions=Admin -apply\ns3.configure -user=anonymous -actions=Admin -apply\ns3.bucket.create -name capture\ns3.bucket.create -name posthog\n' \
+                                | /usr/bin/weed shell -master=localhost:19001 >/dev/null 2>&1 || true
+                        BUCKETS=$$(echo 's3.bucket.list' | /usr/bin/weed shell -master=localhost:19001 2>/dev/null || true)
+                        IDENTITIES=$$(echo 's3.configure' | /usr/bin/weed shell -master=localhost:19001 2>/dev/null || true)
+                        if echo "$$BUCKETS" | grep -q capture \
+                                && echo "$$BUCKETS" | grep -q posthog \
+                                && echo "$$IDENTITIES" | grep -q object_storage_root_user \
+                                && echo "$$IDENTITIES" | grep -q anonymous; then
+                            touch /tmp/objectstorage-ready
+                            echo "Objectstorage SeaweedFS ready with required buckets and identities"
+                            break
+                        fi
+                        sleep 1
+                    done
+                ) &
+                exec /usr/bin/weed "$$@"
+            - --
+        # volumePreallocate=false so per-bucket collections grow on demand instead of
+        # reserving 1 GiB per volume — see docker-compose.base.yml `objectstorage`.
+        command:
+            [
+                'server',
+                '-master.port=19001',
+                '-s3',
+                '-s3.port=19000',
+                '-dir=/data',
+                '-master.volumePreallocate=false',
+            ]
+        healthcheck:
+            test: ['CMD', 'test', '-f', '/tmp/objectstorage-ready']
+            interval: 5s
+            timeout: 5s
+            retries: 30
+            start_period: 10s
+
+    kafka-ui:
+        image: provectuslabs/kafka-ui:latest
+        profiles: ['ui']
+        ports:
+            - '127.0.0.1:8080:8080'
+        depends_on:
+            - kafka
+        environment:
+            KAFKA_CLUSTERS_0_NAME: local
+            KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+    db:
+        container_name: db
+        image: docker.io/library/postgres:16-alpine
+        restart: on-failure
+        environment:
+            POSTGRES_USER: posthog
+            POSTGRES_DB: posthog
+            POSTGRES_PASSWORD: posthog
+        healthcheck:
+            test: ['CMD-SHELL', 'pg_isready -U posthog']
+            interval: 5s
+            timeout: 5s
+        ports:
+            - '127.0.0.1:15432:5432'
+        command: postgres -c max_connections=1000 -c idle_in_transaction_session_timeout=300000

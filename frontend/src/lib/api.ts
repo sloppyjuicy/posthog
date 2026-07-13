@@ -1,0 +1,7594 @@
+import { EventSourceMessage, fetchEventSource } from '@microsoft/fetch-event-source'
+import { encodeParams } from 'kea-router'
+
+// Re-exported so code outside frontend/ (e.g. products/*/frontend) can type stream
+// callbacks without importing @microsoft/fetch-event-source directly — that package
+// only resolves from frontend/node_modules, not the repo root.
+export type { EventSourceMessage } from '@microsoft/fetch-event-source'
+import posthog from 'posthog-js'
+
+import { ApiError } from 'lib/api-error'
+import { ActivityLogProps } from 'lib/components/ActivityLog/ActivityLog'
+import { ActivityLogItem } from 'lib/components/ActivityLog/humanizeActivity'
+import { apiStatusLogic } from 'lib/logic/apiStatusLogic'
+import { getBackendHost, getStoredSession, isOAuthMode, refreshAccessToken } from 'lib/oauth/oauthClient'
+import { assertNotReadOnly } from 'lib/readOnlyGuard'
+import { objectClean } from 'lib/utils/objects'
+import { toParams } from 'lib/utils/url'
+import { CohortCalculationHistoryResponse } from 'scenes/cohorts/cohortCalculationHistorySceneLogic'
+import { EventSchema } from 'scenes/data-management/events/eventDefinitionSchemaLogic'
+import { SchemaPropertyGroup } from 'scenes/data-management/schema/schemaManagementLogic'
+import {
+    SignalReport,
+    SignalReportArtefact,
+    SignalReportArtefactResponse,
+    SignalReportStateRequest,
+    SignalScoutConfig,
+    SignalScoutConfigUpdate,
+    SignalScoutEmission,
+    SignalScoutEmissionReportLink,
+    SignalScoutRunSummary,
+    SignalSourceConfig,
+    SignalTeamConfig,
+    SignalUserAutonomyConfig,
+} from 'scenes/inbox/types'
+import { MaxBillingContext } from 'scenes/max/maxBillingContextLogic'
+import { NotebookListItemType, NotebookNodeResource, NotebookType } from 'scenes/notebooks/types'
+import { RecordingComment } from 'scenes/session-recordings/player/inspector/playerInspectorLogic'
+import { SessionSummaryContent } from 'scenes/session-recordings/player/player-meta/types'
+import { LINK_PAGE_SIZE, SURVEY_PAGE_SIZE } from 'scenes/surveys/constants'
+
+import { getCurrentExporterData, isSharedView } from '~/exporter/exporterViewLogic'
+import { OrganizationOAuthApplicationApi, ProjectSecretAPIKeyApi } from '~/generated/core/api.schemas'
+import { Variable } from '~/queries/nodes/DataVisualization/types'
+import {
+    AggregatedSpanRow,
+    AnyResponseType,
+    DashboardFilter,
+    DataWarehouseManagedViewsetKind,
+    DatabaseSerializedFieldType,
+    DomainConnectProviderName,
+    EndpointLastExecutionTimesRequest,
+    EndpointRequest,
+    EndpointRunRequest,
+    ErrorTrackingExternalReference,
+    ErrorTrackingIssue,
+    ErrorTrackingRelationalIssue,
+    ExternalDataSourceType,
+    FileSystemCount,
+    FileSystemEntry,
+    FileSystemViewLogEntry,
+    GroupsQuery,
+    GroupsQueryResponse,
+    HogCompileResponse,
+    HogQLQuery,
+    HogQLQueryResponse,
+    HogQLVariable,
+    LogMessage,
+    LogsQuery,
+    MatchingEventsResponse,
+    Node,
+    NodeKind,
+    QueryLogTags,
+    QuerySchema,
+    QueryStatusResponse,
+    RecordingsQuery,
+    RecordingsQueryResponse,
+    RefreshType,
+    SourceConfig,
+    SpanTreeNode,
+    TileFilters,
+    UserProductListItem,
+} from '~/queries/schema/schema-general'
+import { HogQLQueryString, setLatestVersionsOnQuery } from '~/queries/utils'
+import {
+    ActionType,
+    ActivityScope,
+    AppMetricsTotalsV2Response,
+    AppMetricsV2RequestParams,
+    AppMetricsV2Response,
+    BatchExportBackfill,
+    BatchExportConfiguration,
+    BatchExportConfigurationTest,
+    BatchExportConfigurationTestStep,
+    BatchExportRun,
+    BatchExportService,
+    CohortType,
+    CommentCreationParams,
+    CommentType,
+    Conversation,
+    ConversationDetail,
+    ConversationQueueResponse,
+    CoreMemory,
+    CreateGroupParams,
+    CustomerProfileConfigType,
+    CyclotronJobFiltersType,
+    CyclotronJobTestInvocationResult,
+    DashboardTemplateEditorType,
+    DashboardTemplateListParams,
+    DashboardTemplateType,
+    DashboardType,
+    DataColorThemeModel,
+    DataModelingDAG,
+    DataModelingEdge,
+    DataModelingJob,
+    DataModelingNode,
+    DataWarehouseManagedViewsetSavedQuery,
+    DataWarehouseSavedQuery,
+    DataWarehouseSavedQueryDependencies,
+    DataWarehouseSavedQueryDraft,
+    DataWarehouseSavedQueryFolder,
+    DataWarehouseSavedQueryRunHistory,
+    DataWarehouseTable,
+    DataWarehouseViewLink,
+    DataWarehouseViewLinkValidation,
+    Dataset,
+    DatasetItem,
+    EarlyAccessFeatureType,
+    EmailSenderDomainStatus,
+    EndpointType,
+    EndpointVersionType,
+    EventDefinition,
+    EventDefinitionMetrics,
+    EventDefinitionType,
+    EventType,
+    EventsListQueryParams,
+    Experiment,
+    ExportedAssetType,
+    ExternalDataJob,
+    ExternalDataSchemaWithSource,
+    ExternalDataSource,
+    ExternalDataSourceConnectionOption,
+    ExternalDataSourceCreatePayload,
+    ExternalDataSourceRevenueAnalyticsConfig,
+    ExternalDataSourceSchema,
+    ExternalDataSourceSyncSchema,
+    FeatureFlagStatusResponse,
+    FeatureFlagType,
+    FileSystemDeleteResponse,
+    GoogleAdsConversionActionType,
+    Group,
+    GroupListParams,
+    HeatmapScreenshotContentResponse,
+    HeatmapScreenshotType,
+    HeatmapStatus,
+    HeatmapType,
+    HogFunctionIconResponse,
+    HogFunctionStatus,
+    HogFunctionTemplateType,
+    HogFunctionType,
+    HogFunctionTypeType,
+    InsightModel,
+    IntegrationType,
+    JiraProjectType,
+    LLMPrompt,
+    LLMPromptPublic,
+    LLMPromptResolveResponse,
+    LinearTeamType,
+    LinkType,
+    LinkedInAdsAccountType,
+    LinkedInAdsConversionRuleType,
+    ListOrganizationMembersParams,
+    LogEntry,
+    LogEntryRequestParams,
+    MediaUploadResponse,
+    NewEarlyAccessFeatureType,
+    ObjectMediaPreview,
+    OrganizationFeatureFlag,
+    OrganizationFeatureFlagKeysResponse,
+    OrganizationFeatureFlagsCopyBody,
+    OrganizationMemberScopedApiKeysResponse,
+    OrganizationMemberType,
+    OrganizationType,
+    PersonListParams,
+    PersonType,
+    PersonalAPIKeyType,
+    PluginConfigTypeNew,
+    PluginConfigWithPluginInfoNew,
+    PluginLogEntry,
+    ProductTour,
+    ProductTourAIGenerationResponse,
+    ProductTourStep,
+    ProjectSecretAPIKeyRequest,
+    ProjectType,
+    PropertyDefinition,
+    PropertyDefinitionType,
+    PropertyGroupFilter,
+    QueryBasedInsightModel,
+    QueryTabState,
+    QuickFilter,
+    RawAnnotationType,
+    RawBatchExportBackfill,
+    RawBatchExportRun,
+    RoleMemberType,
+    RoleType,
+    SavedSessionRecordingPlaylistsResult,
+    ScheduledChangeType,
+    SchemaIncrementalFieldsResponse,
+    SearchListParams,
+    SearchResponse,
+    SessionRecordingExternalReference,
+    SessionRecordingPlaylistType,
+    SessionRecordingSnapshotParams,
+    SessionRecordingSnapshotResponse,
+    SessionRecordingType,
+    SessionRecordingUpdateType,
+    SessionSummaryResponse,
+    SharingConfigurationType,
+    SlackChannelType,
+    SubscriptionType,
+    Survey,
+    SurveyStatsResponse,
+    TeamType,
+    TwilioPhoneNumberType,
+    UserBasicType,
+    UserInterviewType,
+    UserType,
+    WebAnalyticsFilterPresetType,
+    WebhookInfo,
+} from '~/types'
+
+import { AlertConfig, AlertSimulationResult, AlertType, AlertTypeWrite } from 'products/alerts/frontend/types'
+import type { CustomerJourneyApi } from 'products/customer_analytics/frontend/generated/api.schemas'
+import type {
+    ErrorTrackingRule,
+    ErrorTrackingRuleType,
+} from 'products/error_tracking/frontend/scenes/ErrorTrackingConfigurationScene/rules/types'
+import type { SymbolSetOrder } from 'products/error_tracking/frontend/scenes/ErrorTrackingConfigurationScene/symbol_sets/symbolSetLogic'
+import type { ErrorTrackingRecommendation } from 'products/error_tracking/frontend/scenes/ErrorTrackingScene/tabs/recommendations/types'
+import type {
+    GitHubBranchesResponseApi,
+    GitHubReposResponseApi,
+} from 'products/integrations/frontend/generated/api.schemas'
+import type { LogExplanation } from 'products/logs/frontend/components/LogsViewer/LogDetailsModal/Tabs/ExploreWithAI/types'
+import type { NotebookCollabCursorApi } from 'products/notebooks/frontend/generated/api.schemas'
+import type { Task, TaskListParams, TaskRun, TaskUpsertProps } from 'products/posthog_ai/frontend/types/taskTypes'
+import type {
+    ColumnConfigurationApi,
+    PaginatedColumnConfigurationListApi,
+} from 'products/product_analytics/frontend/generated/api.schemas'
+import type {
+    SessionGroupSummaryListItemType,
+    SessionGroupSummaryType,
+    SessionSummariesConfig,
+} from 'products/session_summaries/frontend/types'
+import type {
+    ClaudeTaskRunCreateSchemaApi,
+    TaskRunBootstrapCreateRequestInitialPermissionModeEnumApi,
+} from 'products/tasks/frontend/generated/api.schemas'
+import type { BlastRadiusApi } from 'products/workflows/frontend/generated/api.schemas'
+import type { OptOutEntry } from 'products/workflows/frontend/OptOuts/types'
+import type { MessageTemplate } from 'products/workflows/frontend/TemplateLibrary/types'
+import type { HogflowTestResult } from 'products/workflows/frontend/Workflows/hogflows/steps/types'
+import type {
+    HogFlow,
+    HogFlowAction,
+    HogFlowBatchJob,
+    HogFlowSchedule,
+    HogFlowTemplate,
+} from 'products/workflows/frontend/Workflows/hogflows/types'
+
+import { AgentMode } from '../queries/schema'
+import type { AttachedContext, MaxUIContext } from '../scenes/max/maxTypes'
+import {
+    ErrorTrackingFingerprint,
+    ErrorTrackingRelease,
+    ErrorTrackingSettings,
+    ErrorTrackingSpikeDetectionConfig,
+    ErrorTrackingSpikeEvent,
+    ErrorTrackingStackFrame,
+    ErrorTrackingStackFrameRecord,
+    ErrorTrackingSymbolSet,
+    SymbolSetStatusFilter,
+} from './components/Errors/types'
+import {
+    ACTIVITY_PAGE_SIZE,
+    COHORT_PERSONS_QUERY_LIMIT,
+    EVENT_DEFINITIONS_PER_PAGE,
+    EVENT_PROPERTY_DEFINITIONS_PER_PAGE,
+    LOGS_PORTION_LIMIT,
+} from './constants'
+import type { ProductIntentProperties } from './utils/product-intents'
+
+/**
+ * WARNING: Be very careful importing things here. This file is heavily used and can trigger a lot of cyclic imports
+ * Preferably create a dedicated file in utils/..
+ */
+
+export type CheckboxValueType = string | number | boolean
+
+const PAGINATION_DEFAULT_MAX_PAGES = 10
+
+export interface PaginatedResponse<T> {
+    results: T[]
+    next?: string | null
+    previous?: string | null
+}
+
+export interface CountedPaginatedResponse<T> extends PaginatedResponse<T> {
+    count: number
+}
+
+export interface CountResponse {
+    count: number
+}
+
+export interface CountedPaginatedResponseWithUsers<T> extends CountedPaginatedResponse<T> {
+    users: UserBasicType[]
+}
+
+export interface ActivityLogPaginatedResponse<T> extends PaginatedResponse<T> {
+    count: number
+}
+
+export interface ApiMethodOptions {
+    signal?: AbortSignal
+    headers?: Record<string, any>
+}
+
+export { ApiError }
+
+export class RateLimitError extends Error {
+    constructor(public retryAfterSeconds: number) {
+        super('Rate limit exceeded')
+        this.name = 'RateLimitError'
+    }
+}
+
+export class RecordingDeletedError extends Error {
+    constructor(
+        public deletedAt: number | null,
+        public deletedBy: string | null
+    ) {
+        super('Recording has been permanently deleted')
+        this.name = 'RecordingDeletedError'
+    }
+}
+
+const CSRF_COOKIE_NAME = 'posthog_csrftoken'
+
+export function getCookie(name: string): string | null {
+    let cookieValue: string | null = null
+    if (document.cookie && document.cookie !== '') {
+        for (let cookie of document.cookie.split(';')) {
+            cookie = cookie.trim()
+            // Does this cookie string begin with the name we want?
+            if (cookie.substring(0, name.length + 1) === name + '=') {
+                cookieValue = decodeURIComponent(cookie.substring(name.length + 1))
+                break
+            }
+        }
+    }
+    return cookieValue
+}
+
+export async function getJSONOrNull(response: Response): Promise<any> {
+    try {
+        return await response.json()
+    } catch {
+        return null
+    }
+}
+
+export class ApiConfig {
+    private static _currentOrganizationId: OrganizationType['id'] | null = null
+    private static _currentProjectId: ProjectType['id'] | null = null
+    private static _currentTeamId: TeamType['id'] | null = null
+
+    static getCurrentOrganizationId(): OrganizationType['id'] {
+        if (!this._currentOrganizationId) {
+            throw new Error('Organization ID is not known.')
+        }
+        return this._currentOrganizationId
+    }
+
+    static setCurrentOrganizationId(id: OrganizationType['id'] | null): void {
+        this._currentOrganizationId = id
+    }
+
+    static getCurrentTeamId(): TeamType['id'] {
+        if (!this._currentTeamId) {
+            throw new Error('Team ID is not known.')
+        }
+        return this._currentTeamId
+    }
+
+    static hasCurrentTeamId(): boolean {
+        return !!this._currentTeamId
+    }
+
+    static setCurrentTeamId(id: TeamType['id']): void {
+        this._currentTeamId = id
+    }
+
+    static getCurrentProjectId(): ProjectType['id'] {
+        if (!this._currentProjectId) {
+            throw new Error('Project ID is not known.')
+        }
+        return this._currentProjectId
+    }
+
+    static setCurrentProjectId(id: ProjectType['id']): void {
+        this._currentProjectId = id
+    }
+}
+
+export class ApiRequest {
+    private pathComponents: string[]
+    private queryString: string | undefined
+
+    public constructor() {
+        this.pathComponents = []
+    }
+
+    // URL assembly
+
+    public assembleEndpointUrl(): string {
+        let url = this.pathComponents.join('/')
+        if (this.queryString) {
+            if (!this.queryString.startsWith('?')) {
+                url += '?'
+            }
+            url += this.queryString
+        }
+        return url
+    }
+
+    public assembleFullUrl(includeLeadingSlash = false): string {
+        return (includeLeadingSlash ? '/api/' : 'api/') + this.assembleEndpointUrl()
+    }
+
+    // Generic endpoint composition
+
+    private addPathComponent(component: string | number): ApiRequest {
+        this.pathComponents.push(component.toString())
+        return this
+    }
+
+    private addEncodedPathComponent(component: string | number): ApiRequest {
+        this.pathComponents.push(encodeURIComponent(component.toString()))
+        return this
+    }
+
+    public withQueryString(queryString?: string | Record<string, any>): ApiRequest {
+        this.queryString = typeof queryString === 'object' ? toParams(queryString) : queryString
+        return this
+    }
+
+    public withAction(apiAction: string): ApiRequest {
+        return this.addPathComponent(apiAction)
+    }
+
+    // API-aware endpoint composition
+
+    // # Utils
+    public current(): ApiRequest {
+        return this.addPathComponent('@current')
+    }
+
+    // # Organizations
+    public organizations(): ApiRequest {
+        return this.addPathComponent('organizations')
+    }
+
+    public organizationsDetail(id: OrganizationType['id'] = ApiConfig.getCurrentOrganizationId()): ApiRequest {
+        return this.organizations().addPathComponent(id)
+    }
+
+    public organizationFeatureFlags(orgId: OrganizationType['id'], featureFlagKey: FeatureFlagType['key']): ApiRequest {
+        return this.organizations()
+            .addPathComponent(orgId)
+            .addPathComponent('feature_flags')
+            .addEncodedPathComponent(featureFlagKey) // Never trust user input.
+    }
+
+    public copyOrganizationFeatureFlags(orgId: OrganizationType['id']): ApiRequest {
+        return this.organizations()
+            .addPathComponent(orgId)
+            .addPathComponent('feature_flags')
+            .addPathComponent('copy_flags')
+    }
+
+    public organizationFeatureFlagKeys(orgId: OrganizationType['id']): ApiRequest {
+        return this.organizations().addPathComponent(orgId).addPathComponent('feature_flags').addPathComponent('keys')
+    }
+
+    // # Projects
+    public projects(): ApiRequest {
+        return this.addPathComponent('projects')
+    }
+
+    public projectsDetail(id: ProjectType['id'] = ApiConfig.getCurrentProjectId()): ApiRequest {
+        return this.projects().addPathComponent(id)
+    }
+
+    // # Environments
+    public environments(): ApiRequest {
+        return this.addPathComponent('environments')
+    }
+
+    public environmentsDetail(id: TeamType['id'] = ApiConfig.getCurrentTeamId()): ApiRequest {
+        return this.environments().addPathComponent(id)
+    }
+
+    // # CSP reporting
+
+    public cspReportingExplanation(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('csp-reporting').addPathComponent('explain')
+    }
+
+    // # AI observability
+
+    public aiObservabilityTranslate(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('llm_analytics').addPathComponent('translate')
+    }
+
+    // # Insights
+    public insights(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('insights')
+    }
+
+    public insight(id: QueryBasedInsightModel['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.insights(teamId).addPathComponent(id)
+    }
+
+    public insightsActivity(teamId?: TeamType['id']): ApiRequest {
+        return this.insights(teamId).addPathComponent('activity')
+    }
+
+    public insightSharing(id: QueryBasedInsightModel['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.insight(id, teamId).addPathComponent('sharing')
+    }
+
+    public insightSharingPasswords(id: QueryBasedInsightModel['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.insightSharing(id, teamId).addPathComponent('passwords')
+    }
+
+    public insightSharingPassword(
+        id: QueryBasedInsightModel['id'],
+        passwordId: string,
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.insightSharingPasswords(id, teamId).addPathComponent(passwordId)
+    }
+
+    public insightsCancel(teamId?: TeamType['id']): ApiRequest {
+        return this.insights(teamId).addPathComponent('cancel')
+    }
+
+    // # Column Configurations
+    public columnConfigurations(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('column_configurations')
+    }
+
+    public columnConfigurationDetail(id: string, teamId?: TeamType['id']): ApiRequest {
+        return this.columnConfigurations(teamId).addPathComponent(id)
+    }
+
+    // # File System
+    // These endpoints operate on the "web" surface — the tree shown in this app's sidebar.
+    // Surface is server-controlled per route (clients can't send it): the `file_system*`
+    // routes are pinned to "web" server-side, while the separate `desktop_file_system*` routes
+    // (used by a different app, not this frontend) serve the "desktop" surface. So every call
+    // from this frontend is implicitly and exclusively scoped to "web".
+    public fileSystem(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('file_system')
+    }
+
+    public fileSystemUnfiled(type?: string, teamId?: TeamType['id']): ApiRequest {
+        const path = this.fileSystem(teamId).addPathComponent('unfiled')
+        if (type) {
+            path.withQueryString({ type })
+        }
+        return path
+    }
+
+    public fileSystemDetail(id: NonNullable<FileSystemEntry['id']>, teamId?: TeamType['id']): ApiRequest {
+        return this.fileSystem(teamId).addPathComponent(id)
+    }
+
+    public fileSystemLogView(teamId?: TeamType['id']): ApiRequest {
+        return this.fileSystem(teamId).addPathComponent('log_view')
+    }
+
+    public fileSystemMove(id: NonNullable<FileSystemEntry['id']>, teamId?: TeamType['id']): ApiRequest {
+        return this.fileSystem(teamId).addPathComponent(id).addPathComponent('move')
+    }
+
+    public fileSystemLink(id: NonNullable<FileSystemEntry['id']>, teamId?: TeamType['id']): ApiRequest {
+        return this.fileSystem(teamId).addPathComponent(id).addPathComponent('link')
+    }
+
+    public fileSystemCount(id: NonNullable<FileSystemEntry['id']>, teamId?: TeamType['id']): ApiRequest {
+        return this.fileSystem(teamId).addPathComponent(id).addPathComponent('count')
+    }
+
+    public fileSystemUndoDelete(teamId?: TeamType['id']): ApiRequest {
+        return this.fileSystem(teamId).addPathComponent('undo_delete')
+    }
+
+    public fileSystemShortcut(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('file_system_shortcut')
+    }
+
+    public fileSystemShortcutDetail(id: NonNullable<FileSystemEntry['id']>, teamId?: TeamType['id']): ApiRequest {
+        return this.fileSystemShortcut(teamId).addPathComponent(id)
+    }
+
+    public fileSystemShortcutReorder(teamId?: TeamType['id']): ApiRequest {
+        return this.fileSystemShortcut(teamId).addPathComponent('reorder')
+    }
+
+    // # User product list
+    public userProductList(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('user_product_list')
+    }
+
+    // # Plugins
+    public plugins(orgId?: OrganizationType['id']): ApiRequest {
+        return this.organizationsDetail(orgId).addPathComponent('plugins')
+    }
+
+    public pluginsActivity(orgId?: OrganizationType['id']): ApiRequest {
+        return this.plugins(orgId).addPathComponent('activity')
+    }
+
+    public pluginConfigs(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('plugin_configs')
+    }
+
+    public pluginConfig(id: number, teamId?: TeamType['id']): ApiRequest {
+        return this.pluginConfigs(teamId).addPathComponent(id)
+    }
+
+    public hog(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('hog')
+    }
+
+    public hogFunctions(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('hog_functions')
+    }
+
+    public hogFunction(id: HogFunctionType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.hogFunctions(teamId).addPathComponent(id)
+    }
+
+    public hogFunctionTemplates(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('hog_function_templates')
+    }
+
+    public hogFunctionTemplate(id: HogFunctionTemplateType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.hogFunctionTemplates(teamId).addPathComponent(id)
+    }
+
+    // # Links
+    public links(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('links')
+    }
+
+    public link(id: LinkType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.links(teamId).addPathComponent(id)
+    }
+
+    // # MCP Store
+    public mcpServers(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('mcp_servers')
+    }
+
+    public mcpServerInstallations(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('mcp_server_installations')
+    }
+
+    public mcpServerInstallation(id: string, teamId?: TeamType['id']): ApiRequest {
+        return this.mcpServerInstallations(teamId).addPathComponent(id)
+    }
+
+    // # Actions
+    public actions(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('actions')
+    }
+
+    public actionsDetail(actionId: ActionType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.actions(teamId).addPathComponent(actionId)
+    }
+
+    // # Comments
+    public comments(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('comments')
+    }
+
+    public comment(id: CommentType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.comments(teamId).addPathComponent(id)
+    }
+
+    // # Exports
+    public exports(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('exports')
+    }
+
+    public export(id: number, teamId?: TeamType['id']): ApiRequest {
+        return this.exports(teamId).addPathComponent(id)
+    }
+
+    // # Events
+    public events(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('events')
+    }
+
+    public event(id: EventType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.events(teamId).addPathComponent(id)
+    }
+
+    public tags(projectId?: ProjectType['id']): ApiRequest {
+        return this.projectsDetail(projectId).addPathComponent('tags')
+    }
+
+    // # Logs
+    public logs(projectId?: ProjectType['id']): ApiRequest {
+        return this.environmentsDetail(projectId).addPathComponent('logs')
+    }
+
+    public logsQuery(projectId?: ProjectType['id']): ApiRequest {
+        return this.logs(projectId).addPathComponent('query')
+    }
+
+    public logsSparkline(projectId?: ProjectType['id']): ApiRequest {
+        return this.logs(projectId).addPathComponent('sparkline')
+    }
+
+    public logsServices(projectId?: ProjectType['id']): ApiRequest {
+        return this.logs(projectId).addPathComponent('services')
+    }
+
+    public logsHasLogs(projectId?: ProjectType['id']): ApiRequest {
+        return this.logs(projectId).addPathComponent('has_logs')
+    }
+
+    public logsExplainWithAI(projectId?: ProjectType['id']): ApiRequest {
+        return this.logs(projectId).addPathComponent('explainLogWithAI')
+    }
+
+    public logsExport(projectId?: ProjectType['id']): ApiRequest {
+        return this.logs(projectId).addPathComponent('export')
+    }
+
+    // # Tracing
+    public tracingSpans(): ApiRequest {
+        return this.environmentsDetail().addPathComponent('tracing').addPathComponent('spans')
+    }
+
+    // # Data management
+    public eventDefinitions(projectId?: ProjectType['id']): ApiRequest {
+        return this.projectsDetail(projectId).addPathComponent('event_definitions')
+    }
+
+    public eventDefinitionDetail(eventDefinitionId: EventDefinition['id'], projectId?: ProjectType['id']): ApiRequest {
+        return this.projectsDetail(projectId).addPathComponent('event_definitions').addPathComponent(eventDefinitionId)
+    }
+
+    public objectMediaPreviews(projectId?: ProjectType['id']): ApiRequest {
+        return this.projectsDetail(projectId).addPathComponent('object_media_previews')
+    }
+
+    public objectMediaPreviewDetail(previewId: string, projectId?: ProjectType['id']): ApiRequest {
+        return this.objectMediaPreviews(projectId).addPathComponent(previewId)
+    }
+
+    public propertyDefinitions(projectId?: ProjectType['id']): ApiRequest {
+        return this.projectsDetail(projectId).addPathComponent('property_definitions')
+    }
+
+    public propertyDefinitionDetail(
+        propertyDefinitionId: PropertyDefinition['id'],
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.projectsDetail(teamId)
+            .addPathComponent('property_definitions')
+            .addPathComponent(propertyDefinitionId)
+    }
+
+    public propertyDefinitionSeenTogether(
+        eventNames: string[],
+        propertyDefinitionName: PropertyDefinition['name'],
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        const queryParams = toParams({ event_names: eventNames, property_name: propertyDefinitionName }, true)
+
+        return this.projectsDetail(teamId)
+            .addPathComponent('property_definitions')
+            .addPathComponent('seen_together')
+            .withQueryString(queryParams)
+    }
+
+    public sessionPropertyDefinitions(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('sessions').addPathComponent('property_definitions')
+    }
+
+    public schemaPropertyGroups(projectId?: ProjectType['id']): ApiRequest {
+        return this.projectsDetail(projectId).addPathComponent('schema_property_groups')
+    }
+
+    public schemaPropertyGroupsDetail(id: string, projectId?: ProjectType['id']): ApiRequest {
+        return this.schemaPropertyGroups(projectId).addPathComponent(id)
+    }
+
+    public eventSchemas(projectId?: ProjectType['id']): ApiRequest {
+        return this.projectsDetail(projectId).addPathComponent('event_schemas')
+    }
+
+    public eventSchemasDetail(id: string, projectId?: ProjectType['id']): ApiRequest {
+        return this.eventSchemas(projectId).addPathComponent(id)
+    }
+
+    public dataManagementActivity(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('data_management').addPathComponent('activity')
+    }
+
+    // # Cohorts
+    public cohorts(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('cohorts')
+    }
+
+    public cohortsDetail(cohortId: CohortType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.cohorts(teamId).addPathComponent(cohortId)
+    }
+
+    public cohortsDetailPersons(cohortId: CohortType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.cohorts(teamId).addPathComponent(cohortId).addPathComponent('persons')
+    }
+
+    public cohortsAddPersonsToStatic(cohortId: CohortType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.cohorts(teamId).addPathComponent(cohortId).addPathComponent('add_persons_to_static_cohort')
+    }
+
+    public cohortsRemovePersonFromStatic(cohortId: CohortType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.cohorts(teamId).addPathComponent(cohortId).addPathComponent('remove_person_from_static_cohort')
+    }
+
+    public cohortsCalculationHistory(cohortId: CohortType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.cohortsDetail(cohortId, teamId).addPathComponent('calculation_history')
+    }
+
+    // # Customer Profile Configs
+    public customerProfileConfigs(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('customer_profile_configs')
+    }
+
+    public customerProfileConfigsDetail(id: CustomerProfileConfigType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.customerProfileConfigs(teamId).addPathComponent(id)
+    }
+
+    public customerJourneys(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('customer_journeys')
+    }
+
+    public customerJourneysDetail(id: CustomerJourneyApi['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.customerJourneys(teamId).addPathComponent(id)
+    }
+
+    // Recordings
+    public recordings(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('session_recordings')
+    }
+
+    public recording(recordingId: SessionRecordingType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.recordings(teamId).addPathComponent(recordingId)
+    }
+
+    public sessionRecordingsExternalReferences(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('session_recording_external_references')
+    }
+
+    public recordingMatchingEvents(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId)
+            .addPathComponent('session_recordings')
+            .addPathComponent('matching_events')
+    }
+
+    public recordingPlaylists(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('session_recording_playlists')
+    }
+
+    public recordingPlaylist(
+        playlistId?: SessionRecordingPlaylistType['short_id'],
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.projectsDetail(teamId)
+            .addPathComponent('session_recording_playlists')
+            .addPathComponent(String(playlistId))
+    }
+
+    public recordingSharing(id: SessionRecordingType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.recording(id, teamId).addPathComponent('sharing')
+    }
+
+    public recordingSharingPasswords(id: SessionRecordingType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.recordingSharing(id, teamId).addPathComponent('passwords')
+    }
+
+    public recordingSharingPassword(
+        id: SessionRecordingType['id'],
+        passwordId: string,
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.recordingSharingPasswords(id, teamId).addPathComponent(passwordId)
+    }
+
+    // # Dashboards
+    public dashboards(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('dashboards')
+    }
+
+    public dashboardsDetail(dashboardId: DashboardType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.dashboards(teamId).addPathComponent(dashboardId)
+    }
+
+    public dashboardCollaborators(
+        dashboardId: DashboardType['id'],
+        projectId: ProjectType['id'] = ApiConfig.getCurrentProjectId() // Collaborators endpoint is project-level, not team-level
+    ): ApiRequest {
+        return this.dashboardsDetail(dashboardId, projectId).addPathComponent('collaborators')
+    }
+
+    public dashboardSharing(dashboardId: DashboardType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.dashboardsDetail(dashboardId, teamId).addPathComponent('sharing')
+    }
+
+    public notebookSharing(notebookShortId: NotebookType['short_id'], teamId?: TeamType['id']): ApiRequest {
+        return this.notebook(notebookShortId, teamId).addPathComponent('sharing')
+    }
+
+    public notebookSharingPasswords(notebookShortId: NotebookType['short_id'], teamId?: TeamType['id']): ApiRequest {
+        return this.notebookSharing(notebookShortId, teamId).addPathComponent('passwords')
+    }
+
+    public notebookSharingPassword(
+        notebookShortId: NotebookType['short_id'],
+        passwordId: string,
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.notebookSharingPasswords(notebookShortId, teamId).addPathComponent(passwordId)
+    }
+
+    public dashboardSharingPasswords(dashboardId: DashboardType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.dashboardSharing(dashboardId, teamId).addPathComponent('passwords')
+    }
+
+    public dashboardSharingPassword(
+        dashboardId: DashboardType['id'],
+        passwordId: string,
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.dashboardSharingPasswords(dashboardId, teamId).addPathComponent(passwordId)
+    }
+
+    public dashboardCollaboratorsDetail(
+        dashboardId: DashboardType['id'],
+        userUuid: UserType['uuid'],
+        projectId?: ProjectType['id']
+    ): ApiRequest {
+        return this.dashboardCollaborators(dashboardId, projectId).addPathComponent(userUuid)
+    }
+
+    // # Dashboard templates
+    public dashboardTemplates(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('dashboard_templates')
+    }
+
+    public dashboardTemplatesDetail(
+        dashboardTemplateId: DashboardTemplateType['id'],
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.dashboardTemplates(teamId).addPathComponent(dashboardTemplateId)
+    }
+
+    public dashboardTemplatesCopyBetweenProjects(teamId?: TeamType['id']): ApiRequest {
+        return this.dashboardTemplates(teamId).addPathComponent('copy_between_projects')
+    }
+
+    public dashboardTemplateSchema(): ApiRequest {
+        return this.dashboardTemplates().addPathComponent('json_schema')
+    }
+
+    // # Experiments
+    public experiments(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('experiments')
+    }
+
+    public experimentsDetail(experimentId: Experiment['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.experiments(teamId).addPathComponent(experimentId)
+    }
+
+    public experimentCreateExposureCohort(experimentId: Experiment['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.experimentsDetail(experimentId, teamId).addPathComponent('create_exposure_cohort_for_experiment')
+    }
+
+    // # Roles
+    public roles(): ApiRequest {
+        return this.organizations().current().addPathComponent('roles')
+    }
+
+    public rolesDetail(roleId: RoleType['id']): ApiRequest {
+        return this.roles().addPathComponent(roleId)
+    }
+
+    public roleMemberships(roleId: RoleType['id']): ApiRequest {
+        return this.rolesDetail(roleId).addPathComponent('role_memberships')
+    }
+
+    public roleMembershipsDetail(roleId: RoleType['id'], userUuid: UserType['uuid']): ApiRequest {
+        return this.roleMemberships(roleId).addPathComponent(userUuid)
+    }
+
+    // # OrganizationMembers
+    public organizationMembers(): ApiRequest {
+        return this.organizations().current().addPathComponent('members')
+    }
+
+    public organizationMembersForAccount(): ApiRequest {
+        return this.projectsDetail().addPathComponent('organization_members')
+    }
+
+    public organizationMember(uuid: OrganizationMemberType['user']['uuid']): ApiRequest {
+        return this.organizationMembers().addPathComponent(uuid)
+    }
+
+    public organizationMemberScopedApiKeys(uuid: OrganizationMemberType['user']['uuid']): ApiRequest {
+        return this.organizationMember(uuid).addPathComponent('scoped_api_keys')
+    }
+
+    // # Persons
+    public persons(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('persons')
+    }
+
+    public person(id: string | number, teamId?: TeamType['id']): ApiRequest {
+        return this.persons(teamId).addPathComponent(id)
+    }
+
+    public personActivity(id: string | number | undefined): ApiRequest {
+        if (id) {
+            return this.person(id).addPathComponent('activity')
+        }
+        return this.persons().addPathComponent('activity')
+    }
+
+    // # Groups
+    public groups(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('groups')
+    }
+
+    public group(index: number, key: string, teamId?: TeamType['id']): ApiRequest {
+        return this.groups(teamId).withQueryString({
+            group_type_index: index,
+            group_key: key,
+        })
+    }
+
+    public groupActivity(teamId?: TeamType['id']): ApiRequest {
+        return this.groups(teamId).addPathComponent('activity')
+    }
+
+    // # Search
+    public search(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('search')
+    }
+
+    // # Annotations
+    public annotations(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('annotations')
+    }
+
+    public annotation(id: RawAnnotationType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.annotations(teamId).addPathComponent(id)
+    }
+
+    // # Feature flags
+    public featureFlags(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('feature_flags')
+    }
+
+    public featureFlag(id: FeatureFlagType['id'], teamId?: TeamType['id']): ApiRequest {
+        if (!id) {
+            throw new Error('Must provide an ID for the feature flag to construct the URL')
+        }
+        return this.featureFlags(teamId).addPathComponent(id)
+    }
+
+    public featureFlagCreateStaticCohort(id: FeatureFlagType['id'], teamId?: TeamType['id']): ApiRequest {
+        if (!id) {
+            throw new Error('Must provide an ID for the feature flag to construct the URL')
+        }
+        return this.featureFlag(id, teamId).addPathComponent('create_static_cohort_for_flag')
+    }
+
+    public featureFlagsActivity(id: FeatureFlagType['id'], teamId: TeamType['id']): ApiRequest {
+        if (id) {
+            return this.featureFlag(id, teamId).addPathComponent('activity')
+        }
+        return this.featureFlags(teamId).addPathComponent('activity')
+    }
+
+    public featureFlagScheduledChanges(teamId: TeamType['id'], featureFlagId: FeatureFlagType['id']): ApiRequest {
+        return this.projectsDetail(teamId)
+            .addPathComponent('scheduled_changes')
+            .withQueryString(
+                toParams({
+                    model_name: 'FeatureFlag',
+                    record_id: featureFlagId,
+                })
+            )
+    }
+
+    public featureFlagStatus(teamId: TeamType['id'], featureFlagId: FeatureFlagType['id']): ApiRequest {
+        return this.projectsDetail(teamId)
+            .addPathComponent('feature_flags')
+            .addPathComponent(String(featureFlagId))
+            .addPathComponent('status')
+    }
+
+    public featureFlagCreateScheduledChange(teamId: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('scheduled_changes')
+    }
+
+    public featureFlagScheduledChange(
+        teamId: TeamType['id'],
+        scheduledChangeId: ScheduledChangeType['id']
+    ): ApiRequest {
+        return this.projectsDetail(teamId)
+            .addPathComponent('scheduled_changes')
+            .addPathComponent(`${scheduledChangeId}`)
+    }
+
+    public featureFlagDeleteScheduledChange(
+        teamId: TeamType['id'],
+        scheduledChangeId: ScheduledChangeType['id']
+    ): ApiRequest {
+        return this.featureFlagScheduledChange(teamId, scheduledChangeId)
+    }
+
+    // # Features
+    public earlyAccessFeatures(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('early_access_feature')
+    }
+
+    public earlyAccessFeature(id: EarlyAccessFeatureType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.earlyAccessFeatures(teamId).addPathComponent(id)
+    }
+
+    // # User interviews
+    public userInterviews(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('user_interviews')
+    }
+
+    public userInterview(id: UserInterviewType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.userInterviews(teamId).addPathComponent(id)
+    }
+
+    // # Users
+    public users(email?: string): ApiRequest {
+        if (email) {
+            return this.addPathComponent('users').withQueryString({ email })
+        }
+        return this.addPathComponent('users')
+    }
+
+    // # Signal Reports
+    public signalReports(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('signals').addPathComponent('reports')
+    }
+
+    public signalReport(id: SignalReport['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.signalReports(teamId).addPathComponent(id)
+    }
+
+    // Per-user signal autonomy config (singleton keyed by user). Not project-scoped.
+    public signalUserAutonomy(userId: string | '@me' = '@me'): ApiRequest {
+        return this.addPathComponent('users').addPathComponent(userId).addPathComponent('signal_autonomy')
+    }
+
+    // # Signal Source Configs
+    public signalSourceConfigs(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('signals').addPathComponent('source_configs')
+    }
+
+    public signalSourceConfig(id: string, teamId?: TeamType['id']): ApiRequest {
+        return this.signalSourceConfigs(teamId).addPathComponent(id)
+    }
+
+    // # Signal Team Config (singleton per team)
+    public signalTeamConfig(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('signals').addPathComponent('config')
+    }
+
+    // # Signal Report Artefacts (suggested_reviewers is the only writable type)
+    public signalReportArtefact(reportId: SignalReport['id'], artefactId: string, teamId?: TeamType['id']): ApiRequest {
+        return this.signalReport(reportId, teamId).addPathComponent('artefacts').addPathComponent(artefactId)
+    }
+
+    // # Signal Scouts
+    public signalScoutRuns(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId)
+            .addPathComponent('signals')
+            .addPathComponent('scout')
+            .addPathComponent('runs')
+    }
+
+    public signalScoutRun(id: string, teamId?: TeamType['id']): ApiRequest {
+        return this.signalScoutRuns(teamId).addPathComponent(id)
+    }
+
+    public signalScoutConfigs(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId)
+            .addPathComponent('signals')
+            .addPathComponent('scout')
+            .addPathComponent('configs')
+    }
+
+    public signalScoutConfig(id: string, teamId?: TeamType['id']): ApiRequest {
+        return this.signalScoutConfigs(teamId).addPathComponent(id)
+    }
+
+    // # Tasks
+    public tasks(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('tasks')
+    }
+
+    public task(id: Task['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.tasks(teamId).addPathComponent(id)
+    }
+
+    public taskRuns(taskId: Task['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.task(taskId, teamId).addPathComponent('runs')
+    }
+
+    public taskRun(taskId: Task['id'], runId: TaskRun['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.taskRuns(taskId, teamId).addPathComponent(runId)
+    }
+
+    // # Surveys
+    public surveys(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('surveys')
+    }
+
+    public surveysResponsesCount(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('surveys/responses_count')
+    }
+
+    public survey(id: Survey['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.surveys(teamId).addPathComponent(id)
+    }
+
+    public surveyActivity(id: Survey['id'] | undefined, teamId?: TeamType['id']): ApiRequest {
+        if (id) {
+            return this.survey(id, teamId).addPathComponent('activity')
+        }
+        return this.surveys(teamId).addPathComponent('activity')
+    }
+
+    // Product tours
+    public productTours(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('product_tours')
+    }
+
+    public productTour(id: ProductTour['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.productTours(teamId).addPathComponent(id)
+    }
+
+    // Error tracking
+    public errorTracking(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('error_tracking')
+    }
+
+    public errorTrackingIssues(teamId?: TeamType['id']): ApiRequest {
+        return this.errorTracking(teamId).addPathComponent('issues')
+    }
+
+    public errorTrackingIssuesExists(teamId?: TeamType['id']): ApiRequest {
+        return this.errorTrackingIssues(teamId).addPathComponent('exists')
+    }
+
+    public errorTrackingIssue(id: ErrorTrackingIssue['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.errorTrackingIssues(teamId).addPathComponent(id)
+    }
+
+    public errorTrackingIssueMerge(into: ErrorTrackingIssue['id']): ApiRequest {
+        return this.errorTrackingIssue(into).addPathComponent('merge')
+    }
+
+    public errorTrackingIssueSplit(into: ErrorTrackingIssue['id']): ApiRequest {
+        return this.errorTrackingIssue(into).addPathComponent('split')
+    }
+
+    public errorTrackingIssueBulk(teamId?: TeamType['id']): ApiRequest {
+        return this.errorTrackingIssues(teamId).addPathComponent('bulk')
+    }
+
+    public errorTrackingAssignIssue(into: ErrorTrackingIssue['id']): ApiRequest {
+        return this.errorTrackingIssue(into).addPathComponent('assign')
+    }
+
+    public errorTrackingSimilarIssues(issueId: ErrorTrackingIssue['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.errorTrackingIssues(teamId).addPathComponent(`${issueId}/similar_issues`)
+    }
+
+    public errorTrackingExternalReference(teamId?: TeamType['id']): ApiRequest {
+        return this.errorTracking(teamId).addPathComponent('external_references')
+    }
+
+    public errorTrackingIssueFingerprints(teamId?: TeamType['id']): ApiRequest {
+        return this.errorTracking(teamId).addPathComponent('fingerprints')
+    }
+
+    public errorTrackingSymbolSets(teamId?: TeamType['id']): ApiRequest {
+        return this.errorTracking(teamId).addPathComponent('symbol_sets')
+    }
+
+    public errorTrackingSymbolSet(id: ErrorTrackingSymbolSet['id']): ApiRequest {
+        return this.errorTrackingSymbolSets().addPathComponent(id)
+    }
+
+    public errorTrackingReleases(teamId?: TeamType['id']): ApiRequest {
+        return this.errorTracking(teamId).addPathComponent('releases')
+    }
+
+    public errorTrackingRelease(id: ErrorTrackingRelease['id']): ApiRequest {
+        return this.errorTrackingReleases().addPathComponent(id)
+    }
+
+    public gitProviderFileLinks(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId)
+            .addPathComponent('error_tracking')
+            .addPathComponent('git-provider-file-links')
+    }
+
+    public errorTrackingStackFrames(): ApiRequest {
+        return this.errorTracking().addPathComponent('stack_frames/batch_get')
+    }
+
+    public errorTrackingRules(ruleType: ErrorTrackingRuleType, teamId?: TeamType['id']): ApiRequest {
+        return this.errorTracking(teamId).addPathComponent(ruleType)
+    }
+
+    public errorTrackingRule(ruleType: ErrorTrackingRuleType, id: ErrorTrackingRule['id']): ApiRequest {
+        return this.errorTrackingRules(ruleType).addPathComponent(id)
+    }
+
+    public errorTrackingReorderRules(rule: ErrorTrackingRuleType): ApiRequest {
+        return this.errorTrackingRules(rule).addPathComponent('reorder')
+    }
+
+    public errorTrackingIssueCohort(issueId: ErrorTrackingIssue['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.errorTrackingIssue(issueId, teamId).addPathComponent(`cohort`)
+    }
+
+    public errorTrackingSpikeDetectionConfig(teamId?: TeamType['id']): ApiRequest {
+        return this.errorTracking(teamId).addPathComponent('spike_detection_config')
+    }
+
+    public errorTrackingSettings(teamId?: TeamType['id']): ApiRequest {
+        return this.errorTracking(teamId).addPathComponent('settings')
+    }
+
+    public errorTrackingSpikeEvents(teamId?: TeamType['id']): ApiRequest {
+        return this.errorTracking(teamId).addPathComponent('spike_events')
+    }
+
+    public errorTrackingRecommendations(teamId?: TeamType['id']): ApiRequest {
+        return this.errorTracking(teamId).addPathComponent('recommendations')
+    }
+
+    public errorTrackingRecommendation(id: string, teamId?: TeamType['id']): ApiRequest {
+        return this.errorTrackingRecommendations(teamId).addPathComponent(id)
+    }
+
+    public quickFilters(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('quick_filters')
+    }
+
+    public quickFilter(id: string, teamId?: TeamType['id']): ApiRequest {
+        return this.quickFilters(teamId).addPathComponent(id)
+    }
+
+    // # Web Analytics Filter Presets
+    public webAnalyticsFilterPresets(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('web_analytics_filter_presets')
+    }
+
+    public webAnalyticsFilterPreset(shortId: string, teamId?: TeamType['id']): ApiRequest {
+        return this.webAnalyticsFilterPresets(teamId).addPathComponent(shortId)
+    }
+
+    // # Warehouse
+    public dataWarehouseTables(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('warehouse_tables')
+    }
+
+    public dataWarehouseTable(id: DataWarehouseTable['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.dataWarehouseTables(teamId).addPathComponent(id)
+    }
+
+    // # Warehouse view
+    public dataWarehouseSavedQueries(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('warehouse_saved_queries')
+    }
+
+    public dataWarehouseSavedQueryFolders(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('warehouse_saved_query_folders')
+    }
+
+    public dataWarehouseSavedQuery(id: DataWarehouseSavedQuery['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.dataWarehouseSavedQueries(teamId).addPathComponent(id)
+    }
+
+    public dataWarehouseSavedQueryFolder(id: string, teamId?: TeamType['id']): ApiRequest {
+        return this.dataWarehouseSavedQueryFolders(teamId).addPathComponent(id)
+    }
+
+    public dataWarehouseSavedQueryDrafts(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('warehouse_saved_query_drafts')
+    }
+
+    public dataWarehouseSavedQueryDraft(id: DataWarehouseSavedQueryDraft['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.dataWarehouseSavedQueryDrafts(teamId).addPathComponent(id)
+    }
+
+    public dataWarehouseSavedQueryActivity(id: DataWarehouseSavedQuery['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.dataWarehouseSavedQuery(id, teamId).addPathComponent('activity')
+    }
+
+    // # Data Modeling Jobs (ie) materialized view runs
+    public dataWarehouseDataModelingJobs(
+        savedQueryId: DataWarehouseSavedQuery['id'],
+        pageSize = 10,
+        offset = 0,
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('data_modeling_jobs').withQueryString({
+            saved_query_id: savedQueryId,
+            limit: pageSize,
+            offset,
+        })
+    }
+
+    public dataModelingJobsRunning(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('data_modeling_jobs').addPathComponent('running')
+    }
+
+    public dataModelingJobsRecent(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('data_modeling_jobs').addPathComponent('recent')
+    }
+
+    // # Data Modeling DAGs
+    public dataModelingDags(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('data_modeling_dags')
+    }
+
+    public dataModelingDag(id: DataModelingDAG['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.dataModelingDags(teamId).addPathComponent(id)
+    }
+
+    // # Data Modeling Nodes
+    public dataModelingNodes(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('data_modeling_nodes')
+    }
+
+    public dataModelingNode(id: DataModelingNode['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.dataModelingNodes(teamId).addPathComponent(id)
+    }
+
+    // # Data Modeling Edges
+    public dataModelingEdges(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('data_modeling_edges')
+    }
+
+    // # Warehouse view link
+    public dataWarehouseViewLinks(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('warehouse_view_link')
+    }
+
+    public dataWarehouseViewLink(id: DataWarehouseViewLink['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.dataWarehouseViewLinks(teamId).addPathComponent(id)
+    }
+
+    // # Query Tab State
+    public queryTabState(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('query_tab_state')
+    }
+
+    public queryTabStateDetail(id: QueryTabState['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.queryTabState(teamId).addPathComponent(id)
+    }
+
+    public queryTabStateUser(teamId?: TeamType['id']): ApiRequest {
+        return this.queryTabState(teamId).addPathComponent('user')
+    }
+
+    // # Subscriptions
+    public subscriptions(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('subscriptions')
+    }
+
+    public subscription(id: SubscriptionType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.subscriptions(teamId).addPathComponent(id)
+    }
+
+    // # Integrations
+    public integrations(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('integrations')
+    }
+
+    public integration(id: IntegrationType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId).addPathComponent(id)
+    }
+
+    public integrationSlackChannels(
+        id: IntegrationType['id'],
+        forceRefresh: boolean,
+        params?: { search?: string; limit?: number; offset?: number },
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.integrations(teamId)
+            .addPathComponent(id)
+            .addPathComponent('channels')
+            .withQueryString({ force_refresh: forceRefresh, ...params })
+    }
+
+    public integrationSlackChannelsById(
+        id: IntegrationType['id'],
+        channelId: string,
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.integrations(teamId)
+            .addPathComponent(id)
+            .addPathComponent('channels')
+            .withQueryString({ channel_id: channelId })
+    }
+
+    public integrationTwilioPhoneNumbers(
+        id: IntegrationType['id'],
+        forceRefresh: boolean,
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.integrations(teamId)
+            .addPathComponent(id)
+            .addPathComponent('twilio_phone_numbers')
+            .withQueryString({ force_refresh: forceRefresh })
+    }
+
+    public integrationLinearTeams(id: IntegrationType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId).addPathComponent(id).addPathComponent('linear_teams')
+    }
+
+    public integrationGitHubRepositories(id: IntegrationType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId).addPathComponent(id).addPathComponent('github_repos')
+    }
+
+    public integrationGitHubBranches(id: IntegrationType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId).addPathComponent(id).addPathComponent('github_branches')
+    }
+
+    public integrationJiraProjects(id: IntegrationType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId).addPathComponent(id).addPathComponent('jira_projects')
+    }
+
+    public integrationGoogleAdsAccounts(id: IntegrationType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId).addPathComponent(id).addPathComponent('google_accessible_accounts')
+    }
+
+    public integrationGoogleAdsConversionActions(
+        id: IntegrationType['id'],
+        params: { customerId: string; parentId: string },
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.integrations(teamId)
+            .addPathComponent(id)
+            .addPathComponent('google_conversion_actions')
+            .withQueryString(params)
+    }
+
+    public integrationLinkedInAdsAccounts(id: IntegrationType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId).addPathComponent(id).addPathComponent('linkedin_ads_accounts')
+    }
+
+    public integrationLinkedInAdsConversionRules(
+        id: IntegrationType['id'],
+        accountId: string,
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.integrations(teamId)
+            .addPathComponent(id)
+            .addPathComponent('linkedin_ads_conversion_rules')
+            .withQueryString({ accountId })
+    }
+
+    public integrationClickUpSpaces(
+        id: IntegrationType['id'],
+        workspaceId: string,
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.integrations(teamId)
+            .addPathComponent(id)
+            .addPathComponent('clickup_spaces')
+            .withQueryString({ workspaceId })
+    }
+
+    public integrationClickUpLists(id: IntegrationType['id'], spaceId: string, teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId)
+            .addPathComponent(id)
+            .addPathComponent('clickup_lists')
+            .withQueryString({ spaceId })
+    }
+
+    public integrationClickUpWorkspaces(id: IntegrationType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId).addPathComponent(id).addPathComponent('clickup_workspaces')
+    }
+
+    public integrationEmail(id: IntegrationType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId).addPathComponent(id).addPathComponent('email')
+    }
+
+    public integrationEmailVerify(id: IntegrationType['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId).addPathComponent(id).addPathComponent('email/verify')
+    }
+
+    public integrationsDomainConnectCheck(teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId).addPathComponent('domain-connect/check')
+    }
+
+    public integrationsDomainConnectApplyUrl(teamId?: TeamType['id']): ApiRequest {
+        return this.integrations(teamId).addPathComponent('domain-connect/apply-url')
+    }
+
+    // # Organization Integrations
+    public organizationIntegrations(): ApiRequest {
+        return this.organizations().current().addPathComponent('integrations')
+    }
+
+    public organizationIntegrationsDetail(id: IntegrationType['id']): ApiRequest {
+        return this.organizationIntegrations().addPathComponent(id)
+    }
+
+    // # Organization OAuth Applications
+    public organizationOAuthApplications(): ApiRequest {
+        return this.organizations().current().addPathComponent('oauth_applications')
+    }
+
+    public media(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('uploaded_media')
+    }
+
+    // # Alerts
+    public alerts(alertId?: AlertType['id'], insightId?: InsightModel['id'], teamId?: TeamType['id']): ApiRequest {
+        if (alertId) {
+            return this.environmentsDetail(teamId)
+                .addPathComponent('alerts')
+                .addPathComponent(alertId)
+                .withQueryString({
+                    insight_id: insightId,
+                })
+        }
+
+        return this.environmentsDetail(teamId).addPathComponent('alerts').withQueryString({
+            insight_id: insightId,
+        })
+    }
+
+    public alert(alertId: AlertType['id']): ApiRequest {
+        return this.alerts(alertId)
+    }
+
+    // Resource Access Permissions
+
+    public featureFlagAccessPermissions(flagId: FeatureFlagType['id']): ApiRequest {
+        return this.featureFlag(flagId).addPathComponent('role_access')
+    }
+
+    // Queries
+    public query(teamId?: TeamType['id'], queryKind?: string): ApiRequest {
+        const apiRequest = this.environmentsDetail(teamId).addPathComponent('query')
+        if (queryKind) {
+            return apiRequest.addPathComponent(queryKind)
+        }
+        return apiRequest
+    }
+
+    public queryStatus(queryId: string, showProgress: boolean, teamId?: TeamType['id']): ApiRequest {
+        const apiRequest = this.query(teamId).addPathComponent(queryId)
+        if (showProgress) {
+            return apiRequest.withQueryString('show_progress=true')
+        }
+        return apiRequest
+    }
+
+    public queryUpgrade(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('query').addPathComponent('upgrade')
+    }
+
+    public queryLog(queryId: string, teamId?: TeamType['id']): ApiRequest {
+        return this.query(teamId).addPathComponent(queryId).addPathComponent('log')
+    }
+
+    // Endpoints
+    public endpoint(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('endpoints')
+    }
+
+    public endpointDetail(name: string): ApiRequest {
+        return this.endpoint().addPathComponent(name)
+    }
+
+    public lastExecutionTimes(): ApiRequest {
+        return this.addPathComponent('last_execution_times')
+    }
+
+    // Managed Viewsets
+    public dataWarehouseManagedViewset(kind: DataWarehouseManagedViewsetKind, teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('managed_viewsets').addPathComponent(kind)
+    }
+
+    // Conversations (Max AI)
+    public conversations(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('conversations')
+    }
+
+    public conversation(id: string, teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('conversations').addPathComponent(id)
+    }
+
+    // Max hands-free mode (ElevenLabs Scribe token proxy)
+    public maxHandsFree(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('max_hands_free')
+    }
+
+    // Conversations (Support product)
+    public conversationsTickets(teamId?: TeamType['id']): ApiRequest {
+        return this.projectsDetail(teamId).addPathComponent('conversations').addPathComponent('tickets')
+    }
+
+    public conversationsTicket(id: string, teamId?: TeamType['id']): ApiRequest {
+        return this.conversationsTickets(teamId).addPathComponent(id)
+    }
+
+    // Notebooks
+    public notebooks(projectId?: ProjectType['id']): ApiRequest {
+        return this.projectsDetail(projectId).addPathComponent('notebooks')
+    }
+
+    public notebook(id: NotebookType['short_id'], teamId?: TeamType['id']): ApiRequest {
+        return this.notebooks(teamId).addPathComponent(id)
+    }
+
+    // Batch Exports
+    public batchExports(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('batch_exports')
+    }
+
+    public batchExport(id: BatchExportConfiguration['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.batchExports(teamId).addPathComponent(id)
+    }
+
+    public batchExportRuns(id: BatchExportConfiguration['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.batchExports(teamId).addPathComponent(id).addPathComponent('runs')
+    }
+
+    public batchExportBackfills(id: BatchExportConfiguration['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.batchExports(teamId).addPathComponent(id).addPathComponent('backfills')
+    }
+
+    public batchExportRun(
+        id: BatchExportConfiguration['id'],
+        runId: BatchExportRun['id'],
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.batchExportRuns(id, teamId).addPathComponent(runId)
+    }
+
+    public batchExportBackfill(
+        id: BatchExportConfiguration['id'],
+        backfillId: BatchExportBackfill['id'],
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.batchExportBackfills(id, teamId).addPathComponent(backfillId)
+    }
+
+    // External Data Source
+    public externalDataSources(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('external_data_sources')
+    }
+
+    public externalDataSource(sourceId: ExternalDataSource['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.externalDataSources(teamId).addPathComponent(sourceId)
+    }
+
+    public externalDataSourceConnections(teamId?: TeamType['id']): ApiRequest {
+        return this.externalDataSources(teamId).addPathComponent('connections')
+    }
+
+    public externalDataSchemas(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('external_data_schemas')
+    }
+
+    public externalDataSourceSchema(schemaId: ExternalDataSourceSchema['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.externalDataSchemas(teamId).addPathComponent(schemaId)
+    }
+
+    public externalDataSourceRevenueAnalyticsConfig(
+        sourceId: ExternalDataSource['id'],
+        teamId?: TeamType['id']
+    ): ApiRequest {
+        return this.externalDataSources(teamId).addPathComponent(sourceId).addPathComponent('revenue_analytics_config')
+    }
+
+    // Fix HogQL errors
+    public fixHogQLErrors(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('fix_hogql')
+    }
+
+    // Insight Variables
+    public insightVariables(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('insight_variables')
+    }
+
+    public insightVariable(variableId: string, teamId?: TeamType['id']): ApiRequest {
+        return this.insightVariables(teamId).addPathComponent(variableId)
+    }
+
+    // ActivityLog
+    public activityLog(projectId?: ProjectType['id']): ApiRequest {
+        return this.projectsDetail(projectId).addPathComponent('activity_log')
+    }
+
+    // Personal API keys
+    public personalApiKeys(): ApiRequest {
+        return this.addPathComponent('personal_api_keys')
+    }
+
+    public personalApiKey(id: PersonalAPIKeyType['id']): ApiRequest {
+        return this.personalApiKeys().addPathComponent(id)
+    }
+
+    // Project API Keys
+    public projectSecretApiKeys(projectId?: ProjectType['id']): ApiRequest {
+        return this.projectsDetail(projectId).addPathComponent('project_secret_api_keys')
+    }
+
+    public projectSecretApiKey(id: ProjectSecretAPIKeyApi['id'], projectId?: ProjectType['id']): ApiRequest {
+        return this.projectSecretApiKeys(projectId).addPathComponent(id)
+    }
+
+    // Request finalization
+    public async get(options?: ApiMethodOptions): Promise<any> {
+        return await api.get(this.assembleFullUrl(), options)
+    }
+
+    public async getResponse(options?: ApiMethodOptions): Promise<Response> {
+        return await api.getResponse(this.assembleFullUrl(), options)
+    }
+
+    public async update(options?: ApiMethodOptions & { data: any }): Promise<any> {
+        return await api.update(this.assembleFullUrl(), options?.data, options)
+    }
+
+    public async put(options?: ApiMethodOptions & { data: any }): Promise<any> {
+        return await api.put(this.assembleFullUrl(), options?.data, options)
+    }
+
+    public async create(options?: ApiMethodOptions & { data: any }): Promise<any> {
+        return await api.create(this.assembleFullUrl(), options?.data, options)
+    }
+
+    public async delete(): Promise<any> {
+        return await api.delete(this.assembleFullUrl())
+    }
+
+    // Data color themes
+    public dataColorThemes(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('data_color_themes')
+    }
+
+    public dataColorTheme(id: DataColorThemeModel['id'], teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('data_color_themes').addPathComponent(id)
+    }
+
+    public addProductIntent(): ApiRequest {
+        return this.environments().current().addPathComponent('add_product_intent')
+    }
+
+    // Max Core Memory
+    public coreMemory(): ApiRequest {
+        return this.environmentsDetail().addPathComponent('core_memory')
+    }
+
+    public coreMemoryDetail(id: CoreMemory['id']): ApiRequest {
+        return this.coreMemory().addPathComponent(id)
+    }
+
+    public authenticateWizard(): ApiRequest {
+        return this.wizard().addPathComponent('authenticate')
+    }
+
+    public messagingTemplates(): ApiRequest {
+        return this.environments().current().addPathComponent('messaging_templates')
+    }
+
+    public messagingTemplate(templateId: MessageTemplate['id']): ApiRequest {
+        return this.messagingTemplates().addPathComponent(templateId)
+    }
+
+    public messagingCategories(): ApiRequest {
+        return this.environments().current().addPathComponent('messaging_categories')
+    }
+
+    public messagingCategory(categoryId: string): ApiRequest {
+        return this.messagingCategories().addPathComponent(categoryId)
+    }
+
+    public messagingCategoriesImportFromCustomerIO(): ApiRequest {
+        return this.messagingCategories().addPathComponent('import_from_customerio')
+    }
+
+    public messagingCategoriesOptOutSyncConfig(): ApiRequest {
+        return this.messagingCategories().addPathComponent('optout_sync_config')
+    }
+
+    public messagingCategoriesRemoveCustomerIOAppConfig(): ApiRequest {
+        return this.messagingCategories().addPathComponent('remove_customerio_app_config')
+    }
+
+    public messagingCategoriesSaveWebhookConfig(): ApiRequest {
+        return this.messagingCategories().addPathComponent('save_webhook_config')
+    }
+
+    public messagingCategoriesRemoveWebhookConfig(): ApiRequest {
+        return this.messagingCategories().addPathComponent('remove_webhook_config')
+    }
+
+    public messagingCategoriesSaveTrackConfig(): ApiRequest {
+        return this.messagingCategories().addPathComponent('save_track_config')
+    }
+
+    public messagingCategoriesRemoveTrackConfig(): ApiRequest {
+        return this.messagingCategories().addPathComponent('remove_track_config')
+    }
+
+    public messagingPreferences(): ApiRequest {
+        return this.environments().current().addPathComponent('messaging_preferences')
+    }
+
+    public messagingPreferencesLink(): ApiRequest {
+        return this.environments().current().addPathComponent('messaging_preferences').addPathComponent('generate_link')
+    }
+
+    public messagingPreferencesOptOuts(): ApiRequest {
+        return this.environments().current().addPathComponent('messaging_preferences').addPathComponent('opt_outs')
+    }
+
+    public messagingPreferencesAddOptOut(): ApiRequest {
+        return this.environments().current().addPathComponent('messaging_preferences').addPathComponent('add_opt_out')
+    }
+
+    public hogFlows(): ApiRequest {
+        return this.environments().current().addPathComponent('hog_flows')
+    }
+
+    public hogFlow(hogFlowId: HogFlow['id']): ApiRequest {
+        return this.hogFlows().addPathComponent(hogFlowId)
+    }
+
+    public hogFlowTemplates(): ApiRequest {
+        return this.environments().current().addPathComponent('hog_flow_templates')
+    }
+
+    public hogFlowTemplate(hogFlowTemplateId: HogFlowTemplate['id']): ApiRequest {
+        return this.hogFlowTemplates().addPathComponent(hogFlowTemplateId)
+    }
+
+    public wizard(): ApiRequest {
+        return this.addPathComponent('wizard')
+    }
+
+    public datasets(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('datasets')
+    }
+
+    public dataset(id: string, teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('datasets').addPathComponent(id)
+    }
+
+    public datasetItems(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('dataset_items')
+    }
+
+    public datasetItem(id: string, teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('dataset_items').addPathComponent(id)
+    }
+
+    public llmPrompts(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('llm_prompts')
+    }
+
+    public llmPromptByName(name: string, teamId?: TeamType['id']): ApiRequest {
+        return this.llmPrompts(teamId).addPathComponent('name').addPathComponent(name)
+    }
+
+    public llmPromptArchiveByName(name: string, teamId?: TeamType['id']): ApiRequest {
+        return this.llmPromptByName(name, teamId).addPathComponent('archive')
+    }
+
+    public llmPromptDuplicateByName(name: string, teamId?: TeamType['id']): ApiRequest {
+        return this.llmPromptByName(name, teamId).addPathComponent('duplicate')
+    }
+
+    public llmPromptResolveByName(name: string, teamId?: TeamType['id']): ApiRequest {
+        return this.llmPrompts(teamId).addPathComponent('resolve').addPathComponent('name').addPathComponent(name)
+    }
+
+    public evaluationRuns(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('evaluation_runs')
+    }
+
+    // Session summary
+    public sessionSummary(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('session_summaries')
+    }
+
+    // Session group summaries
+    public sessionGroupSummaries(projectId?: ProjectType['id']): ApiRequest {
+        return this.projectsDetail(projectId).addPathComponent('session_group_summaries')
+    }
+
+    public sessionGroupSummary(id: string, projectId?: ProjectType['id']): ApiRequest {
+        return this.sessionGroupSummaries(projectId).addPathComponent(id)
+    }
+
+    // Heatmap screenshots
+    public heatmapScreenshots(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('heatmap_screenshots')
+    }
+
+    public heatmapScreenshot(id: number, teamId?: TeamType['id']): ApiRequest {
+        return this.heatmapScreenshots(teamId).addPathComponent(id)
+    }
+
+    public heatmapScreenshotsSaved(teamId?: TeamType['id']): ApiRequest {
+        // Deprecated path: kept for potential fallback during rollout
+        return this.environmentsDetail(teamId).addPathComponent('saved')
+    }
+
+    public heatmapScreenshotSaved(id: number | string, teamId?: TeamType['id']): ApiRequest {
+        return this.heatmapScreenshotsSaved(teamId).addPathComponent(id)
+    }
+
+    // Revenue analytics
+    public revenueAnalyticsJoins(teamId?: TeamType['id']): ApiRequest {
+        return this.environmentsDetail(teamId).addPathComponent('revenue_analytics').addPathComponent('joins')
+    }
+}
+
+const normalizeUrl = (url: string): string => {
+    if (url.indexOf('http') !== 0) {
+        if (!url.startsWith('/')) {
+            url = '/' + url
+        }
+
+        url = url + (url.indexOf('?') === -1 && url[url.length - 1] !== '/' ? '/' : '')
+    }
+    return url
+}
+
+const prepareUrl = (url: string): string => {
+    let output = normalizeUrl(url)
+
+    // OAuth mode: route the data API to the selected region's host. Only `/api/*` is rewritten —
+    // it's what the cloud CORS allowlist covers. Other endpoints (e.g. `/_preflight/`) aren't
+    // cross-origin accessible, so they stay same-origin on the local instance.
+    const backendHost = getBackendHost()
+    if (backendHost && output.startsWith('/api/')) {
+        output = backendHost + output
+    }
+
+    const exporterContext = getCurrentExporterData()
+
+    if (exporterContext && exporterContext.accessToken) {
+        output =
+            output +
+            (output.indexOf('?') === -1 ? '?' : '&') +
+            encodeParams({
+                sharing_access_token: exporterContext.accessToken,
+            })
+    }
+
+    return output
+}
+
+/**
+ * Bearer auth header for standalone OAuth mode, attached only to requests bound for the OAuth
+ * backend host (the remote region). Requests that `prepareUrl` left on the local origin (non-`/api`
+ * paths) must not carry the remote region's token. Empty when served by Django (session auth).
+ * Synchronous so requests still dispatch synchronously — an expired token is handled by the
+ * 401 → refresh → retry path in handleFetch. Pass the already-`prepareUrl`'d request URL.
+ */
+function oauthAuthHeaders(url: string): Record<string, string> {
+    const session = getStoredSession()
+    return session && url.startsWith(session.backendHost) ? { Authorization: `Bearer ${session.accessToken}` } : {}
+}
+
+/**
+ * PostHog session/distinct tracing headers. Omitted in OAuth mode because the cross-origin CORS
+ * allowlist (CORS_ALLOWED_TRACING_HEADERS) doesn't include them, so a preflight would fail —
+ * they're debugging aids, not functionally required.
+ */
+function tracingHeaders({ includeDistinctId = false } = {}): Record<string, string> {
+    if (isOAuthMode()) {
+        return {}
+    }
+    const sessionId = getSessionId()
+    const distinctId = includeDistinctId ? getDistinctId() : undefined
+    return {
+        ...(sessionId ? { 'X-POSTHOG-SESSION-ID': sessionId } : {}),
+        ...(distinctId ? { 'X-POSTHOG-DISTINCT-ID': distinctId } : {}),
+    }
+}
+
+const PROJECT_ID_REGEX = /\/api\/(project|environment)s\/(\w+)(?:$|[/?#])/
+
+const ensureProjectIdNotInvalid = (url: string): void => {
+    const projectIdMatch = PROJECT_ID_REGEX.exec(url)
+    if (projectIdMatch) {
+        const projectId = projectIdMatch[2].trim()
+        if (projectId === 'null' || projectId === 'undefined') {
+            throw {
+                status: 0,
+                detail: `Cannot make request - ${projectIdMatch[1]} ID is unknown.`,
+            }
+        }
+    }
+}
+
+function getSessionId(): string | undefined {
+    // get_session_id is not always present e.g. in the toolbar
+    // but our typing in the SDK doesn't make this clear
+    // TODO when the SDK makes this safe this check can be simplified
+    if (typeof posthog?.get_session_id !== 'function') {
+        return undefined
+    }
+    return posthog.get_session_id()
+}
+
+function getDistinctId(): string | undefined {
+    if (typeof posthog?.get_distinct_id !== 'function') {
+        return undefined
+    }
+    return posthog.get_distinct_id()
+}
+
+// TEMPORARY DEBUG — remove once livestream 401 root cause is identified.
+// Decodes the (unverified) JWT payload from an Authorization header and captures
+// a PostHog event so we can aggregate which claim shape is causing 401s. Sensitive
+// fields are masked.
+function captureLivestream401Debug(url: string, authHeader: string | undefined, serverErrorData: any): void {
+    try {
+        const props: Record<string, any> = {
+            url,
+            server_message: serverErrorData?.message || serverErrorData?.error,
+        }
+        if (!authHeader) {
+            posthog.capture('livestream_401_debug', {
+                ...props,
+                decode_status: 'no_auth_header',
+            })
+            return
+        }
+        const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/)
+        if (!bearerMatch) {
+            posthog.capture('livestream_401_debug', {
+                ...props,
+                decode_status: 'not_bearer',
+            })
+            return
+        }
+        const parts = bearerMatch[1].split('.')
+        if (parts.length !== 3) {
+            posthog.capture('livestream_401_debug', {
+                ...props,
+                decode_status: 'malformed_jwt',
+                jwt_parts: parts.length,
+            })
+            return
+        }
+        const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+        const padded = b64 + '==='.slice((b64.length + 3) % 4)
+        const payload = JSON.parse(atob(padded))
+        const now = Math.floor(Date.now() / 1000)
+        const apiTokenMasked =
+            typeof payload.api_token === 'string'
+                ? payload.api_token.slice(0, 4) + `***(len=${payload.api_token.length})`
+                : `<${typeof payload.api_token}>`
+        posthog.capture('livestream_401_debug', {
+            ...props,
+            decode_status: 'ok',
+            team_id: payload.team_id,
+            team_id_type: typeof payload.team_id,
+            user_id: payload.user_id,
+            user_id_type: typeof payload.user_id,
+            organization_id: payload.organization_id,
+            organization_id_type: typeof payload.organization_id,
+            api_token_masked: apiTokenMasked,
+            api_token_type: typeof payload.api_token,
+            aud: payload.aud,
+            aud_type: Array.isArray(payload.aud) ? 'array' : typeof payload.aud,
+            exp: payload.exp,
+            now_epoch: now,
+            exp_seconds_remaining: typeof payload.exp === 'number' ? payload.exp - now : null,
+            token_is_expired: typeof payload.exp === 'number' ? payload.exp < now : null,
+            claim_keys: Object.keys(payload).sort(),
+        })
+    } catch (e) {
+        posthog.capture('livestream_401_debug', {
+            url,
+            decode_status: 'exception',
+            decode_error: String(e),
+        })
+    }
+}
+
+const api = {
+    cspReporting: {
+        explain(properties: Record<string, any>): Promise<{ response: string }> {
+            return new ApiRequest().cspReportingExplanation().create({ data: { properties } })
+        },
+    },
+    aiObservability: {
+        translate(params: { text: string; targetLanguage?: string }): Promise<{
+            translation: string
+            detected_language?: string
+            provider: string
+        }> {
+            // Convert to snake_case for backend
+            const data = {
+                text: params.text,
+                target_language: params.targetLanguage,
+            }
+            return new ApiRequest().aiObservabilityTranslate().create({ data })
+        },
+    },
+    insights: {
+        loadInsight(
+            shortId: InsightModel['short_id'],
+            basic?: boolean,
+            refresh?: RefreshType,
+            filtersOverride?: DashboardFilter | null,
+            variablesOverride?: Record<string, HogQLVariable> | null,
+            tileFiltersOverride?: TileFilters | null
+        ): Promise<PaginatedResponse<Partial<InsightModel>>> {
+            return new ApiRequest()
+                .insights()
+                .withQueryString(
+                    toParams({
+                        short_id: encodeURIComponent(shortId),
+                        basic,
+                        refresh,
+                        filters_override: filtersOverride,
+                        variables_override: variablesOverride,
+                        tile_filters_override: tileFiltersOverride,
+                    })
+                )
+                .get()
+        },
+        async list(params?: Record<string, any>): Promise<PaginatedResponse<InsightModel>> {
+            return await new ApiRequest().insights().withQueryString(params).get()
+        },
+        async get(id: number): Promise<InsightModel | null> {
+            return await new ApiRequest().insight(id).get()
+        },
+        async create(data: any): Promise<InsightModel> {
+            return await new ApiRequest().insights().create({ data })
+        },
+        async update(id: number, data: any): Promise<InsightModel> {
+            return await new ApiRequest().insight(id).update({ data })
+        },
+        async cancelQuery(clientQueryId: string, teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()): Promise<void> {
+            await new ApiRequest().insightsCancel(teamId).create({ data: { client_query_id: clientQueryId } })
+        },
+        async generateMetadata(query: Record<string, any>): Promise<{ name: string; description: string }> {
+            return await new ApiRequest().insights().withAction('generate_metadata').create({ data: { query } })
+        },
+        async trending(params?: { days?: number; limit?: number }): Promise<InsightModel[]> {
+            const response = await new ApiRequest()
+                .insights()
+                .withAction('trending')
+                .withQueryString(toParams(params || {}))
+                .get()
+            // Endpoint returns the standard {count, next, previous, results} envelope.
+            return response.results ?? response
+        },
+    },
+
+    endpoint: {
+        async list(): Promise<CountedPaginatedResponse<EndpointType>> {
+            return await new ApiRequest().endpoint().get()
+        },
+        async get(name: string, version?: number): Promise<EndpointVersionType> {
+            let request = new ApiRequest().endpointDetail(name)
+            if (version !== undefined) {
+                request = request.withQueryString({ version })
+            }
+            return await request.get()
+        },
+        async create(data: EndpointRequest): Promise<EndpointType> {
+            return await new ApiRequest().endpoint().create({ data })
+        },
+        async delete(name: string): Promise<void> {
+            return await new ApiRequest().endpointDetail(name).delete()
+        },
+        async update(name: string, data: EndpointRequest, version?: number): Promise<EndpointType> {
+            const request = new ApiRequest().endpointDetail(name)
+            if (version !== undefined) {
+                request.withQueryString({ version })
+            }
+            return await request.update({ data })
+        },
+        async run(name: string, data: EndpointRunRequest): Promise<AnyResponseType> {
+            return await new ApiRequest().endpointDetail(name).withAction('run').create({ data })
+        },
+        async getLastExecutionTimes(data: EndpointLastExecutionTimesRequest): Promise<Record<string, string>> {
+            if (data.names.length === 0) {
+                return {}
+            }
+
+            const response: QueryStatusResponse = await new ApiRequest()
+                .endpoint()
+                .lastExecutionTimes()
+                .create({ data })
+            const result: Record<string, string> = {}
+            if (response.query_status?.results) {
+                for (const row of response.query_status.results) {
+                    if (row && row.length >= 2) {
+                        const [name, timestamp] = row
+                        if (name && timestamp) {
+                            result[name] = timestamp
+                        }
+                    }
+                }
+            }
+
+            return result
+        },
+        async getMaterializationStatus(name: string, version?: number): Promise<EndpointType['materialization']> {
+            let request = new ApiRequest().endpointDetail(name).withAction('materialization_status')
+            if (version !== undefined) {
+                request = request.withQueryString({ version })
+            }
+            return await request.get()
+        },
+        async getMaterializationPreview(
+            name: string,
+            version?: number,
+            bucketOverrides?: Record<string, string>
+        ): Promise<{
+            can_materialize: boolean
+            reason: string | null
+            transformed_query: string | null
+            range_pairs: {
+                column: string
+                variables: string[]
+                bucket_fn: string
+            }[]
+            aggregates: { expression: string; reaggregate_fn: string | null }[]
+        }> {
+            const data: Record<string, any> = {}
+            if (version !== undefined) {
+                data.version = version
+            }
+            if (bucketOverrides && Object.keys(bucketOverrides).length > 0) {
+                data.bucket_overrides = bucketOverrides
+            }
+            return await new ApiRequest().endpointDetail(name).withAction('materialization_preview').create({ data })
+        },
+        async listVersions(name: string): Promise<CountedPaginatedResponse<EndpointVersionType>> {
+            return await new ApiRequest().endpointDetail(name).withAction('versions').get()
+        },
+    },
+
+    featureFlags: {
+        async get(id: FeatureFlagType['id']): Promise<FeatureFlagType> {
+            return await new ApiRequest().featureFlag(id).get()
+        },
+        async bulkKeys(ids: FeatureFlagType['id'][]): Promise<{ keys: Record<string, string> }> {
+            return await new ApiRequest().featureFlags().withAction('bulk_keys').create({ data: { ids } })
+        },
+        async createStaticCohort(id: FeatureFlagType['id']): Promise<{ cohort: CohortType }> {
+            return await new ApiRequest().featureFlagCreateStaticCohort(id).create()
+        },
+        async getScheduledChanges(
+            teamId: TeamType['id'],
+            featureFlagId: FeatureFlagType['id']
+        ): Promise<CountedPaginatedResponse<ScheduledChangeType>> {
+            return await new ApiRequest().featureFlagScheduledChanges(teamId, featureFlagId).get()
+        },
+        async createScheduledChange(
+            teamId: TeamType['id'],
+            data: any
+        ): Promise<{ scheduled_change: ScheduledChangeType }> {
+            return await new ApiRequest().featureFlagCreateScheduledChange(teamId).create({ data })
+        },
+        async deleteScheduledChange(
+            teamId: TeamType['id'],
+            scheduledChangeId: ScheduledChangeType['id']
+        ): Promise<{ scheduled_change: ScheduledChangeType }> {
+            return await new ApiRequest().featureFlagDeleteScheduledChange(teamId, scheduledChangeId).delete()
+        },
+        async updateScheduledChange(
+            teamId: TeamType['id'],
+            scheduledChangeId: ScheduledChangeType['id'],
+            data: Partial<ScheduledChangeType>
+        ): Promise<ScheduledChangeType> {
+            return await new ApiRequest().featureFlagScheduledChange(teamId, scheduledChangeId).update({ data })
+        },
+        async getStatus(
+            teamId: TeamType['id'],
+            featureFlagId: FeatureFlagType['id']
+        ): Promise<FeatureFlagStatusResponse> {
+            return await new ApiRequest().featureFlagStatus(teamId, featureFlagId).get()
+        },
+    },
+
+    fileSystem: {
+        async list({
+            parent,
+            path,
+            depth,
+            limit,
+            offset,
+            orderBy,
+            search,
+            ref,
+            notType,
+            type,
+            type__startswith,
+            createdAtGt,
+            createdAtLt,
+            searchNameOnly,
+            signal,
+        }: {
+            parent?: string
+            path?: string
+            depth?: number
+            limit?: number
+            offset?: number
+            orderBy?: string
+            search?: string
+            ref?: string
+            notType?: string
+            type?: string
+            type__startswith?: string
+            createdAtGt?: string
+            createdAtLt?: string
+            searchNameOnly?: boolean
+            signal?: AbortSignal
+        }): Promise<CountedPaginatedResponseWithUsers<FileSystemEntry>> {
+            return await new ApiRequest()
+                .fileSystem()
+                .withQueryString({
+                    parent,
+                    path,
+                    depth,
+                    limit,
+                    offset,
+                    search,
+                    ref,
+                    type,
+                    not_type: notType,
+                    order_by: orderBy,
+                    type__startswith,
+                    created_at__gt: createdAtGt,
+                    created_at__lt: createdAtLt,
+                    search_name_only: searchNameOnly,
+                })
+                .get({ signal })
+        },
+        async unfiled(type?: string): Promise<CountResponse | null> {
+            return await new ApiRequest().fileSystemUnfiled(type).get()
+        },
+        async create(data: FileSystemEntry): Promise<FileSystemEntry> {
+            return await new ApiRequest().fileSystem().create({ data })
+        },
+        async update(id: NonNullable<FileSystemEntry['id']>, data: Partial<FileSystemEntry>): Promise<FileSystemEntry> {
+            return await new ApiRequest().fileSystemDetail(id).update({ data })
+        },
+        async delete(id: NonNullable<FileSystemEntry['id']>): Promise<FileSystemDeleteResponse | null> {
+            const response = await new ApiRequest().fileSystemDetail(id).delete()
+
+            if (typeof Response !== 'undefined' && response instanceof Response) {
+                if (response.status === 204) {
+                    return null
+                }
+
+                try {
+                    return (await response.clone().json()) as FileSystemDeleteResponse
+                } catch {
+                    return null
+                }
+            }
+
+            return (response as FileSystemDeleteResponse) ?? null
+        },
+        async move(id: NonNullable<FileSystemEntry['id']>, newPath: string): Promise<FileSystemEntry> {
+            return await new ApiRequest().fileSystemMove(id).create({ data: { new_path: newPath } })
+        },
+        async link(id: NonNullable<FileSystemEntry['id']>, newPath: string): Promise<FileSystemEntry> {
+            return await new ApiRequest().fileSystemLink(id).create({ data: { new_path: newPath } })
+        },
+        async count(id: NonNullable<FileSystemEntry['id']>): Promise<FileSystemCount> {
+            return await new ApiRequest().fileSystemCount(id).create()
+        },
+        async undoDelete(items: { type: string; ref: string; path?: string }[]): Promise<void> {
+            await new ApiRequest().fileSystemUndoDelete().create({ data: { items } })
+        },
+    },
+
+    fileSystemLogView: {
+        async list(params?: {
+            type?: string
+            limit?: number
+            signal?: AbortSignal
+        }): Promise<FileSystemViewLogEntry[]> {
+            const { signal, ...query } = params ?? {}
+            const request = new ApiRequest().fileSystemLogView()
+            if (Object.keys(query).length) {
+                request.withQueryString(query)
+            }
+            return await request.get({ signal })
+        },
+        async create(data: { ref?: string; type?: string }): Promise<FileSystemEntry> {
+            return await new ApiRequest().fileSystemLogView().create({ data })
+        },
+    },
+
+    fileSystemShortcuts: {
+        async list(params?: {
+            limit?: number
+            offset?: number
+            ordering?: string
+            signal?: AbortSignal
+        }): Promise<CountedPaginatedResponse<FileSystemEntry>> {
+            const { signal, ...query } = params ?? {}
+            const request = new ApiRequest().fileSystemShortcut()
+            if (Object.keys(query).length) {
+                request.withQueryString(query)
+            }
+            return await request.get({ signal })
+        },
+        async create(data: { path: string; href?: string; ref?: string; type?: string }): Promise<FileSystemEntry> {
+            return await new ApiRequest().fileSystemShortcut().create({ data })
+        },
+        async delete(id: FileSystemEntry['id']): Promise<void> {
+            return await new ApiRequest().fileSystemShortcutDetail(id).delete()
+        },
+        async reorder(orderedIds: NonNullable<FileSystemEntry['id']>[]): Promise<FileSystemEntry[]> {
+            return await new ApiRequest().fileSystemShortcutReorder().create({ data: { ordered_ids: orderedIds } })
+        },
+    },
+
+    userProductList: {
+        async list(): Promise<CountedPaginatedResponse<UserProductListItem>> {
+            return await new ApiRequest().userProductList().get()
+        },
+        async seed(): Promise<CountedPaginatedResponse<UserProductListItem>> {
+            return await new ApiRequest().userProductList().withAction('seed').create()
+        },
+        async bulkUpdate(
+            items: { product_path: string; enabled: boolean }[]
+        ): Promise<{ results: UserProductListItem[] }> {
+            return await new ApiRequest().userProductList().withAction('bulk_update').update({ data: { items } })
+        },
+    },
+
+    organizationFeatureFlags: {
+        async get(
+            orgId: OrganizationType['id'] = ApiConfig.getCurrentOrganizationId(),
+            featureFlagKey: FeatureFlagType['key']
+        ): Promise<OrganizationFeatureFlag[]> {
+            return await new ApiRequest().organizationFeatureFlags(orgId, featureFlagKey).get()
+        },
+        async copy(
+            orgId: OrganizationType['id'] = ApiConfig.getCurrentOrganizationId(),
+            data: OrganizationFeatureFlagsCopyBody
+        ): Promise<{
+            success: (FeatureFlagType & { flag_dependency_warnings?: string[]; schedule_copy_warning?: string })[]
+            failed: any
+        }> {
+            return await new ApiRequest().copyOrganizationFeatureFlags(orgId).create({ data })
+        },
+        async keys(
+            orgId: OrganizationType['id'] = ApiConfig.getCurrentOrganizationId(),
+            params: { team_ids: number[]; search?: string; limit?: number; offset?: number }
+        ): Promise<OrganizationFeatureFlagKeysResponse> {
+            return await new ApiRequest()
+                .organizationFeatureFlagKeys(orgId)
+                .withQueryString(toParams(params, true))
+                .get()
+        },
+    },
+
+    actions: {
+        async get(actionId: ActionType['id']): Promise<ActionType> {
+            return await new ApiRequest().actionsDetail(actionId).get()
+        },
+        async create(actionData: Partial<ActionType>): Promise<ActionType> {
+            return await new ApiRequest().actions().create({ data: actionData })
+        },
+        async update(actionId: ActionType['id'], actionData: Partial<ActionType>): Promise<ActionType> {
+            return await new ApiRequest().actionsDetail(actionId).update({ data: actionData })
+        },
+        async migrate(id: ActionType['id']): Promise<HogFunctionType> {
+            return await new ApiRequest().actionsDetail(id).withAction('migrate').create()
+        },
+        async list(params?: string): Promise<CountedPaginatedResponse<ActionType>> {
+            return await new ApiRequest().actions().withQueryString(params).get()
+        },
+        async listMatchingPluginConfigs(
+            actionId: ActionType['id']
+        ): Promise<PaginatedResponse<PluginConfigWithPluginInfoNew>> {
+            return await new ApiRequest()
+                .actionsDetail(actionId)
+                .withAction('plugin_configs')
+                .withQueryString({
+                    limit: 1000,
+                })
+                .get()
+        },
+        determineDeleteEndpoint(): string {
+            return new ApiRequest().actions().assembleEndpointUrl()
+        },
+    },
+
+    activity: {
+        list(
+            filters: Partial<
+                Pick<ActivityLogItem, 'item_id' | 'scope'> & {
+                    user?: UserBasicType['id']
+                }
+            >,
+            projectId: ProjectType['id'] = ApiConfig.getCurrentProjectId()
+        ): Promise<PaginatedResponse<ActivityLogItem>> {
+            return api.activity.listRequest(filters, projectId).get()
+        },
+
+        listRequest(
+            filters: Partial<{
+                scope?: ActivityScope | string
+                scopes?: ActivityScope[] | string
+                user?: UserBasicType['id']
+                page?: number
+                page_size?: number
+                item_id?: number | string
+            }>,
+            projectId: ProjectType['id'] = ApiConfig.getCurrentProjectId()
+        ): ApiRequest {
+            if (Array.isArray(filters.scopes)) {
+                filters.scopes = filters.scopes.join(',')
+            }
+
+            return new ApiRequest().activityLog(projectId).withQueryString(toParams(filters))
+        },
+
+        listLegacy(
+            props: ActivityLogProps,
+            page: number = 1,
+            projectId: ProjectType['id'] = ApiConfig.getCurrentProjectId()
+        ): Promise<ActivityLogPaginatedResponse<ActivityLogItem>> {
+            const scopes = Array.isArray(props.scope) ? [...props.scope] : [props.scope]
+
+            // Opt into the new /activity_log API
+            if (
+                [
+                    ActivityScope.PLUGIN,
+                    ActivityScope.HOG_FUNCTION,
+                    ActivityScope.HOG_FLOW,
+                    ActivityScope.EXPERIMENT,
+                    ActivityScope.TAG,
+                    ActivityScope.BATCH_EXPORT,
+                    ActivityScope.ENDPOINT,
+                    ActivityScope.PRODUCT_TOUR,
+                    ActivityScope.TICKET,
+                    ActivityScope.COHORT,
+                    ActivityScope.OAUTH_APPLICATION,
+                    ActivityScope.EXTERNAL_DATA_SCHEMA,
+                ].includes(scopes[0]) ||
+                scopes.length > 1
+            ) {
+                return api.activity
+                    .listRequest({
+                        scopes,
+                        ...(props.id ? { item_id: props.id } : {}),
+                        page: page || 1,
+                        page_size: ACTIVITY_PAGE_SIZE,
+                    })
+                    .get()
+            }
+
+            // TODO: Can we replace all these endpoint specific implementations with the generic REST endpoint above?
+            const requestForScope: {
+                [key in ActivityScope]?: () => ApiRequest | null
+            } = {
+                [ActivityScope.FEATURE_FLAG]: () => {
+                    return new ApiRequest().featureFlagsActivity((props.id ?? null) as number | null, projectId)
+                },
+                [ActivityScope.PERSON]: () => {
+                    return new ApiRequest().personActivity(props.id)
+                },
+                [ActivityScope.GROUP]: () => {
+                    return new ApiRequest().groupActivity()
+                },
+                [ActivityScope.INSIGHT]: () => {
+                    return new ApiRequest().insightsActivity(projectId)
+                },
+                [ActivityScope.PLUGIN_CONFIG]: () => {
+                    return props.id
+                        ? new ApiRequest().pluginConfig(props.id as number, projectId).withAction('activity')
+                        : new ApiRequest().plugins().withAction('activity')
+                },
+                [ActivityScope.DATA_MANAGEMENT]: () => {
+                    return new ApiRequest().dataManagementActivity()
+                },
+                [ActivityScope.EVENT_DEFINITION]: () => {
+                    // TODO allow someone to load _only_ event definitions?
+                    return new ApiRequest().dataManagementActivity()
+                },
+                [ActivityScope.PROPERTY_DEFINITION]: () => {
+                    // TODO allow someone to load _only_ property definitions?
+                    return new ApiRequest().dataManagementActivity()
+                },
+                [ActivityScope.NOTEBOOK]: () => {
+                    return props.id
+                        ? new ApiRequest().notebook(`${props.id}`).withAction('activity')
+                        : new ApiRequest().notebooks().withAction('activity')
+                },
+                [ActivityScope.TEAM]: () => {
+                    return new ApiRequest().projectsDetail().withAction('activity')
+                },
+                [ActivityScope.SURVEY]: () => {
+                    return new ApiRequest().surveyActivity((props.id ?? null) as string, projectId)
+                },
+                [ActivityScope.DATA_WAREHOUSE_SAVED_QUERY]: () => {
+                    return new ApiRequest().dataWarehouseSavedQueryActivity((props.id ?? null) as string, projectId)
+                },
+            }
+
+            let parameters = {
+                page: page || 1,
+                limit: ACTIVITY_PAGE_SIZE,
+            } as Record<string, any>
+            const request = requestForScope[scopes[0]]?.()
+            // :KLUDGE: Groups don't expose a unique ID so we need to pass the index and the key
+            if (scopes[0] === ActivityScope.GROUP && props.id) {
+                const groupTypeIndex = (props.id as string)[0]
+                const groupKey = (props.id as string).substring(2)
+                parameters = {
+                    ...parameters,
+                    group_type_index: groupTypeIndex,
+                    group_key: groupKey,
+                }
+            }
+            return request
+                ? request.withQueryString(toParams(parameters)).get()
+                : Promise.resolve({ results: [], count: 0 })
+        },
+    },
+
+    comments: {
+        async create(
+            data: Partial<CommentType> & CommentCreationParams,
+            params: Record<string, any> = {},
+            teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()
+        ): Promise<CommentType> {
+            return new ApiRequest().comments(teamId).withQueryString(toParams(params)).create({ data })
+        },
+
+        async update(
+            id: CommentType['id'],
+            data: Partial<CommentType> & CommentCreationParams,
+            params: Record<string, any> = {},
+            teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()
+        ): Promise<CommentType> {
+            return new ApiRequest().comment(id, teamId).withQueryString(toParams(params)).update({ data })
+        },
+
+        async get(id: CommentType['id'], teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()): Promise<CommentType> {
+            return new ApiRequest().comment(id, teamId).get()
+        },
+
+        async list(params: Partial<CommentType> = {}): Promise<CountedPaginatedResponse<CommentType>> {
+            return new ApiRequest().comments().withQueryString(params).get()
+        },
+
+        async getCount(
+            params: Partial<CommentType> & {
+                exclude_emoji_reactions?: boolean
+            }
+        ): Promise<number> {
+            return (await new ApiRequest().comments().withAction('count').withQueryString(params).get()).count
+        },
+
+        async delete(id: CommentType['id'], teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()): Promise<void> {
+            return new ApiRequest().comment(id, teamId).update({ data: { deleted: true } })
+        },
+
+        async complete(
+            id: CommentType['id'],
+            teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()
+        ): Promise<CommentType> {
+            return new ApiRequest().comment(id, teamId).withAction('complete').create()
+        },
+
+        async reopen(
+            id: CommentType['id'],
+            teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()
+        ): Promise<CommentType> {
+            return new ApiRequest().comment(id, teamId).withAction('reopen').create()
+        },
+    },
+
+    logs: {
+        async query({ query, signal }: { query: Omit<LogsQuery, 'kind'>; signal?: AbortSignal }): Promise<{
+            results: LogMessage[]
+            hasMore: boolean
+            nextCursor?: string
+            maxExportableLogs: number
+            // Aliases for the requested customColumns, in request order; rows carry
+            // their custom values under these keys. Null without custom columns.
+            columns?: string[] | null
+        }> {
+            return new ApiRequest().logsQuery().create({ signal, data: { query } })
+        },
+        async sparkline({ query, signal }: { query: Omit<LogsQuery, 'kind'>; signal?: AbortSignal }): Promise<any[]> {
+            return new ApiRequest().logsSparkline().create({ signal, data: { query } })
+        },
+        async services({ query, signal }: { query: Omit<LogsQuery, 'kind'>; signal?: AbortSignal }): Promise<{
+            services: {
+                service_name: string
+                log_count: number
+                error_count: number
+                error_rate: number
+                volume_share_pct?: number
+                severity_breakdown?: {
+                    debug: number
+                    info: number
+                    warn: number
+                    error: number
+                }
+                active_rules?: { rule_id: string; rule_name: string; summary_string: string }[]
+            }[]
+            sparkline: { time: string; service_name: string; count: number }[]
+            summary?: {
+                top_services_count: number
+                top_services_volume_share_pct: number
+            }
+        }> {
+            return new ApiRequest().logsServices().create({ signal, data: { query } })
+        },
+        async hasLogs(): Promise<boolean> {
+            return new ApiRequest()
+                .logsHasLogs()
+                .get()
+                .then((response) => Boolean(response.hasLogs))
+        },
+        async explain(uuid: string, timestamp: string): Promise<LogExplanation> {
+            return new ApiRequest().logsExplainWithAI().create({ data: { uuid, timestamp } })
+        },
+        async exportQuery({ query, columns }: { query: Omit<LogsQuery, 'kind'>; columns?: string[] }): Promise<{
+            id: number
+            export_format: string
+            has_content: boolean
+            filename: string
+        }> {
+            return new ApiRequest().logsExport().create({ data: { query, columns } })
+        },
+    },
+
+    tracing: {
+        async hasSpans(): Promise<boolean> {
+            return new ApiRequest()
+                .tracingSpans()
+                .withAction('has_spans')
+                .get()
+                .then((response) => Boolean(response.hasSpans))
+        },
+        async listSpans(
+            query: {
+                dateRange?: { date_from?: string | null; date_to?: string | null }
+                serviceNames?: string[]
+                statusCodes?: number[]
+                filterGroup?: PropertyGroupFilter
+                orderBy?: 'timestamp' | 'duration'
+                orderDirection?: 'ASC' | 'DESC'
+                limit?: number
+                after?: string
+                offset?: number
+                prefetchSpans?: number
+                // false (default) groups by trace_id and returns root spans; true returns every
+                // matching span (root and child) flat. See products/tracing/backend logic.py.
+                flatSpans?: boolean
+            },
+            signal?: AbortSignal
+        ): Promise<{
+            results: Record<string, any>[]
+            hasMore: boolean
+            nextCursor?: string
+        }> {
+            return new ApiRequest().tracingSpans().withAction('query').create({ signal, data: { query } })
+        },
+        async getTrace(
+            traceId: string,
+            query?: {
+                dateRange?: { date_from?: string | null; date_to?: string | null }
+                serviceNames?: string[]
+                statusCodes?: number[]
+                filterGroup?: PropertyGroupFilter
+                offset?: number
+            }
+        ): Promise<{ results: Record<string, any>[]; hasMore: boolean; nextOffset?: number | null }> {
+            return new ApiRequest()
+                .tracingSpans()
+                .withAction(`trace/${traceId}`)
+                .create({
+                    data: {
+                        ...query,
+                        dateRange: query?.dateRange ?? { date_from: '-24h' },
+                    },
+                })
+        },
+        async sparkline(
+            query: {
+                dateRange?: { date_from?: string | null; date_to?: string | null }
+                serviceNames?: string[]
+                statusCodes?: number[]
+                filterGroup?: PropertyGroupFilter
+                // true counts root spans only (Traces view); false/absent counts every span (Spans view).
+                rootSpans?: boolean
+            },
+            signal?: AbortSignal
+        ): Promise<{
+            results: { time: string; service: string; count: number }[]
+        }> {
+            return new ApiRequest().tracingSpans().withAction('sparkline').create({ signal, data: { query } })
+        },
+        async count(
+            query: {
+                dateRange?: { date_from?: string | null; date_to?: string | null }
+                serviceNames?: string[]
+                statusCodes?: number[]
+                filterGroup?: PropertyGroupFilter
+            },
+            signal?: AbortSignal
+        ): Promise<{ count: number; traceCount: number }> {
+            return new ApiRequest().tracingSpans().withAction('count').create({ signal, data: { query } })
+        },
+        async durationHistogram(
+            query: {
+                dateRange?: { date_from?: string | null; date_to?: string | null }
+                serviceNames?: string[]
+                statusCodes?: number[]
+                filterGroup?: PropertyGroupFilter
+                // true (default) buckets root spans only (a distribution of traces); false buckets
+                // every matching span — pair with a span name filter for operation-scoped pages.
+                rootSpans?: boolean
+            },
+            signal?: AbortSignal
+        ): Promise<{
+            results: { bucket_ns: number; service: string; count: number }[]
+        }> {
+            return new ApiRequest().tracingSpans().withAction('duration-histogram').create({ signal, data: { query } })
+        },
+        async aggregate(
+            query: {
+                dateRange?: { date_from?: string | null; date_to?: string | null }
+                serviceNames?: string[]
+                filterGroup?: PropertyGroupFilter
+                compareFilter?: { compare?: boolean; compare_to?: string | null }
+            },
+            signal?: AbortSignal
+        ): Promise<{
+            results: AggregatedSpanRow[]
+            compare?: AggregatedSpanRow[] | null
+        }> {
+            return new ApiRequest().tracingSpans().withAction('aggregate').create({ signal, data: { query } })
+        },
+        async tree(
+            query: {
+                spanName: string
+                serviceName: string
+                dateRange?: { date_from?: string | null; date_to?: string | null }
+                serviceNames?: string[]
+                filterGroup?: PropertyGroupFilter
+                compareFilter?: { compare?: boolean; compare_to?: string | null }
+            },
+            signal?: AbortSignal
+        ): Promise<{
+            results: SpanTreeNode[]
+            compare?: SpanTreeNode[] | null
+        }> {
+            return new ApiRequest().tracingSpans().withAction('tree').create({ signal, data: { query } })
+        },
+        async serviceNames(params: { dateRange?: string; search?: string }): Promise<{ results: { name: string }[] }> {
+            return new ApiRequest()
+                .tracingSpans()
+                .withAction('service-names')
+                .withQueryString(
+                    Object.entries(params)
+                        .filter(([, v]) => v !== undefined && v !== '')
+                        .map(([k, v]) => `${k}=${encodeURIComponent(v as string)}`)
+                        .join('&')
+                )
+                .get()
+        },
+    },
+
+    exports: {
+        determineExportUrl(exportId: number, teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()): string {
+            return new ApiRequest()
+                .export(exportId, teamId)
+                .withAction('content')
+                .withQueryString('download=true')
+                .assembleFullUrl(true)
+        },
+
+        async create(
+            data: Partial<ExportedAssetType>,
+            params: Record<string, any> = {},
+            teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()
+        ): Promise<ExportedAssetType> {
+            return new ApiRequest().exports(teamId).withQueryString(toParams(params)).create({ data })
+        },
+
+        async list(
+            teamId: TeamType['id'] = ApiConfig.getCurrentTeamId(),
+            params: Record<string, any> = {}
+        ): Promise<PaginatedResponse<ExportedAssetType>> {
+            return new ApiRequest().exports(teamId).withQueryString(toParams(params)).get()
+        },
+
+        async get(id: number, teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()): Promise<ExportedAssetType> {
+            return new ApiRequest().export(id, teamId).get()
+        },
+    },
+
+    events: {
+        async get(
+            id: EventType['id'],
+            includePerson: boolean = false,
+            teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()
+        ): Promise<EventType> {
+            let apiRequest = new ApiRequest().event(id, teamId)
+            if (includePerson) {
+                apiRequest = apiRequest.withQueryString(toParams({ include_person: true }))
+            }
+            return await apiRequest.get()
+        },
+        async list(
+            filters: EventsListQueryParams,
+            limit: number = 100,
+            teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()
+        ): Promise<PaginatedResponse<EventType>> {
+            const params: EventsListQueryParams = {
+                ...filters,
+                limit,
+                orderBy: filters.orderBy ?? ['-timestamp'],
+            }
+            return new ApiRequest().events(teamId).withQueryString(toParams(params)).get()
+        },
+        determineListEndpoint(
+            filters: EventsListQueryParams,
+            limit: number = 100,
+            teamId: TeamType['id'] = ApiConfig.getCurrentTeamId()
+        ): string {
+            const params: EventsListQueryParams = { ...filters, limit }
+            return new ApiRequest().events(teamId).withQueryString(toParams(params)).assembleFullUrl()
+        },
+    },
+
+    tags: {
+        async list(projectId: TeamType['id'] = ApiConfig.getCurrentProjectId()): Promise<string[]> {
+            return new ApiRequest().tags(projectId).get()
+        },
+    },
+
+    eventDefinitions: {
+        async get({ eventDefinitionId }: { eventDefinitionId: EventDefinition['id'] }): Promise<EventDefinition> {
+            return new ApiRequest().eventDefinitionDetail(eventDefinitionId).get()
+        },
+        async create(eventDefinitionData: Partial<EventDefinition>): Promise<EventDefinition> {
+            return new ApiRequest().eventDefinitions().create({ data: eventDefinitionData })
+        },
+        async update({
+            eventDefinitionId,
+            eventDefinitionData,
+        }: {
+            eventDefinitionId: EventDefinition['id']
+            eventDefinitionData: Partial<Omit<EventDefinition, 'owner'> & { owner: number | null }>
+        }): Promise<EventDefinition> {
+            return new ApiRequest().eventDefinitionDetail(eventDefinitionId).update({ data: eventDefinitionData })
+        },
+        async delete({ eventDefinitionId }: { eventDefinitionId: EventDefinition['id'] }): Promise<void> {
+            return new ApiRequest().eventDefinitionDetail(eventDefinitionId).delete()
+        },
+        async list({
+            limit = EVENT_DEFINITIONS_PER_PAGE,
+            teamId,
+            ...params
+        }: {
+            limit?: number
+            offset?: number
+            teamId?: TeamType['id']
+            event_type?: EventDefinitionType
+            search?: string
+            ordering?: string
+        }): Promise<CountedPaginatedResponse<EventDefinition>> {
+            return new ApiRequest()
+                .eventDefinitions(teamId)
+                .withQueryString(toParams({ limit, ...params }))
+                .get()
+        },
+        async primaryProperties({
+            names,
+        }: {
+            names?: string[]
+        } = {}): Promise<{ primary_properties: Record<string, string> }> {
+            const params = names && names.length > 0 ? toParams({ names }, true) : ''
+            return new ApiRequest().eventDefinitions().withAction('primary_properties').withQueryString(params).get()
+        },
+        async byName({ name }: { name: string }): Promise<EventDefinition> {
+            return new ApiRequest().eventDefinitions().withAction('by_name').withQueryString(toParams({ name })).get()
+        },
+        async getMetrics({
+            eventDefinitionId,
+        }: {
+            eventDefinitionId: EventDefinition['id']
+        }): Promise<EventDefinitionMetrics> {
+            return new ApiRequest().eventDefinitionDetail(eventDefinitionId).withAction('metrics').get()
+        },
+        determineListEndpoint({
+            limit = EVENT_DEFINITIONS_PER_PAGE,
+            teamId,
+            ...params
+        }: {
+            limit?: number
+            offset?: number
+            teamId?: TeamType['id']
+            event_type?: EventDefinitionType
+            search?: string
+            ordering?: string
+        }): string {
+            return new ApiRequest()
+                .eventDefinitions(teamId)
+                .withQueryString(toParams({ limit, ...params }))
+                .assembleFullUrl()
+        },
+    },
+
+    propertyDefinitions: {
+        async get({
+            propertyDefinitionId,
+        }: {
+            propertyDefinitionId: PropertyDefinition['id']
+        }): Promise<PropertyDefinition> {
+            return new ApiRequest().propertyDefinitionDetail(propertyDefinitionId).get()
+        },
+        async seenTogether({
+            eventNames,
+            propertyDefinitionName,
+        }: {
+            eventNames: string[]
+            propertyDefinitionName: PropertyDefinition['name']
+        }): Promise<Record<string, boolean>> {
+            return new ApiRequest().propertyDefinitionSeenTogether(eventNames, propertyDefinitionName).get()
+        },
+        async update({
+            propertyDefinitionId,
+            propertyDefinitionData,
+        }: {
+            propertyDefinitionId: PropertyDefinition['id']
+            propertyDefinitionData: Partial<PropertyDefinition>
+        }): Promise<PropertyDefinition> {
+            return new ApiRequest()
+                .propertyDefinitionDetail(propertyDefinitionId)
+                .update({ data: propertyDefinitionData })
+        },
+        async delete({ propertyDefinitionId }: { propertyDefinitionId: PropertyDefinition['id'] }): Promise<void> {
+            return new ApiRequest().propertyDefinitionDetail(propertyDefinitionId).delete()
+        },
+        async list({
+            limit = EVENT_PROPERTY_DEFINITIONS_PER_PAGE,
+            teamId,
+            ...params
+        }: {
+            event_names?: string[]
+            excluded_properties?: string[]
+            exclude_core_properties?: boolean
+            properties?: string[]
+            filter_by_event_names?: boolean
+            type?: PropertyDefinitionType
+            limit?: number
+            offset?: number
+            search?: string
+            teamId?: TeamType['id']
+        }): Promise<CountedPaginatedResponse<PropertyDefinition>> {
+            return new ApiRequest()
+                .propertyDefinitions(teamId)
+                .withQueryString(
+                    toParams({
+                        limit,
+                        ...params,
+                        ...(params.properties ? { properties: params.properties.join(',') } : {}),
+                    })
+                )
+                .get()
+        },
+        determineListEndpoint({
+            limit = EVENT_PROPERTY_DEFINITIONS_PER_PAGE,
+            teamId,
+            ...params
+        }: {
+            event_names?: string[]
+            excluded_properties?: string[]
+            exclude_core_properties?: boolean
+            filter_by_event_names?: boolean
+            is_feature_flag?: boolean
+            limit?: number
+            offset?: number
+            search?: string
+            teamId?: TeamType['id']
+            type?: PropertyDefinitionType
+            group_type_index?: number
+        }): string {
+            return new ApiRequest()
+                .propertyDefinitions(teamId)
+                .withQueryString(
+                    toParams({
+                        limit,
+                        ...params,
+                    })
+                )
+                .assembleFullUrl()
+        },
+    },
+
+    columnConfigurations: {
+        async list({
+            teamId = ApiConfig.getCurrentTeamId(),
+            context_key,
+            ...params
+        }: {
+            teamId?: TeamType['id']
+            context_key?: string
+        } = {}): Promise<PaginatedColumnConfigurationListApi> {
+            return new ApiRequest()
+                .columnConfigurations(teamId)
+                .withQueryString(toParams({ context_key, ...params }))
+                .get()
+        },
+
+        async create({
+            teamId = ApiConfig.getCurrentTeamId(),
+            data,
+        }: {
+            teamId?: TeamType['id']
+            data: Partial<ColumnConfigurationApi>
+        }): Promise<ColumnConfigurationApi> {
+            return new ApiRequest().columnConfigurations(teamId).create({ data })
+        },
+
+        async update({
+            teamId = ApiConfig.getCurrentTeamId(),
+            id,
+            data,
+        }: {
+            teamId?: TeamType['id']
+            id: string
+            data: Partial<ColumnConfigurationApi>
+        }): Promise<ColumnConfigurationApi> {
+            return new ApiRequest().columnConfigurationDetail(id, teamId).update({ data })
+        },
+
+        async delete({
+            teamId = ApiConfig.getCurrentTeamId(),
+            id,
+        }: {
+            teamId?: TeamType['id']
+            id: string
+        }): Promise<void> {
+            return new ApiRequest().columnConfigurationDetail(id, teamId).delete()
+        },
+    },
+
+    sessions: {
+        async propertyDefinitions({
+            teamId,
+            search,
+            properties,
+        }: {
+            teamId?: TeamType['id']
+            search?: string
+            properties?: string[]
+        }): Promise<CountedPaginatedResponse<PropertyDefinition>> {
+            return new ApiRequest()
+                .sessionPropertyDefinitions(teamId)
+                .withQueryString(
+                    toParams({
+                        search,
+                        ...(properties ? { properties: properties.join(',') } : {}),
+                    })
+                )
+                .get()
+        },
+    },
+
+    schemaPropertyGroups: {
+        async list(projectId?: ProjectType['id']): Promise<{ results: SchemaPropertyGroup[] }> {
+            return new ApiRequest().schemaPropertyGroups(projectId).get()
+        },
+        async get(id: string, projectId?: ProjectType['id']): Promise<SchemaPropertyGroup> {
+            return new ApiRequest().schemaPropertyGroupsDetail(id, projectId).get()
+        },
+        async create(data: Partial<SchemaPropertyGroup>, projectId?: ProjectType['id']): Promise<SchemaPropertyGroup> {
+            return new ApiRequest().schemaPropertyGroups(projectId).create({ data })
+        },
+        async update(
+            id: string,
+            data: Partial<SchemaPropertyGroup>,
+            projectId?: ProjectType['id']
+        ): Promise<SchemaPropertyGroup> {
+            return new ApiRequest().schemaPropertyGroupsDetail(id, projectId).update({ data })
+        },
+        async delete(id: string, projectId?: ProjectType['id']): Promise<void> {
+            return new ApiRequest().schemaPropertyGroupsDetail(id, projectId).delete()
+        },
+    },
+
+    eventSchemas: {
+        async list(eventDefinitionId: string, projectId?: ProjectType['id']): Promise<{ results: EventSchema[] }> {
+            return new ApiRequest()
+                .eventSchemas(projectId)
+                .withQueryString(toParams({ event_definition: eventDefinitionId }))
+                .get()
+        },
+        async create(data: Partial<EventSchema>, projectId?: ProjectType['id']): Promise<EventSchema> {
+            return new ApiRequest().eventSchemas(projectId).create({ data })
+        },
+        async update(id: string, data: Partial<EventSchema>, projectId?: ProjectType['id']): Promise<EventSchema> {
+            return new ApiRequest().eventSchemasDetail(id, projectId).update({ data })
+        },
+        async delete(id: string, projectId?: ProjectType['id']): Promise<void> {
+            return new ApiRequest().eventSchemasDetail(id, projectId).delete()
+        },
+    },
+
+    cohorts: {
+        async get(cohortId: CohortType['id']): Promise<CohortType> {
+            return await new ApiRequest().cohortsDetail(cohortId).get()
+        },
+        async create(cohortData: Partial<CohortType>, filterParams?: string): Promise<CohortType> {
+            return await new ApiRequest().cohorts().withQueryString(filterParams).create({ data: cohortData })
+        },
+        async update(
+            cohortId: CohortType['id'],
+            cohortData: Partial<CohortType>,
+            filterParams?: string
+        ): Promise<CohortType> {
+            return await new ApiRequest()
+                .cohortsDetail(cohortId)
+                .withQueryString(filterParams)
+                .update({ data: cohortData })
+        },
+        determineDeleteEndpoint(): string {
+            return new ApiRequest().cohorts().assembleEndpointUrl()
+        },
+        determineListUrl(cohortId: number | 'new', params: PersonListParams): string {
+            return `/api/cohort/${cohortId}/persons?${toParams(params)}`
+        },
+        async listPaginated(
+            params: {
+                limit?: number
+                offset?: number
+                search?: string
+            } = {}
+        ): Promise<CountedPaginatedResponse<CohortType>> {
+            return await new ApiRequest().cohorts().withQueryString(toParams(params)).get()
+        },
+        async getCohortPersons(cohortId: CohortType['id']): Promise<PaginatedResponse<PersonType>> {
+            return await new ApiRequest()
+                .cohortsDetailPersons(cohortId)
+                .withQueryString(toParams({ limit: COHORT_PERSONS_QUERY_LIMIT }))
+                .get()
+        },
+        async addPersonsToStaticCohort(cohortId: CohortType['id'], ids: string[]): Promise<{ success: boolean }> {
+            return await new ApiRequest().cohortsAddPersonsToStatic(cohortId).update({ data: { person_ids: ids } })
+        },
+        async removePersonFromCohort(cohortId: CohortType['id'], personId: string): Promise<{ success: boolean }> {
+            const payload = { person_id: personId }
+            return await new ApiRequest().cohortsRemovePersonFromStatic(cohortId).update({ data: payload })
+        },
+        async getCalculationHistory(cohortId: CohortType['id']): Promise<CohortCalculationHistoryResponse> {
+            return await new ApiRequest().cohortsCalculationHistory(cohortId).get()
+        },
+    },
+
+    customerProfileConfigs: {
+        async list(params: { scope?: string } = {}): Promise<CountedPaginatedResponse<CustomerProfileConfigType>> {
+            return await new ApiRequest().customerProfileConfigs().withQueryString(toParams(params)).get()
+        },
+        async get(id: CustomerProfileConfigType['id']): Promise<CustomerProfileConfigType> {
+            return await new ApiRequest().customerProfileConfigsDetail(id).get()
+        },
+        async create(configData: Partial<CustomerProfileConfigType>): Promise<CustomerProfileConfigType> {
+            return await new ApiRequest().customerProfileConfigs().create({ data: configData })
+        },
+        async update(
+            id: CustomerProfileConfigType['id'],
+            configData: Partial<CustomerProfileConfigType>
+        ): Promise<CustomerProfileConfigType> {
+            return await new ApiRequest().customerProfileConfigsDetail(id).update({ data: configData })
+        },
+        async delete(id: CustomerProfileConfigType['id']): Promise<void> {
+            return await new ApiRequest().customerProfileConfigsDetail(id).delete()
+        },
+    },
+
+    customerJourneys: {
+        async list(): Promise<CountedPaginatedResponse<CustomerJourneyApi>> {
+            return await new ApiRequest().customerJourneys().get()
+        },
+        async create(
+            data: Pick<CustomerJourneyApi, 'insight' | 'name'> & {
+                description?: string
+            }
+        ): Promise<CustomerJourneyApi> {
+            return await new ApiRequest().customerJourneys().create({ data })
+        },
+        async update(
+            id: CustomerJourneyApi['id'],
+            data: Partial<Pick<CustomerJourneyApi, 'name' | 'description'>>
+        ): Promise<CustomerJourneyApi> {
+            return await new ApiRequest().customerJourneysDetail(id).update({ data })
+        },
+        async delete(id: CustomerJourneyApi['id']): Promise<void> {
+            return await new ApiRequest().customerJourneysDetail(id).delete()
+        },
+    },
+
+    dashboards: {
+        async list(params: { tags?: string; creation_mode?: string } = {}): Promise<PaginatedResponse<DashboardType>> {
+            return new ApiRequest().dashboards().withQueryString(toParams(params)).get()
+        },
+
+        async get(id: number): Promise<DashboardType> {
+            return new ApiRequest().dashboardsDetail(id).get()
+        },
+
+        async createUnlistedDashboard(tag: string): Promise<DashboardType> {
+            return new ApiRequest().dashboards().withAction('create_unlisted_dashboard').create({ data: { tag } })
+        },
+
+        async streamTiles(
+            id: number,
+            params: {
+                layoutSize?: 'sm' | 'xs'
+                filtersOverride?: DashboardFilter
+                variablesOverride?: Record<string, HogQLVariable>
+            } = {},
+            onMessage: (data: any) => void,
+            onComplete: () => void,
+            onError: (error: any) => void
+        ): Promise<() => void> {
+            const url = new ApiRequest()
+                .dashboardsDetail(id)
+                .withAction('stream_tiles')
+                .withQueryString(
+                    toParams({
+                        layout_size: params.layoutSize,
+                        filters_override: params.filtersOverride,
+                        variables_override: params.variablesOverride,
+                    })
+                )
+                .assembleFullUrl(true)
+
+            const abortController = new AbortController()
+
+            fetchEventSource(url, {
+                signal: abortController.signal,
+                credentials: 'include',
+                openWhenHidden: true,
+                onopen: async (response) => {
+                    if (!response.ok) {
+                        // Get server error message if available
+                        let errorMessage = `HTTP ${response.status}`
+                        try {
+                            const errorText = await response.text()
+                            if (errorText) {
+                                errorMessage = `HTTP ${response.status}: ${errorText}`
+                            }
+                        } catch {
+                            // If we can't read the response, just use the status
+                        }
+
+                        // For any error, call onError and abort to prevent retries
+                        onError(new Error(errorMessage))
+                        abortController.abort()
+                        return
+                    }
+                },
+                onmessage: (event: EventSourceMessage) => {
+                    try {
+                        const data = JSON.parse(event.data)
+                        if (data.type === 'complete') {
+                            onComplete()
+                        } else if (data.type === 'error') {
+                            onError(new Error(data.error || 'Streaming error'))
+                        } else {
+                            onMessage(data)
+                        }
+                    } catch (error) {
+                        onError(error)
+                    }
+                },
+                onerror: (error) => {
+                    onError(error)
+                },
+            }).catch(onError)
+
+            return () => abortController.abort()
+        },
+    },
+
+    dashboardTemplates: {
+        async list(params: DashboardTemplateListParams = {}): Promise<PaginatedResponse<DashboardTemplateType>> {
+            return await new ApiRequest().dashboardTemplates().withQueryString(toParams(params)).get()
+        },
+
+        async get(
+            dashboardTemplateId: DashboardTemplateType['id'],
+            teamId?: TeamType['id']
+        ): Promise<DashboardTemplateType> {
+            return await new ApiRequest().dashboardTemplatesDetail(dashboardTemplateId, teamId).get()
+        },
+
+        async create(dashboardTemplateData: DashboardTemplateEditorType): Promise<DashboardTemplateType> {
+            return await new ApiRequest().dashboardTemplates().create({ data: dashboardTemplateData })
+        },
+
+        async update(
+            dashboardTemplateId: string,
+            dashboardTemplateData: Partial<DashboardTemplateEditorType>
+        ): Promise<DashboardTemplateType> {
+            return await new ApiRequest()
+                .dashboardTemplatesDetail(dashboardTemplateId)
+                .update({ data: dashboardTemplateData })
+        },
+
+        async delete(dashboardTemplateId: string): Promise<void> {
+            // soft delete
+            return await new ApiRequest().dashboardTemplatesDetail(dashboardTemplateId).update({
+                data: {
+                    deleted: true,
+                },
+            })
+        },
+        async copyBetweenProjects(
+            targetTeamId: TeamType['id'],
+            sourceTemplateId: DashboardTemplateType['id']
+        ): Promise<DashboardTemplateType> {
+            return await new ApiRequest()
+                .dashboardTemplatesCopyBetweenProjects(targetTeamId)
+                .create({ data: { source_template_id: sourceTemplateId } })
+        },
+        async getSchema(): Promise<Record<string, any>> {
+            return await new ApiRequest().dashboardTemplateSchema().get()
+        },
+        determineSchemaUrl(): string {
+            return new ApiRequest().dashboardTemplateSchema().assembleFullUrl()
+        },
+    },
+
+    experiments: {
+        async get(id: number): Promise<Experiment> {
+            return new ApiRequest().experimentsDetail(id).get()
+        },
+        async createExposureCohort(id: number): Promise<{ cohort: CohortType }> {
+            return await new ApiRequest().experimentCreateExposureCohort(id).create()
+        },
+    },
+
+    organizationMembers: {
+        async list(params: ListOrganizationMembersParams = {}): Promise<PaginatedResponse<OrganizationMemberType>> {
+            return await new ApiRequest().organizationMembers().withQueryString(params).get()
+        },
+
+        async listAll(params: ListOrganizationMembersParams = {}): Promise<OrganizationMemberType[]> {
+            const url = new ApiRequest().organizationMembers().withQueryString(params).assembleFullUrl()
+            return api.loadPaginatedResults<OrganizationMemberType>(url)
+        },
+
+        async listForOrg(
+            organizationId: OrganizationType['id'],
+            params: { limit?: number; offset?: number } = {}
+        ): Promise<CountedPaginatedResponse<Pick<OrganizationMemberType, 'id' | 'user'>>> {
+            return await new ApiRequest()
+                .organizationMembersForAccount()
+                .withQueryString({ organization_id: organizationId, ...params })
+                .get()
+        },
+
+        async delete(uuid: OrganizationMemberType['user']['uuid']): Promise<PaginatedResponse<void>> {
+            return await new ApiRequest().organizationMember(uuid).delete()
+        },
+
+        async update(
+            uuid: string,
+            data: Partial<Pick<OrganizationMemberType, 'level'>>
+        ): Promise<OrganizationMemberType> {
+            return new ApiRequest().organizationMember(uuid).update({ data })
+        },
+        scopedApiKeys: {
+            async list(uuid: string): Promise<OrganizationMemberScopedApiKeysResponse> {
+                return new ApiRequest().organizationMemberScopedApiKeys(uuid).get()
+            },
+        },
+    },
+
+    roles: {
+        async get(roleId: RoleType['id']): Promise<RoleType> {
+            return await new ApiRequest().rolesDetail(roleId).get()
+        },
+        async list(): Promise<PaginatedResponse<RoleType>> {
+            return await new ApiRequest().roles().get()
+        },
+        async delete(roleId: RoleType['id']): Promise<void> {
+            return await new ApiRequest().rolesDetail(roleId).delete()
+        },
+        async create(roleName: RoleType['name']): Promise<RoleType> {
+            return await new ApiRequest().roles().create({
+                data: {
+                    name: roleName,
+                },
+            })
+        },
+        async update(roleId: RoleType['id'], roleData: Partial<RoleType>): Promise<RoleType> {
+            return await new ApiRequest().rolesDetail(roleId).update({ data: roleData })
+        },
+        members: {
+            async list(roleId: RoleType['id']): Promise<PaginatedResponse<RoleMemberType>> {
+                return await new ApiRequest().roleMemberships(roleId).get()
+            },
+            async create(roleId: RoleType['id'], userUuid: UserType['uuid']): Promise<RoleMemberType> {
+                return await new ApiRequest().roleMemberships(roleId).create({
+                    data: {
+                        user_uuid: userUuid,
+                    },
+                })
+            },
+            async get(roleId: RoleType['id'], userUuid: UserType['uuid']): Promise<void> {
+                return await new ApiRequest().roleMembershipsDetail(roleId, userUuid).get()
+            },
+            async delete(roleId: RoleType['id'], userUuid: UserType['uuid']): Promise<void> {
+                return await new ApiRequest().roleMembershipsDetail(roleId, userUuid).delete()
+            },
+        },
+    },
+
+    persons: {
+        async update(id: number, person: Partial<PersonType>): Promise<PersonType> {
+            return new ApiRequest().person(id).update({ data: person })
+        },
+        async updateProperty(id: string, property: string, value: any): Promise<void> {
+            return new ApiRequest()
+                .person(id)
+                .withAction('update_property')
+                .create({
+                    data: {
+                        key: property,
+                        value: value,
+                    },
+                })
+        },
+        async deleteProperty(id: string, property: string): Promise<void> {
+            return new ApiRequest()
+                .person(id)
+                .withAction('delete_property')
+                .create({
+                    data: {
+                        $unset: property,
+                    },
+                })
+        },
+        async list(params: PersonListParams = {}): Promise<CountedPaginatedResponse<PersonType>> {
+            return await new ApiRequest().persons().withQueryString(toParams(params)).get()
+        },
+        determineListUrl(params: PersonListParams = {}): string {
+            return new ApiRequest().persons().withQueryString(toParams(params)).assembleFullUrl()
+        },
+        async resetPersonDistinctId(distinctId: string): Promise<void> {
+            return await new ApiRequest()
+                .persons()
+                .withAction('reset_person_distinct_id')
+                .create({
+                    data: {
+                        distinct_id: distinctId,
+                    },
+                })
+        },
+        async getByDistinctIds(distinctIds: string[]): Promise<Record<string, PersonType>> {
+            const response = await new ApiRequest()
+                .persons()
+                .withAction('batch_by_distinct_ids')
+                .create({
+                    data: {
+                        distinct_ids: distinctIds,
+                    },
+                })
+            return response.results
+        },
+        async getByUUIDs(uuids: string[]): Promise<Record<string, PersonType>> {
+            const response = await new ApiRequest().persons().withAction('batch_by_uuids').create({
+                data: {
+                    uuids,
+                },
+            })
+            return response.results
+        },
+    },
+
+    groups: {
+        async list(params: GroupListParams): Promise<CountedPaginatedResponse<Group>> {
+            return await new ApiRequest().groups().withQueryString(toParams(params, true)).get()
+        },
+        async listClickhouse(params: GroupListParams): Promise<GroupsQueryResponse> {
+            const groupsQuery: GroupsQuery = {
+                kind: NodeKind.GroupsQuery,
+                ...params,
+            }
+
+            return await new ApiRequest().query().create({ data: { query: groupsQuery } })
+        },
+        async create(data: CreateGroupParams): Promise<Group> {
+            return await new ApiRequest().groups().create({ data })
+        },
+        async updateProperty(index: number, key: string, property: string, value: any): Promise<void> {
+            return new ApiRequest()
+                .group(index, key)
+                .withAction('update_property')
+                .create({
+                    data: {
+                        key: property,
+                        value: value,
+                    },
+                })
+        },
+        async deleteProperty(index: number, key: string, property: string): Promise<void> {
+            return new ApiRequest()
+                .group(index, key)
+                .withAction('delete_property')
+                .create({
+                    data: {
+                        $unset: property,
+                    },
+                })
+        },
+    },
+
+    search: {
+        async list(params: SearchListParams): Promise<SearchResponse> {
+            return await new ApiRequest().search().withQueryString(toParams(params, true)).get()
+        },
+    },
+
+    sharing: {
+        async get({
+            dashboardId,
+            insightId,
+            recordingId,
+            notebookShortId,
+        }: {
+            dashboardId?: DashboardType['id']
+            insightId?: QueryBasedInsightModel['id']
+            recordingId?: SessionRecordingType['id']
+            notebookShortId?: NotebookType['short_id']
+        }): Promise<SharingConfigurationType | null> {
+            return dashboardId
+                ? new ApiRequest().dashboardSharing(dashboardId).get()
+                : insightId
+                  ? new ApiRequest().insightSharing(insightId).get()
+                  : recordingId
+                    ? new ApiRequest().recordingSharing(recordingId).get()
+                    : notebookShortId
+                      ? new ApiRequest().notebookSharing(notebookShortId).get()
+                      : null
+        },
+
+        async update(
+            {
+                dashboardId,
+                insightId,
+                recordingId,
+                notebookShortId,
+            }: {
+                dashboardId?: DashboardType['id']
+                insightId?: QueryBasedInsightModel['id']
+                recordingId?: SessionRecordingType['id']
+                notebookShortId?: NotebookType['short_id']
+            },
+            data: Partial<SharingConfigurationType>
+        ): Promise<SharingConfigurationType | null> {
+            return dashboardId
+                ? new ApiRequest().dashboardSharing(dashboardId).update({ data })
+                : insightId
+                  ? new ApiRequest().insightSharing(insightId).update({ data })
+                  : recordingId
+                    ? new ApiRequest().recordingSharing(recordingId).update({ data })
+                    : notebookShortId
+                      ? new ApiRequest().notebookSharing(notebookShortId).update({ data })
+                      : null
+        },
+
+        async createPassword(
+            {
+                dashboardId,
+                insightId,
+                recordingId,
+                notebookShortId,
+            }: {
+                dashboardId?: DashboardType['id']
+                insightId?: QueryBasedInsightModel['id']
+                recordingId?: SessionRecordingType['id']
+                notebookShortId?: NotebookType['short_id']
+            },
+            data: { raw_password?: string; note?: string }
+        ): Promise<SharingConfigurationType | null> {
+            return dashboardId
+                ? new ApiRequest().dashboardSharingPasswords(dashboardId).create({ data })
+                : insightId
+                  ? new ApiRequest().insightSharingPasswords(insightId).create({ data })
+                  : recordingId
+                    ? new ApiRequest().recordingSharingPasswords(recordingId).create({ data })
+                    : notebookShortId
+                      ? new ApiRequest().notebookSharingPasswords(notebookShortId).create({ data })
+                      : null
+        },
+
+        async deletePassword(
+            {
+                dashboardId,
+                insightId,
+                recordingId,
+                notebookShortId,
+            }: {
+                dashboardId?: DashboardType['id']
+                insightId?: QueryBasedInsightModel['id']
+                recordingId?: SessionRecordingType['id']
+                notebookShortId?: NotebookType['short_id']
+            },
+            passwordId: string
+        ): Promise<void> {
+            dashboardId
+                ? new ApiRequest().dashboardSharingPassword(dashboardId, passwordId).delete()
+                : insightId
+                  ? new ApiRequest().insightSharingPassword(insightId, passwordId).delete()
+                  : recordingId
+                    ? new ApiRequest().recordingSharingPassword(recordingId, passwordId).delete()
+                    : notebookShortId
+                      ? new ApiRequest().notebookSharingPassword(notebookShortId, passwordId).delete()
+                      : null
+        },
+    },
+
+    pluginConfigs: {
+        async get(id: PluginConfigTypeNew['id']): Promise<PluginConfigWithPluginInfoNew> {
+            return await new ApiRequest().pluginConfig(id).get()
+        },
+        async update(id: PluginConfigTypeNew['id'], data: FormData): Promise<PluginConfigWithPluginInfoNew> {
+            return await new ApiRequest().pluginConfig(id).update({ data })
+        },
+        async create(data: FormData): Promise<PluginConfigWithPluginInfoNew> {
+            return await new ApiRequest().pluginConfigs().create({ data })
+        },
+        async list(): Promise<PaginatedResponse<PluginConfigTypeNew>> {
+            return await new ApiRequest().pluginConfigs().get()
+        },
+        async migrate(id: PluginConfigTypeNew['id']): Promise<HogFunctionType> {
+            return await new ApiRequest().pluginConfig(id).withAction('migrate').create()
+        },
+        async logs(pluginConfigId: number, params: LogEntryRequestParams): Promise<LogEntry[]> {
+            const levels = (params.level?.split(',') ?? []).filter((x) => x !== 'WARNING')
+            const response = await new ApiRequest()
+                .pluginConfig(pluginConfigId)
+                .withAction('logs')
+                .withQueryString(
+                    toParams(
+                        {
+                            limit: LOGS_PORTION_LIMIT,
+                            type_filter: levels,
+                            search: params.search,
+                            before: params.before,
+                            after: params.after,
+                        },
+                        true
+                    )
+                )
+                .get()
+
+            const results = response.results.map((entry: PluginLogEntry) => ({
+                log_source_id: `${entry.plugin_config_id}`,
+                instance_id: entry.source,
+                timestamp: entry.timestamp,
+                level: entry.type,
+                message: entry.message,
+            }))
+
+            return results
+        },
+    },
+    hog: {
+        async create(hog: string, locals?: any[], inRepl?: boolean): Promise<HogCompileResponse> {
+            return await new ApiRequest().hog().create({ data: { hog, locals, in_repl: inRepl || false } })
+        },
+    },
+    hogFunctions: {
+        async list({
+            filter_groups,
+            search,
+            types,
+            limit,
+            full,
+        }: {
+            filter_groups?: CyclotronJobFiltersType[]
+            search?: string
+            types?: HogFunctionTypeType[]
+            limit?: number
+            full?: boolean
+        }): Promise<CountedPaginatedResponse<HogFunctionType>> {
+            return await new ApiRequest()
+                .hogFunctions()
+                .withQueryString({
+                    filter_groups,
+                    // NOTE: The API expects "type" as thats the DB level name
+                    ...(types ? { type: types.join(',') } : {}),
+                    ...(search ? { search } : {}),
+                    ...(limit ? { limit } : {}),
+                    ...(full ? { full: 'true' } : {}),
+                })
+                .get()
+        },
+        async get(id: HogFunctionType['id']): Promise<HogFunctionType> {
+            return await new ApiRequest().hogFunction(id).get()
+        },
+        async create(data: Partial<HogFunctionType>): Promise<HogFunctionType> {
+            return await new ApiRequest().hogFunctions().create({ data })
+        },
+        async update(id: HogFunctionType['id'], data: Partial<HogFunctionType>): Promise<HogFunctionType> {
+            return await new ApiRequest().hogFunction(id).update({ data })
+        },
+        async logs(
+            id: HogFunctionType['id'],
+            params: LogEntryRequestParams = {}
+        ): Promise<PaginatedResponse<LogEntry>> {
+            return await new ApiRequest().hogFunction(id).withAction('logs').withQueryString(params).get()
+        },
+        async metrics(
+            id: HogFunctionType['id'],
+            params: AppMetricsV2RequestParams = {}
+        ): Promise<AppMetricsV2Response> {
+            return await new ApiRequest().hogFunction(id).withAction('metrics').withQueryString(params).get()
+        },
+        async metricsTotals(
+            id: HogFunctionType['id'],
+            params: Partial<AppMetricsV2RequestParams> = {}
+        ): Promise<AppMetricsTotalsV2Response> {
+            return await new ApiRequest().hogFunction(id).withAction('metrics/totals').withQueryString(params).get()
+        },
+        async listTemplates(params: {
+            types: HogFunctionTypeType[]
+        }): Promise<PaginatedResponse<HogFunctionTemplateType>> {
+            const finalParams = {
+                ...params,
+                limit: 500,
+                types: params.types.join(','),
+            }
+
+            return new ApiRequest().hogFunctionTemplates().withQueryString(finalParams).get()
+        },
+        async getTemplate(id: HogFunctionTemplateType['id']): Promise<HogFunctionTemplateType> {
+            return await new ApiRequest().hogFunctionTemplate(id).get()
+        },
+
+        async listIcons(params: { query?: string } = {}): Promise<HogFunctionIconResponse[]> {
+            return await new ApiRequest().hogFunctions().withAction('icons').withQueryString(params).get()
+        },
+
+        async createTestInvocation(
+            id: HogFunctionType['id'],
+            data: {
+                configuration: Record<string, any>
+                mock_async_functions: boolean
+                globals?: any
+                clickhouse_event?: any
+                invocation_id?: string
+            }
+        ): Promise<CyclotronJobTestInvocationResult> {
+            return await new ApiRequest().hogFunction(id).withAction('invocations').create({ data })
+        },
+
+        async getStatus(id: HogFunctionType['id']): Promise<HogFunctionStatus> {
+            return await new ApiRequest().hogFunction(id).withAction('status').get()
+        },
+        async rearrange(orders: Record<string, number>): Promise<HogFunctionType[]> {
+            return await new ApiRequest().hogFunctions().withAction('rearrange').update({ data: { orders } })
+        },
+        async enableBackfills(id: HogFunctionType['id']): Promise<{ batch_export_id: string }> {
+            return await new ApiRequest().hogFunction(id).withAction('enable_backfills').create()
+        },
+    },
+
+    links: {
+        async list(
+            args: {
+                limit?: number
+                offset?: number
+                search?: string
+            } = {
+                limit: LINK_PAGE_SIZE,
+            }
+        ): Promise<CountedPaginatedResponse<LinkType>> {
+            return await new ApiRequest().links().withQueryString(args).get()
+        },
+        async get(id: LinkType['id']): Promise<LinkType> {
+            return await new ApiRequest().link(id).get()
+        },
+        async create(data: Partial<LinkType>): Promise<LinkType> {
+            return await new ApiRequest().links().create({ data })
+        },
+        async update(id: LinkType['id'], data: Partial<LinkType>): Promise<LinkType> {
+            return await new ApiRequest().link(id).update({ data })
+        },
+        async delete(id: LinkType['id']): Promise<void> {
+            await new ApiRequest().link(id).delete()
+        },
+    },
+
+    mcpServers: {
+        async list(): Promise<CountedPaginatedResponse<Record<string, any>>> {
+            return await new ApiRequest().mcpServers().get()
+        },
+    },
+
+    mcpServerInstallations: {
+        async list(): Promise<CountedPaginatedResponse<Record<string, any>>> {
+            return await new ApiRequest().mcpServerInstallations().get()
+        },
+        async update(id: string, data: Record<string, any>): Promise<Record<string, any>> {
+            return await new ApiRequest().mcpServerInstallation(id).update({ data })
+        },
+        async delete(id: string): Promise<void> {
+            await new ApiRequest().mcpServerInstallation(id).delete()
+        },
+        async share(id: string): Promise<Record<string, any>> {
+            return await new ApiRequest().mcpServerInstallation(id).withAction('share').create({ data: {} })
+        },
+        async unshare(id: string): Promise<Record<string, any>> {
+            return await new ApiRequest().mcpServerInstallation(id).withAction('unshare').create({ data: {} })
+        },
+        async installCustom(data: {
+            name: string
+            url: string
+            auth_type: string
+            api_key?: string
+            description?: string
+            client_id?: string
+            client_secret?: string
+            scope?: 'personal' | 'shared'
+        }): Promise<Record<string, any>> {
+            return await new ApiRequest().mcpServerInstallations().withAction('install_custom').create({ data })
+        },
+        async installTemplate(data: {
+            template_id: string
+            api_key?: string
+            scope?: 'personal' | 'shared'
+        }): Promise<Record<string, any>> {
+            return await new ApiRequest().mcpServerInstallations().withAction('install_template').create({ data })
+        },
+        async listTools(
+            id: string,
+            params?: { include_removed?: boolean }
+        ): Promise<{ results: Record<string, any>[] }> {
+            return await new ApiRequest()
+                .mcpServerInstallation(id)
+                .withAction('tools')
+                .withQueryString(params?.include_removed ? { include_removed: '1' } : undefined)
+                .get()
+        },
+        async updateToolApproval(
+            id: string,
+            toolName: string,
+            approvalState: 'approved' | 'needs_approval' | 'do_not_use'
+        ): Promise<Record<string, any>> {
+            return await new ApiRequest()
+                .mcpServerInstallation(id)
+                .withAction('tools')
+                .withAction(encodeURIComponent(toolName))
+                .update({ data: { approval_state: approvalState } })
+        },
+        async refreshTools(id: string): Promise<{ results: Record<string, any>[] }> {
+            return await new ApiRequest().mcpServerInstallation(id).withAction('tools/refresh').create({ data: {} })
+        },
+    },
+
+    annotations: {
+        async get(annotationId: RawAnnotationType['id']): Promise<RawAnnotationType> {
+            return await new ApiRequest().annotation(annotationId).get()
+        },
+        async update(
+            annotationId: RawAnnotationType['id'],
+            data: Pick<
+                RawAnnotationType,
+                'date_marker' | 'scope' | 'content' | 'dashboard_item' | 'dashboard_id' | 'emoji'
+            >
+        ): Promise<RawAnnotationType> {
+            return await new ApiRequest().annotation(annotationId).update({ data })
+        },
+        async list(params?: {
+            limit?: number
+            offset?: number
+            hidden_in_user_interface?: boolean
+        }): Promise<PaginatedResponse<RawAnnotationType>> {
+            return await new ApiRequest()
+                .annotations()
+                .withQueryString({
+                    limit: params?.limit,
+                    offset: params?.offset,
+                    hidden_in_user_interface: params?.hidden_in_user_interface,
+                })
+                .get()
+        },
+        async create(
+            data: Pick<
+                RawAnnotationType,
+                'date_marker' | 'scope' | 'content' | 'dashboard_item' | 'dashboard_id' | 'emoji'
+            >
+        ): Promise<RawAnnotationType> {
+            return await new ApiRequest().annotations().create({ data })
+        },
+        determineDeleteEndpoint(): string {
+            return new ApiRequest().annotations().assembleEndpointUrl()
+        },
+    },
+
+    errorTracking: {
+        async getIssue(id: ErrorTrackingIssue['id'], fingerprint?: string): Promise<ErrorTrackingRelationalIssue> {
+            return await new ApiRequest().errorTrackingIssue(id).withQueryString(toParams({ fingerprint })).get()
+        },
+
+        async updateIssue(
+            id: ErrorTrackingIssue['id'],
+            data: Partial<Pick<ErrorTrackingIssue, 'status' | 'name' | 'description'>>
+        ): Promise<ErrorTrackingRelationalIssue> {
+            return await new ApiRequest().errorTrackingIssue(id).update({ data })
+        },
+
+        async assignIssue(
+            id: ErrorTrackingIssue['id'],
+            assignee: ErrorTrackingIssue['assignee']
+        ): Promise<{ content: string }> {
+            return await new ApiRequest().errorTrackingAssignIssue(id).update({ data: { assignee } })
+        },
+
+        async bulkMarkStatus(
+            ids: ErrorTrackingIssue['id'][],
+            status: ErrorTrackingIssue['status']
+        ): Promise<{ content: string }> {
+            return await new ApiRequest().errorTrackingIssueBulk().create({
+                data: { action: 'set_status', ids, status: status },
+            })
+        },
+
+        async bulkAssign(
+            ids: ErrorTrackingIssue['id'][],
+            assignee: ErrorTrackingIssue['assignee']
+        ): Promise<{ content: string }> {
+            return await new ApiRequest().errorTrackingIssueBulk().create({ data: { action: 'assign', ids, assignee } })
+        },
+
+        async mergeInto(
+            primaryIssueId: ErrorTrackingIssue['id'],
+            mergingIssueIds: ErrorTrackingIssue['id'][]
+        ): Promise<{ content: string }> {
+            return await new ApiRequest()
+                .errorTrackingIssueMerge(primaryIssueId)
+                .create({ data: { ids: mergingIssueIds } })
+        },
+
+        async split(
+            issueId: ErrorTrackingIssue['id'],
+            fingerprints: {
+                fingerprint: string
+                name?: string
+                description?: string
+            }[]
+        ): Promise<{ success: boolean; new_issue_ids: string[] }> {
+            return await new ApiRequest().errorTrackingIssueSplit(issueId).create({ data: { fingerprints } })
+        },
+
+        fingerprints: {
+            async list(issueId: ErrorTrackingIssue['id']): Promise<ErrorTrackingFingerprint[]> {
+                const url = new ApiRequest()
+                    .errorTrackingIssueFingerprints()
+                    .withQueryString(toParams({ issue_id: issueId }))
+                    .assembleFullUrl()
+                return await api.loadPaginatedResults<ErrorTrackingFingerprint>(url)
+            },
+        },
+
+        symbolSets: {
+            async list({
+                status,
+                offset = 0,
+                limit = 100,
+                orderBy = '-created_at',
+                search,
+            }: {
+                status?: SymbolSetStatusFilter
+                offset: number
+                limit: number
+                orderBy?: SymbolSetOrder
+                search?: string
+            }): Promise<CountedPaginatedResponse<ErrorTrackingSymbolSet>> {
+                const queryString = {
+                    order_by: orderBy,
+                    status,
+                    offset,
+                    limit,
+                    search,
+                }
+                return await new ApiRequest().errorTrackingSymbolSets().withQueryString(toParams(queryString)).get()
+            },
+
+            async delete(id: ErrorTrackingSymbolSet['id']): Promise<void> {
+                return await new ApiRequest().errorTrackingSymbolSet(id).delete()
+            },
+
+            async bulkDelete(ids: ErrorTrackingSymbolSet['id'][]): Promise<void> {
+                return await new ApiRequest()
+                    .errorTrackingSymbolSets()
+                    .withAction('bulk_delete')
+                    .create({ data: { ids } })
+            },
+
+            async download(id: ErrorTrackingSymbolSet['id']): Promise<{ url: string }> {
+                return await new ApiRequest().errorTrackingSymbolSet(id).withAction('download').get()
+            },
+        },
+
+        releases: {
+            async list({
+                offset = 0,
+                limit = 100,
+            }: {
+                offset?: number
+                limit?: number
+            }): Promise<CountedPaginatedResponse<ErrorTrackingRelease>> {
+                const queryString = { order_by: '-created_at', offset, limit }
+                return await new ApiRequest().errorTrackingReleases().withQueryString(toParams(queryString)).get()
+            },
+        },
+
+        async symbolSetStackFrames(
+            id: ErrorTrackingSymbolSet['id']
+        ): Promise<{ results: ErrorTrackingStackFrameRecord[] }> {
+            return await new ApiRequest().errorTrackingStackFrames().create({ data: { symbol_set: id } })
+        },
+
+        async stackFrames(
+            raw_ids: ErrorTrackingStackFrame['raw_id'][]
+        ): Promise<{ results: ErrorTrackingStackFrameRecord[] }> {
+            return await new ApiRequest().errorTrackingStackFrames().create({ data: { raw_ids: raw_ids } })
+        },
+
+        async rules(ruleType: ErrorTrackingRuleType): Promise<{ results: ErrorTrackingRule[] }> {
+            return await new ApiRequest().errorTrackingRules(ruleType).get()
+        },
+
+        async listRecommendations({ poll = false }: { poll?: boolean } = {}): Promise<{
+            results: ErrorTrackingRecommendation[]
+        }> {
+            return await new ApiRequest().errorTrackingRecommendations().withQueryString({ poll }).get()
+        },
+
+        async dismissRecommendation(id: string): Promise<ErrorTrackingRecommendation> {
+            return await new ApiRequest().errorTrackingRecommendation(id).withAction('dismiss').create()
+        },
+
+        async restoreRecommendation(id: string): Promise<ErrorTrackingRecommendation> {
+            return await new ApiRequest().errorTrackingRecommendation(id).withAction('restore').create()
+        },
+
+        async refreshRecommendation(
+            id: string,
+            { force = true }: { force?: boolean } = {}
+        ): Promise<ErrorTrackingRecommendation> {
+            return await new ApiRequest()
+                .errorTrackingRecommendation(id)
+                .withAction('refresh')
+                .withQueryString({ force })
+                .create()
+        },
+
+        async createRule(
+            ruleType: ErrorTrackingRuleType,
+            { id: _, ...data }: ErrorTrackingRule
+        ): Promise<ErrorTrackingRule> {
+            return await new ApiRequest().errorTrackingRules(ruleType).create({ data })
+        },
+
+        async updateRule(ruleType: ErrorTrackingRuleType, { id, ...data }: ErrorTrackingRule): Promise<void> {
+            return await new ApiRequest().errorTrackingRule(ruleType, id).update({ data })
+        },
+
+        async deleteRule(ruleType: ErrorTrackingRuleType, id: ErrorTrackingRule['id']): Promise<void> {
+            return await new ApiRequest().errorTrackingRule(ruleType, id).delete()
+        },
+
+        async reorderRules(ruleType: ErrorTrackingRuleType, orders: Record<string, number>): Promise<void> {
+            return await new ApiRequest().errorTrackingReorderRules(ruleType).update({ data: { orders } })
+        },
+
+        async createExternalReference(
+            issueId: string,
+            integrationId: number,
+            config: Record<string, string>
+        ): Promise<ErrorTrackingExternalReference> {
+            return await new ApiRequest().errorTrackingExternalReference().create({
+                data: {
+                    integration_id: integrationId,
+                    issue: issueId,
+                    config,
+                },
+            })
+        },
+
+        async getSimilarIssues(
+            issueId: ErrorTrackingIssue['id']
+        ): Promise<Array<{ id: string; title: string; description: string }>> {
+            return await new ApiRequest().errorTrackingSimilarIssues(issueId).get()
+        },
+
+        async assignCohort(issueId: ErrorTrackingIssue['id'], cohortId: CohortType['id']): Promise<{ id: string }> {
+            return await new ApiRequest().errorTrackingIssueCohort(issueId).put({ data: { cohortId } })
+        },
+
+        async getSpikeDetectionConfig(): Promise<ErrorTrackingSpikeDetectionConfig> {
+            return await new ApiRequest().errorTrackingSpikeDetectionConfig().get()
+        },
+
+        async updateSpikeDetectionConfig(
+            data: Partial<ErrorTrackingSpikeDetectionConfig>
+        ): Promise<ErrorTrackingSpikeDetectionConfig> {
+            return await new ApiRequest()
+                .errorTrackingSpikeDetectionConfig()
+                .withAction('update_config')
+                .update({ data })
+        },
+
+        async getSettings(): Promise<ErrorTrackingSettings> {
+            return await new ApiRequest().errorTrackingSettings().withAction('retrieve_settings').get()
+        },
+
+        async updateSettings(data: Partial<ErrorTrackingSettings>): Promise<ErrorTrackingSettings> {
+            return await new ApiRequest().errorTrackingSettings().withAction('update_settings').update({ data })
+        },
+
+        async getSpikeEvents(params?: {
+            issueIds?: string[]
+            limit?: number
+            offset?: number
+            orderBy?: string
+            dateFrom?: string
+            dateTo?: string
+        }): Promise<CountedPaginatedResponse<ErrorTrackingSpikeEvent>> {
+            const query: Record<string, string | number> = {}
+            if (params?.issueIds !== undefined && params.issueIds.length > 0) {
+                const ids = params.issueIds.filter(Boolean)
+                if (ids.length > 0) {
+                    query.issue_ids = ids.join(',')
+                }
+            }
+            if (params?.limit !== undefined) {
+                query.limit = params.limit
+            }
+            if (params?.offset !== undefined) {
+                query.offset = params.offset
+            }
+            if (params?.orderBy) {
+                query.order_by = params.orderBy
+            }
+            if (params?.dateFrom) {
+                query.date_from = params.dateFrom
+            }
+            if (params?.dateTo) {
+                query.date_to = params.dateTo
+            }
+            let request = new ApiRequest().errorTrackingSpikeEvents()
+            if (Object.keys(query).length > 0) {
+                request = request.withQueryString(query)
+            }
+            return await request.get()
+        },
+    },
+
+    quickFilters: {
+        async list(context: string): Promise<CountedPaginatedResponse<QuickFilter>> {
+            return await new ApiRequest().quickFilters().withQueryString(toParams({ context })).get()
+        },
+        async get(id: string): Promise<QuickFilter> {
+            return await new ApiRequest().quickFilter(id).get()
+        },
+        async create(
+            data: Pick<QuickFilter, 'contexts' | 'name' | 'property_name' | 'type' | 'options'>
+        ): Promise<QuickFilter> {
+            return await new ApiRequest().quickFilters().create({ data })
+        },
+        async update(
+            id: string,
+            data: Partial<Pick<QuickFilter, 'name' | 'property_name' | 'type' | 'options' | 'contexts'>>
+        ): Promise<QuickFilter> {
+            return await new ApiRequest().quickFilter(id).update({ data })
+        },
+        async delete(id: string): Promise<void> {
+            return await new ApiRequest().quickFilter(id).delete()
+        },
+    },
+
+    gitProviderFileLinks: {
+        async resolveGithub(
+            owner: string,
+            repository: string,
+            codeSample: string,
+            fileName: string
+        ): Promise<{ found: boolean; url?: string }> {
+            return await new ApiRequest()
+                .gitProviderFileLinks()
+                .withAction('resolve_github')
+                .withQueryString({
+                    owner,
+                    repository,
+                    code_sample: codeSample,
+                    file_name: fileName,
+                })
+                .get()
+        },
+        async resolveGitlab(
+            owner: string,
+            repository: string,
+            codeSample: string,
+            fileName: string
+        ): Promise<{ found: boolean; url?: string }> {
+            return await new ApiRequest()
+                .gitProviderFileLinks()
+                .withAction('resolve_gitlab')
+                .withQueryString({
+                    owner,
+                    repository,
+                    code_sample: codeSample,
+                    file_name: fileName,
+                })
+                .get()
+        },
+    },
+
+    recordings: {
+        async list(params: RecordingsQuery): Promise<RecordingsQueryResponse> {
+            return await new ApiRequest().recordings().withQueryString(toParams(params)).get()
+        },
+        async getMatchingEvents(params: string): Promise<MatchingEventsResponse> {
+            return await new ApiRequest().recordingMatchingEvents().withQueryString(params).get()
+        },
+        async getCaptureDiagnostics(
+            recordingId: SessionRecordingType['id']
+        ): Promise<{ properties: Record<string, any> | null }> {
+            return await new ApiRequest().recording(recordingId).withAction('capture_diagnostics').get()
+        },
+        async get(
+            recordingId: SessionRecordingType['id'],
+            params: Record<string, any> = {},
+            headers: Record<string, string> = {}
+        ): Promise<SessionRecordingType> {
+            return await new ApiRequest().recording(recordingId).withQueryString(toParams(params)).get({ headers })
+        },
+        async update(
+            recordingId: SessionRecordingType['id'],
+            data: Partial<SessionRecordingUpdateType>
+        ): Promise<SessionRecordingType> {
+            return await new ApiRequest().recording(recordingId).update({ data })
+        },
+
+        async summarizeStream(
+            recordingId: SessionRecordingType['id'],
+            options?: ApiMethodOptions & { forceRestart?: boolean }
+        ): Promise<Response> {
+            const { forceRestart, ...apiOptions } = options ?? {}
+            return await api.createResponse(
+                new ApiRequest().recording(recordingId).withAction('summarize').assembleFullUrl(),
+                forceRestart ? { force_restart: true } : undefined,
+                apiOptions
+            )
+        },
+
+        async cancelSummarize(recordingId: SessionRecordingType['id']): Promise<{ cancelled: boolean }> {
+            return await new ApiRequest().recording(recordingId).withAction('summarize/cancel').create()
+        },
+
+        async similarRecordings(recordingId: SessionRecordingType['id']): Promise<[string, number][]> {
+            return await new ApiRequest().recording(recordingId).withAction('similar_sessions').get()
+        },
+
+        async delete(recordingId: SessionRecordingType['id']): Promise<{ success: boolean }> {
+            return await new ApiRequest().recording(recordingId).delete()
+        },
+
+        async batchCheckExists(
+            sessionIds: string[],
+            options?: { includeOutcomes?: boolean }
+        ): Promise<{
+            results: Record<string, boolean>
+            outcomes?: Record<string, { description?: string | null }>
+        }> {
+            const data: Record<string, unknown> = { session_ids: sessionIds }
+            if (options?.includeOutcomes) {
+                data.include_outcomes = true
+            }
+            return await new ApiRequest().recordings().withAction('batch_check_exists').create({ data })
+        },
+
+        async createExternalReference(
+            sessionRecordingId: SessionRecordingType['id'],
+            integrationId: number,
+            config: Record<string, any>
+        ): Promise<SessionRecordingExternalReference> {
+            return await new ApiRequest().sessionRecordingsExternalReferences().create({
+                data: {
+                    session_recording_id: sessionRecordingId,
+                    integration_id: integrationId,
+                    config,
+                },
+            })
+        },
+
+        async listSnapshotSources(
+            recordingId: SessionRecordingType['id'],
+            headers: Record<string, string> = {}
+        ): Promise<SessionRecordingSnapshotResponse> {
+            return await new ApiRequest().recording(recordingId).withAction('snapshots').get({ headers })
+        },
+
+        async getSnapshots(
+            recordingId: SessionRecordingType['id'],
+            params: SessionRecordingSnapshotParams,
+            headers: Record<string, string> = {}
+        ): Promise<string[] | Uint8Array> {
+            let response: Response
+            try {
+                response = await new ApiRequest()
+                    .recording(recordingId)
+                    .withAction('snapshots')
+                    .withQueryString(params)
+                    .getResponse({ headers })
+            } catch (e) {
+                if (e instanceof ApiError && e.status === 410 && e.data?.error === 'recording_deleted') {
+                    throw new RecordingDeletedError(e.data?.deleted_at ?? null, e.data?.deleted_by ?? null)
+                }
+                throw e
+            }
+
+            const contentBuffer = new Uint8Array(await response.arrayBuffer())
+
+            // If client requested uncompressed data (decompress=false), return binary data
+            if (params.decompress === false) {
+                return contentBuffer
+            }
+
+            // Otherwise try to decode as text
+            try {
+                const textDecoder = new TextDecoder()
+                const textLines = textDecoder.decode(contentBuffer)
+
+                if (textLines) {
+                    const lines = textLines.split('\n')
+                    return lines
+                }
+            } catch (error) {
+                console.error('Failed to decode snapshot response as text:', error)
+            }
+            return []
+        },
+
+        async listPlaylists(params: string): Promise<SavedSessionRecordingPlaylistsResult> {
+            return await new ApiRequest().recordingPlaylists().withQueryString(params).get()
+        },
+        async getPlaylist(playlistId: SessionRecordingPlaylistType['short_id']): Promise<SessionRecordingPlaylistType> {
+            return await new ApiRequest().recordingPlaylist(playlistId).get()
+        },
+        async playlistViewed(playlistId: SessionRecordingPlaylistType['short_id']): Promise<void> {
+            return await new ApiRequest().recordingPlaylist(playlistId).withAction('playlist_viewed').create()
+        },
+        async createPlaylist(playlist: Partial<SessionRecordingPlaylistType>): Promise<SessionRecordingPlaylistType> {
+            return await new ApiRequest().recordingPlaylists().create({ data: playlist })
+        },
+        async updatePlaylist(
+            playlistId: SessionRecordingPlaylistType['short_id'],
+            playlist: Partial<SessionRecordingPlaylistType>
+        ): Promise<SessionRecordingPlaylistType> {
+            return await new ApiRequest().recordingPlaylist(playlistId).update({ data: playlist })
+        },
+
+        async listPlaylistRecordings(
+            playlistId: SessionRecordingPlaylistType['short_id'],
+            params: Record<string, any> = {}
+        ): Promise<RecordingsQueryResponse> {
+            return await new ApiRequest()
+                .recordingPlaylist(playlistId)
+                .withAction('recordings')
+                .withQueryString(toParams(params))
+                .get()
+        },
+
+        async addRecordingToPlaylist(
+            playlistId: SessionRecordingPlaylistType['short_id'],
+            session_recording_id: SessionRecordingType['id']
+        ): Promise<SessionRecordingPlaylistType> {
+            return await new ApiRequest()
+                .recordingPlaylist(playlistId)
+                .withAction('recordings')
+                .withAction(session_recording_id)
+                .create()
+        },
+
+        async bulkAddRecordingsToPlaylist(
+            playlistId: SessionRecordingPlaylistType['short_id'],
+            session_recording_ids: SessionRecordingType['id'][]
+        ): Promise<{
+            success: boolean
+            added_count: number
+            total_requested: number
+        }> {
+            return await new ApiRequest()
+                .recordingPlaylist(playlistId)
+                .withAction('recordings')
+                .withAction('bulk_add')
+                .create({ data: { session_recording_ids } })
+        },
+
+        async bulkDeleteRecordingsFromPlaylist(
+            playlistId: SessionRecordingPlaylistType['short_id'],
+            session_recording_ids: SessionRecordingType['id'][]
+        ): Promise<{
+            success: boolean
+            added_count: number
+            total_requested: number
+        }> {
+            return await new ApiRequest()
+                .recordingPlaylist(playlistId)
+                .withAction('recordings')
+                .withAction('bulk_delete')
+                .create({ data: { session_recording_ids } })
+        },
+
+        async removeRecordingFromPlaylist(
+            playlistId: SessionRecordingPlaylistType['short_id'],
+            session_recording_id: SessionRecordingType['id']
+        ): Promise<SessionRecordingPlaylistType> {
+            return await new ApiRequest()
+                .recordingPlaylist(playlistId)
+                .withAction('recordings')
+                .withAction(session_recording_id)
+                .delete()
+        },
+
+        async aiRegex(regex: string): Promise<{ result: string; data: any }> {
+            return await new ApiRequest().recordings().withAction('ai/regex').create({ data: { regex } })
+        },
+
+        async bulkDeleteRecordings(
+            session_recording_ids: SessionRecordingType['id'][],
+            date_from?: string | null
+        ): Promise<{
+            success: boolean
+            deleted_count: number
+            total_requested: number
+            failed_ids: SessionRecordingType['id'][]
+        }> {
+            return await new ApiRequest()
+                .recordings()
+                .withAction('bulk_delete')
+                .create({
+                    data: {
+                        session_recording_ids,
+                        ...(date_from ? { date_from } : {}),
+                    },
+                })
+        },
+
+        async bulkViewedRecordings(session_recording_ids: SessionRecordingType['id'][]): Promise<{
+            success: boolean
+            viewed_count: number
+            total_requested: number
+        }> {
+            return await new ApiRequest()
+                .recordings()
+                .withAction('bulk_viewed')
+                .create({ data: { session_recording_ids } })
+        },
+
+        async bulkNotViewedRecordings(session_recording_ids: SessionRecordingType['id'][]): Promise<{
+            success: boolean
+            not_viewed_count: number
+            total_requested: number
+        }> {
+            return await new ApiRequest()
+                .recordings()
+                .withAction('bulk_not_viewed')
+                .create({ data: { session_recording_ids } })
+        },
+    },
+
+    notebooks: {
+        async get(
+            notebookId: NotebookType['short_id'],
+            params: Record<string, any> = {},
+            headers: Record<string, any> = {}
+        ): Promise<NotebookType> {
+            return await new ApiRequest().notebook(notebookId).withQueryString(toParams(params)).get({
+                headers,
+            })
+        },
+        async update(
+            notebookId: NotebookType['short_id'],
+            data: Partial<Pick<NotebookType, 'version' | 'content' | 'text_content' | 'title' | '_create_in_folder'>>
+        ): Promise<NotebookType> {
+            return await new ApiRequest().notebook(notebookId).update({ data })
+        },
+        async list(
+            params: {
+                contains?: NotebookNodeResource[]
+                created_by?: UserBasicType['uuid']
+                search?: string
+                order?: string
+                offset?: number
+                limit?: number
+            } = {}
+        ): Promise<CountedPaginatedResponse<NotebookListItemType>> {
+            // TODO attrs could be a union of types like NotebookNodeRecordingAttributes
+            const apiRequest = new ApiRequest().notebooks()
+            const { contains, ...queryParams } = objectClean(params)
+
+            const newQueryParams: Omit<typeof params, 'contains'> & {
+                contains?: string
+            } = queryParams
+            if (contains?.length) {
+                const containsString =
+                    contains
+                        .map(({ type, attrs }) => {
+                            const target = type.replace(/^ph-/, '')
+                            const match = attrs['id'] ? `:${attrs['id']}` : ''
+                            return `${target}${match}`
+                        })
+                        .join(',') || undefined
+
+                newQueryParams['contains'] = containsString
+            }
+
+            return await apiRequest.withQueryString(newQueryParams).get()
+        },
+        async recordingComments(recordingId: string): Promise<{ results: RecordingComment[] }> {
+            return await new ApiRequest()
+                .notebooks()
+                .withAction('recording_comments')
+                .withQueryString({ recording_id: recordingId })
+                .get()
+        },
+        async create(
+            data?: Pick<NotebookType, 'content' | 'text_content' | 'title' | '_create_in_folder'> & {
+                short_id?: string
+            }
+        ): Promise<NotebookType> {
+            return await new ApiRequest().notebooks().create({ data })
+        },
+        async delete(notebookId: NotebookType['short_id']): Promise<NotebookType> {
+            return await new ApiRequest().notebook(notebookId).delete()
+        },
+        async kernelExecute(
+            notebookId: NotebookType['short_id'],
+            data: {
+                code: string
+                return_variables?: boolean
+                timeout?: number
+            }
+        ): Promise<Record<string, any>> {
+            return await new ApiRequest().notebook(notebookId).withAction('kernel/execute').create({ data })
+        },
+        async hogqlExecute(
+            notebookId: NotebookType['short_id'],
+            data: { query: string }
+        ): Promise<{ columns?: string[]; results?: any[]; error?: string }> {
+            return await new ApiRequest().notebook(notebookId).withAction('hogql/execute').create({ data })
+        },
+        async kernelExecuteStream(
+            notebookId: NotebookType['short_id'],
+            data: {
+                code: string
+                return_variables?: boolean
+                timeout?: number
+            },
+            {
+                onMessage,
+                onError,
+                signal,
+            }: {
+                onMessage: (data: EventSourceMessage) => void
+                onError: (error: any) => void
+                signal?: AbortSignal
+            }
+        ): Promise<void> {
+            const url = new ApiRequest().notebook(notebookId).withAction('kernel/execute/stream').assembleFullUrl(true)
+            await api.stream(url, {
+                method: 'POST',
+                data,
+                onMessage,
+                onError,
+                signal,
+            })
+        },
+        async kernelDataframe(
+            notebookId: NotebookType['short_id'],
+            params: {
+                variable_name: string
+                offset?: number
+                limit?: number
+                timeout?: number
+            }
+        ): Promise<{
+            columns: string[]
+            rows: Record<string, any>[]
+            rowCount: number
+        }> {
+            const response = await new ApiRequest()
+                .notebook(notebookId)
+                .withAction('kernel/dataframe')
+                .withQueryString(params)
+                .get()
+
+            return {
+                columns: response.columns ?? [],
+                rows: response.rows ?? [],
+                rowCount: response.row_count ?? 0,
+            }
+        },
+        async kernelStart(notebookId: NotebookType['short_id']): Promise<Record<string, any>> {
+            return await new ApiRequest().notebook(notebookId).withAction('kernel/start').create()
+        },
+        async kernelStop(notebookId: NotebookType['short_id']): Promise<Record<string, any>> {
+            return await new ApiRequest().notebook(notebookId).withAction('kernel/stop').create()
+        },
+        async kernelRestart(notebookId: NotebookType['short_id']): Promise<Record<string, any>> {
+            return await new ApiRequest().notebook(notebookId).withAction('kernel/restart').create()
+        },
+        async kernelConfig(
+            notebookId: NotebookType['short_id'],
+            data: {
+                cpu_cores?: number
+                memory_gb?: number
+                idle_timeout_seconds?: number
+            }
+        ): Promise<Record<string, any>> {
+            return await new ApiRequest().notebook(notebookId).withAction('kernel/config').create({ data })
+        },
+        async kernelStatus(notebookId: NotebookType['short_id']): Promise<Record<string, any>> {
+            return await new ApiRequest().notebook(notebookId).withAction('kernel/status').get()
+        },
+        async sqlV2Run(
+            notebookId: NotebookType['short_id'],
+            data: {
+                node_id: string
+                code: string
+                refs?: Record<string, string>
+                node_type?: 'hogql' | 'python'
+                output_name?: string
+            }
+        ): Promise<{ run_id: string }> {
+            return await new ApiRequest().notebook(notebookId).withAction('sql_v2/run').create({ data })
+        },
+        async sqlV2RunResult(
+            notebookId: NotebookType['short_id'],
+            runId: string
+        ): Promise<{
+            status: 'running' | 'done' | 'failed'
+            result: {
+                columns?: string[]
+                types?: [string, string][]
+                row_count?: number
+                first_page?: (string | number | null)[][]
+                has_more?: boolean
+                stdout?: string
+                stderr?: string
+                media?: { mime_type: string; data: string }[]
+            } | null
+            error: string | null
+        }> {
+            return await new ApiRequest().notebook(notebookId).withAction(`sql_v2/runs/${runId}`).get()
+        },
+        async sqlV2RunPage(
+            notebookId: NotebookType['short_id'],
+            runId: string,
+            params: { offset: number; limit: number }
+        ): Promise<{
+            columns: string[]
+            types: [string, string][]
+            rows: (string | number | null)[][]
+            has_more: boolean
+        }> {
+            return await new ApiRequest()
+                .notebook(notebookId)
+                .withAction(`sql_v2/runs/${runId}/page`)
+                .withQueryString(params)
+                .get()
+        },
+        async markdownSave(
+            notebookId: NotebookType['short_id'],
+            data: {
+                client_id: string
+                /** The notebook version the content is based on (optimistic concurrency baseline). */
+                version: number
+                content: NotebookType['content']
+                text_content?: string
+                title?: string
+                /** The author's caret in the saved markdown, broadcast with the update event. */
+                cursor?: NotebookCollabCursorApi
+            }
+        ): Promise<NotebookType> {
+            return await new ApiRequest().notebook(notebookId).withAction('collab/markdown_save').create({ data })
+        },
+        async collabStream(
+            notebookId: NotebookType['short_id'],
+            {
+                onMessage,
+                onError,
+                onOpen,
+                onClose,
+                signal,
+                lastEventId,
+            }: {
+                onMessage: (data: EventSourceMessage) => void
+                onError: (error: any) => void
+                onOpen?: () => void
+                onClose?: () => void
+                signal?: AbortSignal
+                /** Stream id of the last received event; sent as `Last-Event-ID` so the
+                 *  server resumes from there instead of restarting at the stream tip. */
+                lastEventId?: string
+            }
+        ): Promise<void> {
+            const url = new ApiRequest().notebook(notebookId).withAction('collab/stream').assembleFullUrl(true)
+            await api.stream(url, {
+                method: 'GET',
+                onMessage,
+                onError,
+                onOpen,
+                onClose,
+                signal,
+                headers: lastEventId ? { 'Last-Event-ID': lastEventId } : undefined,
+            })
+        },
+    },
+
+    sessionGroupSummaries: {
+        async get(id: string): Promise<SessionGroupSummaryType> {
+            return await new ApiRequest().sessionGroupSummary(id).get()
+        },
+        async list(
+            params: {
+                created_by?: string
+                search?: string
+                order?: string
+                limit?: number
+                offset?: number
+            } = {}
+        ): Promise<CountedPaginatedResponse<SessionGroupSummaryListItemType>> {
+            return await new ApiRequest().sessionGroupSummaries().withQueryString(toParams(params)).get()
+        },
+        async delete(id: string): Promise<void> {
+            return await new ApiRequest().sessionGroupSummary(id).delete()
+        },
+    },
+
+    batchExports: {
+        async list(params: Record<string, any> = {}): Promise<CountedPaginatedResponse<BatchExportConfiguration>> {
+            return await new ApiRequest().batchExports().withQueryString(toParams(params)).get()
+        },
+        async get(id: BatchExportConfiguration['id']): Promise<BatchExportConfiguration> {
+            return await new ApiRequest().batchExport(id).get()
+        },
+        async update(
+            id: BatchExportConfiguration['id'],
+            data: Partial<BatchExportConfiguration>
+        ): Promise<BatchExportConfiguration> {
+            return await new ApiRequest().batchExport(id).update({ data })
+        },
+        async create(data?: Partial<BatchExportConfiguration>): Promise<BatchExportConfiguration> {
+            return await new ApiRequest().batchExports().create({ data })
+        },
+        async delete(id: BatchExportConfiguration['id']): Promise<BatchExportConfiguration> {
+            return await new ApiRequest().batchExport(id).delete()
+        },
+        async pause(id: BatchExportConfiguration['id']): Promise<BatchExportConfiguration> {
+            return await new ApiRequest().batchExport(id).withAction('pause').create()
+        },
+        async unpause(id: BatchExportConfiguration['id']): Promise<BatchExportConfiguration> {
+            return await new ApiRequest().batchExport(id).withAction('unpause').create()
+        },
+        async listRuns(
+            id: BatchExportConfiguration['id'],
+            params: Record<string, any> = {}
+        ): Promise<PaginatedResponse<RawBatchExportRun>> {
+            return await new ApiRequest().batchExportRuns(id).withQueryString(toParams(params)).get()
+        },
+        async createBackfill(
+            id: BatchExportConfiguration['id'],
+            data: Pick<BatchExportConfiguration, 'start_at' | 'end_at'>
+        ): Promise<{ backfill_id: string }> {
+            return await new ApiRequest().batchExportBackfills(id).create({ data })
+        },
+        async listBackfills(
+            id: BatchExportConfiguration['id'],
+            params: Record<string, any> = {}
+        ): Promise<PaginatedResponse<RawBatchExportBackfill>> {
+            return await new ApiRequest().batchExportBackfills(id).withQueryString(toParams(params)).get()
+        },
+        async getBackfill(
+            id: BatchExportConfiguration['id'],
+            backfillId: string,
+            teamId?: TeamType['id']
+        ): Promise<RawBatchExportBackfill> {
+            return await new ApiRequest().batchExportBackfill(id, backfillId, teamId).get()
+        },
+        async cancelBackfill(
+            id: BatchExportConfiguration['id'],
+            backfillId: BatchExportBackfill['id'],
+            teamId?: TeamType['id']
+        ): Promise<BatchExportBackfill> {
+            return await new ApiRequest().batchExportBackfill(id, backfillId, teamId).withAction('cancel').create()
+        },
+        async retryRun(
+            id: BatchExportConfiguration['id'],
+            runId: BatchExportRun['id'],
+            teamId?: TeamType['id']
+        ): Promise<BatchExportRun> {
+            return await new ApiRequest().batchExportRun(id, runId, teamId).withAction('retry').create()
+        },
+        async cancelRun(
+            id: BatchExportConfiguration['id'],
+            runId: BatchExportRun['id'],
+            teamId?: TeamType['id']
+        ): Promise<BatchExportRun> {
+            return await new ApiRequest().batchExportRun(id, runId, teamId).withAction('cancel').create()
+        },
+        async logs(
+            id: BatchExportConfiguration['id'],
+            params: LogEntryRequestParams = {}
+        ): Promise<PaginatedResponse<LogEntry>> {
+            return await new ApiRequest().batchExport(id).withAction('logs').withQueryString(params).get()
+        },
+        async test(destination: BatchExportService['type']): Promise<BatchExportConfigurationTest> {
+            return await new ApiRequest().batchExports().withAction('test').withQueryString({ destination }).get()
+        },
+        async runTestStep(
+            id: BatchExportConfiguration['id'],
+            step: number,
+            data: Record<string, any>
+        ): Promise<BatchExportConfigurationTestStep> {
+            return await new ApiRequest()
+                .batchExport(id)
+                .withAction('run_test_step')
+                .create({ data: { step: step, ...data } })
+        },
+        async runTestStepNew(step: number, data: Record<string, any>): Promise<BatchExportConfigurationTestStep> {
+            return await new ApiRequest()
+                .batchExports()
+                .withAction('run_test_step_new')
+                .create({ data: { step: step, ...data } })
+        },
+    },
+
+    earlyAccessFeatures: {
+        async get(featureId: EarlyAccessFeatureType['id']): Promise<EarlyAccessFeatureType> {
+            return await new ApiRequest().earlyAccessFeature(featureId).get()
+        },
+        async create(data: NewEarlyAccessFeatureType): Promise<EarlyAccessFeatureType> {
+            return await new ApiRequest().earlyAccessFeatures().create({ data })
+        },
+        async delete(featureId: EarlyAccessFeatureType['id']): Promise<void> {
+            await new ApiRequest().earlyAccessFeature(featureId).delete()
+        },
+        async update(
+            featureId: EarlyAccessFeatureType['id'],
+            data: Pick<EarlyAccessFeatureType, 'name' | 'description' | 'stage' | 'documentation_url'> & {
+                rollout_to_all?: boolean
+            }
+        ): Promise<EarlyAccessFeatureType> {
+            return await new ApiRequest().earlyAccessFeature(featureId).update({ data })
+        },
+        async list(): Promise<PaginatedResponse<EarlyAccessFeatureType>> {
+            return await new ApiRequest().earlyAccessFeatures().get()
+        },
+    },
+
+    userInterviews: {
+        async list(): Promise<PaginatedResponse<UserInterviewType>> {
+            return await new ApiRequest().userInterviews().get()
+        },
+        async get(id: UserInterviewType['id']): Promise<UserInterviewType> {
+            return await new ApiRequest().userInterview(id).get()
+        },
+        async update(
+            id: UserInterviewType['id'],
+            data: Pick<UserInterviewType, 'summary'>
+        ): Promise<UserInterviewType> {
+            return await new ApiRequest().userInterview(id).update({ data })
+        },
+    },
+
+    users: {
+        async list(email?: string): Promise<PaginatedResponse<UserType>> {
+            return await new ApiRequest().users(email).get()
+        },
+    },
+
+    signalReports: {
+        async list(params?: {
+            limit?: number
+            offset?: number
+            status?: string
+            search?: string
+            ordering?: string
+            /** Comma-separated source products. */
+            source_product?: string
+            /** Comma-separated P0–P4. */
+            priority?: string
+            /** Comma-separated actionability values (immediately_actionable|requires_human_input|not_actionable). */
+            actionability?: string
+            /** Filter by whether a shipped implementation PR exists. */
+            has_implementation_pr?: 'true' | 'false'
+            /** Comma-separated reviewer user UUIDs (For-you / teammate scope). */
+            suggested_reviewers?: string
+        }): Promise<CountedPaginatedResponse<SignalReport>> {
+            return await new ApiRequest().signalReports().withQueryString(params).get()
+        },
+        async analyzeSessions(): Promise<Record<string, any>> {
+            return await new ApiRequest().signalReports().withAction('analyze_sessions').create()
+        },
+        async get(id: SignalReport['id']): Promise<SignalReport> {
+            return await new ApiRequest().signalReport(id).get()
+        },
+        async artefacts(
+            id: SignalReport['id'],
+            params: { limit?: number } = {}
+        ): Promise<SignalReportArtefactResponse> {
+            return await new ApiRequest().signalReport(id).withAction('artefacts').withQueryString(params).get()
+        },
+        async delete(id: SignalReport['id']): Promise<void> {
+            await new ApiRequest().signalReport(id).delete()
+        },
+        async reingest(id: SignalReport['id']): Promise<{ status: string; report_id: string }> {
+            return await new ApiRequest().signalReport(id).withAction('reingest').create()
+        },
+        // State transitions: suppress (dismiss) or snooze back to potential. Backend: `state` action.
+        async setState(id: SignalReport['id'], data: SignalReportStateRequest): Promise<SignalReport> {
+            return await new ApiRequest().signalReport(id).withAction('state').create({ data })
+        },
+        // Backend returns a flat `{ [user_uuid]: { name, email } }` map (not paginated).
+        async availableReviewers(query?: string): Promise<{ user_uuid: string; name: string; email: string }[]> {
+            const response: Record<string, { name: string; email: string }> = await new ApiRequest()
+                .signalReports()
+                .withAction('available_reviewers')
+                .withQueryString(query ? { query } : undefined)
+                .get()
+            return Object.entries(response).map(([user_uuid, { name, email }]) => ({ user_uuid, name, email }))
+        },
+        // PUT replaces the content of a `suggested_reviewers` artefact (only writable type).
+        // Backend: SignalReportArtefactViewSet.update.
+        async updateArtefact(
+            reportId: SignalReport['id'],
+            artefactId: string,
+            content: Record<string, any>[]
+        ): Promise<SignalReportArtefact> {
+            return await new ApiRequest().signalReportArtefact(reportId, artefactId).put({ data: { content } })
+        },
+    },
+
+    // Team-level signal autonomy config (singleton). Backend: SignalTeamConfigViewSet.
+    signalTeamConfig: {
+        async get(): Promise<SignalTeamConfig> {
+            return await new ApiRequest().signalTeamConfig().get()
+        },
+        // Backend exposes update via POST to the collection (singleton create-or-update, partial).
+        async update(data: Partial<SignalTeamConfig>): Promise<SignalTeamConfig> {
+            return await new ApiRequest().signalTeamConfig().create({ data })
+        },
+    },
+
+    // Scouts: scheduled agents that sweep the project and emit findings. Backend:
+    // SignalScoutRunViewSet (runs) + SignalScoutConfigViewSet (configs).
+    signalScout: {
+        runs: {
+            // Newest-first raw array (not paginated), capped at 100 server-side.
+            async list(params?: {
+                limit?: number
+                text?: string
+                emitted?: boolean
+                date_from?: string
+                date_to?: string
+            }): Promise<SignalScoutRunSummary[]> {
+                return await new ApiRequest().signalScoutRuns().withQueryString(params).get()
+            },
+            async get(runId: string): Promise<SignalScoutRunSummary> {
+                return await new ApiRequest().signalScoutRun(runId).get()
+            },
+            async emissions(runId: string): Promise<SignalScoutEmission[]> {
+                return await new ApiRequest().signalScoutRun(runId).withAction('emissions').get()
+            },
+            // Per-finding reverse lookup: which inbox report each emitted finding grouped into.
+            // `report` is null when a finding hasn't grouped, was deduped, or its signal was deleted.
+            async emissionReports(runId: string): Promise<SignalScoutEmissionReportLink[]> {
+                return await new ApiRequest().signalScoutRun(runId).withAction('emissions/reports').get()
+            },
+            // Batched form of `emissions`: every run's findings in one request, flat newest-first
+            // (each row carries its `run_id`). POST since the run-id set can be large.
+            async emissionsBatch(runIds: string[]): Promise<SignalScoutEmission[]> {
+                return await new ApiRequest()
+                    .signalScoutRuns()
+                    .withAction('emissions/batch')
+                    .create({ data: { run_ids: runIds } })
+            },
+            // Batched form of `emissionReports`: resolves every run's findings to their inbox report
+            // in a single ClickHouse round-trip, instead of one query per run.
+            async emissionReportsBatch(runIds: string[]): Promise<SignalScoutEmissionReportLink[]> {
+                return await new ApiRequest()
+                    .signalScoutRuns()
+                    .withAction('emissions/reports/batch')
+                    .create({ data: { run_ids: runIds } })
+            },
+        },
+        configs: {
+            // Newest-first raw array, ordered by skill_name.
+            async list(): Promise<SignalScoutConfig[]> {
+                return await new ApiRequest().signalScoutConfigs().get()
+            },
+            async update(id: string, data: SignalScoutConfigUpdate): Promise<SignalScoutConfig> {
+                return await new ApiRequest().signalScoutConfig(id).update({ data })
+            },
+            async delete(id: string): Promise<void> {
+                return await new ApiRequest().signalScoutConfig(id).delete()
+            },
+        },
+    },
+
+    signalUserAutonomy: {
+        async get(userId: string | '@me' = '@me'): Promise<SignalUserAutonomyConfig | null> {
+            try {
+                return await new ApiRequest().signalUserAutonomy(userId).get()
+            } catch (error: any) {
+                // 404 = no config yet (user hasn't opted in). Treat as null.
+                if (error?.status === 404) {
+                    return null
+                }
+                throw error
+            }
+        },
+        async update(
+            data: Partial<SignalUserAutonomyConfig>,
+            userId: string | '@me' = '@me'
+        ): Promise<SignalUserAutonomyConfig> {
+            return await new ApiRequest().signalUserAutonomy(userId).create({ data })
+        },
+        async remove(userId: string | '@me' = '@me'): Promise<void> {
+            await new ApiRequest().signalUserAutonomy(userId).delete()
+        },
+    },
+
+    signalSourceConfigs: {
+        async list(): Promise<PaginatedResponse<SignalSourceConfig>> {
+            return await new ApiRequest().signalSourceConfigs().get()
+        },
+        async create(data: Partial<SignalSourceConfig>): Promise<SignalSourceConfig> {
+            return await new ApiRequest().signalSourceConfigs().create({ data })
+        },
+        async update(id: string, data: Partial<SignalSourceConfig>): Promise<SignalSourceConfig> {
+            return await new ApiRequest().signalSourceConfig(id).update({ data })
+        },
+        async delete(id: string): Promise<void> {
+            return await new ApiRequest().signalSourceConfig(id).delete()
+        },
+    },
+
+    tasks: {
+        async list(params: TaskListParams = {}): Promise<PaginatedResponse<Task>> {
+            return await new ApiRequest().tasks().withQueryString(params).get()
+        },
+        async repositories(): Promise<{ repositories: string[] }> {
+            return await new ApiRequest().tasks().withAction('repositories').get()
+        },
+        async get(id: Task['id'], params: Record<string, any> = {}): Promise<Task> {
+            return await new ApiRequest().task(id).withQueryString(params).get()
+        },
+        async create(data: TaskUpsertProps): Promise<Task> {
+            return await new ApiRequest().tasks().create({ data })
+        },
+        async update(id: string, data: Partial<TaskUpsertProps>): Promise<Task> {
+            return await new ApiRequest().task(id).update({ data })
+        },
+        async delete(id: Task['id']): Promise<void> {
+            return await new ApiRequest().task(id).delete()
+        },
+        async bulkReorder(columns: Record<string, string[]>): Promise<{ updated: number; tasks: Task[] }> {
+            return await new ApiRequest().tasks().withAction('bulk_reorder').create({ data: { columns } })
+        },
+        async run(id: Task['id'], data?: ClaudeTaskRunCreateSchemaApi): Promise<Task> {
+            return await new ApiRequest()
+                .task(id)
+                .withAction('run')
+                .create(data ? { data } : undefined)
+        },
+        runs: {
+            async list(taskId: Task['id'], params: Record<string, any> = {}): Promise<PaginatedResponse<TaskRun>> {
+                return await new ApiRequest().taskRuns(taskId).withQueryString(params).get()
+            },
+            async get(taskId: Task['id'], runId: TaskRun['id'], params: Record<string, any> = {}): Promise<TaskRun> {
+                return await new ApiRequest().taskRun(taskId, runId).withQueryString(params).get()
+            },
+            async getLogs(taskId: Task['id'], runId: TaskRun['id']): Promise<string> {
+                const run = await new ApiRequest().taskRun(taskId, runId).get()
+                if (run.log_url) {
+                    const response = await fetch(run.log_url, {
+                        cache: 'no-store',
+                        headers: {
+                            'Cache-Control': 'no-cache',
+                        },
+                    })
+                    return await response.text()
+                }
+                return ''
+            },
+            /**
+             * Fetch the assembled resume-chain ACP log for a run (the products/tasks `logs/`
+             * endpoint returns JSONL — one `StoredLogEntry` per line, concatenated server-side
+             * across the entire resume chain). Used to bootstrap the sandbox stream before
+             * opening SSE.
+             */
+            async getLogEntries(taskId: Task['id'], runId: TaskRun['id']): Promise<Record<string, any>[]> {
+                const response = await new ApiRequest().taskRun(taskId, runId).withAction('logs').getResponse()
+                const text = await response.text()
+                const entries: Record<string, any>[] = []
+                for (const line of text.split('\n')) {
+                    const trimmed = line.trim()
+                    if (!trimmed) {
+                        continue
+                    }
+                    try {
+                        entries.push(JSON.parse(trimmed))
+                    } catch {
+                        // Skip unparseable lines — the stream is best-effort historical replay.
+                    }
+                }
+                return entries
+            },
+            /**
+             * Open the live SSE stream for a run as a `fetch` response (the caller reads it with
+             * `response.body.getReader()` + an `eventsource-parser`). Unlike a native `EventSource`,
+             * a `fetch` lets us set request headers — so a reconnect resumes exactly after the
+             * last-seen frame via `Last-Event-ID` (the Redis stream id) instead of re-broadcasting
+             * the whole stream. `startLatest` (the first connect after replaying S3 history) streams
+             * only frames newer than the connect cutoff; it is ignored once a `lastEventId` is
+             * present, since the header resume is exact.
+             */
+            async openStream(
+                taskId: Task['id'],
+                runId: TaskRun['id'],
+                options: {
+                    signal: AbortSignal
+                    lastEventId?: string
+                    startLatest?: boolean
+                    /**
+                     * When set, read the stream from the standalone agent-proxy instead of the Django
+                     * endpoint. `baseUrl` is the proxy origin the server resolved via `stream_token`,
+                     * and the run-scoped `token` is sent as a Bearer header. Absent ⇒ the same-origin
+                     * Django stream (session auth) — the pre-proxy behavior.
+                     */
+                    proxyTarget?: { baseUrl: string; token: string }
+                }
+            ): Promise<Response> {
+                const headers: Record<string, string> = {}
+                if (options.lastEventId) {
+                    headers['Last-Event-ID'] = options.lastEventId
+                }
+                if (options.proxyTarget) {
+                    // Absolute proxy URL with a run-scoped Bearer token — `ApiRequest` only builds
+                    // Django-relative paths, so assemble the proxy URL directly. `start=latest` applies
+                    // only on a first connect (no resume cursor); the Last-Event-ID header, when
+                    // present, takes precedence and an exact resume ignores `start`.
+                    const base = options.proxyTarget.baseUrl.replace(/\/+$/, '')
+                    const url =
+                        !options.lastEventId && options.startLatest
+                            ? `${base}/v1/runs/${runId}/stream?start=latest`
+                            : `${base}/v1/runs/${runId}/stream`
+                    headers['Authorization'] = `Bearer ${options.proxyTarget.token}`
+                    return api.getResponse(url, { signal: options.signal, headers })
+                }
+                let request = new ApiRequest().taskRun(taskId, runId).withAction('stream')
+                if (!options.lastEventId && options.startLatest) {
+                    request = request.withQueryString({ start: 'latest' })
+                }
+                return request.getResponse({ signal: options.signal, headers })
+            },
+        },
+    },
+
+    surveys: {
+        async list(
+            args: {
+                limit?: number
+                offset?: number
+                search?: string
+                archived?: boolean
+                ids?: string
+            } = {
+                limit: SURVEY_PAGE_SIZE,
+            }
+        ): Promise<CountedPaginatedResponse<Survey>> {
+            return await new ApiRequest().surveys().withQueryString(args).get()
+        },
+        async get(surveyId: Survey['id']): Promise<Survey> {
+            return await new ApiRequest().survey(surveyId).get()
+        },
+        async create(data: Partial<Survey>, teamId?: TeamType['id']): Promise<Survey> {
+            return await new ApiRequest().surveys(teamId).create({ data })
+        },
+        async delete(surveyId: Survey['id']): Promise<void> {
+            await new ApiRequest().survey(surveyId).delete()
+        },
+        async update(surveyId: Survey['id'], data: Partial<Survey>): Promise<Survey> {
+            return await new ApiRequest().survey(surveyId).update({ data })
+        },
+        async getResponsesCount(surveyIds?: string): Promise<{ [key: string]: number }> {
+            return await new ApiRequest()
+                .surveysResponsesCount()
+                .withQueryString(surveyIds ? { survey_ids: surveyIds } : undefined)
+                .get()
+        },
+        async questionLabels(): Promise<{
+            labels: {
+                question_id: string
+                question_text: string
+                question_index: number
+                survey_id: string
+                survey_name: string
+            }[]
+        }> {
+            return await new ApiRequest().surveys().withAction('question_labels').get()
+        },
+        async summarize_responses(
+            surveyId: Survey['id'],
+            questionIndex: number | undefined,
+            questionId: string | undefined,
+            forceRefresh: boolean = false
+        ): Promise<{
+            content: string
+            response_count: number
+            generated_at: string
+            cached: boolean
+            trace_id: string
+        }> {
+            const apiRequest = new ApiRequest().survey(surveyId).withAction('summarize_responses')
+            const queryParams: Record<string, string> = {}
+
+            if (questionIndex !== undefined) {
+                queryParams['question_index'] = questionIndex.toString()
+            }
+            if (questionId !== undefined) {
+                queryParams['question_id'] = questionId
+            }
+            return await apiRequest.withQueryString(queryParams).create({ data: { force_refresh: forceRefresh } })
+        },
+        async getSummaryHeadline(
+            surveyId: Survey['id'],
+            forceRefresh: boolean = false
+        ): Promise<{
+            headline: string
+            responses_sampled: number
+            has_more: boolean
+        }> {
+            return await new ApiRequest()
+                .survey(surveyId)
+                .withAction('summary_headline')
+                .create({ data: { force_refresh: forceRefresh } })
+        },
+        async generateTranslations(
+            surveyId: Survey['id'],
+            data: {
+                target_language: string
+                source_language?: string
+                overwrite?: boolean
+                survey?: unknown
+            }
+        ): Promise<{
+            translations: Record<string, Record<string, string>>
+            questions: Array<{ id: string; translations: Record<string, Record<string, any>> }>
+            generated_field_paths: string[]
+            trace_id: string
+        }> {
+            return await new ApiRequest().survey(surveyId).withAction('generate_translations').create({ data })
+        },
+        async getSurveyStats({
+            surveyId,
+            dateFrom = null,
+            dateTo = null,
+        }: {
+            surveyId: Survey['id']
+            dateFrom?: string | null
+            dateTo?: string | null
+        }): Promise<
+            SurveyStatsResponse & {
+                survey_id: string
+                start_date: string
+                end_date?: string
+            }
+        > {
+            const apiRequest = new ApiRequest().survey(surveyId).withAction('stats')
+            const queryParams: Record<string, string> = {}
+            if (dateFrom) {
+                queryParams['date_from'] = dateFrom
+            }
+            if (dateTo) {
+                queryParams['date_to'] = dateTo
+            }
+
+            return await apiRequest.withQueryString(queryParams).get()
+        },
+        async getGlobalSurveyStats({
+            dateFrom = null,
+            dateTo = null,
+        }: {
+            dateFrom?: string | null
+            dateTo?: string | null
+        }): Promise<SurveyStatsResponse> {
+            const apiRequest = new ApiRequest().surveys().withAction('stats')
+            const queryParams: Record<string, string> = {}
+            if (dateFrom) {
+                queryParams['date_from'] = dateFrom
+            }
+            if (dateTo) {
+                queryParams['date_to'] = dateTo
+            }
+            return await apiRequest.get()
+        },
+        async duplicateToProjects(
+            surveyId: Survey['id'],
+            targetTeamIds: TeamType['id'][]
+        ): Promise<{
+            created_surveys: Array<{
+                team_id: number
+                survey_id: string
+                name: string
+            }>
+            count: number
+        }> {
+            return await new ApiRequest()
+                .survey(surveyId)
+                .withAction('duplicate_to_projects')
+                .create({ data: { target_team_ids: targetTeamIds } })
+        },
+        async archiveResponse(surveyId: Survey['id'], responseUuid: string): Promise<{ success: boolean }> {
+            return await new ApiRequest().survey(surveyId).withAction(`responses/${responseUuid}/archive`).create()
+        },
+        async unarchiveResponse(surveyId: Survey['id'], responseUuid: string): Promise<{ success: boolean }> {
+            return await new ApiRequest().survey(surveyId).withAction(`responses/${responseUuid}/unarchive`).create()
+        },
+        async getArchivedResponseUuids(surveyId: Survey['id']): Promise<string[]> {
+            return await new ApiRequest().survey(surveyId).withAction('archived-response-uuids').get()
+        },
+    },
+
+    productTours: {
+        async list({ search }: { search?: string } = {}): Promise<PaginatedResponse<ProductTour>> {
+            return await new ApiRequest()
+                .productTours()
+                .withQueryString(search ? { search } : {})
+                .get()
+        },
+        async get(tourId: ProductTour['id']): Promise<ProductTour> {
+            return await new ApiRequest().productTour(tourId).get()
+        },
+        async create(data: Partial<ProductTour>): Promise<ProductTour> {
+            return await new ApiRequest().productTours().create({ data })
+        },
+        async update(tourId: ProductTour['id'], data: Partial<ProductTour>): Promise<ProductTour> {
+            return await new ApiRequest().productTour(tourId).update({ data })
+        },
+        async delete(tourId: ProductTour['id']): Promise<void> {
+            await new ApiRequest().productTour(tourId).delete()
+        },
+        async generateContent(
+            tourId: ProductTour['id'],
+            title: ProductTour['name'],
+            steps: ProductTourStep[],
+            goal: string
+        ): Promise<ProductTourAIGenerationResponse> {
+            const apiRequest = new ApiRequest().productTour(tourId).withAction('generate')
+            return await apiRequest.create({ data: { title, steps, goal } })
+        },
+        async saveDraft(tourId: ProductTour['id'], data: Partial<ProductTour>): Promise<ProductTour> {
+            return await new ApiRequest().productTour(tourId).withAction('draft').update({ data })
+        },
+        async publishDraft(tourId: ProductTour['id'], data?: Record<string, any>): Promise<ProductTour> {
+            return await new ApiRequest().productTour(tourId).withAction('publish_draft').create({ data })
+        },
+        async discardDraft(tourId: ProductTour['id']): Promise<void> {
+            await new ApiRequest().productTour(tourId).withAction('discard_draft').delete()
+        },
+        async draftStatus(tourId: ProductTour['id']): Promise<{ updated_at: string; has_draft: boolean }> {
+            return await new ApiRequest().productTour(tourId).withAction('draft_status').get()
+        },
+    },
+
+    dataWarehouseTables: {
+        async list(): Promise<PaginatedResponse<DataWarehouseTable>> {
+            return await new ApiRequest().dataWarehouseTables().get()
+        },
+        async get(tableId: DataWarehouseTable['id']): Promise<DataWarehouseTable> {
+            return await new ApiRequest().dataWarehouseTable(tableId).get()
+        },
+        async create(data: Partial<DataWarehouseTable>): Promise<DataWarehouseTable> {
+            return await new ApiRequest().dataWarehouseTables().create({ data })
+        },
+        async delete(tableId: DataWarehouseTable['id']): Promise<void> {
+            await new ApiRequest().dataWarehouseTable(tableId).delete()
+        },
+        async update(
+            tableId: DataWarehouseTable['id'],
+            data: Pick<DataWarehouseTable, 'name'>
+        ): Promise<DataWarehouseTable> {
+            return await new ApiRequest().dataWarehouseTable(tableId).update({ data })
+        },
+        async updateSchema(
+            tableId: DataWarehouseTable['id'],
+            updates: Record<string, DatabaseSerializedFieldType>
+        ): Promise<void> {
+            await new ApiRequest().dataWarehouseTable(tableId).withAction('update_schema').create({ data: { updates } })
+        },
+        async refreshSchema(tableId: DataWarehouseTable['id']): Promise<void> {
+            await new ApiRequest().dataWarehouseTable(tableId).withAction('refresh_schema').create()
+        },
+    },
+
+    dataWarehouseSavedQueries: {
+        async list(): Promise<PaginatedResponse<DataWarehouseSavedQuery>> {
+            return await new ApiRequest().dataWarehouseSavedQueries().get()
+        },
+        async get(viewId: DataWarehouseSavedQuery['id']): Promise<DataWarehouseSavedQuery> {
+            return await new ApiRequest().dataWarehouseSavedQuery(viewId).get()
+        },
+        async create(data: Partial<DataWarehouseSavedQuery> & { types: string[][] }): Promise<DataWarehouseSavedQuery> {
+            return await new ApiRequest().dataWarehouseSavedQueries().create({ data })
+        },
+        async delete(viewId: DataWarehouseSavedQuery['id']): Promise<void> {
+            await new ApiRequest().dataWarehouseSavedQuery(viewId).delete()
+        },
+        async update(
+            viewId: DataWarehouseSavedQuery['id'],
+            data: Partial<DataWarehouseSavedQuery> & {
+                types?: string[][]
+                edited_history_id?: string
+            }
+        ): Promise<DataWarehouseSavedQuery> {
+            return await new ApiRequest().dataWarehouseSavedQuery(viewId).update({ data })
+        },
+        async run(viewId: DataWarehouseSavedQuery['id']): Promise<void> {
+            return await new ApiRequest().dataWarehouseSavedQuery(viewId).withAction('run').create()
+        },
+        async cancel(viewId: DataWarehouseSavedQuery['id']): Promise<void> {
+            return await new ApiRequest().dataWarehouseSavedQuery(viewId).withAction('cancel').create()
+        },
+        async materialize(viewId: DataWarehouseSavedQuery['id']): Promise<void> {
+            return await new ApiRequest().dataWarehouseSavedQuery(viewId).withAction('materialize').create()
+        },
+        async revertMaterialization(viewId: DataWarehouseSavedQuery['id']): Promise<void> {
+            return await new ApiRequest().dataWarehouseSavedQuery(viewId).withAction('revert_materialization').create()
+        },
+        async resumeSchedules(viewIds: DataWarehouseSavedQuery['id'][]): Promise<void> {
+            return await new ApiRequest()
+                .dataWarehouseSavedQueries()
+                .withAction('resume_schedules')
+                .create({ data: { view_ids: viewIds } })
+        },
+        async ancestors(viewId: DataWarehouseSavedQuery['id'], level?: number): Promise<Record<string, string[]>> {
+            return await new ApiRequest()
+                .dataWarehouseSavedQuery(viewId)
+                .withAction('ancestors')
+                .create({ data: { level } })
+        },
+        async descendants(viewId: DataWarehouseSavedQuery['id'], level?: number): Promise<Record<string, string[]>> {
+            return await new ApiRequest()
+                .dataWarehouseSavedQuery(viewId)
+                .withAction('descendants')
+                .create({ data: { level } })
+        },
+        async dependencies(viewId: DataWarehouseSavedQuery['id']): Promise<DataWarehouseSavedQueryDependencies> {
+            return await new ApiRequest().dataWarehouseSavedQuery(viewId).withAction('dependencies').get()
+        },
+        async runHistory(
+            viewId: DataWarehouseSavedQuery['id']
+        ): Promise<{ run_history: DataWarehouseSavedQueryRunHistory[] }> {
+            return await new ApiRequest().dataWarehouseSavedQuery(viewId).withAction('run_history').get()
+        },
+        dataWarehouseDataModelingJobs: {
+            async list(
+                savedQueryId: DataWarehouseSavedQuery['id'],
+                pageSize: number,
+                offset: number
+            ): Promise<CountedPaginatedResponse<DataModelingJob>> {
+                return await new ApiRequest().dataWarehouseDataModelingJobs(savedQueryId, pageSize, offset).get()
+            },
+        },
+    },
+
+    dataWarehouseSavedQueryFolders: {
+        async list(): Promise<DataWarehouseSavedQueryFolder[]> {
+            return await new ApiRequest().dataWarehouseSavedQueryFolders().get()
+        },
+        async create(data: Pick<DataWarehouseSavedQueryFolder, 'name'>): Promise<DataWarehouseSavedQueryFolder> {
+            return await new ApiRequest().dataWarehouseSavedQueryFolders().create({ data })
+        },
+        async update(
+            folderId: DataWarehouseSavedQueryFolder['id'],
+            data: Pick<DataWarehouseSavedQueryFolder, 'name'>
+        ): Promise<DataWarehouseSavedQueryFolder> {
+            return await new ApiRequest().dataWarehouseSavedQueryFolder(folderId).update({ data })
+        },
+        async delete(folderId: DataWarehouseSavedQueryFolder['id']): Promise<void> {
+            await new ApiRequest().dataWarehouseSavedQueryFolder(folderId).delete()
+        },
+    },
+
+    dataModelingDags: {
+        async list(): Promise<PaginatedResponse<DataModelingDAG>> {
+            return await new ApiRequest().dataModelingDags().get()
+        },
+        async create(data: { name: string; description?: string; sync_frequency?: string }): Promise<DataModelingDAG> {
+            return await new ApiRequest().dataModelingDags().create({ data })
+        },
+        async update(
+            dagId: DataModelingDAG['id'],
+            data: Partial<Pick<DataModelingDAG, 'name' | 'description' | 'sync_frequency'>>
+        ): Promise<DataModelingDAG> {
+            return await new ApiRequest().dataModelingDag(dagId).update({ data })
+        },
+        async delete(dagId: DataModelingDAG['id']): Promise<void> {
+            await new ApiRequest().dataModelingDag(dagId).delete()
+        },
+    },
+
+    dataModelingNodes: {
+        async list(dagId?: string): Promise<PaginatedResponse<DataModelingNode>> {
+            const req = new ApiRequest().dataModelingNodes()
+            if (dagId) {
+                return await req.withQueryString({ dag: dagId }).get()
+            }
+            return await req.get()
+        },
+        async get(nodeId: DataModelingNode['id']): Promise<DataModelingNode> {
+            return await new ApiRequest().dataModelingNode(nodeId).get()
+        },
+        async update(
+            nodeId: DataModelingNode['id'],
+            data: Partial<Pick<DataModelingNode, 'description'>>
+        ): Promise<DataModelingNode> {
+            return await new ApiRequest().dataModelingNode(nodeId).update({ data })
+        },
+        async run(
+            nodeId: DataModelingNode['id'],
+            direction: 'upstream' | 'downstream'
+        ): Promise<{ node_ids: string[] }> {
+            return await new ApiRequest().dataModelingNode(nodeId).withAction('run').create({ data: { direction } })
+        },
+        async materialize(nodeId: DataModelingNode['id']): Promise<void> {
+            await new ApiRequest().dataModelingNode(nodeId).withAction('materialize').create()
+        },
+        async dagIds(): Promise<{
+            dag_ids: Array<{ id: string; name: string }>
+        }> {
+            return await new ApiRequest().dataModelingNodes().withAction('dag_ids').get()
+        },
+        async lineage({
+            nodeId,
+            savedQueryId,
+        }: {
+            nodeId?: DataModelingNode['id']
+            savedQueryId?: string
+        }): Promise<{ nodes: DataModelingNode[]; edges: DataModelingEdge[] }> {
+            const params: Record<string, string> = {}
+            if (nodeId) {
+                params.node_id = nodeId
+            }
+            if (savedQueryId) {
+                params.saved_query_id = savedQueryId
+            }
+            return await new ApiRequest().dataModelingNodes().withAction('lineage').withQueryString(params).get()
+        },
+    },
+
+    dataModelingEdges: {
+        async list(dagId?: string): Promise<PaginatedResponse<DataModelingEdge>> {
+            const req = new ApiRequest().dataModelingEdges()
+            if (dagId) {
+                return await req.withQueryString({ dag: dagId }).get()
+            }
+            return await req.get()
+        },
+    },
+
+    dataModelingJobs: {
+        async listRunning(): Promise<DataModelingJob[]> {
+            return await new ApiRequest().dataModelingJobsRunning().get()
+        },
+        async listRecent(): Promise<DataModelingJob[]> {
+            return await new ApiRequest().dataModelingJobsRecent().get()
+        },
+    },
+
+    dataWarehouseSavedQueryDrafts: {
+        async list(): Promise<PaginatedResponse<DataWarehouseSavedQueryDraft>> {
+            return await new ApiRequest().dataWarehouseSavedQueryDrafts().get()
+        },
+        async get(id: DataWarehouseSavedQueryDraft['id']): Promise<DataWarehouseSavedQueryDraft> {
+            return await new ApiRequest().dataWarehouseSavedQueryDraft(id).get()
+        },
+        async create(data: Partial<DataWarehouseSavedQueryDraft>): Promise<DataWarehouseSavedQueryDraft> {
+            return await new ApiRequest().dataWarehouseSavedQueryDrafts().create({ data })
+        },
+        async delete(id: DataWarehouseSavedQueryDraft['id']): Promise<void> {
+            await new ApiRequest().dataWarehouseSavedQueryDraft(id).delete()
+        },
+        async update(
+            id: DataWarehouseSavedQueryDraft['id'],
+            data: Partial<DataWarehouseSavedQueryDraft>
+        ): Promise<DataWarehouseSavedQueryDraft> {
+            return await new ApiRequest().dataWarehouseSavedQueryDraft(id).update({ data })
+        },
+    },
+
+    externalDataSources: {
+        async list(options?: ApiMethodOptions | undefined): Promise<PaginatedResponse<ExternalDataSource>> {
+            return await new ApiRequest().externalDataSources().get(options)
+        },
+        async connections(options?: ApiMethodOptions | undefined): Promise<ExternalDataSourceConnectionOption[]> {
+            return await new ApiRequest().externalDataSourceConnections().get(options)
+        },
+        async get(sourceId: ExternalDataSource['id']): Promise<ExternalDataSource> {
+            return await new ApiRequest().externalDataSource(sourceId).get()
+        },
+        async create(data: Partial<ExternalDataSourceCreatePayload>): Promise<{ id: string }> {
+            return await new ApiRequest().externalDataSources().create({ data })
+        },
+        async delete(sourceId: ExternalDataSource['id']): Promise<void> {
+            await new ApiRequest().externalDataSource(sourceId).delete()
+        },
+        async reload(sourceId: ExternalDataSource['id']): Promise<void> {
+            await new ApiRequest().externalDataSource(sourceId).withAction('reload').create()
+        },
+        async getWebhookInfo(sourceId: ExternalDataSource['id']): Promise<WebhookInfo> {
+            return await new ApiRequest().externalDataSource(sourceId).withAction('webhook_info').get()
+        },
+        async createWebhook(
+            sourceId: ExternalDataSource['id']
+        ): Promise<{ success: boolean; webhook_url: string; error?: string; pending_inputs?: string[] }> {
+            return await new ApiRequest().externalDataSource(sourceId).withAction('create_webhook').create()
+        },
+        async updateWebhookInputs(
+            sourceId: ExternalDataSource['id'],
+            inputs: Record<string, any>
+        ): Promise<{ success: boolean }> {
+            return await new ApiRequest()
+                .externalDataSource(sourceId)
+                .withAction('update_webhook_inputs')
+                .create({ data: { inputs } })
+        },
+        async deleteWebhook(sourceId: ExternalDataSource['id']): Promise<{
+            success: boolean
+            external_deleted: boolean
+            error?: string | null
+        }> {
+            return await new ApiRequest().externalDataSource(sourceId).withAction('delete_webhook').create()
+        },
+        async refreshSchemas(sourceId: ExternalDataSource['id']): Promise<{
+            added: number
+            deleted: number
+            total_tables_seen: number
+        }> {
+            return await new ApiRequest().externalDataSource(sourceId).withAction('refresh_schemas').create()
+        },
+        async bulkUpdateSchemas(
+            sourceId: ExternalDataSource['id'],
+            // Callers send a minimal diff — only `id` is required; the backend writes just the fields
+            // present and leaves the rest untouched. (Matches `externalDataSchemas.update`'s shape.)
+            schemas: (Partial<ExternalDataSourceSchema> & Pick<ExternalDataSourceSchema, 'id'>)[]
+        ): Promise<ExternalDataSourceSchema[]> {
+            return await new ApiRequest().externalDataSource(sourceId).withAction('bulk_update_schemas').update({
+                data: { schemas },
+            })
+        },
+        async update(
+            sourceId: ExternalDataSource['id'],
+            data: Partial<ExternalDataSource>
+        ): Promise<ExternalDataSource> {
+            return await new ApiRequest().externalDataSource(sourceId).update({ data })
+        },
+        async database_schema(
+            source_type: ExternalDataSourceType,
+            payload: Record<string, any>
+        ): Promise<ExternalDataSourceSyncSchema[]> {
+            return await new ApiRequest()
+                .externalDataSources()
+                .withAction('database_schema')
+                .create({ data: { source_type, ...payload } })
+        },
+        async wizard(): Promise<Record<string, SourceConfig>> {
+            return await new ApiRequest().externalDataSources().withAction('wizard').get()
+        },
+        async source_prefix(
+            source_type: ExternalDataSourceType,
+            prefix: string
+        ): Promise<ExternalDataSourceSyncSchema[]> {
+            return await new ApiRequest()
+                .externalDataSources()
+                .withAction('source_prefix')
+                .create({ data: { source_type, prefix } })
+        },
+        async check_cdc_prerequisites(
+            payload: {
+                source_type: ExternalDataSourceType
+                cdc_management_mode: 'posthog' | 'self_managed'
+                tables?: string[]
+                cdc_slot_name?: string | null
+                cdc_publication_name?: string | null
+                [key: string]: any
+            },
+            teamId?: TeamType['id']
+        ): Promise<{ valid: boolean; errors: string[] }> {
+            return await new ApiRequest()
+                .externalDataSources(teamId)
+                .withAction('check_cdc_prerequisites')
+                .create({ data: payload })
+        },
+        async check_cdc_prerequisites_for_source(
+            sourceId: ExternalDataSource['id'],
+            payload: {
+                cdc_management_mode: 'posthog' | 'self_managed'
+                cdc_slot_name?: string | null
+                cdc_publication_name?: string | null
+            }
+        ): Promise<{ valid: boolean; errors: string[] }> {
+            return await new ApiRequest()
+                .externalDataSource(sourceId)
+                .withAction('check_cdc_prerequisites_for_source')
+                .create({ data: payload })
+        },
+        async enable_cdc(
+            sourceId: ExternalDataSource['id'],
+            payload: {
+                cdc_management_mode: 'posthog' | 'self_managed'
+                cdc_slot_name?: string | null
+                cdc_publication_name?: string | null
+                cdc_auto_drop_slot?: boolean
+                cdc_lag_warning_threshold_mb?: number
+                cdc_lag_critical_threshold_mb?: number
+            }
+        ): Promise<{ success: boolean }> {
+            return await new ApiRequest()
+                .externalDataSource(sourceId)
+                .withAction('enable_cdc')
+                .create({ data: payload })
+        },
+        async disable_cdc(sourceId: ExternalDataSource['id']): Promise<{ success: boolean }> {
+            return await new ApiRequest().externalDataSource(sourceId).withAction('disable_cdc').create()
+        },
+        async cdc_status(sourceId: ExternalDataSource['id']): Promise<{
+            enabled: boolean
+            management_mode?: 'posthog' | 'self_managed'
+            slot_name?: string
+            publication_name?: string
+            lag_warning_threshold_mb?: number
+            lag_critical_threshold_mb?: number
+            slot_exists?: boolean
+            publication_exists?: boolean
+            lag_bytes?: number | null
+            published_tables?: string[]
+        }> {
+            return await new ApiRequest().externalDataSource(sourceId).withAction('cdc_status').get()
+        },
+        async update_cdc_settings(
+            sourceId: ExternalDataSource['id'],
+            payload: {
+                cdc_auto_drop_slot?: boolean
+                cdc_lag_warning_threshold_mb?: number
+                cdc_lag_critical_threshold_mb?: number
+            }
+        ): Promise<{ success: boolean }> {
+            return await new ApiRequest()
+                .externalDataSource(sourceId)
+                .withAction('update_cdc_settings')
+                .create({ data: payload })
+        },
+        async jobs(
+            sourceId: ExternalDataSource['id'],
+            before: string | null,
+            after: string | null,
+            schemas?: string[]
+        ): Promise<ExternalDataJob[]> {
+            return await new ApiRequest()
+                .externalDataSource(sourceId)
+                .withAction('jobs')
+                .withQueryString(toParams({ before, after, schemas }, true))
+                .get()
+        },
+        async updateRevenueAnalyticsConfig(
+            sourceId: ExternalDataSource['id'],
+            data: Partial<ExternalDataSourceRevenueAnalyticsConfig>
+        ): Promise<ExternalDataSource> {
+            return await new ApiRequest().externalDataSourceRevenueAnalyticsConfig(sourceId).update({ data })
+        },
+    },
+
+    externalDataSchemas: {
+        async get(schemaId: ExternalDataSourceSchema['id']): Promise<ExternalDataSchemaWithSource> {
+            return await new ApiRequest().externalDataSourceSchema(schemaId).get()
+        },
+        async update(
+            schemaId: ExternalDataSourceSchema['id'],
+            data: Partial<ExternalDataSourceSchema>
+        ): Promise<ExternalDataSourceSchema> {
+            return await new ApiRequest().externalDataSourceSchema(schemaId).update({ data })
+        },
+        async reload(schemaId: ExternalDataSourceSchema['id']): Promise<void> {
+            await new ApiRequest().externalDataSourceSchema(schemaId).withAction('reload').create()
+        },
+        async resync(schemaId: ExternalDataSourceSchema['id']): Promise<void> {
+            await new ApiRequest().externalDataSourceSchema(schemaId).withAction('resync').create()
+        },
+        async cancel(schemaId: ExternalDataSourceSchema['id']): Promise<void> {
+            await new ApiRequest().externalDataSourceSchema(schemaId).withAction('cancel').create()
+        },
+        async incremental_fields(schemaId: ExternalDataSourceSchema['id']): Promise<SchemaIncrementalFieldsResponse> {
+            return await new ApiRequest().externalDataSourceSchema(schemaId).withAction('incremental_fields').create()
+        },
+        async delete_data(schemaId: ExternalDataSourceSchema['id']): Promise<SchemaIncrementalFieldsResponse> {
+            return await new ApiRequest().externalDataSourceSchema(schemaId).withAction('delete_data').delete()
+        },
+    },
+    fixHogQLErrors: {
+        async fix(query: string, error?: string): Promise<Record<string, any>> {
+            return await new ApiRequest().fixHogQLErrors().create({ data: { query, error } })
+        },
+    },
+
+    dataWarehouseViewLinks: {
+        async list(): Promise<PaginatedResponse<DataWarehouseViewLink>> {
+            return await new ApiRequest().dataWarehouseViewLinks().get()
+        },
+        async get(viewLinkId: DataWarehouseViewLink['id']): Promise<DataWarehouseViewLink> {
+            return await new ApiRequest().dataWarehouseViewLink(viewLinkId).get()
+        },
+        async create(data: Partial<DataWarehouseViewLink>): Promise<DataWarehouseViewLink> {
+            return await new ApiRequest().dataWarehouseViewLinks().create({ data })
+        },
+        async delete(viewId: DataWarehouseViewLink['id']): Promise<void> {
+            await new ApiRequest().dataWarehouseViewLink(viewId).delete()
+        },
+        determineDeleteEndpoint(): string {
+            return new ApiRequest().dataWarehouseViewLinks().assembleEndpointUrl()
+        },
+        async update(
+            viewId: DataWarehouseViewLink['id'],
+            data: Pick<
+                DataWarehouseViewLink,
+                'source_table_name' | 'source_table_key' | 'joining_table_name' | 'joining_table_key' | 'field_name'
+            >
+        ): Promise<DataWarehouseViewLink> {
+            return await new ApiRequest().dataWarehouseViewLink(viewId).update({ data })
+        },
+        async validate(
+            data: Pick<
+                DataWarehouseViewLink,
+                'source_table_name' | 'source_table_key' | 'joining_table_name' | 'joining_table_key'
+            >
+        ): Promise<DataWarehouseViewLinkValidation> {
+            return await new ApiRequest().dataWarehouseViewLinks().withAction('validate').create({ data })
+        },
+    },
+
+    queryTabState: {
+        async create(data: Partial<QueryTabState>): Promise<QueryTabState> {
+            return await new ApiRequest().queryTabState().create({ data })
+        },
+        async get(id: QueryTabState['id']): Promise<QueryTabState> {
+            return await new ApiRequest().queryTabStateDetail(id).get()
+        },
+        async update(id: QueryTabState['id'], data: Partial<QueryTabState>): Promise<QueryTabState> {
+            return await new ApiRequest().queryTabStateDetail(id).update({ data })
+        },
+        async delete(id: QueryTabState['id']): Promise<void> {
+            await new ApiRequest().queryTabStateDetail(id).delete()
+        },
+        async user(userId: UserType['uuid']): Promise<QueryTabState> {
+            return await new ApiRequest().queryTabStateUser().withQueryString({ user_id: userId }).get()
+        },
+    },
+    insightVariables: {
+        async list(options?: ApiMethodOptions | undefined): Promise<PaginatedResponse<Variable>> {
+            return await new ApiRequest().insightVariables().get(options)
+        },
+        async create(data: Partial<Variable>): Promise<Variable> {
+            return await new ApiRequest().insightVariables().create({ data })
+        },
+        async update(variableId: string, data: Partial<Variable>): Promise<Variable> {
+            return await new ApiRequest().insightVariable(variableId).update({ data })
+        },
+        async delete(variableId: string): Promise<void> {
+            await new ApiRequest().insightVariable(variableId).delete()
+        },
+    },
+
+    subscriptions: {
+        async get(subscriptionId: SubscriptionType['id']): Promise<SubscriptionType> {
+            return await new ApiRequest().subscription(subscriptionId).get()
+        },
+        async create(data: Partial<SubscriptionType>): Promise<SubscriptionType> {
+            return await new ApiRequest().subscriptions().create({ data })
+        },
+        async update(
+            subscriptionId: SubscriptionType['id'],
+            data: Partial<SubscriptionType>
+        ): Promise<SubscriptionType> {
+            return await new ApiRequest().subscription(subscriptionId).update({ data })
+        },
+        async list({
+            insights,
+            dashboardId,
+            dashboardTiles,
+            resourceType,
+        }: {
+            insights?: number[]
+            dashboardId?: number
+            dashboardTiles?: number
+            resourceType?: SubscriptionType['resource_type']
+        }): Promise<PaginatedResponse<SubscriptionType>> {
+            const params = [
+                insights?.length ? `insights=${insights.join(',')}` : null,
+                dashboardId ? `dashboard=${dashboardId}` : null,
+                dashboardTiles ? `dashboard_tiles=${dashboardTiles}` : null,
+                resourceType ? `resource_type=${resourceType}` : null,
+            ].filter(Boolean)
+            return await new ApiRequest().subscriptions().withQueryString(params.join('&')).get()
+        },
+        determineDeleteEndpoint(): string {
+            return new ApiRequest().subscriptions().assembleEndpointUrl()
+        },
+        async testDelivery(subscriptionId: SubscriptionType['id']): Promise<void> {
+            await new ApiRequest().subscription(subscriptionId).withAction('test-delivery').create()
+        },
+        async summaryQuota(): Promise<{ active_count: number; limit: number | null; at_limit: boolean }> {
+            return await new ApiRequest().subscriptions().withAction('summary_quota').get()
+        },
+    },
+
+    integrations: {
+        async get(id: IntegrationType['id']): Promise<IntegrationType> {
+            return await new ApiRequest().integration(id).get()
+        },
+        async create(data: Partial<IntegrationType> | FormData): Promise<IntegrationType> {
+            return await new ApiRequest().integrations().create({ data })
+        },
+        async delete(integrationId: IntegrationType['id']): Promise<IntegrationType> {
+            return await new ApiRequest().integration(integrationId).delete()
+        },
+        async list(): Promise<PaginatedResponse<IntegrationType>> {
+            return await new ApiRequest().integrations().get()
+        },
+        authorizeUrl(params: { kind: string; next?: string }): string {
+            return new ApiRequest().integrations().withAction('authorize').withQueryString(params).assembleFullUrl(true)
+        },
+        async slackChannels(
+            id: IntegrationType['id'],
+            forceRefresh: boolean,
+            params?: { search?: string; limit?: number; offset?: number }
+        ): Promise<{ channels: SlackChannelType[]; lastRefreshedAt: string; has_more?: boolean }> {
+            return await new ApiRequest().integrationSlackChannels(id, forceRefresh, params).get()
+        },
+        async slackChannelsById(
+            id: IntegrationType['id'],
+            channelId: string
+        ): Promise<{ channels: SlackChannelType[] }> {
+            return await new ApiRequest().integrationSlackChannelsById(id, channelId).get()
+        },
+        async twilioPhoneNumbers(
+            id: IntegrationType['id'],
+            forceRefresh: boolean
+        ): Promise<{
+            phone_numbers: TwilioPhoneNumberType[]
+            lastRefreshedAt: string
+        }> {
+            return await new ApiRequest().integrationTwilioPhoneNumbers(id, forceRefresh).get()
+        },
+        async linearTeams(id: IntegrationType['id']): Promise<{ teams: LinearTeamType[] }> {
+            return await new ApiRequest().integrationLinearTeams(id).get()
+        },
+        async githubRepositories(
+            id: IntegrationType['id'],
+            params?: { limit?: number; offset?: number; search?: string }
+        ): Promise<GitHubReposResponseApi> {
+            return await new ApiRequest().integrationGitHubRepositories(id).withQueryString(params).get()
+        },
+        async githubBranches(
+            id: IntegrationType['id'],
+            params: { repo: string; limit?: number; offset?: number; search?: string }
+        ): Promise<GitHubBranchesResponseApi> {
+            return await new ApiRequest().integrationGitHubBranches(id).withQueryString(params).get()
+        },
+        async githubLinkExisting(
+            data: {
+                source_team_id?: number
+                installation_id?: string | number
+            },
+            teamId?: TeamType['id']
+        ): Promise<IntegrationType> {
+            return await new ApiRequest().integrations(teamId).withAction('github/link_existing').create({ data })
+        },
+        async githubOAuthAuthorize(
+            data: {
+                installation_id: string | number
+                next?: string
+                connect_from?: string
+            },
+            teamId?: TeamType['id']
+        ): Promise<{ oauth_url: string }> {
+            return await new ApiRequest().integrations(teamId).withAction('github/oauth_authorize').create({ data })
+        },
+        async jiraProjects(id: IntegrationType['id']): Promise<{ projects: JiraProjectType[] }> {
+            return await new ApiRequest().integrationJiraProjects(id).get()
+        },
+        async googleAdsAccounts(id: IntegrationType['id']): Promise<{
+            accessibleAccounts: {
+                id: string
+                name: string
+                level: string
+                parent_id: string
+            }[]
+        }> {
+            return await new ApiRequest().integrationGoogleAdsAccounts(id).get()
+        },
+        async googleAdsConversionActions(
+            id: IntegrationType['id'],
+            params: { customerId: string; parentId: string }
+        ): Promise<{ conversionActions: GoogleAdsConversionActionType[] }> {
+            return await new ApiRequest().integrationGoogleAdsConversionActions(id, params).get()
+        },
+        async linkedInAdsAccounts(id: IntegrationType['id']): Promise<{ adAccounts: LinkedInAdsAccountType[] }> {
+            return await new ApiRequest().integrationLinkedInAdsAccounts(id).get()
+        },
+        async linkedInAdsConversionRules(
+            id: IntegrationType['id'],
+            accountId: string
+        ): Promise<{ conversionRules: LinkedInAdsConversionRuleType[] }> {
+            return await new ApiRequest().integrationLinkedInAdsConversionRules(id, accountId).get()
+        },
+        async clickUpSpaces(
+            id: IntegrationType['id'],
+            workspaceId: string,
+            teamId?: TeamType['id']
+        ): Promise<{ spaces: { id: string; name: string }[] }> {
+            return await new ApiRequest().integrationClickUpSpaces(id, workspaceId, teamId).get()
+        },
+        async clickUpLists(
+            id: IntegrationType['id'],
+            spaceId: string,
+            teamId?: TeamType['id']
+        ): Promise<{ lists: { id: string; name: string }[] }> {
+            return await new ApiRequest().integrationClickUpLists(id, spaceId, teamId).get()
+        },
+        async clickUpWorkspaces(
+            id: IntegrationType['id'],
+            teamId?: TeamType['id']
+        ): Promise<{ workspaces: { id: string; name: string }[] }> {
+            return await new ApiRequest().integrationClickUpWorkspaces(id, teamId).get()
+        },
+        async verifyEmail(id: IntegrationType['id']): Promise<EmailSenderDomainStatus> {
+            return await new ApiRequest().integrationEmailVerify(id).create()
+        },
+        async updateEmailConfig(
+            integrationId: IntegrationType['id'],
+            data: Partial<IntegrationType> | FormData
+        ): Promise<IntegrationType> {
+            return await new ApiRequest().integrationEmail(integrationId).update({ data })
+        },
+        async domainConnectCheck(domain: string): Promise<{
+            supported: boolean
+            provider_name: DomainConnectProviderName | null
+            available_providers: {
+                endpoint: string
+                name: DomainConnectProviderName
+            }[]
+        }> {
+            return await new ApiRequest()
+                .integrationsDomainConnectCheck()
+                .withQueryString(`domain=${encodeURIComponent(domain)}`)
+                .get()
+        },
+        async domainConnectApplyUrl(data: {
+            context: 'email' | 'proxy'
+            integration_id?: number
+            proxy_record_id?: string
+            redirect_uri?: string
+            provider_endpoint?: string
+        }): Promise<{ url: string }> {
+            return await new ApiRequest().integrationsDomainConnectApplyUrl().create({ data })
+        },
+    },
+
+    organizationIntegrations: {
+        async list(): Promise<PaginatedResponse<IntegrationType>> {
+            return await new ApiRequest().organizationIntegrations().get()
+        },
+        async delete(id: IntegrationType['id']): Promise<void> {
+            await new ApiRequest().organizationIntegrationsDetail(id).delete()
+        },
+    },
+
+    organizationOAuthApplications: {
+        async list(params?: Record<string, any>): Promise<PaginatedResponse<OrganizationOAuthApplicationApi>> {
+            return await new ApiRequest().organizationOAuthApplications().withQueryString(params).get()
+        },
+    },
+
+    media: {
+        async upload(data: FormData): Promise<MediaUploadResponse> {
+            return await new ApiRequest().media().create({ data })
+        },
+    },
+
+    objectMediaPreviews: {
+        async list(eventDefinitionId: string): Promise<{ results: ObjectMediaPreview[] }> {
+            return await new ApiRequest()
+                .objectMediaPreviews()
+                .withQueryString(`event_definition=${eventDefinitionId}`)
+                .get()
+        },
+        async create(data: {
+            uploaded_media_id: string
+            event_definition_id: string
+            metadata?: Record<string, any>
+        }): Promise<ObjectMediaPreview> {
+            return await new ApiRequest().objectMediaPreviews().create({ data })
+        },
+        async getPreferred(eventDefinitionId: string): Promise<ObjectMediaPreview> {
+            return await new ApiRequest()
+                .objectMediaPreviews()
+                .withAction('preferred_for_event')
+                .withQueryString(`event_definition=${eventDefinitionId}`)
+                .get()
+        },
+        async delete(previewId: string): Promise<void> {
+            return await new ApiRequest().objectMediaPreviewDetail(previewId).delete()
+        },
+        async update(previewId: string, data: Partial<ObjectMediaPreview>): Promise<ObjectMediaPreview> {
+            return await new ApiRequest().objectMediaPreviewDetail(previewId).update({ data })
+        },
+    },
+
+    queryStatus: {
+        async get(queryId: string, showProgress: boolean): Promise<QueryStatusResponse> {
+            return await new ApiRequest().queryStatus(queryId, showProgress).get()
+        },
+    },
+
+    queryLog: {
+        async get(queryId: string): Promise<HogQLQueryResponse> {
+            return await new ApiRequest().queryLog(queryId).get()
+        },
+    },
+
+    personalApiKeys: {
+        async list(): Promise<PersonalAPIKeyType[]> {
+            return await new ApiRequest().personalApiKeys().get()
+        },
+        async create(data: Partial<PersonalAPIKeyType>): Promise<PersonalAPIKeyType> {
+            return await new ApiRequest().personalApiKeys().create({ data })
+        },
+        async update(id: PersonalAPIKeyType['id'], data: Partial<PersonalAPIKeyType>): Promise<PersonalAPIKeyType> {
+            return await new ApiRequest().personalApiKey(id).update({ data })
+        },
+        async delete(id: PersonalAPIKeyType['id']): Promise<void> {
+            await new ApiRequest().personalApiKey(id).delete()
+        },
+        async roll(id: PersonalAPIKeyType['id']): Promise<PersonalAPIKeyType> {
+            return await new ApiRequest().personalApiKey(id).withAction('roll').create()
+        },
+    },
+
+    projectSecretApiKeys: {
+        async list(): Promise<ProjectSecretAPIKeyApi[]> {
+            const response: CountedPaginatedResponse<ProjectSecretAPIKeyApi> = await new ApiRequest()
+                .projectSecretApiKeys()
+                .get()
+            return response.results
+        },
+        async create(data: ProjectSecretAPIKeyRequest): Promise<ProjectSecretAPIKeyApi> {
+            return await new ApiRequest().projectSecretApiKeys().create({ data })
+        },
+        async update(
+            id: ProjectSecretAPIKeyApi['id'],
+            data: Partial<ProjectSecretAPIKeyRequest>
+        ): Promise<ProjectSecretAPIKeyApi> {
+            return await new ApiRequest().projectSecretApiKey(id).update({ data })
+        },
+        async delete(id: ProjectSecretAPIKeyApi['id']): Promise<void> {
+            return await new ApiRequest().projectSecretApiKey(id).delete()
+        },
+        async roll(id: ProjectSecretAPIKeyApi['id']): Promise<ProjectSecretAPIKeyApi> {
+            return await new ApiRequest().projectSecretApiKey(id).withAction('roll').create()
+        },
+    },
+
+    alerts: {
+        /**
+         * Retrieve includes check history; pass `checksLimit` / `checksOffset` for pagination (newest first).
+         *
+         * Only forwarded when explicitly provided — omitting both lets the backend skip the `COUNT(*)` it runs
+         * for "X of Y" totals (see `AlertViewSet.retrieve`), so callers that only need a chart window or the
+         * default slice shouldn't pay for pagination bookkeeping.
+         */
+        async get(
+            alertId: AlertType['id'],
+            options?: { checksLimit?: number; checksOffset?: number }
+        ): Promise<AlertType> {
+            const params: Record<string, number> = {}
+            if (options?.checksLimit !== undefined) {
+                params.checks_limit = options.checksLimit
+            }
+            if (options?.checksOffset !== undefined) {
+                params.checks_offset = options.checksOffset
+            }
+            return await new ApiRequest().alert(alertId).withQueryString(params).get()
+        },
+        async create(data: Partial<AlertTypeWrite>): Promise<AlertType> {
+            return await new ApiRequest().alerts().create({ data })
+        },
+        async update(alertId: AlertType['id'], data: Partial<AlertTypeWrite>): Promise<AlertType> {
+            return await new ApiRequest().alert(alertId).update({ data })
+        },
+        async list(
+            insightId?: InsightModel['id'],
+            params: { limit?: number; offset?: number; search?: string; created_by?: string } = {}
+        ): Promise<CountedPaginatedResponse<AlertType>> {
+            const queryParams: Record<string, any> = { ...params }
+            if (insightId !== undefined) {
+                queryParams.insight_id = insightId
+            }
+            return await new ApiRequest().alerts().withQueryString(toParams(queryParams)).get()
+        },
+        async delete(alertId: AlertType['id']): Promise<void> {
+            return await new ApiRequest().alert(alertId).delete()
+        },
+        async simulate(data: {
+            insight: number
+            detector_config: Record<string, any>
+            series_index?: number
+            date_from?: string
+            config?: AlertConfig | null
+        }): Promise<AlertSimulationResult> {
+            return await new ApiRequest().alerts().withAction('simulate').create({ data })
+        },
+    },
+
+    dataColorThemes: {
+        async list(): Promise<DataColorThemeModel[]> {
+            return await new ApiRequest().dataColorThemes().get()
+        },
+        async create(data: Partial<DataColorThemeModel>): Promise<DataColorThemeModel> {
+            return await new ApiRequest().dataColorThemes().create({ data })
+        },
+        async update(id: DataColorThemeModel['id'], data: Partial<DataColorThemeModel>): Promise<DataColorThemeModel> {
+            return await new ApiRequest().dataColorTheme(id).update({ data })
+        },
+    },
+
+    productIntents: {
+        async update(data: ProductIntentProperties): Promise<TeamType> {
+            return await new ApiRequest().addProductIntent().update({ data })
+        },
+    },
+    teamSettings: {
+        async asOf(at: string, scope?: string | string[]): Promise<Record<string, any>> {
+            const params: Record<string, any> = {
+                at,
+                ...(scope !== undefined ? { scope } : {}),
+            }
+            return await new ApiRequest()
+                .environments()
+                .current()
+                .withAction('settings_as_of')
+                .withQueryString(toParams(params, true))
+                .get()
+        },
+    },
+
+    coreMemory: {
+        async list(): Promise<PaginatedResponse<CoreMemory>> {
+            return await new ApiRequest().coreMemory().get()
+        },
+        async create(coreMemory: Pick<CoreMemory, 'text'>): Promise<CoreMemory> {
+            return await new ApiRequest().coreMemory().create({
+                data: coreMemory,
+            })
+        },
+        async update(coreMemoryId: CoreMemory['id'], coreMemory: Pick<CoreMemory, 'text'>): Promise<CoreMemory> {
+            return await new ApiRequest().coreMemoryDetail(coreMemoryId).update({ data: coreMemory })
+        },
+    },
+    wizard: {
+        async authenticateWizard(data: { hash: string; projectId: number }): Promise<{ success: boolean }> {
+            return await new ApiRequest().authenticateWizard().create({ data })
+        },
+    },
+    messaging: {
+        async getTemplates(): Promise<PaginatedResponse<MessageTemplate>> {
+            return await new ApiRequest().messagingTemplates().get()
+        },
+        async getTemplate(templateId: MessageTemplate['id']): Promise<MessageTemplate> {
+            return await new ApiRequest().messagingTemplate(templateId).get()
+        },
+        async createTemplate(data: Partial<MessageTemplate>): Promise<MessageTemplate> {
+            return await new ApiRequest().messagingTemplates().create({ data })
+        },
+        async updateTemplate(
+            templateId: MessageTemplate['id'],
+            data: Partial<MessageTemplate>
+        ): Promise<MessageTemplate> {
+            return await new ApiRequest().messagingTemplate(templateId).update({ data })
+        },
+
+        // Messaging Categories
+        async getCategories(params?: { category_type?: string }): Promise<PaginatedResponse<any>> {
+            return await new ApiRequest()
+                .messagingCategories()
+                .withQueryString(toParams(params || {}))
+                .get()
+        },
+        async getCategory(categoryId: string): Promise<any> {
+            return await new ApiRequest().messagingCategory(categoryId).get()
+        },
+        async createCategory(data: any): Promise<any> {
+            return await new ApiRequest().messagingCategories().create({ data })
+        },
+        async updateCategory(categoryId: string, data: any): Promise<any> {
+            return await new ApiRequest().messagingCategory(categoryId).update({ data })
+        },
+        async deleteCategory(categoryId: string): Promise<void> {
+            return await new ApiRequest().messagingCategory(categoryId).delete()
+        },
+        async generateMessagingPreferencesLink(recipient?: string): Promise<string | null> {
+            const response = await new ApiRequest().messagingPreferencesLink().create({
+                data: {
+                    recipient,
+                },
+            })
+            return response.preferences_url || null
+        },
+        async getMessageOptOuts(categoryKey?: string, page?: number): Promise<CountedPaginatedResponse<OptOutEntry>> {
+            return await new ApiRequest()
+                .messagingPreferencesOptOuts()
+                .withQueryString({
+                    category_key: categoryKey,
+                    page: page || 1,
+                })
+                .get()
+        },
+        async addOptOut(identifier: string, categoryKey?: string): Promise<OptOutEntry> {
+            return await new ApiRequest().messagingPreferencesAddOptOut().create({
+                data: { identifier, category_key: categoryKey },
+            })
+        },
+    },
+    hogFlows: {
+        async getHogFlows(): Promise<PaginatedResponse<HogFlow>> {
+            return await new ApiRequest().hogFlows().get()
+        },
+        async getHogFlow(hogFlowId: HogFlow['id']): Promise<HogFlow> {
+            return await new ApiRequest().hogFlow(hogFlowId).get()
+        },
+        async createHogFlow(data: Partial<HogFlow>): Promise<HogFlow> {
+            return await new ApiRequest().hogFlows().create({ data })
+        },
+        async updateHogFlow(
+            hogFlowId: HogFlow['id'],
+            // `base_updated_at` is the updated_at the client loaded; the server rejects the write with a
+            // 409 if the stored copy is newer (optimistic concurrency). Omit it for last-writer-wins.
+            data: Partial<HogFlow> & { base_updated_at?: string | null }
+        ): Promise<HogFlow> {
+            return await new ApiRequest().hogFlow(hogFlowId).update({ data })
+        },
+        async deleteHogFlow(hogFlowId: HogFlow['id']): Promise<void> {
+            return await new ApiRequest().hogFlow(hogFlowId).delete()
+        },
+        async bulkDeleteHogFlows(ids: string[]): Promise<{ deleted: number }> {
+            return await new ApiRequest().hogFlows().withAction('bulk_delete').create({ data: { ids } })
+        },
+        async createTestInvocation(
+            hogFlowId: HogFlow['id'],
+            data: {
+                configuration: Record<string, any>
+                mock_async_functions: boolean
+                globals?: any
+                clickhouse_event?: any
+                invocation_id?: string
+                current_action_id?: string
+            }
+        ): Promise<HogflowTestResult> {
+            return await new ApiRequest().hogFlow(hogFlowId).withAction('invocations').create({ data })
+        },
+        async getBatchTriggerBlastRadius(
+            filters: Extract<HogFlowAction['config'], { type: 'batch' }>['filters'],
+            dedupeKey?: 'email'
+        ): Promise<BlastRadiusApi> {
+            return await new ApiRequest()
+                .hogFlows()
+                .withAction('user_blast_radius')
+                .create({ data: { filters, dedupe_key: dedupeKey ?? null } })
+        },
+        async createHogFlowBatchJob(
+            hogFlowId: HogFlow['id'],
+            data: {
+                variables: Record<string, HogQLVariable>
+                filters: Extract<HogFlowAction['config'], { type: 'batch' }>['filters']
+            }
+        ): Promise<void> {
+            return await new ApiRequest().hogFlow(hogFlowId).withAction('batch_jobs').create({ data })
+        },
+        async getHogFlowBatchJobs(hogFlowId: HogFlow['id']): Promise<HogFlowBatchJob[]> {
+            return await new ApiRequest().hogFlow(hogFlowId).withAction('batch_jobs').get()
+        },
+        async getHogFlowSchedules(hogFlowId: HogFlow['id']): Promise<HogFlowSchedule[]> {
+            return await new ApiRequest().hogFlow(hogFlowId).withAction('schedules').get()
+        },
+        async createHogFlowSchedule(
+            hogFlowId: HogFlow['id'],
+            data: { rrule: string; starts_at: string; timezone?: string }
+        ): Promise<HogFlowSchedule> {
+            return await new ApiRequest().hogFlow(hogFlowId).withAction('schedules').create({ data })
+        },
+        async updateHogFlowSchedule(
+            hogFlowId: HogFlow['id'],
+            scheduleId: string,
+            data: Partial<{
+                rrule: string
+                starts_at: string
+                timezone?: string
+            }>
+        ): Promise<HogFlowSchedule> {
+            return await new ApiRequest()
+                .hogFlow(hogFlowId)
+                .withAction('schedules')
+                .withAction(scheduleId)
+                .update({ data })
+        },
+        async deleteHogFlowSchedule(hogFlowId: HogFlow['id'], scheduleId: string): Promise<void> {
+            return await new ApiRequest().hogFlow(hogFlowId).withAction('schedules').withAction(scheduleId).delete()
+        },
+    },
+    hogFlowTemplates: {
+        async getHogFlowTemplates(): Promise<PaginatedResponse<HogFlowTemplate>> {
+            return await new ApiRequest().hogFlowTemplates().get()
+        },
+        async getHogFlowTemplate(hogFlowTemplateId: HogFlowTemplate['id']): Promise<HogFlowTemplate> {
+            return await new ApiRequest().hogFlowTemplate(hogFlowTemplateId).get()
+        },
+        async createHogFlowTemplate(data: Partial<HogFlowTemplate>): Promise<HogFlowTemplate> {
+            return await new ApiRequest().hogFlowTemplates().create({ data })
+        },
+        async updateHogFlowTemplate(
+            hogFlowTemplateId: HogFlowTemplate['id'],
+            data: Partial<HogFlowTemplate>
+        ): Promise<HogFlowTemplate> {
+            return await new ApiRequest().hogFlowTemplate(hogFlowTemplateId).update({ data })
+        },
+        async deleteHogFlowTemplate(hogFlowTemplateId: HogFlowTemplate['id']): Promise<void> {
+            return await new ApiRequest().hogFlowTemplate(hogFlowTemplateId).delete()
+        },
+    },
+
+    webAnalyticsFilterPresets: {
+        async list(params?: string): Promise<PaginatedResponse<WebAnalyticsFilterPresetType>> {
+            return await new ApiRequest().webAnalyticsFilterPresets().withQueryString(params).get()
+        },
+        async get(shortId: string): Promise<WebAnalyticsFilterPresetType> {
+            return await new ApiRequest().webAnalyticsFilterPreset(shortId).get()
+        },
+        async create(
+            data: Pick<WebAnalyticsFilterPresetType, 'name' | 'description' | 'filters'>
+        ): Promise<WebAnalyticsFilterPresetType> {
+            return await new ApiRequest().webAnalyticsFilterPresets().create({ data })
+        },
+        async update(
+            shortId: string,
+            data: Partial<Pick<WebAnalyticsFilterPresetType, 'name' | 'description' | 'filters' | 'pinned' | 'deleted'>>
+        ): Promise<WebAnalyticsFilterPresetType> {
+            return await new ApiRequest().webAnalyticsFilterPreset(shortId).update({ data })
+        },
+        async delete(shortId: string): Promise<void> {
+            await new ApiRequest().webAnalyticsFilterPreset(shortId).update({ data: { deleted: true } })
+        },
+    },
+
+    queryURL: (queryKind?: string): string => {
+        return new ApiRequest().query(undefined, queryKind).assembleFullUrl(true)
+    },
+
+    async query<T extends Record<string, any> = QuerySchema>(
+        query: T,
+        queryOptions?: {
+            requestOptions?: ApiMethodOptions
+            clientQueryId?: string
+            refresh?: RefreshType
+            filtersOverride?: DashboardFilter | null
+            variablesOverride?: Record<string, HogQLVariable> | null
+            limitContext?: 'posthog_ai'
+            queryKind?: string
+        }
+    ): Promise<
+        T extends { [response: string]: any }
+            ? T['response'] extends (infer P) | undefined
+                ? P
+                : T['response']
+            : Record<string, any>
+    > {
+        const bodyKind = (query as { kind?: string }).kind
+        const pathKind = queryOptions?.queryKind
+
+        if (pathKind && pathKind !== bodyKind) {
+            throw new Error(`Query kind mismatch: path kind "${pathKind}" does not match body kind "${bodyKind}".`)
+        }
+
+        return await new ApiRequest().query(undefined, bodyKind).create({
+            ...queryOptions?.requestOptions,
+            data: {
+                query,
+                client_query_id: queryOptions?.clientQueryId,
+                refresh: queryOptions?.refresh,
+                filters_override: queryOptions?.filtersOverride,
+                variables_override: queryOptions?.variablesOverride,
+                limit_context: queryOptions?.limitContext,
+            },
+        })
+    },
+
+    async queryHogQL<T = any[]>(
+        query: HogQLQueryString,
+        tags: QueryLogTags,
+        queryOptions?: {
+            requestOptions?: ApiMethodOptions
+            clientQueryId?: string
+            refresh?: RefreshType
+            filtersOverride?: DashboardFilter | null
+            variablesOverride?: Record<string, HogQLVariable> | null
+            queryParams?: Omit<HogQLQuery, 'kind' | 'query' | 'tags'>
+            queryKind?: string
+        }
+    ): Promise<HogQLQueryResponse<T>> {
+        const hogQLQuery: HogQLQuery = setLatestVersionsOnQuery({
+            ...queryOptions?.queryParams,
+            kind: NodeKind.HogQLQuery,
+            query,
+            tags,
+        })
+        if (queryOptions?.queryKind && queryOptions.queryKind !== hogQLQuery.kind) {
+            throw new Error(
+                `Query kind mismatch: path kind "${queryOptions.queryKind}" does not match body kind "${hogQLQuery.kind}".`
+            )
+        }
+
+        return await new ApiRequest().query(undefined, hogQLQuery.kind).create({
+            ...queryOptions?.requestOptions,
+            data: {
+                query: hogQLQuery,
+                client_query_id: queryOptions?.clientQueryId,
+                refresh: queryOptions?.refresh,
+                filters_override: queryOptions?.filtersOverride,
+                variables_override: queryOptions?.variablesOverride,
+            },
+        })
+    },
+
+    schema: {
+        async queryUpgrade(data: { query: Node }): Promise<{ query: Node }> {
+            return await new ApiRequest().queryUpgrade().create({ data })
+        },
+    },
+
+    maxHandsFree: {
+        async token(options?: ApiMethodOptions): Promise<{ token: string }> {
+            return await api.create(
+                new ApiRequest().maxHandsFree().withAction('token').assembleFullUrl(),
+                undefined,
+                options
+            )
+        },
+        async synthesize(text: string, options?: ApiMethodOptions): Promise<Response> {
+            return await api.createResponse(
+                new ApiRequest().maxHandsFree().withAction('synthesize').assembleFullUrl(),
+                { text },
+                options
+            )
+        },
+    },
+
+    conversations: {
+        async stream(
+            data: {
+                /** The user message. Null content means we're resuming streaming or continuing previous generation. */
+                content: string | null
+                contextual_tools?: Record<string, any>
+                ui_context?: MaxUIContext
+                billing_context?: MaxBillingContext
+                conversation?: string | null
+                trace_id: string
+                agent_mode?: AgentMode | null
+                resume_payload?: {
+                    action: 'approve' | 'reject'
+                    proposal_id: string
+                    feedback?: string
+                } | null
+            },
+            options?: ApiMethodOptions
+        ): Promise<Response> {
+            return api.createResponse(new ApiRequest().conversations().assembleFullUrl(), data, options)
+        },
+
+        /**
+         * Single sandbox session opener (`agent_runtime === 'sandbox'`). Create-or-resume: the
+         * conversation row is created on first use from the client-minted id. With `content`,
+         * processes the turn (first message, in-progress follow-up, or terminal resume); with
+         * null/omitted `content`, warms a sandbox that idles awaiting the first message. Returns the
+         * `(task, run)` handle to open SSE against, or `null` on a 204 (a warm that provisioned
+         * nothing — the pool was full). Control verbs (cancel, permission reply, warm release) go
+         * through the generic `runs/{run}/command/` relay, not this endpoint.
+         */
+        async open(
+            conversationId: string,
+            data: {
+                content?: string | null
+                trace_id?: string
+                attached_context?: AttachedContext[]
+                initial_permission_mode?: TaskRunBootstrapCreateRequestInitialPermissionModeEnumApi
+                /** Bind a brand-new sandbox conversation to an existing Task, resuming its run on the first message. */
+                task_id?: string
+            }
+        ): Promise<{
+            task_id: string
+            run_id: string
+            trace_id: string | null
+            run_status: 'queued' | 'in_progress'
+            just_created_run: boolean
+        } | null> {
+            const response = await api.createResponse(
+                new ApiRequest().conversation(conversationId).withAction('open').assembleFullUrl(),
+                data
+            )
+            if (response.status === 204) {
+                return null
+            }
+            return response.json()
+        },
+
+        /** Cancel an in-progress LangGraph run. Sandbox runs cancel through the tasks relay. */
+        cancel(conversationId: string): Promise<void> {
+            return new ApiRequest().conversation(conversationId).withAction('cancel').update()
+        },
+
+        list(): Promise<PaginatedResponse<Conversation>> {
+            return new ApiRequest().conversations().get()
+        },
+
+        get(conversationId: string): Promise<ConversationDetail> {
+            return new ApiRequest().conversation(conversationId).get()
+        },
+
+        appendMessage(conversationId: string, content: string): Promise<{ id: string }> {
+            return new ApiRequest()
+                .conversation(conversationId)
+                .withAction('append_message')
+                .create({ data: { content } })
+        },
+
+        queue: {
+            list(conversationId: string): Promise<ConversationQueueResponse> {
+                return new ApiRequest().conversation(conversationId).withAction('queue').get()
+            },
+
+            enqueue(
+                conversationId: string,
+                data: {
+                    content: string
+                    contextual_tools?: Record<string, any>
+                    ui_context?: MaxUIContext
+                    billing_context?: MaxBillingContext | null
+                    agent_mode?: AgentMode | null
+                }
+            ): Promise<ConversationQueueResponse> {
+                return new ApiRequest().conversation(conversationId).withAction('queue').create({ data })
+            },
+
+            update(conversationId: string, queueId: string, content: string): Promise<ConversationQueueResponse> {
+                return new ApiRequest()
+                    .conversation(conversationId)
+                    .withAction(`queue/${queueId}`)
+                    .update({ data: { content } })
+            },
+
+            delete(conversationId: string, queueId: string): Promise<ConversationQueueResponse> {
+                return new ApiRequest().conversation(conversationId).withAction(`queue/${queueId}`).delete()
+            },
+
+            clear(conversationId: string): Promise<ConversationQueueResponse> {
+                return new ApiRequest().conversation(conversationId).withAction('queue/clear').create({ data: {} })
+            },
+        },
+    },
+
+    datasets: {
+        list({
+            ids,
+            ...params
+        }: {
+            search?: string
+            order_by?: string
+            offset?: number
+            limit?: number
+            ids?: string[]
+        }): Promise<CountedPaginatedResponse<Dataset>> {
+            return new ApiRequest()
+                .datasets()
+                .withQueryString({
+                    ...params,
+                    id__in: ids?.join(','),
+                })
+                .get()
+        },
+
+        get(datasetId: string): Promise<Dataset> {
+            return new ApiRequest().dataset(datasetId).get()
+        },
+
+        async create(data: Omit<Partial<Dataset>, 'created_by' | 'team'>): Promise<Dataset> {
+            return await new ApiRequest().datasets().create({ data })
+        },
+
+        async update(datasetId: string, data: Omit<Partial<Dataset>, 'created_by' | 'team'>): Promise<Dataset> {
+            return await new ApiRequest().dataset(datasetId).update({ data })
+        },
+    },
+
+    evaluationRuns: {
+        async create(data: {
+            evaluation_id: string
+            target_event_id: string
+            timestamp: string
+            event: string
+            distinct_id?: string
+        }): Promise<{
+            workflow_id: string
+            status: string
+            evaluation: { id: string; name: string }
+            target_event_id: string
+        }> {
+            return await new ApiRequest().evaluationRuns().create({ data })
+        },
+    },
+
+    datasetItems: {
+        list(data: {
+            dataset: string
+            limit?: number
+            offset?: number
+        }): Promise<CountedPaginatedResponse<DatasetItem>> {
+            return new ApiRequest().datasetItems().withQueryString(data).get()
+        },
+
+        async create(data: Partial<DatasetItem>): Promise<DatasetItem> {
+            return await new ApiRequest().datasetItems().create({ data })
+        },
+
+        async update(datasetItemId: string, data: Partial<DatasetItem>): Promise<DatasetItem> {
+            return await new ApiRequest().datasetItem(datasetItemId).update({ data })
+        },
+    },
+
+    conversationsTickets: {
+        async list(
+            params: {
+                status?: string
+                priority?: string
+                channel_source?: string
+                sla?: string
+                assignee?: string
+                tags?: string
+                distinct_ids?: string
+                search?: string
+                date_from?: string
+                date_to?: string
+                order_by?: string
+                limit?: number
+                offset?: number
+            } = {}
+        ): Promise<CountedPaginatedResponse<any>> {
+            return await new ApiRequest().conversationsTickets().withQueryString(params).get()
+        },
+
+        async get(ticketId: string): Promise<any> {
+            return await new ApiRequest().conversationsTicket(ticketId).get()
+        },
+
+        async create(data: {
+            distinct_id: string
+            anonymous_traits?: Record<string, any>
+            channel_source?: string
+        }): Promise<any> {
+            return await new ApiRequest().conversationsTickets().create({ data })
+        },
+
+        async update(
+            ticketId: string,
+            data: Partial<{
+                status: string
+                escalation_reason: string
+            }>
+        ): Promise<any> {
+            return await new ApiRequest().conversationsTicket(ticketId).update({ data })
+        },
+
+        async delete(ticketId: string): Promise<void> {
+            return await new ApiRequest().conversationsTicket(ticketId).delete()
+        },
+
+        async unreadCount(): Promise<{ count: number }> {
+            return await new ApiRequest().conversationsTickets().withAction('unread_count').get()
+        },
+
+        async compose(data: {
+            message: string
+            recipient_email: string
+            email_config_id: string
+            recipient_distinct_id?: string
+            email_subject?: string
+            rich_content?: Record<string, unknown> | null
+        }): Promise<{ id: string; ticket_number: number }> {
+            return await new ApiRequest().conversationsTickets().withAction('compose').create({ data })
+        },
+
+        async bulkUpdateStatus(ids: string[], ticketStatus: string): Promise<{ updated: number; ids: string[] }> {
+            return await new ApiRequest()
+                .conversationsTickets()
+                .withAction('bulk_update_status')
+                .create({ data: { ids, status: ticketStatus } })
+        },
+
+        async submitAiFeedback(
+            ticketId: string,
+            data: { message_id: string; rating: 'good' | 'bad'; feedback_text?: string }
+        ): Promise<void> {
+            await new ApiRequest().conversationsTicket(ticketId).withAction('ai_feedback').create({ data })
+        },
+    },
+
+    llmPrompts: {
+        list(params?: {
+            search?: string
+            order_by?: string
+            offset?: number
+            limit?: number
+        }): Promise<CountedPaginatedResponse<LLMPrompt>> {
+            return new ApiRequest().llmPrompts().withQueryString(params).get()
+        },
+
+        getByName(promptName: string, params?: { version?: number }): Promise<LLMPromptPublic> {
+            return new ApiRequest().llmPromptByName(promptName).withQueryString(params).get()
+        },
+
+        resolveByName(
+            promptName: string,
+            params?: {
+                version?: number
+                version_id?: string
+                offset?: number
+                before_version?: number
+                limit?: number
+            }
+        ): Promise<LLMPromptResolveResponse> {
+            return new ApiRequest().llmPromptResolveByName(promptName).withQueryString(params).get()
+        },
+
+        async update(
+            promptName: string,
+            data: { prompt: LLMPrompt['prompt']; base_version: number; version_description?: string }
+        ): Promise<LLMPrompt> {
+            return await new ApiRequest().llmPromptByName(promptName).update({ data })
+        },
+
+        async archiveByName(promptName: string): Promise<void> {
+            await new ApiRequest().llmPromptArchiveByName(promptName).create({ data: {} })
+        },
+
+        async create(data: { name: LLMPrompt['name']; prompt: LLMPrompt['prompt'] }): Promise<LLMPrompt> {
+            return await new ApiRequest().llmPrompts().create({ data })
+        },
+
+        async duplicateByName(promptName: string, newName: string): Promise<LLMPrompt> {
+            return await new ApiRequest().llmPromptDuplicateByName(promptName).create({ data: { new_name: newName } })
+        },
+    },
+
+    /** Fetch data from specified URL. The result already is JSON-parsed. */
+    async get<T = any>(url: string, options?: ApiMethodOptions): Promise<T> {
+        const res = await api.getResponse(url, options)
+        return await getJSONOrNull(res)
+    },
+
+    async getResponse(url: string, options?: ApiMethodOptions): Promise<Response> {
+        url = prepareUrl(url)
+        ensureProjectIdNotInvalid(url)
+
+        // Add JWT token to Authorization header if available
+        const exporterContext = getCurrentExporterData()
+        const authHeaders: Record<string, string> = {}
+        if (exporterContext?.shareToken) {
+            authHeaders['Authorization'] = `Bearer ${exporterContext.shareToken}`
+        }
+
+        return await handleFetch(url, 'GET', async () => {
+            return fetch(url, {
+                signal: options?.signal,
+                headers: {
+                    ...objectClean(options?.headers ?? {}),
+                    ...tracingHeaders({ includeDistinctId: true }),
+                    ...oauthAuthHeaders(url),
+                    ...authHeaders,
+                },
+            })
+        })
+    },
+
+    async _update<T = any, P = any>(
+        method: 'PATCH' | 'PUT',
+        url: string,
+        data: P,
+        options?: ApiMethodOptions
+    ): Promise<T> {
+        url = prepareUrl(url)
+        ensureProjectIdNotInvalid(url)
+        assertNotReadOnly(method, url)
+        const isFormData = data instanceof FormData
+
+        const response = await handleFetch(url, method, async () => {
+            return await fetch(url, {
+                method: method,
+                headers: {
+                    ...objectClean(options?.headers ?? {}),
+                    ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
+                    'X-CSRFToken': getCookie(CSRF_COOKIE_NAME) || '',
+                    ...tracingHeaders(),
+                    ...oauthAuthHeaders(url),
+                },
+                body: isFormData ? data : JSON.stringify(data),
+                signal: options?.signal,
+            })
+        })
+
+        return await getJSONOrNull(response)
+    },
+
+    async update<T = any, P = any>(url: string, data: P, options?: ApiMethodOptions): Promise<T> {
+        return api._update('PATCH', url, data, options)
+    },
+
+    async put<T = any, P = any>(url: string, data: P, options?: ApiMethodOptions): Promise<T> {
+        return api._update('PUT', url, data, options)
+    },
+
+    async create<T = any, P = any>(url: string, data?: P, options?: ApiMethodOptions): Promise<T> {
+        const res = await api.createResponse(url, data, options)
+        return await getJSONOrNull(res)
+    },
+
+    async createResponse(url: string, data?: any, options?: ApiMethodOptions): Promise<Response> {
+        url = prepareUrl(url)
+        ensureProjectIdNotInvalid(url)
+        assertNotReadOnly('POST', url)
+        const isFormData = data instanceof FormData
+
+        return await handleFetch(url, 'POST', async () =>
+            fetch(url, {
+                method: 'POST',
+                headers: {
+                    ...objectClean(options?.headers ?? {}),
+                    ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
+                    'X-CSRFToken': getCookie(CSRF_COOKIE_NAME) || '',
+                    ...tracingHeaders(),
+                    ...oauthAuthHeaders(url),
+                },
+                body: data ? (isFormData ? data : JSON.stringify(data)) : undefined,
+                signal: options?.signal,
+            })
+        )
+    },
+
+    async delete(url: string): Promise<any> {
+        url = prepareUrl(url)
+        ensureProjectIdNotInvalid(url)
+        assertNotReadOnly('DELETE', url)
+        return await handleFetch(url, 'DELETE', async () =>
+            fetch(url, {
+                method: 'DELETE',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-CSRFToken': getCookie(CSRF_COOKIE_NAME) || '',
+                    ...tracingHeaders(),
+                    ...oauthAuthHeaders(url),
+                },
+            })
+        )
+    },
+
+    /** Stream server-sent events over an EventSource. */
+    async stream(
+        url: string,
+        {
+            method = 'GET',
+            data,
+            onMessage,
+            onError,
+            onOpen,
+            onClose,
+            headers,
+            signal,
+        }:
+            | {
+                  method?: 'GET'
+                  /** GET requests cannot contain a body, use URL params instead. */
+                  data?: never
+                  onMessage: (data: EventSourceMessage) => void
+                  onError: (error: any) => void
+                  /** Fires every time the underlying fetch returns a healthy response — i.e.
+                   *  on initial open *and* on each successful internal reconnect by fetch-event-source. */
+                  onOpen?: () => void
+                  /** Fires when the server cleanly closes the response body (not on errors,
+                   *  not on abort). Use this to react to server-initiated stream rotation. */
+                  onClose?: () => void
+                  headers?: Record<string, string>
+                  signal?: AbortSignal
+              }
+            | {
+                  method: 'POST'
+                  /** Any JSON-serializable object. */
+                  data: any
+                  onMessage: (data: EventSourceMessage) => void
+                  onError: (error: any) => void
+                  onOpen?: () => void
+                  onClose?: () => void
+                  headers?: Record<string, string>
+                  signal?: AbortSignal
+              }
+    ): Promise<void> {
+        const abortController = new AbortController()
+        // If an external signal is provided, forward its abort to our controller
+        signal?.addEventListener('abort', () => abortController.abort())
+
+        await fetchEventSource(url, {
+            method,
+            headers: {
+                ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
+                'X-CSRFToken': getCookie('posthog_csrftoken') || '',
+                ...tracingHeaders(),
+                ...objectClean(headers ?? {}),
+            },
+            body: data !== undefined ? JSON.stringify(data) : undefined,
+            signal: abortController.signal,
+            onopen: async (response) => {
+                // TEMPORARY: livestream SSE lifecycle tracking. Scoped to the two
+                // livestream endpoints so the generic stream helper stays quiet.
+                // Remove together with captureLivestream401Debug once root cause is known.
+                const isLivestreamUrl = /\/(notifications|events)(?:$|\?)/.test(url)
+
+                if (response.status === 429) {
+                    const retryAfter = response.headers.get('Retry-After')
+                    if (retryAfter) {
+                        onError(new RateLimitError(parseInt(retryAfter, 10)))
+                        abortController.abort()
+                    }
+                } else if (!response.ok) {
+                    let errorData: any = {}
+                    try {
+                        errorData = await response.json()
+                    } catch {
+                        // If JSON parsing fails, leave errorData empty
+                    }
+                    // TEMPORARY: capture 401s with decoded (masked) JWT claims so we can
+                    // identify which failure mode is producing the livestream auth baseline.
+                    // Remove once root cause is known.
+                    if (response.status === 401) {
+                        captureLivestream401Debug(url, headers?.Authorization, errorData)
+                    } else if (isLivestreamUrl) {
+                        posthog.capture('livestream_sse_non_ok_non_401', {
+                            url,
+                            status: response.status,
+                            server_message: errorData?.message || errorData?.error,
+                        })
+                    }
+                    onError(
+                        new ApiError(
+                            errorData.error || `Request failed with status ${response.status}`,
+                            response.status,
+                            response.headers,
+                            errorData
+                        )
+                    )
+                    abortController.abort()
+                } else {
+                    onOpen?.()
+                    if (isLivestreamUrl) {
+                        posthog.capture('livestream_sse_opened', {
+                            url,
+                            status: response.status,
+                        })
+                    }
+                }
+            },
+            onmessage: onMessage,
+            onerror: onError,
+            onclose: onClose,
+            // By default fetch-event-source stops connection when document is no longer focused, but that is not how
+            // EventSource works normally, hence reverting (https://github.com/Azure/fetch-event-source/issues/36)
+            openWhenHidden: true,
+        })
+    },
+
+    async loadPaginatedResults<T extends Record<string, any>>(
+        url: string | null,
+        maxIterations: number = PAGINATION_DEFAULT_MAX_PAGES
+    ): Promise<T[]> {
+        let results: T[] = []
+        for (let i = 0; i <= maxIterations; ++i) {
+            if (!url) {
+                break
+            }
+
+            const { results: partialResults, next } = await api.get(url)
+            results = results.concat(partialResults)
+            url = next
+        }
+        return results
+    },
+
+    heatmapScreenshots: {
+        async getContent(id: number): Promise<HeatmapScreenshotContentResponse> {
+            const response = await new ApiRequest().heatmapScreenshot(id).withAction('content').getResponse()
+
+            if (
+                response.ok &&
+                (response.headers.get('content-type')?.includes('image/jpeg') ||
+                    response.headers.get('content-type')?.includes('image/png'))
+            ) {
+                // 200: JPEG/PNG image data
+                return { success: true, data: response }
+            }
+            // 202/404/501: JSON with screenshot metadata
+            const jsonData = await response.json()
+            return { success: false, data: jsonData }
+        },
+    },
+
+    savedHeatmaps: {
+        async list(
+            params: {
+                type?: HeatmapType
+                status?: HeatmapStatus
+                search?: string
+                limit?: number
+                offset?: number
+            } = {}
+        ): Promise<CountedPaginatedResponse<HeatmapScreenshotType>> {
+            return await new ApiRequest().heatmapScreenshotsSaved().withQueryString(params).get()
+        },
+
+        async create(data: {
+            name: string
+            url: string
+            data_url?: string | null
+            width?: number
+            type?: HeatmapType
+            block_consent_modals?: boolean
+        }): Promise<HeatmapScreenshotType> {
+            return await new ApiRequest().heatmapScreenshotsSaved().create({ data })
+        },
+
+        async get(id: number | string): Promise<HeatmapScreenshotType> {
+            return await new ApiRequest().heatmapScreenshotSaved(id).get()
+        },
+
+        async update(
+            id: number | string,
+            data: Partial<{
+                url: string
+                data_url: string | null
+                width: number
+                type: HeatmapType
+                block_consent_modals: boolean
+            }>
+        ): Promise<HeatmapScreenshotType> {
+            return await new ApiRequest().heatmapScreenshotSaved(id).update({ data })
+        },
+
+        async regenerate(id: number | string): Promise<HeatmapScreenshotType> {
+            return await new ApiRequest().heatmapScreenshotSaved(id).withAction('regenerate').create()
+        },
+    },
+
+    sessionSummaries: {
+        async create(data: { session_ids: string[]; focus_area?: string }): Promise<SessionSummaryResponse> {
+            return await new ApiRequest().sessionSummary().withAction('create_session_summaries').create({ data })
+        },
+        async createIndividual(data: {
+            session_ids: string[]
+            focus_area?: string
+        }): Promise<Record<string, SessionSummaryContent>> {
+            return await new ApiRequest()
+                .sessionSummary()
+                .withAction('create_session_summaries_individually')
+                .create({ data })
+        },
+        config: {
+            async get(): Promise<SessionSummariesConfig> {
+                return await new ApiRequest().sessionSummary().withAction('config').get()
+            },
+            async update(data: Partial<SessionSummariesConfig>): Promise<SessionSummariesConfig> {
+                return await new ApiRequest().sessionSummary().withAction('config').update({ data })
+            },
+        },
+    },
+
+    dataWarehouseManagedViewsets: {
+        async toggle(kind: DataWarehouseManagedViewsetKind, enabled: boolean): Promise<void> {
+            return await new ApiRequest().dataWarehouseManagedViewset(kind).put({ data: { enabled } })
+        },
+        async getViews(kind: DataWarehouseManagedViewsetKind): Promise<{
+            views: DataWarehouseManagedViewsetSavedQuery[]
+            count: number
+        }> {
+            return await new ApiRequest().dataWarehouseManagedViewset(kind).get()
+        },
+    },
+
+    revenueAnalyticsJoins: {
+        async sync(enabled: boolean): Promise<void> {
+            return await new ApiRequest().revenueAnalyticsJoins().create({ data: { enabled } })
+        },
+    },
+
+    projects: {
+        async generateConversationsPublicToken(teamId?: TeamType['id']): Promise<TeamType> {
+            return await new ApiRequest()
+                .environmentsDetail(teamId)
+                .withAction('generate_conversations_public_token')
+                .create()
+        },
+    },
+} as const
+
+const warnedSharedViewLeaks = new Set<string>()
+
+async function handleFetch(
+    url: string,
+    method: string,
+    fetcher: () => Promise<Response>,
+    isRetry = false
+): Promise<Response> {
+    const startTime = new Date().getTime()
+
+    let response
+    let error
+    try {
+        response = await fetcher()
+    } catch (e) {
+        error = e
+    }
+
+    apiStatusLogic.findMounted()?.actions.onApiResponse(response?.clone(), error)
+
+    if (error || !response) {
+        if (error && (error as any).name === 'AbortError') {
+            throw error
+        }
+        throw new ApiError(error as any, response?.status)
+    }
+
+    // Standalone OAuth mode: a 401 likely means the access token expired — refresh once and retry.
+    // The fetcher rebuilds its Authorization header on re-invocation, picking up the new token.
+    if (response.status === 401 && isOAuthMode() && !isRetry) {
+        const refreshed = await refreshAccessToken()
+        if (refreshed) {
+            return await handleFetch(url, method, fetcher, true)
+        }
+    }
+
+    if (!response.ok) {
+        const duration = new Date().getTime() - startTime
+        const pathname = new URL(url, location.origin).pathname
+        const inSharedView = isSharedView()
+        // when used inside the posthog toolbar, `posthog.capture` isn't loaded
+        // check if the function is available before calling it.
+        if (posthog.capture) {
+            posthog.capture('client_request_failure', {
+                pathname,
+                method,
+                duration,
+                status: response.status,
+                is_shared_view: inSharedView,
+            })
+        }
+        if (inSharedView && (response.status === 401 || response.status === 403)) {
+            const leakKey = `${method} ${pathname}`
+            if (!warnedSharedViewLeaks.has(leakKey)) {
+                warnedSharedViewLeaks.add(leakKey)
+                console.warn(`[shared-view] unexpected ${response.status} on ${leakKey}`)
+            }
+        }
+
+        const data = await getJSONOrNull(response)
+
+        if (response.status >= 400 && data) {
+            if (typeof data.error === 'string') {
+                throw new ApiError(data.error, response.status, response.headers, data)
+            }
+
+            if (typeof data.detail === 'string') {
+                throw new ApiError(data.detail, response.status, response.headers, data)
+            }
+
+            if (typeof data.message === 'string') {
+                throw new ApiError(data.message, response.status, response.headers, data)
+            }
+        }
+
+        throw new ApiError(
+            `Non-OK response [${method} ${pathname}] (status ${response.status}: ${response.statusText})`,
+            response.status,
+            response.headers,
+            data
+        )
+    }
+
+    return response
+}
+
+export default api

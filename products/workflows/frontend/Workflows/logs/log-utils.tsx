@@ -1,0 +1,114 @@
+import { IconTrash } from '@posthog/icons'
+import { Link } from '@posthog/lemon-ui'
+
+import { PersonDisplay } from 'scenes/persons/PersonDisplay'
+import { urls } from 'scenes/urls'
+
+import { EmailViewerChip } from '../EmailViewerModal'
+import { getHogFlowStep } from '../hogflows/steps/HogFlowSteps'
+import { HogFlow } from '../hogflows/types'
+
+// We pull out actions like [Action:action_function_webhook_13ec288f-10af-4e98-abd4-e2828de3305e] and replace them with a link to the action
+
+const RICH_LOG_REGEX = /(\[[a-zA-Z0-9_-]+:.*?\])/
+
+const ACTION_REGEX = /\[Action:([a-zA-Z0-9_-]+)\]/
+const PERSON_REGEX = /\[Person:([a-zA-Z0-9_-]+)\|(.*?)\]/
+const EVENT_REGEX = /\[Event:([a-zA-Z0-9_-]+)\|(.*?)\|(.*?)\]/
+const ACTOR_REGEX = /\[Actor:(.*?)\]/
+const EMAIL_REGEX = /\[Email:([a-zA-Z0-9_-]+):([a-zA-Z0-9_-]*)\]/
+
+export const renderWorkflowLogMessage = (workflow: HogFlow, message: string): JSX.Element => {
+    // Modifies the rendered log message to auto-detect action or person parts and replace them with a link
+    const parts = message.split(RICH_LOG_REGEX)
+    const elements: (string | JSX.Element)[] = []
+
+    for (const part of parts) {
+        const matchesActionRegex = ACTION_REGEX.exec(part)
+
+        if (matchesActionRegex) {
+            const actionId = matchesActionRegex[1]
+            const action = workflow.actions.find((action) => action.id === actionId)
+
+            const step = action ? getHogFlowStep(action, {}) : undefined
+            const stepName = action?.name || 'Deleted action'
+            const stepIcon = step?.icon || <IconTrash />
+
+            elements.push(
+                <Link
+                    key={part}
+                    className="rounded p-1 -m-1 bg-border text-bg-primary"
+                    to={urls.workflow(workflow.id, 'workflow') + `?node=${actionId}&mode=logs`}
+                >
+                    <span className="mr-1">{stepIcon}</span>
+                    {stepName}
+                </Link>
+            )
+            continue
+        }
+
+        const matchesPersonRegex = PERSON_REGEX.exec(part)
+        if (matchesPersonRegex) {
+            const personId = matchesPersonRegex[1]
+            const personName = matchesPersonRegex[2]
+
+            elements.push(
+                <PersonDisplay
+                    key={part}
+                    person={{ id: personId }}
+                    displayName={personName}
+                    withIcon="sm"
+                    className="mt-1"
+                    inline
+                />
+            )
+            continue
+        }
+
+        const matchesActorRegex = ACTOR_REGEX.exec(part)
+        if (matchesActorRegex) {
+            const actorEmail = matchesActorRegex[1]
+
+            elements.push(
+                <PersonDisplay key={part} displayName={actorEmail} className="mt-1" withIcon="sm" inline noPopover />
+            )
+            continue
+        }
+
+        const matchesEmailRegex = EMAIL_REGEX.exec(part)
+        if (matchesEmailRegex) {
+            const invocationId = matchesEmailRegex[1]
+            const actionId = matchesEmailRegex[2]
+            elements.push(
+                <EmailViewerChip key={part} workflowId={workflow.id} invocationId={invocationId} actionId={actionId} />
+            )
+            continue
+        }
+
+        const matchesEventRegex = EVENT_REGEX.exec(part)
+        if (matchesEventRegex) {
+            const eventUuid = matchesEventRegex[1]
+            const eventName = matchesEventRegex[2]
+            const eventTimestamp = matchesEventRegex[3]
+
+            elements.push(
+                <Link
+                    key={part}
+                    className="rounded p-1 -m-1 bg-border text-bg-primary"
+                    to={urls.event(eventUuid, eventTimestamp)}
+                    target="_blank"
+                    targetBlankIcon
+                >
+                    Event: {eventName}
+                </Link>
+            )
+            continue
+        }
+
+        if (part) {
+            elements.push(part)
+        }
+    }
+
+    return <>{elements}</>
+}

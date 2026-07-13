@@ -11,11 +11,10 @@ def update_stickiness(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0146_eventproperty_sync"),
     ]
 
     operations = [
-        migrations.RunPython(update_stickiness, migrations.RunPython.noop),
+        migrations.RunPython(update_stickiness, migrations.RunPython.noop, elidable=True),
     ]

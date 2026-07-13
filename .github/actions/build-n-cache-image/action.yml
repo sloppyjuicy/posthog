@@ -1,0 +1,109 @@
+name: Build and cache Docker image test
+description: Build the PostHog Docker image via Depot, optionally caching it in the ephemeral registry and pushing to ECR/DockerHub.
+
+inputs:
+    actions-id-token-request-url:
+        required: true
+        description: "ACTIONS_ID_TOKEN_REQUEST_URL, issued by GitHub when permission 'id-token' is set to 'write'"
+    save:
+        required: false
+        default: 'false'
+        description: Whether to save the image in the Depot ephemeral registry after building it
+    push-image:
+        required: false
+        default: 'false'
+        description: Whether to push the built image - requires aws-role-to-assume
+    aws-role-to-assume:
+        required: false
+        description: AWS role to assume for ECR access (required when push-image is true)
+    dockerhub-username:
+        required: false
+        description: Dockerhub username for pushing image
+    dockerhub-password:
+        required: false
+        description: Dockerhub password for pushing image
+    pr-number:
+        required: false
+        default: ''
+        description: PR number for tagging the image
+    no-cache:
+        required: false
+        default: 'false'
+        description: Whether to disable caching on the docker depot build
+
+outputs:
+    tag:
+        description: The tag of the image that was built
+        value: ${{ steps.emit.outputs.tag }}
+    build-id:
+        description: The ID of the build
+        value: ${{ steps.build.outputs.build-id }}
+    digest:
+        description: The digest of the image that was built
+        value: ${{ steps.build.outputs.digest }}
+    registry:
+        description: The ECR registry URL
+        value: ${{ steps.aws-ecr.outputs.registry }}
+
+runs:
+    using: 'composite'
+    steps:
+        - name: Checkout
+          uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+        - name: Set up Docker Buildx
+          uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+        - name: Set up Depot CLI
+          uses: depot/setup-action@15c09a5f77a0840ad4bce955686522a257853461 # v1.7.1
+
+        - name: Configure AWS credentials
+          if: ${{ inputs.push-image == 'true' }}
+          uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
+          with:
+              role-to-assume: ${{ inputs.aws-role-to-assume }}
+              aws-region: us-east-1
+
+        - name: Login to DockerHub
+          if: ${{ inputs.push-image == 'true' }}
+          uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+          with:
+              username: ${{ inputs.dockerhub-username }}
+              password: ${{ inputs.dockerhub-password }}
+
+        - name: Login to Amazon ECR
+          if: ${{ inputs.push-image == 'true' }}
+          id: aws-ecr
+          uses: aws-actions/amazon-ecr-login@f2e9fc6c2b355c1890b65e6f6f0e2ac3e6e22f78 # v2.1.2
+
+        - name: Emit image tag
+          id: emit
+          shell: bash
+          env:
+              COMMIT_SHA: ${{ github.sha }}
+              REGISTRY: ${{ steps.aws-ecr.outputs.registry }}
+              PR_NUMBER: ${{ inputs.pr-number }}
+          run: |
+              TAGS="posthog/posthog:$COMMIT_SHA"
+              if [[ -n "$REGISTRY" ]]; then
+                TAGS="$TAGS,$REGISTRY/posthog-cloud:$COMMIT_SHA"
+              fi
+              if [[ "$PR_NUMBER" != "" ]]; then
+                TAGS="$TAGS,$REGISTRY/posthog-cloud:pr-$PR_NUMBER"
+              fi
+              echo "tag=$TAGS" >> $GITHUB_OUTPUT
+
+        - name: Build image
+          id: build
+          uses: depot/build-push-action@5f3b3c2e5a00f0093de47f657aeaefcedff27d18 # v1.17.0
+          with:
+              context: .
+              buildx-fallback: false # buildx is so slow it's better to just fail
+              tags: ${{ steps.emit.outputs.tag }}
+              platforms: linux/amd64,linux/arm64
+              build-args: COMMIT_HASH=${{ github.sha }}
+              save: ${{ inputs.save }}
+              push: ${{ inputs.push-image }}
+              no-cache: ${{ inputs.no-cache }}
+          env:
+              ACTIONS_ID_TOKEN_REQUEST_URL: ${{ inputs.actions-id-token-request-url }}

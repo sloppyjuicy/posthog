@@ -1,0 +1,3111 @@
+import { BreakPointFunction, actions, afterMount, connect, kea, listeners, path, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+import { router, urlToAction } from 'kea-router'
+import { subscriptions } from 'kea-subscriptions'
+import { windowValues } from 'kea-window-values'
+import posthog from 'posthog-js'
+
+import { IconGear } from '@posthog/icons'
+import { LemonMenuItem } from '@posthog/lemon-ui'
+import { errorTrackingQuery } from '@posthog/products-error-tracking/frontend/queries'
+
+import api from 'lib/api'
+import { AuthorizedUrlListType, authorizedUrlListLogic } from 'lib/components/AuthorizedUrlList/authorizedUrlListLogic'
+import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
+import { FEATURE_FLAGS, RETENTION_FIRST_OCCURRENCE_MATCHING_FILTERS } from 'lib/constants'
+import { IconOpenInNew } from 'lib/lemon-ui/icons'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { Link } from 'lib/lemon-ui/Link/Link'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { trackedActionToUrl } from 'lib/logic/scenes/trackedActionToUrl'
+import { getDefaultInterval, isValidRelativeOrAbsoluteDate } from 'lib/utils/dateFilters'
+import { isDefinitionStale } from 'lib/utils/definitions'
+import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { getCurrentTeamId } from 'lib/utils/getAppContext'
+import { UnexpectedNeverError, isNotNil } from 'lib/utils/guards'
+import { objectsEqual } from 'lib/utils/objects'
+import { addProductIntentForCrossSell } from 'lib/utils/product-intents'
+import { preflightLogic } from 'scenes/PreflightCheck/preflightLogic'
+import { Scene } from 'scenes/sceneTypes'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+import { userLogic } from 'scenes/userLogic'
+
+import { dataNodeCollectionLogic } from '~/queries/nodes/DataNode/dataNodeCollectionLogic'
+import { WEB_VITALS_COLORS, WEB_VITALS_THRESHOLDS } from '~/queries/nodes/WebVitals/definitions'
+import { hogqlQuery } from '~/queries/query'
+import { isCompareFilter, isWebAnalyticsPropertyFilters } from '~/queries/schema-guards'
+import {
+    ActionConversionGoal,
+    ActionsNode,
+    AnyEntityNode,
+    CustomEventConversionGoal,
+    DataTableNode,
+    EventsNode,
+    InsightVizNode,
+    NodeKind,
+    ProductIntentContext,
+    ProductKey,
+    TrendsFilter,
+    TrendsQuery,
+    WebAnalyticsConversionGoal,
+    WebAnalyticsOrderBy,
+    WebAnalyticsOrderByDirection,
+    WebAnalyticsOrderByFields,
+    WebAnalyticsPropertyFilters,
+    WebStatsBreakdown,
+    WebStatsTableQuery,
+    WebVitalsMetric,
+} from '~/queries/schema/schema-general'
+import { hogql } from '~/queries/utils'
+import {
+    AvailableFeature,
+    BaseMathType,
+    Breadcrumb,
+    ChartDisplayType,
+    FilterLogicalOperator,
+    InsightLogicProps,
+    InsightType,
+    IntervalType,
+    PropertyFilterType,
+    PropertyMathType,
+    PropertyOperator,
+    RecordingUniversalFilters,
+    RetentionPeriod,
+    TeamPublicType,
+    TeamType,
+    UniversalFiltersGroupValue,
+    UserType,
+    WebAnalyticsFiltersConfig,
+} from '~/types'
+
+import { botAnalyticsLogic } from './botAnalyticsLogic'
+import {
+    ActiveHoursTab,
+    ConversionGoalWarning,
+    DeviceTab,
+    DeviceType,
+    GEOIP_TEMPLATE_IDS,
+    GeographyTab,
+    GraphsTab,
+    INITIAL_DATE_FROM,
+    INITIAL_DATE_TO,
+    INITIAL_INTERVAL,
+    PathTab,
+    ProductTab,
+    SourceTab,
+    TILES_ALLOWED_ON_PRE_AGGREGATED,
+    TabsTileTab,
+    TileId,
+    TileVisualizationOption,
+    WEB_ANALYTICS_DATA_COLLECTION_NODE_ID,
+    WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+    WebAnalyticsTile,
+    WebVitalsPercentile,
+    eventPropertiesToPathClean,
+    getWebAnalyticsBreakdownFilter,
+    loadPriorityMap,
+    personPropertiesToPathClean,
+    sessionPropertiesToPathClean,
+} from './common'
+import {
+    PROPERTY_HOST,
+    WEB_ANALYTICS_PRE_AGGREGATED_ALLOWED_EVENT_PROPERTIES,
+    WEB_ANALYTICS_PRE_AGGREGATED_ALLOWED_SESSION_PROPERTIES,
+    convertCurrentURLFilter,
+    hasURLSearchParams,
+} from './constants'
+import { FOCUS_MODE_TILE_IDS, computeFocusHiddenTiles } from './focus-mode/focusModeMapping'
+import { WebAnalyticsConcern, getFocusModeOnboardingSeenKey } from './focus-mode/types'
+import { webAnalyticsHealthLogic } from './health'
+import { IncludeHostToggle } from './IncludeHostToggle'
+import { getDashboardItemId, getNewInsightUrlFactory } from './insightsUtils'
+import { webAnalyticsFilterLogic } from './webAnalyticsFilterLogic'
+import type { webAnalyticsLogicType } from './webAnalyticsLogicType'
+
+export interface DateFilterState {
+    dateFrom: string | null
+    dateTo: string | null
+    interval: IntervalType
+    isIntervalManuallySet: boolean
+}
+
+export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
+    path(['scenes', 'webAnalytics', 'webAnalyticsSceneLogic']),
+    connect(() => ({
+        values: [
+            featureFlagLogic,
+            ['featureFlags'],
+            teamLogic,
+            ['currentTeam', 'baseCurrency'],
+            userLogic,
+            ['hasAvailableFeature', 'user'],
+            preflightLogic,
+            ['isDev'],
+            authorizedUrlListLogic({
+                type: AuthorizedUrlListType.WEB_ANALYTICS,
+                actionId: null,
+                experimentId: null,
+                productTourId: null,
+            }),
+            ['authorizedUrls', 'showProposedURLForm', 'isProposedUrlSubmitting', 'suggestions as urlSuggestions'],
+            webAnalyticsFilterLogic,
+            [
+                'rawWebAnalyticsFilters',
+                'domainFilter',
+                'deviceTypeFilter',
+                'countryFilter',
+                'referrerFilter',
+                'compareFilter',
+                'hasHostFilter',
+                'validatedDomainFilter',
+                'selectedHost',
+                'authorizedDomains',
+            ],
+        ],
+        actions: [
+            webAnalyticsHealthLogic,
+            ['trackTabViewed'],
+            authorizedUrlListLogic({
+                type: AuthorizedUrlListType.WEB_ANALYTICS,
+                actionId: null,
+                experimentId: null,
+                productTourId: null,
+            }),
+            [
+                'addUrl as addAuthorizedUrl',
+                'newUrl as newAuthorizedUrl',
+                'cancelProposingUrl as cancelProposingAuthorizedUrl',
+            ],
+            webAnalyticsFilterLogic,
+            [
+                'setWebAnalyticsFilters',
+                'togglePropertyFilter',
+                'setDomainFilter',
+                'setDeviceTypeFilter',
+                'setCountryFilter',
+                'setReferrerFilter',
+                'setCompareFilter',
+                'loadPreset',
+            ],
+            dataNodeCollectionLogic({ key: WEB_ANALYTICS_DATA_COLLECTION_NODE_ID }),
+            ['cancelAllLoading'],
+            userLogic,
+            ['updateUser'],
+        ],
+    })),
+    actions({
+        removeIncompatibleFilters: true,
+        setGraphsTab: (tab: string) => ({ tab }),
+        setSourceTab: (tab: string) => ({ tab }),
+        setDeviceTab: (tab: string) => ({ tab }),
+        setPathTab: (tab: string) => ({ tab }),
+        setGeographyTab: (tab: string) => ({ tab }),
+        setActiveHoursTab: (tab: string) => ({ tab }),
+        openSurveyModal: (path: string) => ({ path }),
+        closeSurveyModal: true,
+        clearTablesOrderBy: () => true,
+        setTablesOrderBy: (orderBy: WebAnalyticsOrderByFields, direction: WebAnalyticsOrderByDirection) => ({
+            orderBy,
+            direction,
+        }),
+        setDates: (dateFrom: string | null, dateTo: string | null) => ({ dateFrom, dateTo }),
+        setDateInterval: (interval: IntervalType) => ({ interval }),
+        setDatesAndInterval: (dateFrom: string | null, dateTo: string | null, interval: IntervalType) => ({
+            dateFrom,
+            dateTo,
+            interval,
+        }),
+        setIsPathCleaningEnabled: (isPathCleaningEnabled: boolean) => ({ isPathCleaningEnabled }),
+        setShouldFilterTestAccounts: (shouldFilterTestAccounts: boolean) => ({ shouldFilterTestAccounts }),
+        setUseWebAnalyticsPrecompute: (useWebAnalyticsPrecompute: boolean | null) => ({ useWebAnalyticsPrecompute }),
+        setShouldStripQueryParams: (shouldStripQueryParams: boolean) => ({ shouldStripQueryParams }),
+        setIncludeHostPath: (includeHostPath: boolean) => ({ includeHostPath }),
+        setConversionGoal: (conversionGoal: WebAnalyticsConversionGoal | null) => ({ conversionGoal }),
+        openAsNewInsight: (tileId: TileId, tabId?: string) => ({ tileId, tabId }),
+        setConversionGoalWarning: (warning: ConversionGoalWarning | null) => ({ warning }),
+        setProductTab: (tab: ProductTab) => ({ tab }),
+        setWebVitalsPercentile: (percentile: WebVitalsPercentile) => ({ percentile }),
+        setWebVitalsTab: (tab: WebVitalsMetric) => ({ tab }),
+        setTileVisualization: (tileId: TileId, visualization: TileVisualizationOption) => ({ tileId, visualization }),
+        setTileVisibility: (tileId: TileId, visible: boolean) => ({ tileId, visible }),
+        setHiddenTiles: (hiddenTiles: TileId[]) => ({ hiddenTiles }),
+        resetTileVisibility: () => true,
+        openFocusModeModal: (onboarding: boolean = false) => ({ onboarding }),
+        closeFocusModeModal: true,
+        openFocusModeOnboarding: true,
+        dismissFocusModeOnboarding: true,
+        startFocusModeOnboarding: true,
+        markFocusModeOnboardingSeen: true,
+        setFocusModeConcerns: (concerns: WebAnalyticsConcern[]) => ({ concerns }),
+        setFocusModeDraftConcerns: (concerns: WebAnalyticsConcern[]) => ({ concerns }),
+        setFocusModeEnabled: (enabled: boolean) => ({ enabled }),
+        toggleFocusModeConcern: (concern: WebAnalyticsConcern) => ({ concern }),
+        enterFocusMode: true,
+        exitFocusMode: true,
+        applyFocusMode: true,
+        zoomIntoPeriod: (dateFrom: string, dateTo: string) => ({ dateFrom, dateTo }),
+        resetZoom: true,
+        setPreZoomDateFilter: (
+            filter: { dateFrom: string | null; dateTo: string | null; interval: IntervalType } | null
+        ) => ({ filter }),
+        clearFilters: true,
+    }),
+    loaders(({ values }) => ({
+        shouldShowGeoIPQueries: {
+            _default: null as boolean | null,
+            loadShouldShowGeoIPQueries: async (): Promise<boolean> => {
+                // Always display on dev mode, we don't always have events and/or hogQL functions
+                // but we want the map to be there for debugging purposes
+                if (values.isDev) {
+                    return true
+                }
+
+                const [propertiesResponse, hogFunctionsResponse] = await Promise.allSettled([
+                    api.propertyDefinitions.list({
+                        event_names: ['$pageview'],
+                        properties: ['$geoip_country_code'],
+                    }),
+                    api.hogFunctions.list({ types: ['transformation'] }),
+                ])
+
+                const hasNonStaleCountryCodeDefinition =
+                    propertiesResponse.status === 'fulfilled' &&
+                    propertiesResponse.value.results.some(
+                        (property) => property.name === '$geoip_country_code' && !isDefinitionStale(property)
+                    )
+
+                if (!hasNonStaleCountryCodeDefinition) {
+                    return false
+                }
+
+                if (hogFunctionsResponse.status !== 'fulfilled') {
+                    return false
+                }
+
+                const enabledGeoIPHogFunction = hogFunctionsResponse.value.results.find((hogFunction) => {
+                    const isFromTemplate = GEOIP_TEMPLATE_IDS.includes(hogFunction.template?.id ?? '')
+                    const matchesName = hogFunction.name === 'GeoIP' // Failsafe in case someone implements their custom GeoIP function
+
+                    return (isFromTemplate || matchesName) && hogFunction.enabled
+                })
+
+                return Boolean(enabledGeoIPHogFunction)
+            },
+        },
+    })),
+    reducers(() => {
+        const persistConfig = { persist: true, prefix: `${getCurrentTeamId()}__` }
+        // The precompute toggle changed from opt-in (default `false`) to a tri-state where
+        // `null` means "use the team default". Legacy users persisted the old `false`, which
+        // would now read as an explicit opt-out. A versioned prefix orphans that stale value so
+        // they rehydrate `null` and the backend's per-team default applies.
+        const precomputePersistConfig = { persist: true, prefix: `${getCurrentTeamId()}__precompute_optout_v2__` }
+        return {
+            surveyModalPath: [
+                null as string | null,
+                {
+                    openSurveyModal: (_, { path }) => path,
+                    closeSurveyModal: () => null,
+                },
+            ],
+            _graphsTab: [
+                null as string | null,
+                persistConfig,
+                {
+                    setGraphsTab: (_, { tab }) => tab,
+                    togglePropertyFilter: (oldTab, { tabChange }) => tabChange?.graphsTab || oldTab,
+                    setConversionGoal: (oldTab, { conversionGoal }) => {
+                        if (conversionGoal) {
+                            return GraphsTab.UNIQUE_CONVERSIONS
+                        }
+                        return oldTab
+                    },
+                },
+            ],
+            _sourceTab: [
+                null as string | null,
+                persistConfig,
+                {
+                    setSourceTab: (_, { tab }) => tab,
+                    togglePropertyFilter: (oldTab, { tabChange }) => tabChange?.sourceTab || oldTab,
+                },
+            ],
+            _deviceTab: [
+                null as string | null,
+                persistConfig,
+                {
+                    setDeviceTab: (_, { tab }) => tab,
+                    togglePropertyFilter: (oldTab, { tabChange }) => tabChange?.deviceTab || oldTab,
+                },
+            ],
+            _pathTab: [
+                null as string | null,
+                persistConfig,
+                {
+                    setPathTab: (_, { tab }) => tab,
+                    togglePropertyFilter: (oldTab, { tabChange }) => tabChange?.pathTab || oldTab,
+                },
+            ],
+            _geographyTab: [
+                null as string | null,
+                persistConfig,
+                {
+                    setGeographyTab: (_, { tab }) => tab,
+                    togglePropertyFilter: (oldTab, { tabChange }) => tabChange?.geographyTab || oldTab,
+                },
+            ],
+            _activeHoursTab: [
+                null as string | null,
+                persistConfig,
+                {
+                    setActiveHoursTab: (_, { tab }) => tab,
+                },
+            ],
+            _isPathCleaningEnabled: [
+                true as boolean,
+                persistConfig,
+                {
+                    setIsPathCleaningEnabled: (_, { isPathCleaningEnabled }) => isPathCleaningEnabled,
+                    clearFilters: () => true,
+                },
+            ],
+            tablesOrderBy: [
+                null as WebAnalyticsOrderBy | null,
+                persistConfig,
+                {
+                    setTablesOrderBy: (_, { orderBy, direction }) => [orderBy, direction],
+                    clearTablesOrderBy: () => null,
+
+                    // Reset the order by when the conversion goal changes because most of the columns are different
+                    setConversionGoal: () => null,
+                },
+            ],
+            dateFilter: [
+                {
+                    dateFrom: INITIAL_DATE_FROM,
+                    dateTo: INITIAL_DATE_TO,
+                    interval: INITIAL_INTERVAL,
+                    isIntervalManuallySet: false,
+                } as DateFilterState,
+                persistConfig,
+                {
+                    setDates: ({ interval, isIntervalManuallySet }, { dateTo, dateFrom }) => {
+                        if (dateTo && !isValidRelativeOrAbsoluteDate(dateTo)) {
+                            dateTo = INITIAL_DATE_TO
+                        }
+                        if (dateFrom && !isValidRelativeOrAbsoluteDate(dateFrom)) {
+                            dateFrom = INITIAL_DATE_FROM
+                        }
+                        return {
+                            dateTo,
+                            dateFrom,
+                            interval: isIntervalManuallySet ? interval : getDefaultInterval(dateFrom, dateTo),
+                            isIntervalManuallySet,
+                        }
+                    },
+                    setDateInterval: ({ dateFrom, dateTo }, { interval }) => ({
+                        dateTo,
+                        dateFrom,
+                        interval,
+                        isIntervalManuallySet: true,
+                    }),
+                    setDatesAndInterval: (_, { dateTo, dateFrom, interval }) => {
+                        if (!dateFrom && !dateTo) {
+                            dateFrom = INITIAL_DATE_FROM
+                            dateTo = INITIAL_DATE_TO
+                        }
+                        if (dateTo && !isValidRelativeOrAbsoluteDate(dateTo)) {
+                            dateTo = INITIAL_DATE_TO
+                        }
+                        if (dateFrom && !isValidRelativeOrAbsoluteDate(dateFrom)) {
+                            dateFrom = INITIAL_DATE_FROM
+                        }
+                        return {
+                            dateTo,
+                            dateFrom,
+                            interval: interval || getDefaultInterval(dateFrom, dateTo),
+                            isIntervalManuallySet: !!interval,
+                        }
+                    },
+                    clearFilters: () => ({
+                        dateFrom: INITIAL_DATE_FROM,
+                        dateTo: INITIAL_DATE_TO,
+                        interval: INITIAL_INTERVAL,
+                        isIntervalManuallySet: false,
+                    }),
+                },
+            ],
+            preZoomDateFilter: [
+                null as { dateFrom: string | null; dateTo: string | null; interval: IntervalType } | null,
+                {
+                    setPreZoomDateFilter: (_, { filter }) => filter,
+                    setDates: () => null,
+                    setDateInterval: () => null,
+                    clearFilters: () => null,
+                },
+            ],
+            shouldFilterTestAccounts: [
+                false as boolean,
+                persistConfig,
+                {
+                    setShouldFilterTestAccounts: (_, { shouldFilterTestAccounts }) => shouldFilterTestAccounts,
+                    clearFilters: () => false,
+                },
+            ],
+            useWebAnalyticsPrecompute: [
+                // Tri-state: `null` means the user never touched the toggle, so the
+                // backend's per-team default decides (opt-out for unrestricted teams,
+                // opt-in for everyone else). An explicit `true`/`false` overrides it.
+                null as boolean | null,
+                precomputePersistConfig,
+                {
+                    setUseWebAnalyticsPrecompute: (_, { useWebAnalyticsPrecompute }) => useWebAnalyticsPrecompute,
+                },
+            ],
+            shouldStripQueryParams: [
+                false as boolean,
+                persistConfig,
+                {
+                    setShouldStripQueryParams: (_, { shouldStripQueryParams }) => shouldStripQueryParams,
+                },
+            ],
+            includeHostPath: [
+                false as boolean,
+                persistConfig,
+                {
+                    setIncludeHostPath: (_, { includeHostPath }) => includeHostPath,
+                },
+            ],
+            conversionGoal: [
+                null as WebAnalyticsConversionGoal | null,
+                persistConfig,
+                {
+                    setConversionGoal: (_, { conversionGoal }) => conversionGoal,
+                    clearFilters: () => null,
+                },
+            ],
+            conversionGoalWarning: [
+                null as ConversionGoalWarning | null,
+                {
+                    setConversionGoalWarning: (_, { warning }) => warning,
+                },
+            ],
+            productTab: [
+                ProductTab.ANALYTICS as ProductTab,
+                {
+                    setProductTab: (_, { tab }) => tab,
+                },
+            ],
+            webVitalsPercentile: [
+                PropertyMathType.P90 as WebVitalsPercentile,
+                persistConfig,
+                {
+                    setWebVitalsPercentile: (_, { percentile }) => percentile,
+                },
+            ],
+            webVitalsTab: [
+                'INP' as WebVitalsMetric,
+                {
+                    setWebVitalsTab: (_, { tab }) => tab,
+                },
+            ],
+            tileVisualizations: [
+                {} as Record<TileId, TileVisualizationOption>,
+                {
+                    setTileVisualization: (state, { tileId, visualization }) => ({
+                        ...state,
+                        [tileId]: visualization,
+                    }),
+                },
+            ],
+            hiddenTiles: [
+                [] as TileId[],
+                persistConfig,
+                {
+                    setTileVisibility: (state, { tileId, visible }) => {
+                        if (visible) {
+                            return state.filter((id) => id !== tileId)
+                        }
+                        return state.includes(tileId) ? state : [...state, tileId]
+                    },
+                    setHiddenTiles: (_, { hiddenTiles }) => hiddenTiles,
+                    resetTileVisibility: () => [],
+                },
+            ],
+            focusModeModalOpen: [
+                false,
+                {
+                    openFocusModeModal: () => true,
+                    closeFocusModeModal: () => false,
+                    setProductTab: (state, { tab }) => (tab === ProductTab.ANALYTICS ? state : false),
+                },
+            ],
+            focusModeOnboardingModalOpen: [
+                false,
+                {
+                    openFocusModeOnboarding: () => true,
+                    dismissFocusModeOnboarding: () => false,
+                    startFocusModeOnboarding: () => false,
+                    setProductTab: (state, { tab }) => (tab === ProductTab.ANALYTICS ? state : false),
+                },
+            ],
+            focusModeModalIsOnboarding: [
+                false,
+                {
+                    openFocusModeModal: (_, { onboarding }) => onboarding,
+                    closeFocusModeModal: () => false,
+                },
+            ],
+            focusModeConcerns: [
+                [] as WebAnalyticsConcern[],
+                persistConfig,
+                {
+                    setFocusModeConcerns: (_, { concerns }) => concerns,
+                },
+            ],
+            focusModeEnabled: [
+                false,
+                persistConfig,
+                {
+                    setFocusModeEnabled: (_, { enabled }) => enabled,
+                    resetTileVisibility: () => false,
+                },
+            ],
+            focusModeDraftConcerns: [
+                [] as WebAnalyticsConcern[],
+                {
+                    setFocusModeDraftConcerns: (_, { concerns }) => concerns,
+                    closeFocusModeModal: () => [],
+                    toggleFocusModeConcern: (state, { concern }) =>
+                        state.includes(concern) ? state.filter((item) => item !== concern) : [...state, concern],
+                },
+            ],
+        }
+    }),
+    windowValues({
+        isGreaterThanMd: (window: Window) => window.innerWidth > 768,
+    }),
+    selectors({
+        preAggregatedEnabled: [
+            (s) => [s.featureFlags, s.currentTeam],
+            (featureFlags: Record<string, boolean>, currentTeam: TeamPublicType | TeamType | null) => {
+                return (
+                    featureFlags[FEATURE_FLAGS.SETTINGS_WEB_ANALYTICS_PRE_AGGREGATED_TABLES] &&
+                    currentTeam?.modifiers?.useWebAnalyticsPreAggregatedTables
+                )
+            },
+        ],
+        incompatibleFilters: [
+            (s) => [s.rawWebAnalyticsFilters, s.preAggregatedEnabled],
+            (
+                rawWebAnalyticsFilters: WebAnalyticsPropertyFilters,
+                preAggregatedEnabled: boolean
+            ): WebAnalyticsPropertyFilters => {
+                if (!preAggregatedEnabled) {
+                    return []
+                }
+
+                return rawWebAnalyticsFilters.filter((filter) => {
+                    if (filter.type === PropertyFilterType.Cohort) {
+                        return true
+                    }
+
+                    if (hasURLSearchParams(filter)) {
+                        return true
+                    }
+
+                    if (filter.type === PropertyFilterType.Event) {
+                        return !WEB_ANALYTICS_PRE_AGGREGATED_ALLOWED_EVENT_PROPERTIES.includes(filter.key)
+                    } else if (filter.type === PropertyFilterType.Session) {
+                        return !WEB_ANALYTICS_PRE_AGGREGATED_ALLOWED_SESSION_PROPERTIES.includes(filter.key)
+                    } else if (filter.type === PropertyFilterType.Person) {
+                        return true
+                    }
+                    return false
+                })
+            },
+        ],
+        hasIncompatibleFilters: [
+            (s) => [s.incompatibleFilters],
+            (incompatibleFilters: WebAnalyticsPropertyFilters) => incompatibleFilters.length > 0,
+        ],
+        breadcrumbs: [
+            () => [],
+            (): Breadcrumb[] => {
+                return [
+                    {
+                        key: Scene.WebAnalytics,
+                        name: `Web analytics`,
+                        path: urls.webAnalytics(),
+                        iconType: 'web_analytics',
+                    },
+                ]
+            },
+        ],
+        graphsTab: [(s) => [s._graphsTab], (graphsTab: string | null) => graphsTab || GraphsTab.UNIQUE_USERS],
+        sourceTab: [(s) => [s._sourceTab], (sourceTab: string | null) => sourceTab || SourceTab.CHANNEL],
+        deviceTab: [(s) => [s._deviceTab], (deviceTab: string | null) => deviceTab || DeviceTab.DEVICE_TYPE],
+        pathTab: [(s) => [s._pathTab], (pathTab: string | null) => pathTab || PathTab.PATH],
+        geographyTab: [(s) => [s._geographyTab], (geographyTab: string | null) => geographyTab || GeographyTab.MAP],
+        activeHoursTab: [
+            (s) => [s._activeHoursTab],
+            (activeHoursTab: string | null) => activeHoursTab || ActiveHoursTab.UNIQUE,
+        ],
+        isPathCleaningEnabled: [
+            (s) => [s._isPathCleaningEnabled, s.hasAvailableFeature],
+            (isPathCleaningEnabled: boolean, hasAvailableFeature) => {
+                return hasAvailableFeature(AvailableFeature.PATHS_ADVANCED) && isPathCleaningEnabled
+            },
+        ],
+        currentFiltersConfig: [
+            (s) => [
+                s.rawWebAnalyticsFilters,
+                s.domainFilter,
+                s.deviceTypeFilter,
+                s.countryFilter,
+                s.referrerFilter,
+                s.compareFilter,
+                s.dateFilter,
+                s.conversionGoal,
+                s.isPathCleaningEnabled,
+                s.shouldFilterTestAccounts,
+            ],
+            (
+                properties,
+                domainFilter,
+                deviceTypeFilter,
+                countryFilter,
+                referrerFilter,
+                compareFilter,
+                dateFilter,
+                conversionGoal,
+                isPathCleaningEnabled,
+                shouldFilterTestAccounts
+            ): WebAnalyticsFiltersConfig => ({
+                properties,
+                dateFrom: dateFilter.dateFrom,
+                dateTo: dateFilter.dateTo,
+                interval: dateFilter.interval,
+                compareFilter,
+                domainFilter,
+                deviceTypeFilter,
+                countryFilter,
+                referrerFilter,
+                conversionGoal,
+                isPathCleaningEnabled,
+                shouldFilterTestAccounts,
+            }),
+        ],
+        webAnalyticsFilters: [
+            (s) => [
+                s.rawWebAnalyticsFilters,
+                s.isPathCleaningEnabled,
+                s.selectedHost,
+                s.deviceTypeFilter,
+                s.countryFilter,
+                s.referrerFilter,
+            ],
+            (
+                rawWebAnalyticsFilters: WebAnalyticsPropertyFilters,
+                isPathCleaningEnabled: boolean,
+                selectedHost: string | null,
+                deviceTypeFilter: DeviceType | null,
+                countryFilter: string | null,
+                referrerFilter: string | null
+            ) => {
+                let filters = rawWebAnalyticsFilters
+
+                if (selectedHost) {
+                    filters = [
+                        ...filters,
+                        {
+                            key: '$host',
+                            value: selectedHost,
+                            operator: PropertyOperator.Exact,
+                            type: PropertyFilterType.Event,
+                        },
+                    ]
+                }
+
+                // Add device type filter if set
+                if (deviceTypeFilter) {
+                    filters = [
+                        ...filters,
+                        {
+                            key: '$device_type',
+                            // Extra handling for device type to include mobile+tablet as a single filter
+                            value: deviceTypeFilter === 'Desktop' ? 'Desktop' : ['Mobile', 'Tablet'],
+                            operator: PropertyOperator.Exact,
+                            type: PropertyFilterType.Event,
+                        },
+                    ]
+                }
+
+                if (countryFilter) {
+                    filters = [
+                        ...filters,
+                        {
+                            key: '$geoip_country_code',
+                            value: countryFilter,
+                            operator: PropertyOperator.Exact,
+                            type: PropertyFilterType.Event,
+                        },
+                    ]
+                }
+
+                if (referrerFilter) {
+                    filters = [
+                        ...filters,
+                        {
+                            key: '$referring_domain',
+                            value: referrerFilter,
+                            operator: PropertyOperator.Exact,
+                            type: PropertyFilterType.Event,
+                        },
+                    ]
+                }
+
+                // Translate exact path filters to cleaned path filters
+                if (isPathCleaningEnabled) {
+                    filters = filters.map((filter) => {
+                        if (filter.type === PropertyFilterType.Cohort) {
+                            return filter
+                        }
+                        if (filter.operator !== PropertyOperator.Exact) {
+                            return filter
+                        }
+                        let propertiesToPathClean: Set<string>
+                        switch (filter.type) {
+                            case PropertyFilterType.Event:
+                                propertiesToPathClean = eventPropertiesToPathClean
+                                break
+                            case PropertyFilterType.Person:
+                                propertiesToPathClean = personPropertiesToPathClean
+                                break
+                            case PropertyFilterType.Session:
+                                propertiesToPathClean = sessionPropertiesToPathClean
+                                break
+                            default:
+                                throw new UnexpectedNeverError(filter)
+                        }
+                        if (propertiesToPathClean.has(filter.key)) {
+                            return {
+                                ...filter,
+                                operator: PropertyOperator.IsCleanedPathExact,
+                            }
+                        }
+                        return filter
+                    })
+                }
+
+                return filters
+            },
+        ],
+        tabs: [
+            (s) => [
+                s.graphsTab,
+                s.sourceTab,
+                s.deviceTab,
+                s.pathTab,
+                s.geographyTab,
+                s.activeHoursTab,
+                s.shouldShowGeoIPQueries,
+            ],
+            (graphsTab, sourceTab, deviceTab, pathTab, geographyTab, activeHoursTab, shouldShowGeoIPQueries) => ({
+                graphsTab,
+                sourceTab,
+                deviceTab,
+                pathTab,
+                geographyTab,
+                activeHoursTab,
+                shouldShowGeoIPQueries,
+            }),
+        ],
+        controls: [
+            (s) => [
+                s.isPathCleaningEnabled,
+                s.shouldFilterTestAccounts,
+                s.shouldStripQueryParams,
+                s.includeHostPath,
+                s.useWebAnalyticsPrecompute,
+                s.featureFlags,
+            ],
+            (
+                isPathCleaningEnabled: boolean,
+                filterTestAccounts: boolean,
+                shouldStripQueryParams: boolean,
+                includeHostPath: boolean,
+                useWebAnalyticsPrecompute: boolean | null,
+                featureFlags: Record<string, boolean>
+            ) => ({
+                isPathCleaningEnabled,
+                filterTestAccounts,
+                shouldStripQueryParams,
+                includeHostPath: !!featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_INCLUDE_HOST] && includeHostPath,
+                // `null` (untouched) → omitted, so the backend's per-team default decides.
+                // Explicit `false` (opt-out) → always sent, even if the flag is later killed.
+                // Explicit `true` (opt-in) → only sent while the flag is on; with the flag off we
+                // omit it (fall back to the default) rather than flipping it to `false`, which on an
+                // unrestricted team would wrongly opt the user out instead of leaving them default-on.
+                useWebAnalyticsPrecompute:
+                    useWebAnalyticsPrecompute == null
+                        ? undefined
+                        : useWebAnalyticsPrecompute === false
+                          ? false
+                          : featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_PRECOMPUTE_TOGGLE]
+                            ? true
+                            : undefined,
+            }),
+        ],
+        filters: [
+            (s) => [
+                s.webAnalyticsFilters,
+                s.replayFilters,
+                s.dateFilter,
+                s.compareFilter,
+                s.webVitalsTab,
+                s.webVitalsPercentile,
+                s.tablesOrderBy,
+                s.conversionGoal,
+            ],
+            (
+                webAnalyticsFilters,
+                replayFilters,
+                dateFilter,
+                compareFilter,
+                webVitalsTab,
+                webVitalsPercentile,
+                tablesOrderBy,
+                conversionGoal
+            ) => ({
+                webAnalyticsFilters,
+                replayFilters,
+                dateFilter,
+                compareFilter,
+                webVitalsTab,
+                webVitalsPercentile,
+                tablesOrderBy,
+                conversionGoal,
+            }),
+        ],
+        replayFilters: [
+            (s) => [s.webAnalyticsFilters, s.dateFilter, s.shouldFilterTestAccounts, s.conversionGoal],
+            (
+                webAnalyticsFilters: WebAnalyticsPropertyFilters,
+                dateFilter,
+                shouldFilterTestAccounts,
+                conversionGoal
+            ): RecordingUniversalFilters => {
+                const filters: UniversalFiltersGroupValue[] = [...webAnalyticsFilters]
+                if (conversionGoal) {
+                    if ('actionId' in conversionGoal) {
+                        filters.push({
+                            id: conversionGoal.actionId,
+                            name: String(conversionGoal.actionId),
+                            type: 'actions',
+                        })
+                    } else if ('customEventName' in conversionGoal) {
+                        filters.push({
+                            id: conversionGoal.customEventName,
+                            name: conversionGoal.customEventName,
+                            type: 'events',
+                        })
+                    }
+                }
+
+                return {
+                    filter_test_accounts: shouldFilterTestAccounts,
+
+                    date_from: dateFilter.dateFrom,
+                    date_to: dateFilter.dateTo,
+                    filter_group: {
+                        type: FilterLogicalOperator.And,
+                        values: [
+                            {
+                                type: FilterLogicalOperator.And,
+                                values: filters,
+                            },
+                        ],
+                    },
+                    duration: [
+                        {
+                            type: PropertyFilterType.Recording,
+                            key: 'active_seconds',
+                            operator: PropertyOperator.GreaterThan,
+                            value: 1,
+                        },
+                    ],
+                }
+            },
+        ],
+        hasCountryFilter: [
+            (s) => [s.webAnalyticsFilters],
+            (webAnalyticsFilters: WebAnalyticsPropertyFilters) => {
+                return webAnalyticsFilters.some((filter) => filter.key === '$geoip_country_code')
+            },
+        ],
+        webVitalsMetricQuery: [
+            (s) => [
+                s.webVitalsPercentile,
+                s.webVitalsTab,
+                s.dateFilter,
+                s.webAnalyticsFilters,
+                s.shouldFilterTestAccounts,
+            ],
+            (
+                webVitalsPercentile,
+                webVitalsTab,
+                { dateFrom, dateTo, interval },
+                webAnalyticsFilters,
+                filterTestAccounts
+            ): InsightVizNode<TrendsQuery> => ({
+                kind: NodeKind.InsightVizNode,
+                source: {
+                    kind: NodeKind.TrendsQuery,
+                    dateRange: {
+                        date_from: dateFrom,
+                        date_to: dateTo,
+                    },
+                    interval,
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            event: '$web_vitals',
+                            name: '$web_vitals',
+                            custom_name: webVitalsTab,
+                            math: webVitalsPercentile,
+                            math_property: `$web_vitals_${webVitalsTab}_value`,
+                        },
+                    ],
+                    trendsFilter: {
+                        display: ChartDisplayType.ActionsLineGraph,
+                        aggregationAxisFormat: webVitalsTab === 'CLS' ? 'numeric' : 'duration_ms',
+                        goalLines: [
+                            {
+                                label: 'Good',
+                                value: WEB_VITALS_THRESHOLDS[webVitalsTab].good,
+                                displayLabel: false,
+                                borderColor: WEB_VITALS_COLORS.good,
+                            },
+                            {
+                                label: 'Poor',
+                                value: WEB_VITALS_THRESHOLDS[webVitalsTab].poor,
+                                displayLabel: false,
+                                borderColor: WEB_VITALS_COLORS.needs_improvements,
+                            },
+                        ],
+                    } as TrendsFilter,
+                    filterTestAccounts,
+                    properties: webAnalyticsFilters,
+                    tags: WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+                },
+                embedded: false,
+            }),
+        ],
+    }),
+    selectors(({ actions }) => ({
+        showFocusMode: [
+            (s) => [s.featureFlags, s.productTab],
+            (featureFlags, productTab: ProductTab): boolean =>
+                featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_FOCUS_MODE] === 'test' && productTab === ProductTab.ANALYTICS,
+        ],
+        hasSavedFocusMode: [
+            (s) => [s.focusModeConcerns],
+            (focusModeConcerns: WebAnalyticsConcern[]): boolean => focusModeConcerns.length > 0,
+        ],
+        hasSeenFocusModeOnboarding: [
+            (s) => [s.user, s.currentTeam],
+            (user: UserType | null, currentTeam: TeamPublicType | TeamType | null): boolean =>
+                !!currentTeam && !!user?.has_seen_product_intro_for?.[getFocusModeOnboardingSeenKey(currentTeam.id)],
+        ],
+        shouldAutoOpenFocusModeOnboarding: [
+            (s) => [s.user, s.currentTeam, s.showFocusMode, s.hasSavedFocusMode, s.hasSeenFocusModeOnboarding],
+            (
+                user: UserType | null,
+                currentTeam: TeamPublicType | TeamType | null,
+                showFocusMode: boolean,
+                hasSavedFocusMode: boolean,
+                hasSeenFocusModeOnboarding: boolean
+            ): boolean => !!user && !!currentTeam && showFocusMode && !hasSavedFocusMode && !hasSeenFocusModeOnboarding,
+        ],
+        isFocusModeActive: [
+            (s) => [s.showFocusMode, s.focusModeEnabled, s.focusModeConcerns],
+            (showFocusMode: boolean, focusModeEnabled: boolean, focusModeConcerns: WebAnalyticsConcern[]): boolean =>
+                showFocusMode && focusModeEnabled && focusModeConcerns.length > 0,
+        ],
+        tiles: [
+            (s) => [
+                s.productTab,
+                s.tabs,
+                s.controls,
+                s.filters,
+                s.featureFlags,
+                s.isGreaterThanMd,
+                s.tileVisualizations,
+                s.preAggregatedEnabled,
+                s.hiddenTiles,
+            ],
+            (
+                productTab,
+                { graphsTab, sourceTab, deviceTab, pathTab, geographyTab, shouldShowGeoIPQueries, activeHoursTab },
+                {
+                    isPathCleaningEnabled,
+                    filterTestAccounts,
+                    shouldStripQueryParams,
+                    includeHostPath,
+                    useWebAnalyticsPrecompute,
+                },
+                {
+                    webAnalyticsFilters,
+                    replayFilters,
+                    dateFilter: { dateFrom, dateTo, interval },
+                    conversionGoal,
+                    compareFilter,
+                    webVitalsPercentile,
+                    webVitalsTab,
+                    tablesOrderBy,
+                },
+                featureFlags,
+                isGreaterThanMd,
+                tileVisualizations,
+                preAggregatedEnabled,
+                hiddenTiles
+            ): WebAnalyticsTile[] => {
+                const dateRange = { date_from: dateFrom, date_to: dateTo }
+                const sampling = { enabled: false, forceSamplingRate: { numerator: 1, denominator: 10 } }
+
+                const uniqueUserSeries: EventsNode = {
+                    event: featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_FOR_MOBILE] ? '$screen' : '$pageview',
+                    kind: NodeKind.EventsNode,
+                    math: BaseMathType.UniqueUsers,
+                    name: 'Pageview',
+                    custom_name: 'Unique visitors',
+                }
+
+                const pageViewsSeries = {
+                    ...uniqueUserSeries,
+                    math: BaseMathType.TotalCount,
+                    custom_name: featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_FOR_MOBILE] ? 'Screen Views' : 'Page views',
+                }
+
+                const sessionsSeries = {
+                    ...uniqueUserSeries,
+                    math: BaseMathType.UniqueSessions,
+                    custom_name: 'Sessions',
+                }
+
+                const sessionDurationSeries: EventsNode = {
+                    event: featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_FOR_MOBILE] ? '$screen' : '$pageview',
+                    kind: NodeKind.EventsNode,
+                    math: PropertyMathType.Average,
+                    math_property: '$session_duration',
+                    math_property_type: 'session_properties',
+                    name: 'Session duration',
+                    custom_name: 'Average session duration',
+                }
+
+                const bounceRateSeries: EventsNode = {
+                    event: featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_FOR_MOBILE] ? '$screen' : '$pageview',
+                    kind: NodeKind.EventsNode,
+                    math: PropertyMathType.Average,
+                    math_property: '$is_bounce',
+                    math_property_type: 'session_properties',
+                    name: 'Bounce rate',
+                    custom_name: 'Average bounce rate',
+                }
+
+                const uniqueConversionsSeries: ActionsNode | EventsNode | undefined = !conversionGoal
+                    ? undefined
+                    : 'actionId' in conversionGoal
+                      ? {
+                            kind: NodeKind.ActionsNode,
+                            id: conversionGoal.actionId,
+                            math: BaseMathType.UniqueUsers,
+                            name: 'Unique conversions',
+                            custom_name: 'Unique conversions',
+                        }
+                      : {
+                            kind: NodeKind.EventsNode,
+                            event: conversionGoal.customEventName,
+                            math: BaseMathType.UniqueUsers,
+                            name: 'Unique conversions',
+                            custom_name: 'Unique conversions',
+                        }
+                const totalConversionSeries = uniqueConversionsSeries
+                    ? {
+                          ...uniqueConversionsSeries,
+                          math: BaseMathType.TotalCount,
+                          name: 'Total conversions',
+                          custom_name: 'Total conversions',
+                      }
+                    : undefined
+
+                const createInsightProps = (tile: TileId, tab?: string): InsightLogicProps => {
+                    return {
+                        dashboardItemId: getDashboardItemId(tile, tab, false),
+                        loadPriority: loadPriorityMap[tile],
+                        dataNodeCollectionId: WEB_ANALYTICS_DATA_COLLECTION_NODE_ID,
+                    }
+                }
+
+                const createGraphsTrendsTab = (
+                    id: GraphsTab,
+                    title: string | JSX.Element,
+                    linkText: string | JSX.Element,
+                    series: AnyEntityNode[],
+                    trendsFilter?: Partial<TrendsFilter>,
+                    trendsQueryProperties?: Partial<TrendsQuery>
+                ): TabsTileTab => ({
+                    id,
+                    title,
+                    linkText,
+                    query: {
+                        kind: NodeKind.InsightVizNode,
+                        source: {
+                            kind: NodeKind.TrendsQuery,
+                            dateRange,
+                            interval,
+                            series: series,
+                            trendsFilter: {
+                                display: ChartDisplayType.ActionsLineGraph,
+                                ...trendsFilter,
+                            },
+                            compareFilter,
+                            filterTestAccounts,
+                            conversionGoal,
+                            properties: webAnalyticsFilters,
+                            tags: WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+                            ...trendsQueryProperties,
+                        },
+                        hidePersonsModal: true,
+                        embedded: true,
+                        hideTooltipOnScroll: true,
+                    },
+                    showIntervalSelect: true,
+                    insightProps: createInsightProps(TileId.GRAPHS, id),
+                    canOpenInsight: true,
+                    canOpenModal: true,
+                })
+
+                const createTableTab = (
+                    tileId: TileId,
+                    tabId: string,
+                    title: string,
+                    linkText: string,
+                    breakdownBy: WebStatsBreakdown,
+                    source?: Partial<WebStatsTableQuery>,
+                    tab?: Partial<TabsTileTab>
+                ): TabsTileTab => {
+                    const columns = [
+                        'breakdown_value',
+                        'visitors',
+                        'views',
+                        source?.includeBounceRate ? 'bounce_rate' : null,
+                        source?.includeAvgTimeOnPage ? 'avg_time_on_page' : null,
+                        'cross_sell',
+                    ].filter(isNotNil)
+
+                    // Check if this tile has a visualization preference
+                    const visualization =
+                        tileVisualizations[tileId as unknown as keyof typeof tileVisualizations] || undefined
+
+                    const baseTabProps = {
+                        id: tabId,
+                        title,
+                        linkText,
+                        insightProps: createInsightProps(tileId, tabId),
+                        ...tab,
+                    }
+
+                    // In case of a graph, we need to use the breakdownFilter and a InsightsVizNode,
+                    // which will actually be handled by a WebStatsTrendTile instead of a WebStatsTableTile
+                    if (visualization === 'graph') {
+                        const breakdownFilter = getWebAnalyticsBreakdownFilter(breakdownBy)
+                        return {
+                            ...baseTabProps,
+                            query: {
+                                kind: NodeKind.InsightVizNode,
+                                source: {
+                                    kind: NodeKind.TrendsQuery,
+                                    dateRange,
+                                    interval,
+                                    series: [uniqueUserSeries],
+                                    trendsFilter: {
+                                        display: ChartDisplayType.ActionsLineGraph,
+                                    },
+                                    breakdownFilter: breakdownFilter
+                                        ? {
+                                              ...breakdownFilter,
+                                              breakdown_path_cleaning: isPathCleaningEnabled,
+                                          }
+                                        : undefined,
+                                    filterTestAccounts,
+                                    conversionGoal,
+                                    properties: webAnalyticsFilters,
+                                    tags: WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+                                },
+                                hidePersonsModal: true,
+                                embedded: true,
+                                hideTooltipOnScroll: true,
+                            },
+                            canOpenInsight: true,
+                            canOpenModal: true,
+                        }
+                    }
+
+                    return {
+                        ...baseTabProps,
+                        query: {
+                            full: true,
+                            kind: NodeKind.DataTableNode,
+                            source: {
+                                kind: NodeKind.WebStatsTableQuery,
+                                properties: webAnalyticsFilters,
+                                breakdownBy: breakdownBy,
+                                dateRange,
+                                sampling,
+                                compareFilter,
+                                limit: 10,
+                                filterTestAccounts,
+                                conversionGoal,
+                                orderBy: tablesOrderBy ?? undefined,
+                                tags: WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+                                // Apply the per-team opt-in here so every stats-table tab (Path,
+                                // Entry path, End path, channel breakdowns, etc.) consistently
+                                // reaches the lazy precompute gate. The backend gate decides
+                                // per-breakdown which combinations are actually served from the
+                                // precompute. `source` overrides can still pin this off for a
+                                // specific tab if ever needed.
+                                useWebAnalyticsPrecompute,
+                                ...source,
+                            },
+                            embedded: false,
+                            showActions: true,
+                            columns,
+                        },
+                        canOpenInsight: true,
+                        canOpenModal: true,
+                    }
+                }
+
+                let errorTrackingQ: DataTableNode | undefined
+
+                try {
+                    errorTrackingQ = errorTrackingQuery({
+                        orderBy: 'users',
+                        dateRange: dateRange,
+                        filterTestAccounts: filterTestAccounts,
+                        filterGroup: replayFilters.filter_group,
+                        columns: ['error', 'users', 'occurrences', 'last_seen'],
+                        limit: 4,
+                    })
+                } catch (e) {
+                    posthog.captureException(e, { dateRange, replayFilters, filterTestAccounts })
+                }
+
+                if (productTab === ProductTab.WEB_VITALS) {
+                    const createSeries = (name: WebVitalsMetric, math: PropertyMathType): AnyEntityNode => ({
+                        kind: NodeKind.EventsNode,
+                        event: '$web_vitals',
+                        name: '$web_vitals',
+                        custom_name: name,
+                        math: math,
+                        math_property: `$web_vitals_${name}_value`,
+                    })
+
+                    return [
+                        {
+                            kind: 'query',
+                            tileId: TileId.WEB_VITALS,
+                            layout: {
+                                colSpanClassName: 'md:col-span-full',
+                                orderWhenLargeClassName: '2xl:order-0',
+                            },
+                            query: {
+                                kind: NodeKind.WebVitalsQuery,
+                                properties: webAnalyticsFilters,
+                                source: {
+                                    kind: NodeKind.TrendsQuery,
+                                    dateRange,
+                                    interval,
+                                    series: (['INP', 'LCP', 'CLS', 'FCP'] as WebVitalsMetric[]).map((metric) =>
+                                        createSeries(metric, webVitalsPercentile)
+                                    ),
+                                    trendsFilter: { display: ChartDisplayType.ActionsLineGraph },
+                                    filterTestAccounts,
+                                    properties: webAnalyticsFilters,
+                                },
+                                tags: WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+                            },
+                            insightProps: {
+                                dashboardItemId: getDashboardItemId(TileId.WEB_VITALS, 'web-vitals-overview', false),
+                                loadPriority: loadPriorityMap[TileId.WEB_VITALS],
+                                dataNodeCollectionId: WEB_ANALYTICS_DATA_COLLECTION_NODE_ID,
+                            },
+                            showIntervalSelect: true,
+                        },
+                        {
+                            kind: 'query',
+                            tileId: TileId.WEB_VITALS_PATH_BREAKDOWN,
+                            layout: {
+                                colSpanClassName: 'md:col-span-full',
+                                orderWhenLargeClassName: '2xl:order-0',
+                            },
+                            query: {
+                                kind: NodeKind.WebVitalsPathBreakdownQuery,
+                                dateRange,
+                                filterTestAccounts,
+                                properties: webAnalyticsFilters,
+                                percentile: webVitalsPercentile,
+                                metric: webVitalsTab,
+                                doPathCleaning: isPathCleaningEnabled,
+                                thresholds: [
+                                    WEB_VITALS_THRESHOLDS[webVitalsTab].good,
+                                    WEB_VITALS_THRESHOLDS[webVitalsTab].poor,
+                                ],
+                                useWebAnalyticsPrecompute,
+                            },
+                            insightProps: {
+                                dashboardItemId: getDashboardItemId(
+                                    TileId.WEB_VITALS_PATH_BREAKDOWN,
+                                    'web-vitals-path-breakdown',
+                                    false
+                                ),
+                                loadPriority: loadPriorityMap[TileId.WEB_VITALS_PATH_BREAKDOWN],
+                                dataNodeCollectionId: WEB_ANALYTICS_DATA_COLLECTION_NODE_ID,
+                            },
+                        },
+                    ]
+                }
+
+                const useTileHeaderV2 = featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_TILE_HEADER_V2] === 'test'
+
+                const includeHostMenuItem: LemonMenuItem | null =
+                    useTileHeaderV2 && featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_INCLUDE_HOST]
+                        ? {
+                              label: 'Include host',
+                              tooltip: 'Show the full host + path (e.g. example.com/about) instead of just the path',
+                              active: includeHostPath,
+                              onClick: () => actions.setIncludeHostPath(!includeHostPath),
+                          }
+                        : null
+
+                const pathTabExtras = useTileHeaderV2
+                    ? { extraMenuItems: includeHostMenuItem ? [includeHostMenuItem] : undefined }
+                    : { control: <IncludeHostToggle /> }
+
+                const allTiles: (WebAnalyticsTile | null)[] = [
+                    {
+                        kind: 'query',
+                        tileId: TileId.OVERVIEW,
+                        layout: {
+                            colSpanClassName: 'md:col-span-full',
+                            orderWhenLargeClassName: '2xl:order-0',
+                            className: '-mt-2',
+                        },
+                        query: {
+                            kind: NodeKind.WebOverviewQuery,
+                            properties: webAnalyticsFilters,
+                            dateRange,
+                            interval,
+                            sampling,
+                            compareFilter,
+                            filterTestAccounts,
+                            conversionGoal,
+                            useWebAnalyticsPrecompute,
+                        },
+                        insightProps: createInsightProps(TileId.OVERVIEW),
+                        canOpenInsight: true,
+                        canOpenModal: false,
+                    },
+                    {
+                        kind: 'tabs',
+                        tileId: TileId.GRAPHS,
+                        layout: {
+                            colSpanClassName: useTileHeaderV2 ? 'md:col-span-full' : 'md:col-span-2',
+                            orderWhenLargeClassName: '2xl:order-1',
+                            className: useTileHeaderV2 ? 'WebTile--short-chart' : undefined,
+                        },
+                        activeTabId: graphsTab,
+                        setTabId: actions.setGraphsTab,
+                        tabs: (
+                            [
+                                createGraphsTrendsTab(GraphsTab.UNIQUE_USERS, 'Unique visitors', 'Visitors', [
+                                    uniqueUserSeries,
+                                ]),
+                                !conversionGoal
+                                    ? createGraphsTrendsTab(GraphsTab.PAGE_VIEWS, 'Page views', 'Views', [
+                                          pageViewsSeries,
+                                      ])
+                                    : null,
+                                !conversionGoal
+                                    ? createGraphsTrendsTab(GraphsTab.NUM_SESSION, 'Unique sessions', 'Sessions', [
+                                          sessionsSeries,
+                                      ])
+                                    : null,
+                                !conversionGoal && featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_SESSION_PROPERTY_CHARTS]
+                                    ? createGraphsTrendsTab(
+                                          GraphsTab.SESSION_DURATION,
+                                          'Average session duration',
+                                          'Session duration',
+                                          [sessionDurationSeries]
+                                      )
+                                    : null,
+                                !conversionGoal && featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_SESSION_PROPERTY_CHARTS]
+                                    ? createGraphsTrendsTab(
+                                          GraphsTab.BOUNCE_RATE,
+                                          'Average bounce rate',
+                                          'Bounce rate',
+                                          [bounceRateSeries],
+                                          {
+                                              aggregationAxisFormat: 'percentage_scaled',
+                                          }
+                                      )
+                                    : null,
+                                conversionGoal && uniqueConversionsSeries
+                                    ? createGraphsTrendsTab(
+                                          GraphsTab.UNIQUE_CONVERSIONS,
+                                          'Unique conversions',
+                                          'Unique conversions',
+                                          [uniqueConversionsSeries]
+                                      )
+                                    : null,
+                                conversionGoal && totalConversionSeries
+                                    ? createGraphsTrendsTab(
+                                          GraphsTab.TOTAL_CONVERSIONS,
+                                          'Total conversions',
+                                          'Total conversions',
+                                          [totalConversionSeries]
+                                      )
+                                    : null,
+                                conversionGoal && uniqueUserSeries && uniqueConversionsSeries
+                                    ? createGraphsTrendsTab(
+                                          GraphsTab.CONVERSION_RATE,
+                                          'Conversion rate',
+                                          'Conversion rate',
+                                          [uniqueConversionsSeries, uniqueUserSeries],
+                                          {
+                                              formula: 'A / B',
+                                              aggregationAxisFormat: 'percentage_scaled',
+                                          }
+                                      )
+                                    : null,
+                            ] as (TabsTileTab | null)[]
+                        ).filter(isNotNil),
+                    },
+                    {
+                        kind: 'tabs',
+                        tileId: TileId.PATHS,
+                        layout: {
+                            colSpanClassName: useTileHeaderV2 ? 'md:col-span-full' : 'md:col-span-2',
+                            orderWhenLargeClassName: useTileHeaderV2 ? '2xl:order-2' : '2xl:order-4',
+                        },
+                        activeTabId: pathTab,
+                        setTabId: actions.setPathTab,
+                        tabs: featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_FOR_MOBILE]
+                            ? [
+                                  createTableTab(
+                                      TileId.PATHS,
+                                      PathTab.SCREEN_NAME,
+                                      'Screens',
+                                      'Screen',
+                                      WebStatsBreakdown.ScreenName,
+                                      {},
+                                      {}
+                                  ),
+                              ]
+                            : (
+                                  [
+                                      createTableTab(
+                                          TileId.PATHS,
+                                          PathTab.PATH,
+                                          'Paths',
+                                          'Path',
+                                          WebStatsBreakdown.Page,
+                                          {
+                                              includeScrollDepth: false, // TODO needs some perf work before it can be enabled
+                                              includeBounceRate: true,
+                                              doPathCleaning: isPathCleaningEnabled,
+                                              includeHost: includeHostPath,
+                                              includeAvgTimeOnPage:
+                                                  !!featureFlags[FEATURE_FLAGS.AVERAGE_PAGE_VIEW_COLUMN],
+                                              useWebAnalyticsPrecompute,
+                                          },
+                                          {
+                                              ...pathTabExtras,
+                                              docs: {
+                                                  url: 'https://posthog.com/docs/web-analytics/dashboard#paths',
+                                                  title: 'Paths',
+                                                  description: (
+                                                      <div>
+                                                          <p>
+                                                              In this view you can validate all of the paths that were
+                                                              accessed in your application, regardless of when they were
+                                                              accessed through the lifetime of a user session.
+                                                          </p>
+                                                          {conversionGoal ? (
+                                                              <p>
+                                                                  The conversion rate is the percentage of users who
+                                                                  completed the conversion goal in this specific path.
+                                                              </p>
+                                                          ) : (
+                                                              <p>
+                                                                  The{' '}
+                                                                  <Link to="https://posthog.com/docs/web-analytics/dashboard#bounce-rate">
+                                                                      bounce rate
+                                                                  </Link>{' '}
+                                                                  indicates the percentage of users who left your page
+                                                                  immediately after visiting without capturing any
+                                                                  event.
+                                                              </p>
+                                                          )}
+                                                      </div>
+                                                  ),
+                                              },
+                                          }
+                                      ),
+                                      createTableTab(
+                                          TileId.PATHS,
+                                          PathTab.INITIAL_PATH,
+                                          'Entry paths',
+                                          'Entry path',
+                                          WebStatsBreakdown.InitialPage,
+                                          {
+                                              includeBounceRate: true,
+                                              includeScrollDepth: false,
+                                              doPathCleaning: isPathCleaningEnabled,
+                                              includeHost: includeHostPath,
+                                              includeAvgTimeOnPage:
+                                                  !!featureFlags[FEATURE_FLAGS.AVERAGE_PAGE_VIEW_COLUMN],
+                                          },
+                                          {
+                                              ...pathTabExtras,
+                                              docs: {
+                                                  url: 'https://posthog.com/docs/web-analytics/dashboard#paths',
+                                                  title: 'Entry Path',
+                                                  description: (
+                                                      <div>
+                                                          <p>
+                                                              Entry paths are the paths a user session started, i.e. the
+                                                              first path they saw when they opened your website.
+                                                          </p>
+                                                          {conversionGoal && (
+                                                              <p>
+                                                                  The conversion rate is the percentage of users who
+                                                                  completed the conversion goal after the first path in
+                                                                  their session being this path.
+                                                              </p>
+                                                          )}
+                                                      </div>
+                                                  ),
+                                              },
+                                          }
+                                      ),
+                                      createTableTab(
+                                          TileId.PATHS,
+                                          PathTab.END_PATH,
+                                          'End paths',
+                                          'End path',
+                                          WebStatsBreakdown.ExitPage,
+                                          {
+                                              includeBounceRate: false,
+                                              includeScrollDepth: false,
+                                              doPathCleaning: isPathCleaningEnabled,
+                                              includeHost: includeHostPath,
+                                          },
+                                          {
+                                              ...pathTabExtras,
+                                              docs: {
+                                                  url: 'https://posthog.com/docs/web-analytics/dashboard#paths',
+                                                  title: 'End Path',
+                                                  description: (
+                                                      <div>
+                                                          End paths are the last path a user visited before their
+                                                          session ended, i.e. the last path they saw before leaving your
+                                                          website/closing the browser/turning their computer off.
+                                                      </div>
+                                                  ),
+                                              },
+                                          }
+                                      ),
+                                      {
+                                          id: PathTab.EXIT_CLICK,
+                                          title: 'Outbound link clicks',
+                                          linkText: 'Outbound clicks',
+                                          query: {
+                                              full: true,
+                                              kind: NodeKind.DataTableNode,
+                                              source: {
+                                                  kind: NodeKind.WebExternalClicksTableQuery,
+                                                  properties: webAnalyticsFilters,
+                                                  dateRange,
+                                                  compareFilter,
+                                                  sampling,
+                                                  limit: 10,
+                                                  filterTestAccounts,
+                                                  conversionGoal,
+                                                  orderBy: tablesOrderBy ?? undefined,
+                                                  stripQueryParams: shouldStripQueryParams,
+                                                  doPathCleaning: isPathCleaningEnabled,
+                                              },
+                                              embedded: false,
+                                              showActions: true,
+                                              columns: ['url', 'visitors', 'clicks', 'cross_sell'],
+                                          },
+                                          insightProps: createInsightProps(TileId.PATHS, PathTab.END_PATH),
+                                          canOpenModal: true,
+                                          docs: {
+                                              title: 'Outbound Clicks',
+                                              description: (
+                                                  <div>
+                                                      You'll be able to verify when someone leaves your website by
+                                                      clicking an outbound link (to a separate domain)
+                                                  </div>
+                                              ),
+                                          },
+                                      },
+                                  ] as (TabsTileTab | undefined)[]
+                              ).filter(isNotNil),
+                    },
+                    {
+                        kind: 'tabs',
+                        tileId: TileId.SOURCES,
+                        layout: {
+                            colSpanClassName: `md:col-span-1`,
+                            orderWhenLargeClassName: useTileHeaderV2 ? '2xl:order-3' : '2xl:order-2',
+                        },
+                        activeTabId: sourceTab,
+                        setTabId: actions.setSourceTab,
+                        splitIndices: featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_REFERRER_URL_DRILLDOWN]
+                            ? [1, 3] // [Channel] [Referring Domain ▼ Referring URL] [UTM Source ▼ ...]
+                            : [2], // [Channel] [Referring Domain] [UTM Source ▼ ...]
+                        tabs: [
+                            createTableTab(
+                                TileId.SOURCES,
+                                SourceTab.CHANNEL,
+                                'Channels',
+                                'Channel',
+                                WebStatsBreakdown.InitialChannelType,
+                                {},
+                                {
+                                    ...(useTileHeaderV2
+                                        ? {
+                                              extraMenuItems: [
+                                                  {
+                                                      label: 'Customize channel types',
+                                                      icon: <IconGear />,
+                                                      to: urls.settings('environment-web-analytics', 'channel-type'),
+                                                  },
+                                              ],
+                                          }
+                                        : {
+                                              control: (
+                                                  <div className="flex flex-row deprecated-space-x-2 font-medium">
+                                                      <span>Customize channel types</span>
+                                                      <LemonButton
+                                                          icon={<IconGear />}
+                                                          type="tertiary"
+                                                          status="alt"
+                                                          size="small"
+                                                          noPadding={true}
+                                                          tooltip="Customize channel types"
+                                                          to={urls.settings(
+                                                              'environment-web-analytics',
+                                                              'channel-type'
+                                                          )}
+                                                      />
+                                                  </div>
+                                              ),
+                                          }),
+                                    docs: {
+                                        url: 'https://posthog.com/docs/data/channel-type',
+                                        title: 'Channels',
+                                        description: (
+                                            <div>
+                                                <p>
+                                                    Channels are the different sources that bring traffic to your
+                                                    website, e.g. Paid Search, Organic Social, Direct, etc.
+                                                </p>
+                                                <p>
+                                                    You can also{' '}
+                                                    <Link
+                                                        to={urls.settings('environment-web-analytics', 'channel-type')}
+                                                    >
+                                                        create custom channel types
+                                                    </Link>
+                                                    , allowing you to further categorize your channels.
+                                                </p>
+                                                <p>
+                                                    Something unexpected? Try the{' '}
+                                                    <Link to={urls.sessionAttributionExplorer()}>
+                                                        Session attribution explorer
+                                                    </Link>
+                                                </p>
+                                            </div>
+                                        ),
+                                    },
+                                }
+                            ),
+                            createTableTab(
+                                TileId.SOURCES,
+                                SourceTab.REFERRING_DOMAIN,
+                                'Referrers',
+                                'Referring domain',
+                                WebStatsBreakdown.InitialReferringDomain,
+                                {},
+                                {
+                                    docs: {
+                                        url: 'https://posthog.com/docs/web-analytics/dashboard#channels-referrers-utms',
+                                        title: 'Referrers',
+                                        description: 'Understand where your users are coming from',
+                                    },
+                                }
+                            ),
+                            ...(featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_REFERRER_URL_DRILLDOWN]
+                                ? [
+                                      createTableTab(
+                                          TileId.SOURCES,
+                                          SourceTab.REFERRING_URL,
+                                          'Referrer URLs',
+                                          'Referring URL',
+                                          WebStatsBreakdown.InitialReferringURL,
+                                          {},
+                                          {
+                                              docs: {
+                                                  url: 'https://posthog.com/docs/web-analytics/dashboard#channels-referrers-utms',
+                                                  title: 'Referrer URLs',
+                                                  description:
+                                                      'Full referring URLs (without query parameters) showing where your users came from',
+                                              },
+                                          }
+                                      ),
+                                  ]
+                                : []),
+                            createTableTab(
+                                TileId.SOURCES,
+                                SourceTab.UTM_SOURCE,
+                                'UTM sources',
+                                'UTM source',
+                                WebStatsBreakdown.InitialUTMSource,
+                                {},
+                                {
+                                    docs: {
+                                        url: 'https://posthog.com/docs/web-analytics/dashboard#utms',
+                                        title: 'UTM source',
+                                        description: (
+                                            <>
+                                                Understand where your users are coming from - filtered down by their{' '}
+                                                <code>utm_source</code> parameter
+                                            </>
+                                        ),
+                                    },
+                                }
+                            ),
+                            createTableTab(
+                                TileId.SOURCES,
+                                SourceTab.UTM_MEDIUM,
+                                'UTM medium',
+                                'UTM medium',
+                                WebStatsBreakdown.InitialUTMMedium,
+                                {},
+                                {
+                                    docs: {
+                                        url: 'https://posthog.com/docs/web-analytics/dashboard#utms',
+                                        title: 'UTM medium',
+                                        description: (
+                                            <>
+                                                Understand where your users are coming from - filtered down by their{' '}
+                                                <code>utm_medium</code> parameter
+                                            </>
+                                        ),
+                                    },
+                                }
+                            ),
+                            createTableTab(
+                                TileId.SOURCES,
+                                SourceTab.UTM_CAMPAIGN,
+                                'UTM campaigns',
+                                'UTM campaign',
+                                WebStatsBreakdown.InitialUTMCampaign,
+                                {},
+                                {
+                                    docs: {
+                                        url: 'https://posthog.com/docs/web-analytics/dashboard#utms',
+                                        title: 'UTM campaign',
+                                        description: (
+                                            <>
+                                                Understand where your users are coming from - filtered down by their{' '}
+                                                <code>utm_campaign</code> parameter
+                                            </>
+                                        ),
+                                    },
+                                }
+                            ),
+                            createTableTab(
+                                TileId.SOURCES,
+                                SourceTab.UTM_CONTENT,
+                                'UTM content',
+                                'UTM content',
+                                WebStatsBreakdown.InitialUTMContent,
+                                {},
+                                {
+                                    docs: {
+                                        url: 'https://posthog.com/docs/web-analytics/dashboard#utms',
+                                        title: 'UTM content',
+                                        description: (
+                                            <>
+                                                Understand where your users are coming from - filtered down by their{' '}
+                                                <code>utm_content</code> parameter
+                                            </>
+                                        ),
+                                    },
+                                }
+                            ),
+                            createTableTab(
+                                TileId.SOURCES,
+                                SourceTab.UTM_TERM,
+                                'UTM terms',
+                                'UTM term',
+                                WebStatsBreakdown.InitialUTMTerm,
+                                {},
+                                {
+                                    docs: {
+                                        url: 'https://posthog.com/docs/web-analytics/dashboard#utms',
+                                        title: 'UTM term',
+                                        description: (
+                                            <>
+                                                Understand where your users are coming from - filtered down by their{' '}
+                                                <code>utm_term</code> parameter
+                                            </>
+                                        ),
+                                    },
+                                }
+                            ),
+                            createTableTab(
+                                TileId.SOURCES,
+                                SourceTab.UTM_SOURCE_MEDIUM_CAMPAIGN,
+                                'Source / Medium / Campaign',
+                                'UTM s/m/c',
+                                WebStatsBreakdown.InitialUTMSourceMediumCampaign,
+                                {},
+                                {
+                                    docs: {
+                                        url: 'https://posthog.com/docs/web-analytics/dashboard#utms',
+                                        title: 'UTM parameters',
+                                        description: (
+                                            <>
+                                                Understand where your users are coming from - filtered down by a tuple
+                                                of their <code>utm_source</code>, <code>utm_medium</code>, and{' '}
+                                                <code>utm_campaign</code> parameters
+                                            </>
+                                        ),
+                                    },
+                                }
+                            ),
+                        ],
+                    },
+                    {
+                        kind: 'tabs',
+                        tileId: TileId.DEVICES,
+                        layout: {
+                            colSpanClassName: `md:col-span-1`,
+                            orderWhenLargeClassName: useTileHeaderV2 ? '2xl:order-4' : '2xl:order-3',
+                        },
+                        activeTabId: deviceTab,
+                        setTabId: actions.setDeviceTab,
+                        tabs: [
+                            createTableTab(
+                                TileId.DEVICES,
+                                DeviceTab.DEVICE_TYPE,
+                                'Device type',
+                                'Device type',
+                                WebStatsBreakdown.DeviceType
+                            ),
+                            createTableTab(
+                                TileId.DEVICES,
+                                DeviceTab.BROWSER,
+                                'Browsers',
+                                'Browser',
+                                WebStatsBreakdown.Browser
+                            ),
+                            createTableTab(TileId.DEVICES, DeviceTab.OS, 'OS', 'OS', WebStatsBreakdown.OS),
+                            createTableTab(
+                                TileId.DEVICES,
+                                DeviceTab.VIEWPORT,
+                                'Viewports',
+                                'Viewport',
+                                WebStatsBreakdown.Viewport
+                            ),
+                        ],
+                    },
+
+                    {
+                        kind: 'tabs',
+                        tileId: TileId.GEOGRAPHY,
+                        layout: {
+                            colSpanClassName: 'md:col-span-full',
+                        },
+                        activeTabId:
+                            geographyTab || (shouldShowGeoIPQueries ? GeographyTab.MAP : GeographyTab.LANGUAGES),
+                        setTabId: actions.setGeographyTab,
+                        tabs: (
+                            [
+                                shouldShowGeoIPQueries
+                                    ? {
+                                          id: GeographyTab.MAP,
+                                          title: 'World map',
+                                          linkText: 'Map',
+                                          query: {
+                                              kind: NodeKind.InsightVizNode,
+                                              source: {
+                                                  kind: NodeKind.TrendsQuery,
+                                                  breakdownFilter: {
+                                                      // use the event level country code rather than person, to work better with personless users
+                                                      breakdown: '$geoip_country_code',
+                                                      breakdown_type: 'event',
+                                                  },
+                                                  dateRange,
+                                                  series: [
+                                                      {
+                                                          event: '$pageview',
+                                                          name: 'Pageview',
+                                                          kind: NodeKind.EventsNode,
+                                                          math: BaseMathType.UniqueUsers,
+                                                      },
+                                                  ],
+                                                  trendsFilter: {
+                                                      display: ChartDisplayType.WorldMap,
+                                                  },
+                                                  conversionGoal,
+                                                  filterTestAccounts,
+                                                  properties: webAnalyticsFilters,
+                                                  tags: WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+                                              },
+                                              hidePersonsModal: true,
+                                              embedded: true,
+                                          },
+                                          insightProps: createInsightProps(TileId.GEOGRAPHY, GeographyTab.MAP),
+                                          canOpenInsight: true,
+                                      }
+                                    : null,
+                                shouldShowGeoIPQueries && featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_REGIONS_MAP]
+                                    ? {
+                                          id: GeographyTab.REGIONS_MAP,
+                                          title: 'Regions Map',
+                                          linkText: 'Regions Map',
+                                          query: {
+                                              kind: NodeKind.InsightVizNode,
+                                              source: {
+                                                  kind: NodeKind.TrendsQuery,
+                                                  breakdownFilter: {
+                                                      breakdowns: [
+                                                          { property: '$geoip_country_code', type: 'event' },
+                                                          { property: '$geoip_subdivision_1_code', type: 'event' },
+                                                      ],
+                                                  },
+                                                  dateRange,
+                                                  series: [
+                                                      {
+                                                          event: '$pageview',
+                                                          name: 'Pageview',
+                                                          kind: NodeKind.EventsNode,
+                                                          math: BaseMathType.UniqueUsers,
+                                                      },
+                                                  ],
+                                                  trendsFilter: {
+                                                      display: ChartDisplayType.WorldMap,
+                                                  },
+                                                  conversionGoal,
+                                                  filterTestAccounts,
+                                                  properties: webAnalyticsFilters,
+                                                  tags: WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+                                              },
+                                              hidePersonsModal: true,
+                                              embedded: true,
+                                          },
+                                          insightProps: createInsightProps(TileId.GEOGRAPHY, GeographyTab.REGIONS_MAP),
+                                          canOpenInsight: true,
+                                      }
+                                    : null,
+                                shouldShowGeoIPQueries
+                                    ? createTableTab(
+                                          TileId.GEOGRAPHY,
+                                          GeographyTab.COUNTRIES,
+                                          'Countries',
+                                          'Countries',
+                                          WebStatsBreakdown.Country
+                                      )
+                                    : null,
+                                shouldShowGeoIPQueries
+                                    ? createTableTab(
+                                          TileId.GEOGRAPHY,
+                                          GeographyTab.REGIONS,
+                                          'Regions',
+                                          'Regions',
+                                          WebStatsBreakdown.Region
+                                      )
+                                    : null,
+                                shouldShowGeoIPQueries
+                                    ? createTableTab(
+                                          TileId.GEOGRAPHY,
+                                          GeographyTab.CITIES,
+                                          'Cities',
+                                          'Cities',
+                                          WebStatsBreakdown.City
+                                      )
+                                    : null,
+                                createTableTab(
+                                    TileId.GEOGRAPHY,
+                                    GeographyTab.LANGUAGES,
+                                    'Languages',
+                                    'Languages',
+                                    WebStatsBreakdown.Language
+                                ),
+                                createTableTab(
+                                    TileId.GEOGRAPHY,
+                                    GeographyTab.TIMEZONES,
+                                    'Timezones',
+                                    'Timezones',
+                                    WebStatsBreakdown.Timezone
+                                ),
+                            ] as (TabsTileTab | null)[]
+                        ).filter(isNotNil),
+                    },
+                    !conversionGoal
+                        ? {
+                              kind: 'query',
+                              tileId: TileId.RETENTION,
+                              title: 'Retention',
+                              layout: {
+                                  colSpanClassName: 'md:col-span-2',
+                              },
+                              query: {
+                                  kind: NodeKind.InsightVizNode,
+                                  source: {
+                                      kind: NodeKind.RetentionQuery,
+                                      properties: webAnalyticsFilters,
+                                      dateRange,
+                                      filterTestAccounts,
+                                      retentionFilter: {
+                                          retentionType: RETENTION_FIRST_OCCURRENCE_MATCHING_FILTERS,
+                                          retentionReference: 'total',
+                                          totalIntervals: isGreaterThanMd ? 8 : 5,
+                                          period: RetentionPeriod.Week,
+                                      },
+                                      tags: WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+                                  },
+                                  vizSpecificOptions: {
+                                      [InsightType.RETENTION]: {
+                                          hideLineGraph: true,
+                                          hideSizeColumn: !isGreaterThanMd,
+                                          useSmallLayout: !isGreaterThanMd,
+                                      },
+                                  },
+                                  embedded: true,
+                              },
+                              insightProps: createInsightProps(TileId.RETENTION),
+                              canOpenInsight: true,
+                              canOpenModal: true,
+                              docs: {
+                                  url: 'https://posthog.com/docs/web-analytics/dashboard#retention',
+                                  title: 'Retention',
+                                  description: (
+                                      <>
+                                          <div>
+                                              <p>
+                                                  Retention creates a cohort of unique users who performed any event for
+                                                  the first time in the last week. It then tracks the percentage of
+                                                  users who return to perform any event in the following weeks.
+                                              </p>
+                                              <p>
+                                                  You want the numbers to be the highest possible, suggesting that
+                                                  people that come to your page continue coming to your page - and
+                                                  performing an actions. Also, the further down the table the higher the
+                                                  numbers should be (or at least as high), which would indicate that
+                                                  you're either increasing or keeping your retention at the same level.
+                                              </p>
+                                          </div>
+                                      </>
+                                  ),
+                              },
+                          }
+                        : null,
+                    {
+                        kind: 'tabs',
+                        tileId: TileId.ACTIVE_HOURS,
+                        layout: {
+                            colSpanClassName: 'md:col-span-full',
+                        },
+                        activeTabId: activeHoursTab,
+                        setTabId: actions.setActiveHoursTab,
+                        tabs: [
+                            {
+                                id: ActiveHoursTab.UNIQUE,
+                                title: 'Active Hours',
+                                linkText: 'Unique users',
+                                canOpenModal: true,
+                                canOpenInsight: !!featureFlags[FEATURE_FLAGS.CALENDAR_HEATMAP_INSIGHT],
+                                query: {
+                                    kind: NodeKind.InsightVizNode,
+                                    source: {
+                                        kind: NodeKind.TrendsQuery,
+                                        series: [
+                                            {
+                                                kind: NodeKind.EventsNode,
+                                                event: '$pageview',
+                                                name: '$pageview',
+                                                math: BaseMathType.UniqueUsers,
+                                                properties: webAnalyticsFilters,
+                                            },
+                                        ],
+                                        dateRange,
+                                        conversionGoal,
+                                        tags: WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+                                        trendsFilter: {
+                                            display: ChartDisplayType.CalendarHeatmap,
+                                        },
+                                        // Web overview attributes session metrics to the session's start hour;
+                                        // mirror that here so visitor counts line up across the dashboard.
+                                        calendarHeatmapFilter: {
+                                            bucketBySessionStart: true,
+                                        },
+                                    },
+                                },
+                                docs: {
+                                    url: 'https://posthog.com/docs/web-analytics/dashboard#active-hours',
+                                    title: 'Active hours - Unique users',
+                                    description: (
+                                        <>
+                                            <div>
+                                                <p>
+                                                    Active hours displays a heatmap showing the number of unique users
+                                                    who performed any pageview event, broken down by hour of the day and
+                                                    day of the week.
+                                                </p>
+                                                <p>
+                                                    Each cell represents the number of unique users during a specific
+                                                    hour of a specific day. The "All" column aggregates totals for each
+                                                    day, and the bottom row aggregates totals for each hour. The
+                                                    bottom-right cell shows the grand total. The displayed time is based
+                                                    on your project's date and time settings (UTC by default,
+                                                    configurable in{' '}
+                                                    <Link
+                                                        to={urls.settings('environment-customization', 'date-and-time')}
+                                                    >
+                                                        project settings
+                                                    </Link>
+                                                    ).
+                                                </p>
+                                                <p>
+                                                    <strong>Note:</strong> Selecting a time range longer than 7 days
+                                                    will include additional occurrences of weekdays and hours,
+                                                    potentially increasing the user counts in those buckets. For best
+                                                    results, select 7 closed days or multiple of 7 closed day ranges.
+                                                </p>
+                                            </div>
+                                        </>
+                                    ),
+                                },
+                                insightProps: createInsightProps(TileId.ACTIVE_HOURS, ActiveHoursTab.UNIQUE),
+                            },
+                            {
+                                id: ActiveHoursTab.TOTAL_EVENTS,
+                                title: 'Active Hours',
+                                linkText: 'Total pageviews',
+                                canOpenModal: true,
+                                canOpenInsight: !!featureFlags[FEATURE_FLAGS.CALENDAR_HEATMAP_INSIGHT],
+                                query: {
+                                    kind: NodeKind.InsightVizNode,
+                                    source: {
+                                        kind: NodeKind.TrendsQuery,
+                                        series: [
+                                            {
+                                                kind: NodeKind.EventsNode,
+                                                event: '$pageview',
+                                                name: '$pageview',
+                                                math: BaseMathType.TotalCount,
+                                                properties: webAnalyticsFilters,
+                                            },
+                                        ],
+                                        dateRange,
+                                        conversionGoal,
+                                        trendsFilter: {
+                                            display: ChartDisplayType.CalendarHeatmap,
+                                        },
+                                        tags: WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+                                    },
+                                },
+                                docs: {
+                                    url: 'https://posthog.com/docs/web-analytics/dashboard#active-hours',
+                                    title: 'Active hours - Total pageviews',
+                                    description: (
+                                        <>
+                                            <div>
+                                                <p>
+                                                    Active hours displays a heatmap showing the total number of
+                                                    pageviews, broken down by hour of the day and day of the week.
+                                                </p>
+                                                <p>
+                                                    Each cell represents the number of total pageviews during a specific
+                                                    hour of a specific day. The "All" column aggregates totals for each
+                                                    day, and the bottom row aggregates totals for each hour. The
+                                                    bottom-right cell shows the grand total. The displayed time is based
+                                                    on your project's date and time settings (UTC by default,
+                                                    configurable in{' '}
+                                                    <Link
+                                                        to={urls.settings('environment-customization', 'date-and-time')}
+                                                    >
+                                                        project settings
+                                                    </Link>
+                                                    ).
+                                                </p>
+                                                <p>
+                                                    <strong>Note:</strong> Selecting a time range longer than 7 days
+                                                    will include additional occurrences of weekdays and hours,
+                                                    potentially increasing the user counts in those buckets. For best
+                                                    results, select 7 closed days or multiple of 7 closed day ranges.
+                                                </p>
+                                            </div>
+                                        </>
+                                    ),
+                                },
+                                insightProps: createInsightProps(TileId.ACTIVE_HOURS, ActiveHoursTab.TOTAL_EVENTS),
+                            },
+                        ],
+                    },
+                    // Hiding if conversionGoal is set already because values aren't representative
+                    !conversionGoal
+                        ? {
+                              kind: 'query',
+                              tileId: TileId.GOALS,
+                              title: 'Goals',
+                              layout: {
+                                  colSpanClassName: 'md:col-span-2',
+                              },
+                              query: {
+                                  full: true,
+                                  kind: NodeKind.DataTableNode,
+                                  source: {
+                                      kind: NodeKind.WebGoalsQuery,
+                                      properties: webAnalyticsFilters,
+                                      dateRange,
+                                      compareFilter,
+                                      sampling,
+                                      limit: 10,
+                                      orderBy: tablesOrderBy ?? undefined,
+                                      filterTestAccounts,
+                                      tags: WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+                                      // Backend gate decides whether this query is actually served
+                                      // from the precomputed table; we just pass the per-team opt-in.
+                                      useWebAnalyticsPrecompute,
+                                  },
+                                  embedded: true,
+                                  showActions: true,
+                                  columns: ['breakdown_value', 'visitors', 'views', 'cross_sell'],
+                              },
+                              insightProps: createInsightProps(TileId.GOALS),
+                              canOpenInsight: false,
+                              extraMenuItems: useTileHeaderV2
+                                  ? [
+                                        {
+                                            label: 'Manage actions',
+                                            icon: <IconOpenInNew />,
+                                            to: urls.actions(),
+                                            onClick: () => {
+                                                void addProductIntentForCrossSell({
+                                                    from: ProductKey.WEB_ANALYTICS,
+                                                    to: ProductKey.ACTIONS,
+                                                    intent_context: ProductIntentContext.WEB_ANALYTICS_INSIGHT,
+                                                })
+                                            },
+                                        },
+                                    ]
+                                  : undefined,
+                              docs: {
+                                  url: 'https://posthog.com/docs/web-analytics/dashboard#goals',
+                                  title: 'Goals',
+                                  description: (
+                                      <>
+                                          <div>
+                                              <p>
+                                                  Goals shows your pinned or most recently created actions and the
+                                                  number of conversions they've had. You can set a custom event or
+                                                  action as a{' '}
+                                                  <Link to="https://posthog.com/docs/web-analytics/conversion-goals">
+                                                      conversion goal
+                                                  </Link>{' '}
+                                                  at the top of the dashboard for more specific metrics.
+                                              </p>
+                                          </div>
+                                      </>
+                                  ),
+                              },
+                          }
+                        : null,
+                    !conversionGoal
+                        ? {
+                              kind: 'replay',
+                              tileId: TileId.REPLAY,
+                              layout: {
+                                  colSpanClassName: conversionGoal ? 'md:col-span-full' : 'md:col-span-1',
+                              },
+                              docs: {
+                                  url: 'https://posthog.com/docs/session-replay',
+                                  title: 'Session Replay',
+                                  description:
+                                      'Play back sessions to diagnose UI issues, improve support, and get context for nuanced user behavior.',
+                              },
+                          }
+                        : null,
+                    !conversionGoal && errorTrackingQ
+                        ? {
+                              kind: 'error_tracking',
+                              tileId: TileId.ERROR_TRACKING,
+                              layout: {
+                                  colSpanClassName: 'md:col-span-1',
+                              },
+                              query: errorTrackingQ,
+                              docs: {
+                                  url: 'https://posthog.com/docs/error-tracking',
+                                  title: 'Error Tracking',
+                                  description: (
+                                      <>
+                                          <div>
+                                              <p>
+                                                  Error tracking allows you to track, investigate, and resolve
+                                                  exceptions your customers face.
+                                              </p>
+                                              <p>
+                                                  Errors are captured as <code>$exception</code> events which means that
+                                                  you can create insights, filter recordings and trigger surveys based
+                                                  on them exactly the same way you can for any other type of event.
+                                              </p>
+                                          </div>
+                                      </>
+                                  ),
+                              },
+                          }
+                        : null,
+                    !conversionGoal
+                        ? {
+                              kind: 'query',
+                              title: 'Frustrating Pages',
+                              tileId: TileId.FRUSTRATING_PAGES,
+                              layout: {
+                                  colSpanClassName: 'md:col-span-2',
+                              },
+                              query: {
+                                  full: true,
+                                  kind: NodeKind.DataTableNode,
+                                  source: {
+                                      kind: NodeKind.WebStatsTableQuery,
+                                      breakdownBy: WebStatsBreakdown.FrustrationMetrics,
+                                      dateRange,
+                                      filterTestAccounts,
+                                      properties: webAnalyticsFilters,
+                                      compareFilter,
+                                      limit: 10,
+                                      doPathCleaning: isPathCleaningEnabled,
+                                      tags: WEB_ANALYTICS_DEFAULT_QUERY_TAGS,
+                                      // The backend frustration lazy precompute gate decides whether
+                                      // this query is actually served from the precomputed table; we
+                                      // just pass the per-team opt-in through so it's eligible.
+                                      useWebAnalyticsPrecompute,
+                                  },
+                                  embedded: true,
+                                  showActions: true,
+                                  hiddenColumns: ['views'],
+                              },
+                              insightProps: createInsightProps(TileId.FRUSTRATING_PAGES, 'table'),
+                              canOpenModal: true,
+                              canOpenInsight: true,
+                              docs: {
+                                  title: 'Frustrating Pages',
+                                  description: (
+                                      <>
+                                          <div>
+                                              <p>
+                                                  See which pages are causing frustration by monitoring rage clicks,
+                                                  dead clicks, and errors.
+                                              </p>
+                                              <p>
+                                                  <ul>
+                                                      <li>
+                                                          A dead click is a click that doesn't result in any action.
+                                                          E.g. an image that looks like a button.
+                                                      </li>
+                                                      <li>
+                                                          Rageclicks are collected when a user clicks on a static
+                                                          element more than three times in a one-second window.
+                                                      </li>
+                                                      <li>
+                                                          Errors are JavaScript exceptions that occur when users
+                                                          interact with your site.
+                                                      </li>
+                                                  </ul>
+                                              </p>
+                                              <p>
+                                                  These are captured automatically and can help identify broken
+                                                  functionality, failed API calls, or other technical issues that
+                                                  frustrate users.
+                                              </p>
+                                          </div>
+                                      </>
+                                  ),
+                              },
+                          }
+                        : null,
+                ]
+
+                // Bot analytics tiles live in `botAnalyticsLogic` so the bot tab keeps its own
+                // filter state. `MainContent` reads them directly when productTab === BOT_ANALYTICS.
+                if (productTab === ProductTab.BOT_ANALYTICS) {
+                    return []
+                }
+
+                return allTiles
+                    .filter(isNotNil)
+                    .filter((tile) =>
+                        preAggregatedEnabled ? TILES_ALLOWED_ON_PRE_AGGREGATED.includes(tile.tileId) : true
+                    )
+                    .filter((tile) => !hiddenTiles.includes(tile.tileId))
+            },
+        ],
+        getNewInsightUrl: [(s) => [s.tiles], (tiles: WebAnalyticsTile[]) => getNewInsightUrlFactory(tiles)],
+    })),
+
+    // start the loaders after mounting the logic
+    afterMount(({ actions }) => {
+        actions.loadShouldShowGeoIPQueries()
+    }),
+
+    trackedActionToUrl(({ values, cache }) => {
+        const buildStateUrl = (): string => {
+            const urlParams = new URLSearchParams(router.values.location.search)
+
+            const {
+                rawWebAnalyticsFilters,
+                conversionGoal,
+                dateFilter: { dateTo, dateFrom, interval },
+                _sourceTab,
+                _deviceTab,
+                _pathTab,
+                _geographyTab,
+                _graphsTab,
+                isPathCleaningEnabled,
+                shouldFilterTestAccounts,
+                compareFilter,
+                productTab,
+                webVitalsPercentile,
+                domainFilter,
+                deviceTypeFilter,
+                tileVisualizations,
+                includeHostPath,
+            } = values
+
+            // These tabs don't support any filters, so we can just return the base path to keep the url clean
+            if (productTab === ProductTab.HEALTH) {
+                return urls.webAnalyticsHealth()
+            } else if (productTab === ProductTab.LIVE) {
+                return '/web/live'
+            } else if (productTab === ProductTab.BOT_ANALYTICS) {
+                // Bot tab maintains its own filter state in `botAnalyticsLogic`, so we serialize
+                // those filters here instead of `rawWebAnalyticsFilters` (which only describes the
+                // regular Analytics tab). Date/interval are shared across tabs.
+                const rawBotAnalyticsFilters = botAnalyticsLogic.findMounted()?.values.rawBotAnalyticsFilters ?? []
+                if (rawBotAnalyticsFilters.length > 0) {
+                    urlParams.set('filters', JSON.stringify(rawBotAnalyticsFilters))
+                }
+                if (dateFrom !== INITIAL_DATE_FROM || dateTo !== INITIAL_DATE_TO || interval !== INITIAL_INTERVAL) {
+                    urlParams.set('date_from', dateFrom ?? '')
+                    urlParams.set('date_to', dateTo ?? '')
+                    urlParams.set('interval', interval ?? '')
+                }
+                return `/web/bots${urlParams.toString() ? '?' + urlParams.toString() : ''}`
+            }
+
+            // Make sure we're storing the raw filters only, or else we'll have issues with the domain/device type filters
+            // spreading from their individual dropdowns to the global filters list
+            if (rawWebAnalyticsFilters.length > 0) {
+                urlParams.set('filters', JSON.stringify(rawWebAnalyticsFilters))
+            } else {
+                urlParams.delete('filters')
+            }
+            if (conversionGoal) {
+                if ('actionId' in conversionGoal) {
+                    urlParams.set('conversionGoal.actionId', conversionGoal.actionId.toString())
+                } else {
+                    urlParams.set('conversionGoal.customEventName', conversionGoal.customEventName)
+                }
+            } else {
+                urlParams.delete('conversionGoal.actionId')
+                urlParams.delete('conversionGoal.customEventName')
+            }
+            if (dateFrom !== INITIAL_DATE_FROM || dateTo !== INITIAL_DATE_TO || interval !== INITIAL_INTERVAL) {
+                urlParams.set('date_from', dateFrom ?? '')
+                urlParams.set('date_to', dateTo ?? '')
+                urlParams.set('interval', interval ?? '')
+            }
+            if (_deviceTab) {
+                urlParams.set('device_tab', _deviceTab)
+            }
+            if (_sourceTab) {
+                urlParams.set('source_tab', _sourceTab)
+            }
+            if (_graphsTab) {
+                urlParams.set('graphs_tab', _graphsTab)
+            }
+            if (_pathTab) {
+                urlParams.set('path_tab', _pathTab)
+            }
+            if (_geographyTab) {
+                urlParams.set('geography_tab', _geographyTab)
+            }
+            if (isPathCleaningEnabled != null) {
+                urlParams.set('path_cleaning', isPathCleaningEnabled.toString())
+            }
+            if (shouldFilterTestAccounts != null) {
+                urlParams.set('filter_test_accounts', shouldFilterTestAccounts.toString())
+            }
+            if (compareFilter) {
+                urlParams.set('compare_filter', JSON.stringify(compareFilter))
+            } else {
+                urlParams.delete('compare_filter')
+            }
+
+            if (productTab === ProductTab.WEB_VITALS) {
+                urlParams.set('percentile', webVitalsPercentile)
+            }
+            if (domainFilter) {
+                urlParams.set('domain', domainFilter)
+            }
+            if (deviceTypeFilter) {
+                urlParams.set('device_type', deviceTypeFilter)
+            } else {
+                urlParams.delete('device_type')
+            }
+            if (tileVisualizations) {
+                urlParams.set('tile_visualizations', JSON.stringify(tileVisualizations))
+            }
+            if (includeHostPath) {
+                urlParams.set('include_host_path', 'true')
+            } else {
+                urlParams.delete('include_host_path')
+            }
+
+            let basePath = '/web'
+            if (productTab === ProductTab.PAGE_REPORTS) {
+                basePath = '/web/page-reports'
+            } else if (productTab === ProductTab.WEB_VITALS) {
+                basePath = '/web/web-vitals'
+            }
+
+            return `${basePath}${urlParams.toString() ? '?' + urlParams.toString() : ''}`
+        }
+
+        // Exposed so `urlToAction` can reconcile the URL against the restored state in a single write once
+        // restoration finishes (see `reconcileUrlAfterRestore`), without re-implementing this serialization.
+        cache.buildStateUrl = buildStateUrl
+
+        const stateToUrl = (): string | undefined => {
+            // While `urlToAction` is applying state from the URL, the actions it dispatches would each
+            // re-enter `actionToUrl` and recompute the (already-current) URL. Returning `undefined` here
+            // tells kea-router to skip the write, breaking the actionToUrl <-> urlToAction cascade that
+            // otherwise fires a burst of redundant evaluations and trips the rapid-URL-change detector.
+            // A single corrective write is emitted afterwards by `reconcileUrlAfterRestore`.
+            if (cache.applyUrlStateDepth > 0) {
+                return undefined
+            }
+            return buildStateUrl()
+        }
+
+        return {
+            setWebAnalyticsFilters: stateToUrl,
+            togglePropertyFilter: stateToUrl,
+            setConversionGoal: stateToUrl,
+            setDates: stateToUrl,
+            setDateInterval: stateToUrl,
+            setDeviceTab: stateToUrl,
+            setSourceTab: stateToUrl,
+            setGraphsTab: stateToUrl,
+            setPathTab: stateToUrl,
+            setGeographyTab: stateToUrl,
+            setActiveHoursTab: stateToUrl,
+            setCompareFilter: stateToUrl,
+            setProductTab: stateToUrl,
+            setWebVitalsPercentile: stateToUrl,
+            setIsPathCleaningEnabled: stateToUrl,
+            setDomainFilter: stateToUrl,
+            setDeviceTypeFilter: stateToUrl,
+            setTileVisualization: stateToUrl,
+            setIncludeHostPath: stateToUrl,
+        }
+    }),
+
+    urlToAction(({ actions, values, cache }) => {
+        const applyUrlState = (
+            { productTab = ProductTab.ANALYTICS }: { productTab?: ProductTab },
+            {
+                filters,
+                'conversionGoal.actionId': conversionGoalActionId,
+                'conversionGoal.customEventName': conversionGoalCustomEventName,
+                date_from,
+                date_to,
+                interval,
+                device_tab,
+                source_tab,
+                graphs_tab,
+                path_tab,
+                geography_tab,
+                active_hours_tab,
+                path_cleaning,
+                filter_test_accounts,
+                compare_filter,
+                percentile,
+                domain,
+                device_type,
+                tile_visualizations,
+                include_host_path,
+            }: Record<string, any>
+        ): void => {
+            if (
+                ![
+                    ProductTab.ANALYTICS,
+                    ProductTab.WEB_VITALS,
+                    ProductTab.PAGE_REPORTS,
+                    ProductTab.HEALTH,
+                    ProductTab.LIVE,
+                    ProductTab.BOT_ANALYTICS,
+                ].includes(productTab)
+            ) {
+                return
+            }
+
+            // Redirect away from bot analytics tab if the feature flag is disabled
+            if (
+                productTab === ProductTab.BOT_ANALYTICS &&
+                !values.featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_BOT_ANALYSIS]
+            ) {
+                router.actions.replace(urls.webAnalytics())
+                return
+            }
+
+            // Stamp the last-used timestamp for feature flag targeting (throttled to once per day per browser).
+            const stampKey = `ph_last_web_analytics_stamp_${posthog.get_distinct_id()}`
+            const oneDayMs = 24 * 60 * 60 * 1000
+            const lastStamp = Number(localStorage.getItem(stampKey) || 0)
+            if (Date.now() - lastStamp > oneDayMs) {
+                posthog.setPersonProperties({ last_used_web_analytics_at: new Date().toISOString() })
+                localStorage.setItem(stampKey, Date.now().toString())
+            }
+
+            const parsedFilters = filters ? (isWebAnalyticsPropertyFilters(filters) ? filters : []) : undefined
+            if (parsedFilters) {
+                if (productTab === ProductTab.BOT_ANALYTICS) {
+                    const botLogic = botAnalyticsLogic.findMounted()
+                    if (botLogic && !objectsEqual(parsedFilters, botLogic.values.rawBotAnalyticsFilters)) {
+                        botLogic.actions.setBotAnalyticsFilters(parsedFilters)
+                    }
+                } else if (!objectsEqual(parsedFilters, values.rawWebAnalyticsFilters)) {
+                    actions.setWebAnalyticsFilters(parsedFilters)
+                }
+            }
+            if (
+                conversionGoalActionId &&
+                conversionGoalActionId !== (values.conversionGoal as ActionConversionGoal)?.actionId
+            ) {
+                actions.setConversionGoal({ actionId: parseInt(conversionGoalActionId, 10) })
+            } else if (
+                conversionGoalCustomEventName &&
+                conversionGoalCustomEventName !== (values.conversionGoal as CustomEventConversionGoal)?.customEventName
+            ) {
+                actions.setConversionGoal({ customEventName: conversionGoalCustomEventName })
+            }
+            if (
+                (date_from && date_from !== values.dateFilter.dateFrom) ||
+                (date_to && date_to !== values.dateFilter.dateTo) ||
+                (interval && interval !== values.dateFilter.interval)
+            ) {
+                actions.setPreZoomDateFilter(null)
+                actions.setDatesAndInterval(date_from, date_to, interval)
+            }
+            if (device_tab && device_tab !== values._deviceTab) {
+                actions.setDeviceTab(device_tab)
+            }
+            if (source_tab && source_tab !== values._sourceTab) {
+                actions.setSourceTab(source_tab)
+            }
+            if (graphs_tab && graphs_tab !== values._graphsTab) {
+                actions.setGraphsTab(graphs_tab)
+            }
+            if (path_tab && path_tab !== values._pathTab) {
+                actions.setPathTab(path_tab)
+            }
+            if (geography_tab && geography_tab !== values._geographyTab) {
+                actions.setGeographyTab(geography_tab)
+            }
+            if (active_hours_tab && active_hours_tab !== values._activeHoursTab) {
+                actions.setActiveHoursTab(active_hours_tab)
+            }
+            if (path_cleaning && path_cleaning !== values.isPathCleaningEnabled) {
+                actions.setIsPathCleaningEnabled([true, 'true', 1, '1'].includes(path_cleaning))
+            }
+            if (filter_test_accounts && filter_test_accounts !== values.shouldFilterTestAccounts) {
+                actions.setShouldFilterTestAccounts([true, 'true', 1, '1'].includes(filter_test_accounts))
+            }
+            if (
+                compare_filter &&
+                isCompareFilter(compare_filter) &&
+                !objectsEqual(compare_filter, values.compareFilter)
+            ) {
+                actions.setCompareFilter(compare_filter)
+            }
+            if (productTab && productTab !== values.productTab) {
+                actions.setProductTab(productTab)
+            }
+            if (percentile && percentile !== values.webVitalsPercentile) {
+                actions.setWebVitalsPercentile(percentile as WebVitalsPercentile)
+            }
+            if (domain && domain !== values.domainFilter) {
+                actions.setDomainFilter(domain === 'all' ? null : domain)
+            }
+            if (device_type && device_type !== values.deviceTypeFilter) {
+                actions.setDeviceTypeFilter(device_type)
+            }
+            if (tile_visualizations && !objectsEqual(tile_visualizations, values.tileVisualizations)) {
+                for (const [tileId, visualization] of Object.entries(tile_visualizations)) {
+                    actions.setTileVisualization(tileId as TileId, visualization as TileVisualizationOption)
+                }
+            }
+            if (include_host_path !== undefined) {
+                const parsed = [true, 'true', 1, '1'].includes(include_host_path)
+                if (parsed !== values.includeHostPath) {
+                    actions.setIncludeHostPath(parsed)
+                }
+            }
+        }
+
+        // Reconcile the URL with the restored state in a single write. Restoring can normalise state that
+        // the incoming URL contradicts — e.g. a conversion goal coerces an incompatible `graphs_tab` onto a
+        // conversion-compatible tab. The per-action `actionToUrl` writes are suppressed during restore (see
+        // `stateToUrl`), so without this the visible chart state and the shareable/reload URL would diverge.
+        // Only fire when a param the URL actually carried no longer matches the restored state, so a plain
+        // restore doesn't rewrite the URL with canonical-only defaults.
+        const reconcileUrlAfterRestore = (): void => {
+            const canonicalUrl = cache.buildStateUrl?.()
+            if (!canonicalUrl) {
+                return
+            }
+            const queryStart = canonicalUrl.indexOf('?')
+            const canonicalParams = new URLSearchParams(queryStart === -1 ? '' : canonicalUrl.slice(queryStart + 1))
+            const currentParams = new URLSearchParams(router.values.location.search)
+            let diverged = false
+            currentParams.forEach((value, key) => {
+                // Only a param that restoration re-serialized to a *different* value is a genuine
+                // correction (e.g. `graphs_tab`). A param the current tab simply doesn't serialize back
+                // (e.g. `percentile` outside web vitals) is left untouched, so a plain restore is a no-op.
+                const canonicalValue = canonicalParams.get(key)
+                if (canonicalValue !== null && canonicalValue !== value) {
+                    diverged = true
+                }
+            })
+            if (diverged) {
+                router.actions.replace(canonicalUrl)
+            }
+        }
+
+        // Guard the state-restoration so the actions it dispatches don't write back to the URL via
+        // `actionToUrl` (see `stateToUrl`). Restoring a URL with several params would otherwise fan out
+        // into a burst of redundant URL evaluations and trip the rapid-URL-change detector. The depth
+        // counter keeps the guard correct if a restore re-enters (e.g. the bots-flag redirect).
+        const toAction = (params: { productTab?: ProductTab }, searchParams: Record<string, any>): void => {
+            cache.applyUrlStateDepth = (cache.applyUrlStateDepth ?? 0) + 1
+            try {
+                applyUrlState(params, searchParams)
+            } finally {
+                cache.applyUrlStateDepth -= 1
+            }
+            // Only reconcile once unwound to the outermost restore, so a nested restore doesn't fire its own.
+            if (cache.applyUrlStateDepth === 0) {
+                reconcileUrlAfterRestore()
+            }
+        }
+
+        return {
+            '/web': toAction,
+            '/web/bots': (_, searchParams) => {
+                toAction({ productTab: ProductTab.BOT_ANALYTICS }, searchParams)
+            },
+            '/web/:productTab': toAction,
+        }
+    }),
+
+    listeners(({ values, actions }) => {
+        const checkGraphsTabIsCompatibleWithConversionGoal = (
+            tab: string,
+            conversionGoal: WebAnalyticsConversionGoal | null
+        ): void => {
+            if (conversionGoal) {
+                if (
+                    tab === GraphsTab.PAGE_VIEWS ||
+                    tab === GraphsTab.NUM_SESSION ||
+                    tab === GraphsTab.SESSION_DURATION ||
+                    tab === GraphsTab.BOUNCE_RATE
+                ) {
+                    actions.setGraphsTab(GraphsTab.UNIQUE_USERS)
+                }
+            } else {
+                if (
+                    tab === GraphsTab.TOTAL_CONVERSIONS ||
+                    tab === GraphsTab.CONVERSION_RATE ||
+                    tab === GraphsTab.UNIQUE_CONVERSIONS
+                ) {
+                    actions.setGraphsTab(GraphsTab.UNIQUE_USERS)
+                }
+            }
+        }
+
+        return {
+            setDates: ({ dateFrom, dateTo }) => {
+                eventUsageLogic.actions.reportWebAnalyticsDateRangeChanged({
+                    date_from: dateFrom,
+                    date_to: dateTo,
+                    interval: values.dateFilter.interval,
+                })
+                globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.FilterWebAnalytics)
+            },
+            setDatesAndInterval: ({ dateFrom, dateTo, interval }) => {
+                eventUsageLogic.actions.reportWebAnalyticsDateRangeChanged({
+                    date_from: dateFrom,
+                    date_to: dateTo,
+                    interval,
+                })
+                globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.FilterWebAnalytics)
+            },
+            zoomIntoPeriod: ({ dateFrom, dateTo }) => {
+                if (values.preZoomDateFilter === null) {
+                    actions.setPreZoomDateFilter({
+                        dateFrom: values.dateFilter.dateFrom,
+                        dateTo: values.dateFilter.dateTo,
+                        interval: values.dateFilter.interval,
+                    })
+                }
+                actions.setDatesAndInterval(dateFrom, dateTo, getDefaultInterval(dateFrom, dateTo))
+            },
+            resetZoom: () => {
+                const preZoom = values.preZoomDateFilter
+                if (preZoom) {
+                    actions.setPreZoomDateFilter(null)
+                    actions.setDatesAndInterval(preZoom.dateFrom, preZoom.dateTo, preZoom.interval)
+                }
+            },
+            setWebAnalyticsFilters: () => {
+                globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.FilterWebAnalytics)
+            },
+            setIsPathCleaningEnabled: ({ isPathCleaningEnabled }) => {
+                eventUsageLogic.actions.reportWebAnalyticsPathCleaningToggled({
+                    enabled: isPathCleaningEnabled,
+                })
+            },
+            setWebVitalsPercentile: () => {
+                eventUsageLogic.actions.reportWebAnalyticsFilterApplied({
+                    filter_type: 'percentile',
+                    total_filter_count: values.webAnalyticsFilters.length,
+                })
+            },
+            removeIncompatibleFilters: () => {
+                let compatibleFilters = values.rawWebAnalyticsFilters.filter(
+                    (filter) =>
+                        !values.incompatibleFilters.some(
+                            (incompatible) =>
+                                incompatible.key === filter.key &&
+                                incompatible.value === filter.value &&
+                                incompatible.operator === filter.operator &&
+                                incompatible.type === filter.type
+                        )
+                )
+
+                const convertedFilters: WebAnalyticsPropertyFilters = []
+                for (const filter of compatibleFilters) {
+                    const converted = convertCurrentURLFilter(filter)
+                    if (converted) {
+                        convertedFilters.push(...converted)
+                    } else {
+                        convertedFilters.push(filter)
+                    }
+                }
+
+                const hostFilters = convertedFilters.filter((f) => f.key === PROPERTY_HOST)
+                if (hostFilters.length > 1) {
+                    const dedupedFilters = convertedFilters.filter((f) => f.key !== PROPERTY_HOST)
+                    dedupedFilters.push(hostFilters[0])
+                    actions.setWebAnalyticsFilters(dedupedFilters)
+                } else {
+                    actions.setWebAnalyticsFilters(convertedFilters)
+                }
+            },
+            setProductTab: ({ tab }) => {
+                actions.cancelAllLoading()
+                if (tab === ProductTab.HEALTH) {
+                    actions.trackTabViewed()
+                }
+                if (tab === ProductTab.BOT_ANALYTICS && values.dateFilter.dateFrom === INITIAL_DATE_FROM) {
+                    actions.setDates('-1d', null)
+                }
+            },
+            openFocusModeModal: () => {
+                actions.setFocusModeDraftConcerns(values.focusModeConcerns)
+            },
+            markFocusModeOnboardingSeen: () => {
+                const teamId = values.currentTeam?.id
+                if (!teamId) {
+                    return
+                }
+                actions.updateUser({
+                    has_seen_product_intro_for: {
+                        ...values.user?.has_seen_product_intro_for,
+                        [getFocusModeOnboardingSeenKey(teamId)]: true,
+                    },
+                })
+            },
+            startFocusModeOnboarding: () => {
+                actions.markFocusModeOnboardingSeen()
+                eventUsageLogic.actions.reportWebAnalyticsFocusModeOnboardingStarted()
+                actions.openFocusModeModal(true)
+            },
+            dismissFocusModeOnboarding: () => {
+                actions.markFocusModeOnboardingSeen()
+                eventUsageLogic.actions.reportWebAnalyticsFocusModeOnboardingSkipped()
+            },
+            enterFocusMode: () => {
+                if (!values.showFocusMode || values.focusModeConcerns.length === 0) {
+                    return
+                }
+                actions.setHiddenTiles(computeFocusHiddenTiles(values.hiddenTiles, values.focusModeConcerns))
+                actions.setFocusModeEnabled(true)
+            },
+            exitFocusMode: () => {
+                const focusModeTileSet = new Set<TileId>(FOCUS_MODE_TILE_IDS)
+                actions.setHiddenTiles(values.hiddenTiles.filter((tileId) => !focusModeTileSet.has(tileId)))
+                actions.setFocusModeEnabled(false)
+            },
+            applyFocusMode: () => {
+                if (!values.showFocusMode || values.focusModeDraftConcerns.length === 0) {
+                    return
+                }
+                const wasOnboarding = values.focusModeModalIsOnboarding
+                const concernCount = values.focusModeDraftConcerns.length
+                actions.setFocusModeConcerns(values.focusModeDraftConcerns)
+                actions.setHiddenTiles(computeFocusHiddenTiles(values.hiddenTiles, values.focusModeDraftConcerns))
+                actions.setFocusModeEnabled(true)
+                actions.closeFocusModeModal()
+                if (wasOnboarding) {
+                    eventUsageLogic.actions.reportWebAnalyticsFocusModeOnboardingCompleted({
+                        concern_count: concernCount,
+                    })
+                }
+            },
+            setGraphsTab: ({ tab }) => {
+                checkGraphsTabIsCompatibleWithConversionGoal(tab, values.conversionGoal)
+            },
+            setConversionGoal: [
+                ({ conversionGoal }) => {
+                    checkGraphsTabIsCompatibleWithConversionGoal(values.graphsTab, conversionGoal)
+                },
+                ({ conversionGoal }, breakpoint) =>
+                    checkCustomEventConversionGoalHasSessionIdsHelper(
+                        conversionGoal,
+                        breakpoint,
+                        actions.setConversionGoalWarning
+                    ),
+                ({ conversionGoal }) => {
+                    let goalType: string | null = null
+                    if (conversionGoal && 'actionId' in conversionGoal) {
+                        goalType = 'action'
+                    } else if (conversionGoal && 'customEventName' in conversionGoal) {
+                        goalType = 'custom_event'
+                    }
+                    eventUsageLogic.actions.reportWebAnalyticsConversionGoalSet({ goal_type: goalType })
+                },
+                ({ conversionGoal }) => {
+                    if (conversionGoal) {
+                        globalSetupLogic
+                            .findMounted()
+                            ?.actions.markTaskAsCompleted(SetupTaskId.SetUpWebAnalyticsConversionGoals)
+                    }
+                },
+            ],
+            addAuthorizedUrl: ({ url }) => {
+                actions.setDomainFilter(url)
+            },
+            loadPreset: ({ filters }) => {
+                if (filters.dateFrom !== undefined || filters.dateTo !== undefined) {
+                    const interval = filters.interval ?? values.dateFilter.interval
+                    actions.setPreZoomDateFilter(null)
+                    actions.setDatesAndInterval(
+                        filters.dateFrom ?? values.dateFilter.dateFrom,
+                        filters.dateTo ?? values.dateFilter.dateTo,
+                        interval
+                    )
+                }
+                if (filters.conversionGoal !== undefined) {
+                    actions.setConversionGoal(filters.conversionGoal as WebAnalyticsConversionGoal)
+                }
+                if (filters.isPathCleaningEnabled !== undefined) {
+                    actions.setIsPathCleaningEnabled(filters.isPathCleaningEnabled)
+                }
+                if (filters.shouldFilterTestAccounts !== undefined) {
+                    actions.setShouldFilterTestAccounts(filters.shouldFilterTestAccounts)
+                }
+            },
+        }
+    }),
+    subscriptions(({ actions, values }) => ({
+        shouldAutoOpenFocusModeOnboarding: (shouldOpen: boolean) => {
+            if (shouldOpen && !values.focusModeOnboardingModalOpen) {
+                actions.openFocusModeOnboarding()
+                eventUsageLogic.actions.reportWebAnalyticsFocusModeOnboardingShown()
+            }
+        },
+    })),
+    afterMount(({ actions, values }) => {
+        checkCustomEventConversionGoalHasSessionIdsHelper(
+            values.conversionGoal,
+            undefined,
+            actions.setConversionGoalWarning
+        ).catch(() => {
+            // ignore, this warning is just a nice-to-have, no point showing an error to the user
+        })
+    }),
+])
+
+const checkCustomEventConversionGoalHasSessionIdsHelper = async (
+    conversionGoal: WebAnalyticsConversionGoal | null,
+    breakpoint: BreakPointFunction | undefined,
+    setConversionGoalWarning: (warning: ConversionGoalWarning | null) => void
+): Promise<void> => {
+    if (!conversionGoal || !('customEventName' in conversionGoal) || !conversionGoal.customEventName) {
+        setConversionGoalWarning(null)
+        return
+    }
+    const { customEventName } = conversionGoal
+    // check if we have any conversion events from the last week without sessions ids
+
+    const response = await hogqlQuery(
+        hogql`select count()
+              from events
+              where timestamp >= (now() - toIntervalHour(24))
+                AND ($session_id IS NULL
+                 OR $session_id = '')
+                AND event = {event}`,
+        { event: customEventName }
+    )
+    breakpoint?.()
+    const row = response.results[0]
+    if (row[0]) {
+        setConversionGoalWarning(ConversionGoalWarning.CustomEventWithNoSessionId)
+    } else {
+        setConversionGoalWarning(null)
+    }
+}

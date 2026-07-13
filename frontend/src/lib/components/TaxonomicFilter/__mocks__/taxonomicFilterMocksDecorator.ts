@@ -1,0 +1,70 @@
+import { mswDecorator } from '~/mocks/browser'
+import { mockActionDefinition } from '~/test/mocks'
+
+export const taxonomicFilterMocksDecorator = mswDecorator({
+    get: {
+        '/api/projects/:team_id/actions': { results: [mockActionDefinition] },
+        '/api/environments/:team_id/persons/properties': [
+            { id: 1, name: 'location', count: 1 },
+            { id: 2, name: 'role', count: 2 },
+            { id: 3, name: 'height', count: 3 },
+            { id: 4, name: '$browser', count: 4 },
+        ],
+        '/api/projects/:team_id/property_definitions': {
+            count: 6,
+            results: [
+                { id: 'file_count', name: 'file_count', count: 205 },
+                { id: 'industry', name: 'industry', count: 205 },
+                { id: 'name', name: 'name', count: 205 },
+                { id: 'plan', name: 'plan', count: 205 },
+                { id: 'team_size', name: 'team_size', count: 205 },
+                { id: 'used_mb', name: 'used_mb', count: 205 },
+            ],
+        },
+        '/api/projects/:team_id/event_definitions': [
+            {
+                id: 'a',
+                name: 'signed up',
+                description: 'signed up',
+                count: 101,
+            },
+            {
+                id: 'b',
+                name: 'viewed insights',
+                description: 'signed up',
+                count: 1,
+                verified: true,
+            },
+            {
+                id: 'c',
+                name: 'logged out',
+                description: 'signed up',
+                count: 103,
+            },
+        ],
+        '/api/environments/:team_id/events/values/': [
+            { name: 'https://example.com/page1' },
+            { name: 'https://example.com/page2' },
+            { name: 'https://example.com/page3' },
+        ],
+        '/api/environments/:team_id/persons/values/': [
+            { name: 'user@example.com' },
+            { name: 'admin@example.com' },
+            { name: 'test@example.com' },
+        ],
+        '/api/projects/:team_id/cohorts/': [
+            {
+                id: 1,
+                name: 'Properties Cohort',
+                count: 1,
+                groups: [{ id: 'a', name: 'Properties Group', count: 1, matchType: 'properties' }],
+            },
+            {
+                id: 2,
+                name: 'Entities Cohort',
+                count: 1,
+                groups: [{ id: 'b', name: 'Entities Group', count: 1, matchType: 'entities' }],
+            },
+        ],
+    },
+})

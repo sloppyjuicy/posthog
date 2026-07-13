@@ -1,0 +1,113 @@
+use common_types::{TeamId, TeamIdentifier};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::types::{Json, Uuid};
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, sqlx::FromRow)]
+pub struct Team {
+    pub id: TeamId,
+    pub name: String,
+    pub api_token: String,
+    pub uuid: Uuid,
+    pub organization_id: Option<Uuid>,
+    // The project (environment parent) this team belongs to. Django writes it into the team
+    // metadata cache payload; `#[serde(default)]` keeps cache entries written before the
+    // field existed deserializing (they get `None`, and the handler falls back to a query).
+    #[serde(default)]
+    pub project_id: Option<i64>,
+    pub autocapture_opt_out: Option<bool>,
+    pub autocapture_exceptions_opt_in: Option<bool>,
+    pub autocapture_web_vitals_opt_in: Option<bool>,
+    pub capture_performance_opt_in: Option<bool>,
+    pub capture_console_log_opt_in: Option<bool>,
+    pub logs_settings: Option<Json<serde_json::Value>>,
+    #[serde(default)]
+    pub session_recording_opt_in: bool, // Not nullable in schema, so needs to be handled in deserialization
+    pub inject_web_apps: Option<bool>,
+    pub surveys_opt_in: Option<bool>,
+    pub product_tours_opt_in: Option<bool>,
+    pub heatmaps_opt_in: Option<bool>,
+    pub conversations_enabled: Option<bool>,
+    pub conversations_settings: Option<Json<serde_json::Value>>,
+    pub capture_dead_clicks: Option<bool>,
+    pub flags_persistence_default: Option<bool>,
+    pub session_recording_sample_rate: Option<Decimal>, // numeric(3,2) in postgres, see https://docs.rs/sqlx/latest/sqlx/postgres/types/index.html#rust_decimal
+    pub session_recording_minimum_duration_milliseconds: Option<i32>,
+    pub autocapture_web_vitals_allowed_metrics: Option<Json<serde_json::Value>>,
+    pub autocapture_exceptions_errors_to_ignore: Option<Json<serde_json::Value>>,
+    pub session_recording_linked_flag: Option<Json<serde_json::Value>>,
+    pub session_recording_network_payload_capture_config: Option<Json<serde_json::Value>>,
+    pub session_recording_masking_config: Option<Json<serde_json::Value>>,
+    pub session_replay_config: Option<Json<serde_json::Value>>,
+    pub survey_config: Option<Json<serde_json::Value>>,
+    pub extra_settings: Option<Json<serde_json::Value>>,
+    pub session_recording_url_trigger_config: Option<Vec<Json<serde_json::Value>>>, // jsonb[] in postgres
+    pub session_recording_url_blocklist_config: Option<Vec<Json<serde_json::Value>>>, // jsonb[] in postgres
+    pub session_recording_event_trigger_config: Option<Vec<Option<String>>>, // text[] in postgres. NB: this also contains NULL entries along with strings.
+    pub session_recording_trigger_match_type_config: Option<String>, // character varying(24) in postgres
+    pub recording_domains: Option<Vec<String>>, // character varying(200)[] in postgres
+    #[serde(default, with = "option_i16_as_i16")]
+    pub cookieless_server_hash_mode: Option<i16>,
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    // Sourced from the internal-only TeamFeatureFlagsConfig extension, not a posthog_team
+    // column. #[serde(default)] keeps cache entries written before this field existed
+    // deserializing to `false` (full events), fail-safe.
+    #[serde(default)]
+    pub minimal_flag_called_events: bool,
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
+}
+
+mod option_i16_as_i16 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<i16>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_i16(value.unwrap_or(0))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<i16>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<i16>::deserialize(deserializer)
+    }
+}
+
+impl TeamIdentifier for Team {
+    fn team_id(&self) -> TeamId {
+        self.id
+    }
+
+    fn api_token(&self) -> &str {
+        &self.api_token
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_minimal_flag_called_events_defaults_false_on_legacy_cache_blob() {
+        // A HyperCache JSON blob written before this field existed has no
+        // minimal_flag_called_events key. #[serde(default)] must make that
+        // deserialize to `false` (full events) rather than erroring.
+        let legacy_json = serde_json::json!({
+            "id": 1,
+            "name": "test team",
+            "api_token": "test_token",
+            "uuid": Uuid::new_v4().to_string(),
+        });
+
+        let team: Team =
+            serde_json::from_value(legacy_json).expect("legacy blob must still deserialize");
+
+        assert!(!team.minimal_flag_called_events);
+    }
+}

@@ -1,67 +1,151 @@
+@import '../styles/base';
+
+*,
+*::before,
+*::after {
+    --z-toolbar: 2147483020;
+
+    box-sizing: border-box;
+}
+
 :host {
     // reset fonts
     all: initial;
-    font-family: 'Helvetica Neue', 'Helvetica', 'Arial', sans-serif;
+    font-family: var(--font-sans);
     font-size: 14px;
     line-height: 1.5;
+    color: var(--color-text-primary);
+
+    // @include root-variables;
 }
 
-.toolbar-block {
-    background: white;
-    color: black;
-    font-size: 14px;
-    &.no-padding {
-        padding: 0;
-    }
+// Re-evaluate text color within themed containers so dark mode
+// descendants inherit the correct (light) text color instead of
+// the light-mode value computed on :host.
+[theme] {
+    color: var(--color-text-primary);
 }
 
-.ant-modal-mask,
-.ant-modal-wrap {
-    z-index: 2147483030 !important;
-}
-.ant-select-dropdown,
-.ant-picker-dropdown {
-    z-index: 2147483031 !important;
-}
-.ant-tooltip {
-    z-index: 2147483032 !important;
-}
-.ant-list-item {
-    &:hover {
-        background: #f0f0f0;
-    }
+.LemonModal__overlay--force-modal-above-popovers {
+    z-index: calc(var(--z-toolbar) + var(--z-force-modal-above-popovers)) !important;
 }
 
 .section-title {
-    font-size: 12px;
-    text-transform: uppercase;
-    font-weight: bold;
-    color: hsla(220, 15%, 49%, 1);
     margin-bottom: 10px;
-}
-
-.ant-tabs > .ant-tabs-nav .ant-tabs-nav-wrap,
-.ant-tabs > div > .ant-tabs-nav .ant-tabs-nav-wrap {
-    justify-content: center;
+    font-size: 12px;
+    font-weight: bold;
+    color: hsl(220deg 15% 49% / 100%);
+    text-transform: uppercase;
 }
 
 .fade-component-container {
     position: fixed;
-    z-index: 2147483020;
+    z-index: var(--z-toolbar);
 }
 
 .Toastify__toast-container {
-    z-index: 2147483040;
+    z-index: calc(var(--z-toolbar) + 20);
 }
 
 .toolbar-global-fade-container {
     position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
+    inset: 0;
     pointer-events: none;
+
     > * {
         pointer-events: auto;
     }
+}
+
+.Popover {
+    z-index: calc(var(--z-toolbar) + var(--z-popover)) !important;
+}
+
+.Tooltip {
+    z-index: calc(var(--z-toolbar) + var(--z-tooltip)) !important;
+}
+
+// Product Tours animations
+// Following animation guidelines: ease-out for entering elements, max 0.3s duration
+
+$ease-out-quart: cubic-bezier(0.165, 0.84, 0.44, 1);
+
+@keyframes Toolbar__SlideUp {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes Toolbar__Pop {
+    from {
+        opacity: 0;
+        transform: scale(0.9);
+    }
+
+    to {
+        opacity: 1;
+        transform: scale(1);
+    }
+}
+
+@keyframes Toolbar__BlurRight {
+    from {
+        filter: blur(4px);
+        opacity: 0;
+        transform: translateX(-8px);
+    }
+
+    to {
+        filter: blur(0);
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+
+@keyframes Toolbar__Fade {
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
+}
+
+.toolbar-animate-slide-up {
+    animation: Toolbar__SlideUp 0.2s $ease-out-quart forwards;
+    will-change: transform, opacity;
+
+    @media (prefers-reduced-motion: reduce) {
+        animation: Toolbar__Fade 0.2s $ease-out-quart forwards;
+    }
+}
+
+.toolbar-animate-pop {
+    animation: Toolbar__Pop 0.2s $ease-out-quart forwards;
+    will-change: transform, opacity;
+
+    @media (prefers-reduced-motion: reduce) {
+        animation: Toolbar__Fade 0.2s $ease-out-quart forwards;
+    }
+}
+
+.toolbar-animate-blur-right {
+    animation: Toolbar__BlurRight 0.2s $ease-out-quart forwards;
+    will-change: transform, opacity, filter;
+
+    @media (prefers-reduced-motion: reduce) {
+        animation: Toolbar__Fade 0.2s $ease-out-quart forwards;
+    }
+}
+
+.toolbar-animate-fade {
+    animation: Toolbar__Fade 0.15s $ease-out-quart forwards;
+    will-change: opacity;
 }

@@ -1,0 +1,647 @@
+import { BreakPointFunction } from 'kea'
+
+import { LemonMenuItem } from '@posthog/lemon-ui'
+
+import { PostHogComDocsURL } from 'lib/lemon-ui/Link/Link'
+import { getDefaultInterval } from 'lib/utils/dateFilters'
+import { UnexpectedNeverError } from 'lib/utils/guards'
+
+import { hogqlQuery } from '~/queries/query'
+import {
+    BreakdownFilter,
+    ProductKey,
+    QueryLogTags,
+    QuerySchema,
+    WebAnalyticsConversionGoal,
+    WebAnalyticsPropertyFilters,
+    WebStatsBreakdown,
+} from '~/queries/schema/schema-general'
+import { hogql } from '~/queries/utils'
+import { InsightLogicProps, PropertyFilterType, PropertyMathType } from '~/types'
+
+/** Matches BREAKDOWN_NULL_DISPLAY in posthog/hogql_queries/web_analytics/stats_table.py */
+export const BREAKDOWN_NULL_DISPLAY = '(none)'
+/** Matches BREAKDOWN_REFERRER_PREFIX in posthog/hogql_queries/web_analytics/stats_table.py */
+export const BREAKDOWN_REFERRER_PREFIX = 'referrer:'
+
+export interface WebTileLayout {
+    /** The class has to be spelled out without interpolation, as otherwise Tailwind can't pick it up. */
+    colSpanClassName?:
+        | `md:col-span-${number}`
+        | 'md:col-span-full'
+        | `md:col-span-${number} 2xl:col-span-${number}`
+        | `md:col-span-${number} 2xl:col-span-full`
+    /** The class has to be spelled out without interpolation, as otherwise Tailwind can't pick it up. */
+    rowSpanClassName?: `md:row-span-${number}`
+    /** The class has to be spelled out without interpolation, as otherwise Tailwind can't pick it up. */
+    orderWhenLargeClassName?: `2xl:order-${number}`
+    className?: string
+}
+
+export enum TileId {
+    OVERVIEW = 'OVERVIEW',
+    GRAPHS = 'GRAPHS',
+    PATHS = 'PATHS',
+    SOURCES = 'SOURCES',
+    DEVICES = 'DEVICES',
+    GEOGRAPHY = 'GEOGRAPHY',
+    ACTIVE_HOURS = 'ACTIVE_HOURS',
+    RETENTION = 'RETENTION',
+    REPLAY = 'REPLAY',
+    ERROR_TRACKING = 'ERROR_TRACKING',
+    GOALS = 'GOALS',
+    WEB_VITALS = 'WEB_VITALS',
+    WEB_VITALS_PATH_BREAKDOWN = 'WEB_VITALS_PATH_BREAKDOWN',
+    FRUSTRATING_PAGES = 'FRUSTRATING_PAGES',
+    MARKETING_OVERVIEW = 'MARKETING_OVERVIEW',
+
+    // Page Report Tiles to avoid conflicts with web analytics
+    PAGE_REPORTS_COMBINED_METRICS_CHART_SECTION = 'PR_COMBINED_METRICS_CHART_SECTION',
+    PAGE_REPORTS_PATHS_SECTION = 'PR_PATHS_SECTION',
+    PAGE_REPORTS_DEVICE_INFORMATION_SECTION = 'PR_DEVICE_INFORMATION_SECTION',
+    PAGE_REPORTS_TRAFFIC_SECTION = 'PR_TRAFFIC_SECTION',
+    PAGE_REPORTS_GEOGRAPHY_SECTION = 'PR_GEOGRAPHY_SECTION',
+    PAGE_REPORTS_TOP_EVENTS_SECTION = 'PR_TOP_EVENTS_SECTION',
+    PAGE_REPORTS_COMBINED_METRICS_CHART = 'PR_COMBINED_METRICS_CHART',
+    PAGE_REPORTS_ENTRY_PATHS = 'PR_ENTRY_PATHS',
+    PAGE_REPORTS_EXIT_PATHS = 'PR_EXIT_PATHS',
+    PAGE_REPORTS_OUTBOUND_CLICKS = 'PR_OUTBOUND_CLICKS',
+    PAGE_REPORTS_CHANNELS = 'PR_CHANNELS',
+    PAGE_REPORTS_REFERRERS = 'PR_REFERRERS',
+    PAGE_REPORTS_DEVICE_TYPES = 'PR_DEVICE_TYPES',
+    PAGE_REPORTS_BROWSERS = 'PR_BROWSERS',
+    PAGE_REPORTS_OPERATING_SYSTEMS = 'PR_OPERATING_SYSTEMS',
+    PAGE_REPORTS_COUNTRIES = 'PR_COUNTRIES',
+    PAGE_REPORTS_REGIONS = 'PR_REGIONS',
+    PAGE_REPORTS_CITIES = 'PR_CITIES',
+    PAGE_REPORTS_TIMEZONES = 'PR_TIMEZONES',
+    PAGE_REPORTS_LANGUAGES = 'PR_LANGUAGES',
+    PAGE_REPORTS_TOP_EVENTS = 'PR_TOP_EVENTS',
+    PAGE_REPORTS_PREVIOUS_PAGE = 'PR_PREVIOUS_PAGE',
+    PAGE_REPORTS_UTM_SOURCE = 'PR_UTM_SOURCE',
+    PAGE_REPORTS_UTM_MEDIUM = 'PR_UTM_MEDIUM',
+    PAGE_REPORTS_UTM_CAMPAIGN = 'PR_UTM_CAMPAIGN',
+    PAGE_REPORTS_UTM_CONTENT = 'PR_UTM_CONTENT',
+    PAGE_REPORTS_UTM_TERM = 'PR_UTM_TERM',
+    PAGE_REPORTS_AVG_TIME_ON_PAGE_TREND = 'PR_AVG_TIME_ON_PAGE_TREND',
+
+    // Marketing Tiles
+    MARKETING = 'MARKETING',
+    MARKETING_CAMPAIGN_BREAKDOWN = 'MARKETING_CAMPAIGN_BREAKDOWN',
+    MARKETING_NON_INTEGRATED_CONVERSIONS = 'MARKETING_NON_INTEGRATED_CONVERSIONS',
+
+    // Bot Analytics Tiles
+    BOT_OVERVIEW = 'BOT_OVERVIEW',
+    BOT_TRENDS = 'BOT_TRENDS',
+    BOT_PATHS = 'BOT_PATHS',
+    BOT_SOURCES = 'BOT_SOURCES',
+    BOT_AI_REFERRALS = 'BOT_AI_REFERRALS',
+    BOT_AI_ENGAGEMENT = 'BOT_AI_ENGAGEMENT',
+    BOT_CRAWLERS = 'BOT_CRAWLERS',
+}
+
+export enum ProductTab {
+    ANALYTICS = 'analytics',
+    WEB_VITALS = 'web-vitals',
+    PAGE_REPORTS = 'page-reports',
+    SESSION_ATTRIBUTION_EXPLORER = 'session-attribution-explorer',
+    MARKETING = 'marketing',
+    HEALTH = 'health',
+    LIVE = 'live',
+    BOT_ANALYTICS = 'bots',
+}
+
+export type DeviceType = 'Desktop' | 'Mobile'
+
+export type WebVitalsPercentile = PropertyMathType.P75 | PropertyMathType.P90 | PropertyMathType.P99
+
+export const tabSplitIndicesMap: Partial<Record<TileId, number[]>> = {
+    [TileId.SOURCES]: [1, 3], // [Channel] [Referring Domain ▼ Referring URL] [UTM Source ▼ ...]
+}
+
+export const loadPriorityMap: Record<TileId, number> = {
+    [TileId.OVERVIEW]: 1,
+    [TileId.GRAPHS]: 2,
+    [TileId.PATHS]: 3,
+    [TileId.SOURCES]: 4,
+    [TileId.DEVICES]: 5,
+    [TileId.GEOGRAPHY]: 6,
+    [TileId.ACTIVE_HOURS]: 7,
+    [TileId.RETENTION]: 8,
+    [TileId.REPLAY]: 9,
+    [TileId.ERROR_TRACKING]: 10,
+    [TileId.GOALS]: 11,
+    [TileId.WEB_VITALS]: 12,
+    [TileId.WEB_VITALS_PATH_BREAKDOWN]: 13,
+    [TileId.FRUSTRATING_PAGES]: 14,
+
+    // Page Report Sections
+    [TileId.PAGE_REPORTS_COMBINED_METRICS_CHART_SECTION]: 1,
+    [TileId.PAGE_REPORTS_PATHS_SECTION]: 2,
+    [TileId.PAGE_REPORTS_DEVICE_INFORMATION_SECTION]: 3,
+    [TileId.PAGE_REPORTS_TRAFFIC_SECTION]: 4,
+    [TileId.PAGE_REPORTS_GEOGRAPHY_SECTION]: 5,
+    [TileId.PAGE_REPORTS_TOP_EVENTS_SECTION]: 6,
+
+    // Page Report Tiles
+    [TileId.PAGE_REPORTS_COMBINED_METRICS_CHART]: 1,
+    [TileId.PAGE_REPORTS_ENTRY_PATHS]: 2,
+    [TileId.PAGE_REPORTS_EXIT_PATHS]: 3,
+    [TileId.PAGE_REPORTS_OUTBOUND_CLICKS]: 4,
+    [TileId.PAGE_REPORTS_CHANNELS]: 5,
+    [TileId.PAGE_REPORTS_REFERRERS]: 6,
+    [TileId.PAGE_REPORTS_PREVIOUS_PAGE]: 7,
+    [TileId.PAGE_REPORTS_DEVICE_TYPES]: 8,
+    [TileId.PAGE_REPORTS_BROWSERS]: 9,
+    [TileId.PAGE_REPORTS_OPERATING_SYSTEMS]: 10,
+    [TileId.PAGE_REPORTS_COUNTRIES]: 11,
+    [TileId.PAGE_REPORTS_REGIONS]: 12,
+    [TileId.PAGE_REPORTS_CITIES]: 13,
+    [TileId.PAGE_REPORTS_TIMEZONES]: 14,
+    [TileId.PAGE_REPORTS_LANGUAGES]: 15,
+    [TileId.PAGE_REPORTS_TOP_EVENTS]: 16,
+    [TileId.PAGE_REPORTS_UTM_SOURCE]: 17,
+    [TileId.PAGE_REPORTS_UTM_MEDIUM]: 18,
+    [TileId.PAGE_REPORTS_UTM_CAMPAIGN]: 19,
+    [TileId.PAGE_REPORTS_UTM_CONTENT]: 20,
+    [TileId.PAGE_REPORTS_UTM_TERM]: 21,
+    [TileId.PAGE_REPORTS_AVG_TIME_ON_PAGE_TREND]: 22,
+
+    // Marketing Tiles
+    [TileId.MARKETING_OVERVIEW]: 1,
+    [TileId.MARKETING]: 2,
+    [TileId.MARKETING_CAMPAIGN_BREAKDOWN]: 3,
+    [TileId.MARKETING_NON_INTEGRATED_CONVERSIONS]: 4,
+
+    // Bot Analytics Tiles
+    [TileId.BOT_OVERVIEW]: 1,
+    [TileId.BOT_TRENDS]: 2,
+    [TileId.BOT_PATHS]: 3,
+    [TileId.BOT_SOURCES]: 4,
+    [TileId.BOT_AI_REFERRALS]: 5,
+    [TileId.BOT_AI_ENGAGEMENT]: 6,
+    [TileId.BOT_CRAWLERS]: 7,
+}
+
+// To enable a tile here, you must update the QueryRunner to support it
+// or make sure it can load in a decent time (which event-only tiles usually do).
+// We filter them here to enable a faster experience for the user as the
+// tiles that don't support pre-aggregated tables take a longer time to load
+// and will effectively block other queries to load because of the concurrencyController
+export const TILES_ALLOWED_ON_PRE_AGGREGATED = [
+    TileId.OVERVIEW,
+    TileId.PATHS,
+    TileId.SOURCES,
+    TileId.DEVICES,
+
+    // Not 100% supported yet but they are fast enough that we can show them
+    TileId.GRAPHS,
+    TileId.GEOGRAPHY,
+]
+
+export const TILE_LABELS: Record<TileId, string> = {
+    [TileId.OVERVIEW]: 'Overview stats',
+    [TileId.GRAPHS]: 'Trends',
+    [TileId.PATHS]: 'Paths',
+    [TileId.SOURCES]: 'Traffic sources',
+    [TileId.DEVICES]: 'Device breakdown',
+    [TileId.GEOGRAPHY]: 'Geography',
+    [TileId.ACTIVE_HOURS]: 'Active hours',
+    [TileId.RETENTION]: 'Retention',
+    [TileId.REPLAY]: 'Session replay',
+    [TileId.ERROR_TRACKING]: 'Error tracking',
+    [TileId.GOALS]: 'Goals',
+    [TileId.WEB_VITALS]: 'Web vitals',
+    [TileId.WEB_VITALS_PATH_BREAKDOWN]: 'Web vitals path breakdown',
+    [TileId.FRUSTRATING_PAGES]: 'Frustrating pages',
+    [TileId.MARKETING_OVERVIEW]: 'Marketing overview',
+    [TileId.PAGE_REPORTS_COMBINED_METRICS_CHART_SECTION]: 'Combined metrics',
+    [TileId.PAGE_REPORTS_PATHS_SECTION]: 'Paths',
+    [TileId.PAGE_REPORTS_DEVICE_INFORMATION_SECTION]: 'Device information',
+    [TileId.PAGE_REPORTS_TRAFFIC_SECTION]: 'Traffic',
+    [TileId.PAGE_REPORTS_GEOGRAPHY_SECTION]: 'Geography',
+    [TileId.PAGE_REPORTS_TOP_EVENTS_SECTION]: 'Top events',
+    [TileId.PAGE_REPORTS_COMBINED_METRICS_CHART]: 'Combined metrics chart',
+    [TileId.PAGE_REPORTS_ENTRY_PATHS]: 'Entry paths',
+    [TileId.PAGE_REPORTS_EXIT_PATHS]: 'Exit paths',
+    [TileId.PAGE_REPORTS_OUTBOUND_CLICKS]: 'Outbound clicks',
+    [TileId.PAGE_REPORTS_CHANNELS]: 'Channels',
+    [TileId.PAGE_REPORTS_REFERRERS]: 'Referrers',
+    [TileId.PAGE_REPORTS_DEVICE_TYPES]: 'Device types',
+    [TileId.PAGE_REPORTS_BROWSERS]: 'Browsers',
+    [TileId.PAGE_REPORTS_OPERATING_SYSTEMS]: 'Operating systems',
+    [TileId.PAGE_REPORTS_COUNTRIES]: 'Countries',
+    [TileId.PAGE_REPORTS_REGIONS]: 'Regions',
+    [TileId.PAGE_REPORTS_CITIES]: 'Cities',
+    [TileId.PAGE_REPORTS_TIMEZONES]: 'Timezones',
+    [TileId.PAGE_REPORTS_LANGUAGES]: 'Languages',
+    [TileId.PAGE_REPORTS_TOP_EVENTS]: 'Top events',
+    [TileId.PAGE_REPORTS_PREVIOUS_PAGE]: 'Previous page',
+    [TileId.PAGE_REPORTS_UTM_SOURCE]: 'UTM source',
+    [TileId.PAGE_REPORTS_UTM_MEDIUM]: 'UTM medium',
+    [TileId.PAGE_REPORTS_UTM_CAMPAIGN]: 'UTM campaign',
+    [TileId.PAGE_REPORTS_UTM_CONTENT]: 'UTM content',
+    [TileId.PAGE_REPORTS_UTM_TERM]: 'UTM term',
+    [TileId.PAGE_REPORTS_AVG_TIME_ON_PAGE_TREND]: 'Time on page',
+    [TileId.MARKETING]: 'Marketing',
+    [TileId.MARKETING_CAMPAIGN_BREAKDOWN]: 'Campaign breakdown',
+    [TileId.MARKETING_NON_INTEGRATED_CONVERSIONS]: 'Non-integrated conversions',
+    [TileId.BOT_OVERVIEW]: 'Bot traffic overview',
+    [TileId.BOT_TRENDS]: 'Bot requests over time',
+    [TileId.BOT_PATHS]: 'Most crawled paths',
+    [TileId.BOT_SOURCES]: 'Bot referrer domains',
+    [TileId.BOT_AI_REFERRALS]: 'AI referral traffic',
+    [TileId.BOT_AI_ENGAGEMENT]: 'AI referral engagement',
+    [TileId.BOT_CRAWLERS]: 'Crawlers',
+}
+
+export interface BaseTile {
+    tileId: TileId
+    layout: WebTileLayout
+    docs?: Docs
+}
+
+export interface Docs {
+    url?: PostHogComDocsURL
+    title: string
+    description: string | JSX.Element
+}
+
+export interface QueryTile extends BaseTile {
+    kind: 'query'
+    title?: string
+    query: QuerySchema
+    showIntervalSelect?: boolean
+    control?: JSX.Element
+    insightProps: InsightLogicProps
+    canOpenModal?: boolean
+    canOpenInsight?: boolean
+    extraMenuItems?: LemonMenuItem[]
+}
+
+export interface TabsTileTab {
+    id: string
+    title: string | JSX.Element
+    linkText: string | JSX.Element
+    query: QuerySchema
+    showIntervalSelect?: boolean
+    control?: JSX.Element
+    insightProps: InsightLogicProps
+    canOpenModal?: boolean
+    canOpenInsight?: boolean
+    docs?: Docs
+    extraMenuItems?: LemonMenuItem[]
+}
+
+export interface TabsTile extends BaseTile {
+    kind: 'tabs'
+    activeTabId: string
+    setTabId: (id: string) => void
+    tabs: TabsTileTab[]
+    splitIndices?: number[]
+}
+
+export interface ReplayTile extends BaseTile {
+    kind: 'replay'
+}
+
+export interface ErrorTrackingTile extends BaseTile {
+    kind: 'error_tracking'
+    query: QuerySchema
+}
+
+export interface SectionTile extends BaseTile {
+    kind: 'section'
+    title?: string
+    tiles: WebAnalyticsTile[]
+}
+
+export type WebAnalyticsTile = QueryTile | TabsTile | ReplayTile | ErrorTrackingTile | SectionTile
+
+export enum GraphsTab {
+    UNIQUE_USERS = 'UNIQUE_USERS',
+    PAGE_VIEWS = 'PAGE_VIEWS',
+    NUM_SESSION = 'NUM_SESSION',
+    SESSION_DURATION = 'SESSION_DURATION',
+    BOUNCE_RATE = 'BOUNCE_RATE',
+    UNIQUE_CONVERSIONS = 'UNIQUE_CONVERSIONS',
+    TOTAL_CONVERSIONS = 'TOTAL_CONVERSIONS',
+    CONVERSION_RATE = 'CONVERSION_RATE',
+}
+
+export enum SourceTab {
+    CHANNEL = 'CHANNEL',
+    REFERRING_DOMAIN = 'REFERRING_DOMAIN',
+    REFERRING_URL = 'REFERRING_URL',
+    UTM_SOURCE = 'UTM_SOURCE',
+    UTM_MEDIUM = 'UTM_MEDIUM',
+    UTM_CAMPAIGN = 'UTM_CAMPAIGN',
+    UTM_CONTENT = 'UTM_CONTENT',
+    UTM_TERM = 'UTM_TERM',
+    UTM_SOURCE_MEDIUM_CAMPAIGN = 'UTM_SOURCE_MEDIUM_CAMPAIGN',
+}
+
+export enum DeviceTab {
+    BROWSER = 'BROWSER',
+    OS = 'OS',
+    DEVICE_TYPE = 'DEVICE_TYPE',
+    VIEWPORT = 'VIEWPORT',
+}
+
+export enum PathTab {
+    PATH = 'PATH',
+    INITIAL_PATH = 'INITIAL_PATH',
+    END_PATH = 'END_PATH',
+    EXIT_CLICK = 'EXIT_CLICK',
+    SCREEN_NAME = 'SCREEN_NAME',
+    PREVIOUS_PATH = 'PREVIOUS_PATH',
+    NEXT_PATH = 'NEXT_PATH',
+}
+
+export enum GeographyTab {
+    MAP = 'MAP',
+    REGIONS_MAP = 'REGIONS_MAP',
+    COUNTRIES = 'COUNTRIES',
+    REGIONS = 'REGIONS',
+    CITIES = 'CITIES',
+    TIMEZONES = 'TIMEZONES',
+    HEATMAP = 'HEATMAP',
+    LANGUAGES = 'LANGUAGES',
+}
+
+export enum ActiveHoursTab {
+    UNIQUE = 'UNIQUE',
+    TOTAL_EVENTS = 'TOTAL_EVENTS',
+}
+
+export enum ConversionGoalWarning {
+    CustomEventWithNoSessionId = 'CustomEventWithNoSessionId',
+}
+
+export const SOURCE_DRILL_DOWN_MAP: Partial<Record<WebStatsBreakdown, SourceTab>> = {
+    [WebStatsBreakdown.InitialChannelType]: SourceTab.REFERRING_DOMAIN,
+    [WebStatsBreakdown.InitialReferringDomain]: SourceTab.REFERRING_URL,
+    [WebStatsBreakdown.InitialUTMSource]: SourceTab.UTM_MEDIUM,
+    [WebStatsBreakdown.InitialUTMMedium]: SourceTab.UTM_CAMPAIGN,
+    [WebStatsBreakdown.InitialUTMCampaign]: SourceTab.UTM_CONTENT,
+    [WebStatsBreakdown.InitialUTMContent]: SourceTab.UTM_TERM,
+    [WebStatsBreakdown.InitialUTMSourceMediumCampaign]: SourceTab.UTM_CONTENT,
+}
+
+export const GEOGRAPHY_DRILL_DOWN_MAP: Partial<Record<WebStatsBreakdown, GeographyTab>> = {
+    [WebStatsBreakdown.Country]: GeographyTab.REGIONS,
+    [WebStatsBreakdown.Region]: GeographyTab.CITIES,
+}
+
+export const DEVICE_DRILL_DOWN_MAP: Partial<Record<WebStatsBreakdown, DeviceTab>> = {
+    [WebStatsBreakdown.DeviceType]: DeviceTab.BROWSER,
+    [WebStatsBreakdown.Browser]: DeviceTab.OS,
+    [WebStatsBreakdown.OS]: DeviceTab.VIEWPORT,
+}
+
+export type TileVisualizationOption = 'table' | 'graph'
+
+export const webStatsBreakdownToPropertyName = (
+    breakdownBy: WebStatsBreakdown
+):
+    | { key: string; type: PropertyFilterType.Person | PropertyFilterType.Event | PropertyFilterType.Session }
+    | undefined => {
+    switch (breakdownBy) {
+        case WebStatsBreakdown.Page:
+            return { key: '$pathname', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.InitialPage:
+            return { key: '$entry_pathname', type: PropertyFilterType.Session }
+        case WebStatsBreakdown.ExitPage:
+            return { key: '$end_pathname', type: PropertyFilterType.Session }
+        case WebStatsBreakdown.PreviousPage:
+            return undefined // could be $prev_pageview_pathname or $referrer
+        case WebStatsBreakdown.ExitClick:
+            return { key: '$last_external_click_url', type: PropertyFilterType.Session }
+        case WebStatsBreakdown.ScreenName:
+            return { key: '$screen_name', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.InitialChannelType:
+            return { key: '$channel_type', type: PropertyFilterType.Session }
+        case WebStatsBreakdown.InitialReferringDomain:
+            return { key: '$entry_referring_domain', type: PropertyFilterType.Session }
+        case WebStatsBreakdown.InitialReferringURL:
+            return { key: '$session_entry_referrer', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.InitialUTMSource:
+            return { key: '$entry_utm_source', type: PropertyFilterType.Session }
+        case WebStatsBreakdown.InitialUTMCampaign:
+            return { key: '$entry_utm_campaign', type: PropertyFilterType.Session }
+        case WebStatsBreakdown.InitialUTMMedium:
+            return { key: '$entry_utm_medium', type: PropertyFilterType.Session }
+        case WebStatsBreakdown.InitialUTMContent:
+            return { key: '$entry_utm_content', type: PropertyFilterType.Session }
+        case WebStatsBreakdown.InitialUTMTerm:
+            return { key: '$entry_utm_term', type: PropertyFilterType.Session }
+        case WebStatsBreakdown.Browser:
+            return { key: '$browser', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.OS:
+            return { key: '$os', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.Viewport:
+            return { key: '$viewport', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.DeviceType:
+            return { key: '$device_type', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.Country:
+            return { key: '$geoip_country_code', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.Region:
+            return { key: '$geoip_subdivision_1_code', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.City:
+            return { key: '$geoip_city_name', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.Timezone:
+            return { key: '$timezone', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.Language:
+            return { key: '$browser_language', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.FrustrationMetrics:
+            return { key: '$pathname', type: PropertyFilterType.Event }
+        case WebStatsBreakdown.InitialUTMSourceMediumCampaign:
+            return undefined
+        default:
+            throw new UnexpectedNeverError(breakdownBy)
+    }
+}
+
+export const getWebAnalyticsBreakdownFilter = (breakdown: WebStatsBreakdown): BreakdownFilter | undefined => {
+    const property = webStatsBreakdownToPropertyName(breakdown)
+
+    if (!property) {
+        return undefined
+    }
+
+    return {
+        breakdown_type: property.type,
+        breakdown: property.key,
+    }
+}
+
+export const GEOIP_TEMPLATE_IDS = ['template-geoip', 'plugin-posthog-plugin-geoip']
+
+export const WEB_ANALYTICS_DATA_COLLECTION_NODE_ID = 'web-analytics'
+
+export const INITIAL_WEB_ANALYTICS_FILTER = [] as WebAnalyticsPropertyFilters
+export const INITIAL_DATE_FROM = '-7d' as string | null
+export const INITIAL_DATE_TO = null as string | null
+export const INITIAL_INTERVAL = getDefaultInterval(INITIAL_DATE_FROM, INITIAL_DATE_TO)
+
+/** Events included in bot analytics queries — crawlers don't execute JS so $http_log captures most real bot traffic */
+export const BOT_ANALYTICS_EVENTS = ['$pageview', '$screen', '$http_log']
+
+export const WEB_ANALYTICS_DEFAULT_QUERY_TAGS: QueryLogTags = {
+    productKey: ProductKey.WEB_ANALYTICS,
+}
+
+export const MARKETING_ANALYTICS_DEFAULT_QUERY_TAGS: QueryLogTags = {
+    productKey: ProductKey.MARKETING_ANALYTICS,
+}
+
+export const checkCustomEventConversionGoalHasSessionIdsHelper = async (
+    conversionGoal: WebAnalyticsConversionGoal | null,
+    breakpoint: BreakPointFunction | undefined,
+    setConversionGoalWarning: (warning: ConversionGoalWarning | null) => void
+): Promise<void> => {
+    if (!conversionGoal || !('customEventName' in conversionGoal) || !conversionGoal.customEventName) {
+        setConversionGoalWarning(null)
+        return
+    }
+    const { customEventName } = conversionGoal
+    // check if we have any conversion events from the last week without sessions ids
+
+    const response = await hogqlQuery(
+        hogql`select count() from events where timestamp >= (now() - toIntervalHour(24)) AND ($session_id IS NULL OR $session_id = '') AND event = {event}`,
+        { event: customEventName }
+    )
+    breakpoint?.()
+    const row = response.results[0]
+    if (row[0]) {
+        setConversionGoalWarning(ConversionGoalWarning.CustomEventWithNoSessionId)
+    } else {
+        setConversionGoalWarning(null)
+    }
+}
+
+export const eventPropertiesToPathClean = new Set(['$pathname', '$current_url', '$prev_pageview_pathname'])
+export const sessionPropertiesToPathClean = new Set([
+    '$entry_pathname',
+    '$end_pathname',
+    '$entry_current_url',
+    '$end_current_url',
+])
+export const personPropertiesToPathClean = new Set(['$initial_pathname', '$initial_current_url'])
+
+// Utility function to map SQL/internal column names to UI-friendly display names
+export const getDisplayColumnName = (column: string, breakdownBy?: WebStatsBreakdown): string => {
+    // Strip the "context.columns." prefix if present
+    const baseColumn = column.replace(/^context\.columns\./, '')
+
+    // Handle known metric columns first (these should always show their metric names)
+    const metricMappings: Record<string, string> = {
+        visitors: 'Visitors',
+        views: 'Views',
+        sessions: 'Sessions',
+        bounce_rate: 'Bounce Rate',
+        session_duration: 'Session Duration',
+        total_pageviews: 'Total Pageviews',
+        unique_visitors: 'Unique Visitors',
+        scroll_gt80_percentage: 'Scroll Depth >80%',
+        rage_clicks: 'Rage Clicks',
+    }
+
+    if (metricMappings[baseColumn]) {
+        return metricMappings[baseColumn]
+    }
+
+    // Handle breakdown column - only if this is the breakdown_value column and breakdownBy is defined
+    if (baseColumn === 'breakdown_value' && breakdownBy !== undefined) {
+        switch (breakdownBy) {
+            case WebStatsBreakdown.Page:
+                return 'Path'
+            case WebStatsBreakdown.InitialPage:
+                return 'Initial Path'
+            case WebStatsBreakdown.ExitPage:
+                return 'End Path'
+            case WebStatsBreakdown.PreviousPage:
+                return 'Previous Page'
+            case WebStatsBreakdown.ExitClick:
+                return 'Exit Click'
+            case WebStatsBreakdown.ScreenName:
+                return 'Screen Name'
+            case WebStatsBreakdown.InitialChannelType:
+                return 'Channel Type'
+            case WebStatsBreakdown.InitialReferringDomain:
+                return 'Referring Domain'
+            case WebStatsBreakdown.InitialReferringURL:
+                return 'Referring URL'
+            case WebStatsBreakdown.InitialUTMSource:
+                return 'UTM Source'
+            case WebStatsBreakdown.InitialUTMCampaign:
+                return 'UTM Campaign'
+            case WebStatsBreakdown.InitialUTMMedium:
+                return 'UTM Medium'
+            case WebStatsBreakdown.InitialUTMTerm:
+                return 'UTM Term'
+            case WebStatsBreakdown.InitialUTMContent:
+                return 'UTM Content'
+            case WebStatsBreakdown.Browser:
+                return 'Browser'
+            case WebStatsBreakdown.OS:
+                return 'OS'
+            case WebStatsBreakdown.Viewport:
+                return 'Viewport'
+            case WebStatsBreakdown.DeviceType:
+                return 'Device Type'
+            case WebStatsBreakdown.Country:
+                return 'Country'
+            case WebStatsBreakdown.Region:
+                return 'Region'
+            case WebStatsBreakdown.City:
+                return 'City'
+            case WebStatsBreakdown.Timezone:
+                return 'Timezone'
+            case WebStatsBreakdown.Language:
+                return 'Language'
+            case WebStatsBreakdown.FrustrationMetrics:
+                return 'URL'
+            case WebStatsBreakdown.InitialUTMSourceMediumCampaign:
+                return 'Source / Medium / Campaign'
+        }
+    }
+
+    // Return base column name if no mapping found
+    return baseColumn
+}
+
+export interface ParsedURL {
+    host: string | null
+    pathname: string | null
+    isValid: boolean
+}
+
+export const faviconUrl = (domain: string): string => `${window.JS_URL}/favicons/${domain}`
+
+export const parseWebAnalyticsURL = (urlString: string): ParsedURL => {
+    try {
+        const trimmed = urlString.trim()
+        if (!trimmed) {
+            return { host: null, pathname: null, isValid: false }
+        }
+
+        // If no protocol, add https://
+        const urlWithProtocol = trimmed.match(/^https?:\/\//i) ? trimmed : `https://${trimmed}`
+
+        const url = new URL(urlWithProtocol)
+        const port = url.port ? `:${url.port}` : ''
+
+        return {
+            host: url.hostname + port,
+            pathname: url.pathname,
+            isValid: true,
+        }
+    } catch {
+        return {
+            host: null,
+            pathname: null,
+            isValid: false,
+        }
+    }
+}

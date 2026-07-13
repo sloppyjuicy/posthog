@@ -1,0 +1,66 @@
+import { Meta, StoryObj } from '@storybook/react'
+
+import { makeDelay } from 'lib/utils/async'
+import { App } from 'scenes/App'
+import { urls } from 'scenes/urls'
+
+import { mswDecorator } from '~/mocks/browser'
+import EXPERIMENT_WITH_MULTIPLE_METRICS from '~/mocks/fixtures/api/experiments/experiment_with_multiple_metrics.json'
+import EXPOSURE_QUERY_RESULT from '~/mocks/fixtures/api/experiments/exposure_query_result.json'
+import FUNNEL_METRIC_RESULT from '~/mocks/fixtures/api/experiments/funnel_metric_result.json'
+import MEAN_METRIC_RESULT from '~/mocks/fixtures/api/experiments/mean_metric_result.json'
+import RATIO_METRIC_RESULT from '~/mocks/fixtures/api/experiments/ratio_metric_result.json'
+import {
+    NodeKind,
+    isExperimentFunnelMetric,
+    isExperimentMeanMetric,
+    isExperimentRatioMetric,
+} from '~/queries/schema/schema-general'
+
+const meta: Meta = {
+    component: App,
+    title: 'Scenes-App/Experiments',
+    parameters: {
+        layout: 'fullscreen',
+        viewMode: 'story',
+        mockDate: '2025-01-27',
+        pageUrl: urls.experiment(EXPERIMENT_WITH_MULTIPLE_METRICS.id),
+    },
+    decorators: [
+        mswDecorator({
+            get: {
+                [`/api/projects/:team_id/experiments/${EXPERIMENT_WITH_MULTIPLE_METRICS.id}/`]:
+                    EXPERIMENT_WITH_MULTIPLE_METRICS,
+                [`/api/projects/:team_id/experiment_holdouts`]: [],
+                [`/api/projects/:team_id/experiment_saved_metrics/`]: [],
+                [`/api/projects/:team_id/feature_flags/${EXPERIMENT_WITH_MULTIPLE_METRICS.feature_flag.id}/`]: {},
+                [`/api/projects/:team_id/feature_flags/${EXPERIMENT_WITH_MULTIPLE_METRICS.feature_flag.id}/status/`]:
+                    {},
+                [`/api/environments/:team_id/default_release_conditions/`]: [],
+            },
+            post: {
+                '/api/environments/:team_id/query/:kind': async ({ request }) => {
+                    const body = (await request.json()) as Record<string, any>
+
+                    if (body.query.kind === NodeKind.ExperimentExposureQuery) {
+                        return [200, EXPOSURE_QUERY_RESULT]
+                    }
+
+                    if (isExperimentFunnelMetric(body.query.metric)) {
+                        return [200, FUNNEL_METRIC_RESULT]
+                    } else if (isExperimentMeanMetric(body.query.metric)) {
+                        return [200, MEAN_METRIC_RESULT]
+                    } else if (isExperimentRatioMetric(body.query.metric)) {
+                        return [200, RATIO_METRIC_RESULT]
+                    }
+                },
+            },
+        }),
+    ],
+}
+export default meta
+
+type Story = StoryObj<{}>
+
+// Small delay to ensure charts render completely
+export const ExperimentWithMultipleMetrics: Story = { play: makeDelay(500) }

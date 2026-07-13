@@ -1,0 +1,248 @@
+import json
+from functools import lru_cache
+
+from pydantic import BaseModel, field_validator
+from pydantic_settings import BaseSettings
+
+
+class ProductCostLimit(BaseModel, frozen=True):
+    limit_usd: float
+    window_seconds: int
+
+
+class UserCostLimit(BaseModel, frozen=True):
+    burst_limit_usd: float
+    burst_window_seconds: int
+    sustained_limit_usd: float
+    sustained_window_seconds: int
+
+
+DEFAULT_USER_COST_LIMIT = UserCostLimit(
+    burst_limit_usd=100.0,
+    burst_window_seconds=86400,
+    sustained_limit_usd=1000.0,
+    sustained_window_seconds=2592000,
+)
+
+DEFAULT_PRODUCT_COST_LIMITS: dict[str, "ProductCostLimit"] = {
+    "llm_gateway": ProductCostLimit(limit_usd=1000.0, window_seconds=86400),
+    "ci": ProductCostLimit(limit_usd=1000.0, window_seconds=2592000),  # $1000 / 30 days
+    "wizard": ProductCostLimit(limit_usd=10000.0, window_seconds=86400),
+    "posthog_code": ProductCostLimit(limit_usd=5000.0, window_seconds=3600),
+    "background_agents": ProductCostLimit(limit_usd=1000.0, window_seconds=3600),
+    "django": ProductCostLimit(limit_usd=5000.0, window_seconds=86400),
+    "signals": ProductCostLimit(limit_usd=25000.0, window_seconds=86400),
+    "posthog_ai": ProductCostLimit(limit_usd=5000.0, window_seconds=86400),
+}
+
+DEFAULT_USER_COST_LIMITS: dict[str, "UserCostLimit"] = {
+    "wizard": UserCostLimit(
+        burst_limit_usd=100.0,
+        burst_window_seconds=2592000,  # 30 days
+        sustained_limit_usd=100.0,
+        sustained_window_seconds=2592000,  # 30 days
+    ),
+    "posthog_code": UserCostLimit(
+        burst_limit_usd=500.0,
+        burst_window_seconds=86400,
+        sustained_limit_usd=3000.0,
+        sustained_window_seconds=2592000,
+    ),
+    "background_agents": UserCostLimit(
+        burst_limit_usd=500.0,
+        burst_window_seconds=604800,
+        sustained_limit_usd=1000.0,
+        sustained_window_seconds=2592000,
+    ),
+    "signals": UserCostLimit(
+        burst_limit_usd=2500.0,
+        burst_window_seconds=604800,
+        sustained_limit_usd=10000.0,
+        sustained_window_seconds=2592000,
+    ),
+}
+
+FREE_PLAN_COST_LIMIT = UserCostLimit(
+    burst_limit_usd=75.0,
+    burst_window_seconds=86400,
+    sustained_limit_usd=75.0,
+    sustained_window_seconds=2592000,
+)
+
+
+_COST_LIMIT_KEY_ALIASES: dict[str, str] = {
+    "array": "posthog_code",
+    "twig": "posthog_code",
+    "slack-twig": "slack-posthog-code",
+}
+
+
+def _normalize_cost_key(key: str) -> str:
+    return _COST_LIMIT_KEY_ALIASES.get(key, key)
+
+
+def _parse_model_dict(
+    v: str | dict | None,
+    model_cls: type[BaseModel],
+    default: dict,
+    field_name: str,
+) -> dict:
+    if v is None or v == "":
+        return default
+    if isinstance(v, dict):
+        result = {}
+        for key, config in v.items():
+            normalized = _normalize_cost_key(key)
+            if isinstance(config, model_cls):
+                result[normalized] = config
+            elif isinstance(config, dict):
+                result[normalized] = model_cls(**config)
+            else:
+                raise ValueError(f"Invalid config for {key}")
+        return result
+    try:
+        parsed = json.loads(v)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in {field_name}: {e}") from e
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{field_name} must be a JSON object")
+    return {_normalize_cost_key(key): model_cls(**config) for key, config in parsed.items()}
+
+
+class Settings(BaseSettings):
+    debug: bool = False
+
+    database_url: str = "postgres://posthog:posthog@localhost:5432/posthog"
+    db_pool_min_size: int = 2
+    db_pool_max_size: int = 10
+
+    redis_url: str | None = None
+
+    rate_limit_burst: int = 500
+    rate_limit_burst_window: int = 60
+    rate_limit_sustained: int = 10000
+    rate_limit_sustained_window: int = 3600
+
+    request_timeout: float = 300.0
+    streaming_timeout: float = 300.0
+
+    max_request_body_size: int = 10_485_760  # 10MB
+
+    cors_origins: list[str] = ["*"]
+
+    anthropic_api_key: str | None = None
+    bedrock_region_name: str | None = None
+    openai_api_key: str | None = None
+    openai_api_base_url: str | None = None  # Used for regional endpoints
+    # OpenAI organization ID. When set, forwarded to OpenAI on every request so
+    # traffic is attributed to the HIPAA-covered organization. Omitted when unset.
+    openai_organization: str | None = None
+    openrouter_api_key: str | None = None
+    fireworks_api_key: str | None = None
+    cloudflare_api_key: str | None = None
+    cloudflare_account_id: str | None = None
+
+    # Project token for AI observability events
+    posthog_project_token: str | None = None
+    posthog_host: str = "https://us.i.posthog.com"
+
+    # Optional secondary capture target — mirrors every $ai_generation after the primary,
+    # so the EU deployment lands EU events on EU PostHog (team_id=1) for regional billing.
+    posthog_secondary_project_token: str | None = None
+    posthog_secondary_host: str | None = None
+
+    metrics_enabled: bool = True
+
+    # ~600 bytes per entry (key + AuthenticatedUser + LRU overhead), 10000 entries ≈ 6 MB
+    auth_cache_max_size: int = 10000
+    auth_cache_ttl: int = 900  # 15 minutes — used for personal API keys
+    auth_cache_ttl_oauth: int = 300  # 5 minutes — OAuth tokens can be revoked on refresh, keep short
+
+    team_rate_limit_multipliers: dict[int, int] = {}
+
+    # Additional elevated cap for PostHog staff, keyed on the authenticated
+    # user's is_staff flag rather than team id, so it survives impersonation.
+    # Combined with the team multiplier by taking the larger of the two.
+    staff_rate_limit_multiplier: int = 10
+
+    # When true, PostHog staff (authenticated is_staff) bypass the per-user
+    # burst/sustained cost caps entirely, on every product. Spend is still
+    # recorded for observability — only enforcement and the reported usage
+    # status treat staff as unlimited. Set false to fall back to the
+    # elevated-but-finite `staff_rate_limit_multiplier` cap.
+    staff_unlimited_usage: bool = True
+
+    product_cost_limits: dict[str, ProductCostLimit] = DEFAULT_PRODUCT_COST_LIMITS
+
+    user_cost_limits: dict[str, UserCostLimit] = DEFAULT_USER_COST_LIMITS
+    user_cost_limits_disabled: bool = False
+
+    default_fallback_cost_usd: float = 0.01
+
+    posthog_api_base_url: str = "https://us.posthog.com"
+    plan_cache_ttl: int = 900  # 15 minutes
+    # Billing recomputes quota at most hourly, so we tolerate slight overage rather than
+    # a Django roundtrip on every billable request.
+    quota_cache_ttl: int = 300  # 5 minutes
+    billing_period_days: int = 30
+
+    # Anthropic → Bedrock circuit breaker. When the trailing failure rate crosses `failure_threshold`
+    # (over ≥ `min_requests` in the window), the breaker opens: opted-in requests route straight to
+    # Bedrock with probability `bypass_probability`, the rest stay as probe traffic to detect recovery.
+    anthropic_circuit_breaker_enabled: bool = True
+    anthropic_circuit_breaker_failure_threshold: float = 0.25
+    anthropic_circuit_breaker_window_seconds: int = 300
+    anthropic_circuit_breaker_bypass_probability: float = 0.9
+    anthropic_circuit_breaker_min_requests: int = 20
+
+    @field_validator("product_cost_limits", mode="before")
+    @classmethod
+    def parse_product_cost_limits(cls, v: str | dict | None) -> dict[str, ProductCostLimit]:
+        return _parse_model_dict(v, ProductCostLimit, DEFAULT_PRODUCT_COST_LIMITS, "product_cost_limits")
+
+    @field_validator("user_cost_limits", mode="before")
+    @classmethod
+    def parse_user_cost_limits(cls, v: str | dict | None) -> dict[str, UserCostLimit]:
+        return _parse_model_dict(v, UserCostLimit, DEFAULT_USER_COST_LIMITS, "user_cost_limits")
+
+    @field_validator("staff_rate_limit_multiplier")
+    @classmethod
+    def validate_staff_rate_limit_multiplier(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"staff_rate_limit_multiplier must be >= 1, got {v}")
+        return v
+
+    @field_validator("team_rate_limit_multipliers", mode="before")
+    @classmethod
+    def parse_team_multipliers(cls, v: str | dict[int, int] | None) -> dict[int, int]:
+        if v is None or v == "":
+            return {}
+        if isinstance(v, dict):
+            return v
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in team_rate_limit_multipliers: {e}") from e
+
+        if not isinstance(parsed, dict):
+            raise ValueError("team_rate_limit_multipliers must be a JSON object")
+
+        try:
+            result = {int(k): int(val) for k, val in parsed.items()}
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"team_rate_limit_multipliers keys and values must be integers: {e}") from e
+
+        for team_id, multiplier in result.items():
+            if multiplier < 1:
+                raise ValueError(
+                    f"team_rate_limit_multipliers values must be >= 1, got {multiplier} for team {team_id}"
+                )
+
+        return result
+
+    model_config = {"env_prefix": "LLM_GATEWAY_"}
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

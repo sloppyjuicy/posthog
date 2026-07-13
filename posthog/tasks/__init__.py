@@ -1,12 +1,53 @@
 # Make tasks ready for celery autoimport
-import posthog.tasks.calculate_action
-import posthog.tasks.calculate_cohort
-import posthog.tasks.calculate_event_property_usage
-import posthog.tasks.delete_old_plugin_logs
-import posthog.tasks.email
-import posthog.tasks.session_recording_retention
-import posthog.tasks.split_person
-import posthog.tasks.status_report
-import posthog.tasks.sync_all_organization_available_features
-import posthog.tasks.update_cache
-import posthog.tasks.user_identify
+
+from . import (
+    activity_log,
+    async_migrations,
+    calculate_cohort,
+    demo_create_data,
+    demo_reset_master_team,
+    early_access_feature,
+    email,
+    exporter,
+    health_checks,
+    integrations,
+    llm_prompt_cache,
+    plugin_server,
+    process_scheduled_changes,
+    push_notifications,
+    remote_config,
+    split_person,
+    surveys,
+    sync_all_organization_available_product_features,
+    sync_billing,
+    tasks,
+    team_access_cache_tasks,
+    usage_report,
+    warehouse,
+)
+
+__all__ = [
+    "activity_log",
+    "async_migrations",
+    "calculate_cohort",
+    "demo_create_data",
+    "demo_reset_master_team",
+    "early_access_feature",
+    "email",
+    "exporter",
+    "health_checks",
+    "integrations",
+    "llm_prompt_cache",
+    "plugin_server",
+    "process_scheduled_changes",
+    "push_notifications",
+    "remote_config",
+    "split_person",
+    "surveys",
+    "sync_all_organization_available_product_features",
+    "sync_billing",
+    "tasks",
+    "team_access_cache_tasks",
+    "usage_report",
+    "warehouse",
+]

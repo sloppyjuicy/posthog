@@ -1,0 +1,421 @@
+import { actions, afterMount, connect, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+import { forms } from 'kea-forms'
+import { loaders } from 'kea-loaders'
+import { router, urlToAction } from 'kea-router'
+import React from 'react'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import api from 'lib/api'
+import { tryShowMCPHint } from 'lib/components/MCPHint/mcpHintLogic'
+import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
+import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
+import { identifierToHuman } from 'lib/utils/strings'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { SIDE_PANEL_CONTEXT_KEY, SidePanelSceneContext } from '~/layout/navigation-3000/sidepanel/types'
+import { deleteFromTree, refreshTreeItem } from '~/layout/panel-layout/ProjectTree/projectTreeLogic'
+import { performQuery } from '~/queries/query'
+import { ActorsQuery, NodeKind } from '~/queries/schema/schema-general'
+import { setLatestVersionsOnQuery } from '~/queries/utils'
+import {
+    ActivityScope,
+    Breadcrumb,
+    EarlyAccessFeatureStage,
+    EarlyAccessFeatureTabs,
+    EarlyAccessFeatureType,
+    NewEarlyAccessFeatureType,
+    ProjectTreeRef,
+    PropertyFilterType,
+    PropertyOperator,
+} from '~/types'
+
+import type { earlyAccessFeatureLogicType } from './earlyAccessFeatureLogicType'
+import { earlyAccessFeaturesLogic } from './earlyAccessFeaturesLogic'
+import { GAPromotionDialogContent } from './GAPromotionDialogContent'
+
+export const NEW_EARLY_ACCESS_FEATURE: NewEarlyAccessFeatureType = {
+    name: '',
+    description: '',
+    stage: EarlyAccessFeatureStage.Draft,
+    documentation_url: '',
+    feature_flag_id: undefined,
+    payload: {},
+}
+
+export interface EarlyAccessFeatureLogicProps {
+    /** Either a UUID or "new". */
+    id: string
+}
+
+export const earlyAccessFeatureLogic = kea<earlyAccessFeatureLogicType>([
+    path(['products', 'earlyAccessFeatures', 'frontend', 'earlyAccessFeatureLogic']),
+    props({} as EarlyAccessFeatureLogicProps),
+    key(({ id }) => id),
+    connect(() => ({
+        values: [teamLogic, ['currentTeamId'], earlyAccessFeaturesLogic, ['earlyAccessFeatures']],
+    })),
+    actions({
+        setEarlyAccessFeatureMissing: true,
+        toggleImplementOptInInstructionsModal: true,
+        editFeature: (editing: boolean) => ({ editing }),
+        setOriginalStage: (stage: EarlyAccessFeatureStage) => ({ stage }),
+        updateStage: (stage: EarlyAccessFeatureStage) => ({ stage }),
+        deleteEarlyAccessFeature: (earlyAccessFeatureId: EarlyAccessFeatureType['id']) => ({ earlyAccessFeatureId }),
+        setActiveTab: (activeTab: EarlyAccessFeatureTabs) => ({ activeTab }),
+        showGAPromotionConfirmation: (onConfirm: (rolloutToAll: boolean) => void) => ({ onConfirm }),
+    }),
+    loaders(({ props, values, actions }) => ({
+        earlyAccessFeature: {
+            loadEarlyAccessFeature: async () => {
+                if (props.id && props.id !== 'new') {
+                    try {
+                        const response = await api.earlyAccessFeatures.get(props.id)
+                        return response
+                    } catch (error: any) {
+                        actions.setEarlyAccessFeatureMissing()
+                        throw error
+                    }
+                }
+                return NEW_EARLY_ACCESS_FEATURE
+            },
+            saveEarlyAccessFeature: async (
+                updatedEarlyAccessFeature: Partial<EarlyAccessFeatureType | NewEarlyAccessFeatureType>
+            ) => {
+                let result: EarlyAccessFeatureType
+                if (props.id === 'new') {
+                    result = await api.earlyAccessFeatures.create(
+                        updatedEarlyAccessFeature as NewEarlyAccessFeatureType
+                    )
+                } else {
+                    result = await api.earlyAccessFeatures.update(
+                        props.id,
+                        updatedEarlyAccessFeature as EarlyAccessFeatureType
+                    )
+                }
+                return result
+            },
+        },
+
+        personsCount: [
+            null as [number, number] | null,
+            {
+                loadEarlyAccessFeatureSuccess: async (_, breakpoint) => {
+                    // Should exist because it was a success, but Typescript doesn't know that
+                    if (!values.earlyAccessFeature || !('feature_flag' in values.earlyAccessFeature)) {
+                        return null
+                    }
+
+                    // :KRUDGE: Should try and get this to work with a single query in the future
+                    const results = await Promise.all(
+                        ['true', 'false'].map((value) =>
+                            performQuery<ActorsQuery>(
+                                setLatestVersionsOnQuery({
+                                    kind: NodeKind.ActorsQuery,
+                                    properties: [
+                                        {
+                                            key: values.featureEnrollmentKey,
+                                            type: PropertyFilterType.Person,
+                                            operator: PropertyOperator.Exact,
+                                            value: [value],
+                                        },
+                                    ],
+                                    select: ['count()'],
+                                })
+                            )
+                        )
+                    )
+                    breakpoint()
+
+                    return results.map((result) => result?.results?.[0]?.[0] ?? null) as [number, number]
+                },
+            },
+        ],
+    })),
+    forms(({ actions, props, values }) => ({
+        earlyAccessFeature: {
+            defaults: { ...NEW_EARLY_ACCESS_FEATURE } as NewEarlyAccessFeatureType | EarlyAccessFeatureType,
+            errors: ({ name, payload }) =>
+                ({
+                    name: !name ? 'Feature name must be set' : undefined,
+                    // payload is edited as a JSON string in the form, but typed as Record<string, any>
+                    payload:
+                        payload && typeof payload === 'string'
+                            ? (() => {
+                                  try {
+                                      JSON.parse(payload)
+                                      return undefined
+                                  } catch {
+                                      return 'Payload must be valid JSON'
+                                  }
+                              })()
+                            : undefined,
+                }) as any,
+            submit: async (payload) => {
+                const parsedPayload = {
+                    ...payload,
+                    payload: payload.payload && typeof payload.payload === 'string' ? JSON.parse(payload.payload) : {},
+                }
+
+                // If promoting to General Availability, show confirmation dialog
+                const isPromotingToGA =
+                    parsedPayload.stage === EarlyAccessFeatureStage.GeneralAvailability &&
+                    values.originalEarlyAccessFeatureStage !== EarlyAccessFeatureStage.GeneralAvailability
+
+                if (isPromotingToGA) {
+                    const rolloutToAll = await new Promise<boolean | null>((resolve) => {
+                        let rollout = false
+                        LemonDialog.open({
+                            title: 'Promote to General Availability?',
+                            description:
+                                'Once promoted to General Availability, this feature cannot be edited anymore. Users will have access to the stable version.',
+                            content: React.createElement(GAPromotionDialogContent, {
+                                onChange: (checked: boolean) => {
+                                    rollout = checked
+                                },
+                            }),
+                            primaryButton: {
+                                children: 'Promote to GA',
+                                type: 'primary',
+                                onClick: () => resolve(rollout),
+                            },
+                            secondaryButton: {
+                                children: 'Cancel',
+                                type: 'tertiary',
+                                onClick: () => resolve(null),
+                            },
+                        })
+                    })
+
+                    if (rolloutToAll === null) {
+                        // Throw to trigger submitFailure so kea-forms doesn't
+                        // set hasSubmitted=true when the user just cancelled.
+                        throw new Error('Cancelled')
+                    }
+
+                    const savePayload = {
+                        ...parsedPayload,
+                        ...(rolloutToAll ? { rollout_to_all: true } : {}),
+                        ...(props.id && props.id !== 'new'
+                            ? {}
+                            : { _create_in_folder: 'Unfiled/Early Access Features' }),
+                    }
+                    actions.saveEarlyAccessFeature(savePayload)
+                    return
+                }
+
+                if (props.id && props.id !== 'new') {
+                    actions.saveEarlyAccessFeature(parsedPayload)
+                } else {
+                    actions.saveEarlyAccessFeature({
+                        ...parsedPayload,
+                        _create_in_folder: 'Unfiled/Early Access Features',
+                    })
+                }
+            },
+        },
+    })),
+    reducers({
+        earlyAccessFeatureMissing: [
+            false,
+            {
+                setEarlyAccessFeatureMissing: () => true,
+            },
+        ],
+        isEditingFeature: [
+            false,
+            {
+                editFeature: (_, { editing }) => editing,
+                saveEarlyAccessFeatureSuccess: () => false,
+            },
+        ],
+        originalEarlyAccessFeatureStage: [
+            null as EarlyAccessFeatureStage | null,
+            {
+                setOriginalStage: (_, { stage }) => stage,
+                loadEarlyAccessFeatureSuccess: (_, { earlyAccessFeature }) =>
+                    'stage' in earlyAccessFeature ? earlyAccessFeature.stage : null,
+                saveEarlyAccessFeatureSuccess: (_, { earlyAccessFeature }) => earlyAccessFeature.stage,
+                editFeature: (state, { editing }) => (editing ? state : null),
+            },
+        ],
+        implementOptInInstructionsModal: [
+            false,
+            {
+                toggleImplementOptInInstructionsModal: (state) => !state,
+            },
+        ],
+        activeTab: [
+            EarlyAccessFeatureTabs.OptedIn as EarlyAccessFeatureTabs,
+            {
+                setActiveTab: (_, { activeTab }) => activeTab,
+            },
+        ],
+    }),
+    selectors(({ actions }) => ({
+        breadcrumbs: [
+            (s) => [s.earlyAccessFeature, s.isEditingFeature],
+            (earlyAccessFeature: EarlyAccessFeatureType, isEditingFeature: boolean): Breadcrumb[] => [
+                {
+                    key: 'EarlyAccessFeatures',
+                    path: urls.earlyAccessFeatures(),
+                    name: 'Early access features',
+                    iconType: 'early_access_feature',
+                },
+                {
+                    key: ['EarlyAccessFeature', earlyAccessFeature.id || 'new'],
+                    name: earlyAccessFeature.name,
+                    forceEditMode: isEditingFeature,
+                    onRename: isEditingFeature
+                        ? async (newName) => actions.setEarlyAccessFeatureValue('name', newName)
+                        : undefined,
+                    iconType: 'early_access_feature',
+                },
+            ],
+        ],
+        projectTreeRef: [
+            () => [(_, props: EarlyAccessFeatureLogicProps) => props.id],
+            (id): ProjectTreeRef => ({ type: 'early_access_feature', ref: id === 'new' ? null : String(id) }),
+        ],
+        [SIDE_PANEL_CONTEXT_KEY]: [
+            (s) => [s.earlyAccessFeature],
+            (earlyAccessFeature): SidePanelSceneContext | null => {
+                return 'id' in earlyAccessFeature && earlyAccessFeature.id
+                    ? {
+                          activity_scope: ActivityScope.EARLY_ACCESS_FEATURE,
+                          activity_item_id: `${earlyAccessFeature.id}`,
+                          access_control_resource: 'early_access_feature',
+                          access_control_resource_id: `${earlyAccessFeature.id}`,
+                      }
+                    : null
+            },
+        ],
+        optedInCount: [
+            (s) => [s.personsCount],
+            (personsCount: [number, number] | null): number | null => personsCount?.[0] ?? null,
+        ],
+        optedOutCount: [
+            (s) => [s.personsCount],
+            (personsCount: [number, number] | null): number | null => personsCount?.[1] ?? null,
+        ],
+        featureEnrollmentKey: [
+            (s) => [s.earlyAccessFeature],
+            (earlyAccessFeature: EarlyAccessFeatureType): string => {
+                return '$feature_enrollment/' + earlyAccessFeature.feature_flag.key
+            },
+        ],
+    })),
+    listeners(({ actions, values }) => ({
+        saveEarlyAccessFeatureFailure: ({ errorObject }) => {
+            // kea-loaders calls the failure action with (error.message, error), so:
+            //   `error` = the message string
+            //   `errorObject` = the full ApiError instance
+            // The ApiError has .attr and .detail from exceptions_hog's response format.
+            if (errorObject) {
+                const attr = errorObject.attr
+                const detail = errorObject.detail
+                if (attr && detail) {
+                    const message = detail.replace(/^This field/, identifierToHuman(attr))
+                    lemonToast.error(`Could not save early access feature: ${message}`)
+                    return
+                }
+                if (detail) {
+                    lemonToast.error(`Could not save early access feature: ${detail}`)
+                    return
+                }
+            }
+            lemonToast.error('Could not save early access feature.')
+        },
+        saveEarlyAccessFeatureSuccess: ({ earlyAccessFeature: _earlyAccessFeature }) => {
+            lemonToast.success('Early access feature saved')
+            earlyAccessFeaturesLogic.findMounted()?.actions.loadEarlyAccessFeatures()
+            if (_earlyAccessFeature.id) {
+                refreshTreeItem('early_access_feature', _earlyAccessFeature.id)
+                router.actions.replace(urls.earlyAccessFeature(_earlyAccessFeature.id))
+
+                // Mark feature creation task as completed
+                globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.CreateEarlyAccessFeature)
+                tryShowMCPHint('early_access_features.create')
+            }
+        },
+        showGAPromotionConfirmation: ({ onConfirm }) => {
+            let rolloutToAll = false
+            LemonDialog.open({
+                title: 'Promote to General Availability?',
+                description:
+                    'Once promoted to General Availability, this feature cannot be edited anymore. Users will have access to the stable version.',
+                content: React.createElement(GAPromotionDialogContent, {
+                    onChange: (checked: boolean) => {
+                        rolloutToAll = checked
+                    },
+                }),
+                primaryButton: {
+                    children: 'Promote to GA',
+                    type: 'primary',
+                    onClick: () => onConfirm(rolloutToAll),
+                },
+                secondaryButton: {
+                    children: 'Cancel',
+                    type: 'tertiary',
+                },
+            })
+        },
+        updateStage: async ({ stage }) => {
+            const save = (rolloutToAll?: boolean): void => {
+                actions.saveEarlyAccessFeature({
+                    ...values.earlyAccessFeature,
+                    stage,
+                    ...(rolloutToAll ? { rollout_to_all: true } : {}),
+                })
+
+                // Mark stage update task as completed when user changes stage
+                globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.UpdateFeatureStage)
+            }
+
+            // If promoting to General Availability, show confirmation dialog
+            if (stage === EarlyAccessFeatureStage.GeneralAvailability) {
+                actions.showGAPromotionConfirmation(save)
+            } else {
+                save()
+            }
+        },
+        deleteEarlyAccessFeature: async ({ earlyAccessFeatureId }) => {
+            try {
+                await api.earlyAccessFeatures.delete(earlyAccessFeatureId)
+                lemonToast.info(
+                    'Early access feature deleted. Remember to delete corresponding feature flag if necessary'
+                )
+                earlyAccessFeaturesLogic
+                    .findMounted()
+                    ?.actions.loadEarlyAccessFeaturesSuccess(
+                        values.earlyAccessFeatures.filter((feature) => feature.id !== earlyAccessFeatureId)
+                    )
+                deleteFromTree('early_access_feature', earlyAccessFeatureId)
+                router.actions.push(urls.earlyAccessFeatures())
+            } catch (e) {
+                lemonToast.error(`Error deleting Early Access Feature: ${e}`)
+            }
+        },
+    })),
+    urlToAction(({ actions, props, values }) => ({
+        [urls.earlyAccessFeature(props.id ?? 'new')]: (_, __, ___, { method }) => {
+            // If the URL was pushed (user clicked on a link), reset the scene's data.
+            // This avoids resetting form fields if you click back/forward.
+            if (method === 'PUSH') {
+                // When pushing to `/new` and the early access feature does not have id, do not load the flag again
+                if (props.id === 'new' && !('id' in values.earlyAccessFeature)) {
+                    return
+                }
+                if (props.id) {
+                    actions.loadEarlyAccessFeature()
+                }
+            }
+        },
+    })),
+    afterMount(({ props, actions }) => {
+        if (props.id !== 'new') {
+            actions.loadEarlyAccessFeature()
+        }
+    }),
+])

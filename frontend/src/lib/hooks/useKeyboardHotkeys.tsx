@@ -1,32 +1,18 @@
-import { useValues } from 'kea'
-import { useEventListener } from 'lib/hooks/useEventListener'
 import { DependencyList } from 'react'
-import { navigationLogic } from '~/layout/navigation/navigationLogic'
-import { GlobalHotKeys, HotKeys } from '~/types'
+
+import { useEventListener } from 'lib/hooks/useEventListener'
+import posthog from 'lib/posthog-typed'
+
+import { HotKey } from '~/types'
 
 export interface HotkeyInterface {
-    action: () => void
+    action: (e: KeyboardEvent) => void
     disabled?: boolean
+    // Indicates the "action" will handle the event and preventDefault should not be called
+    willHandleEvent?: boolean
 }
 
-type LocalHotkeysInterface = Partial<Record<HotKeys, HotkeyInterface>>
-export const useKeyboardHotkeys = (
-    hotkeys: LocalHotkeysInterface,
-    deps?: DependencyList,
-    enableOnGlobal?: boolean
-): void => _useKeyboardHotkeys(hotkeys, deps, enableOnGlobal)
-
-/*
- Global keyboard hotkeys reserve special keys for shortcuts that are available everywhere 
- in the app, we separate them to avoid mixup with local commands
- */
-type GlobalHotkeysInterface = Partial<Record<GlobalHotKeys, HotkeyInterface>>
-export const useGlobalKeyboardHotkeys = (hotkeys: GlobalHotkeysInterface, deps?: DependencyList): void =>
-    _useKeyboardHotkeys(hotkeys, deps, true)
-
-type AllHotKeys = GlobalHotKeys | HotKeys
-type AllHotkeysInterface = Partial<Record<AllHotKeys, HotkeyInterface>>
-
+export type HotkeysInterface = Partial<Record<HotKey, HotkeyInterface>>
 /**
  * input boxes in the hovering toolbar do not have event target of input.
  * they are detected as for e.g.div#__POSTHOG_TOOLBAR__.ph-no-capture
@@ -45,48 +31,85 @@ const isToolbarInput = (event: Event, ignorableElements: string[]): boolean => {
     return ignorableElements.includes(tagName.toLowerCase())
 }
 
+const exceptions = ['.hotkey-block', '.hotkey-block *']
+
+// modifier vocabulary and order must stay in lockstep with shortcutLogic.tsx's pressedKeys,
+// so the same chord reports the same `keybind` string from either mechanism
+function formatTriggeredKeybind(event: KeyboardEvent, key: string): string {
+    const parts: string[] = []
+    if (event.metaKey) {
+        parts.push('command')
+    }
+    if (event.ctrlKey) {
+        parts.push('ctrl')
+    }
+    if (event.shiftKey) {
+        parts.push('shift')
+    }
+    if (event.altKey) {
+        parts.push('option')
+    }
+    parts.push(key)
+    return parts.join('+')
+}
+
 /**
  *
  * @param hotkeys Hotkeys to listen to and actions to execute
  * @param deps List of dependencies for the hook
- * @param enableOnGlobal Whether these hotkeys should run when a globally-scoped hotkey is enabled
  */
-function _useKeyboardHotkeys(hotkeys: AllHotkeysInterface, deps?: DependencyList, enableOnGlobal?: boolean): void {
+export function useKeyboardHotkeys(hotkeys: HotkeysInterface, deps?: DependencyList): void {
     const IGNORE_INPUTS = ['input', 'textarea'] // Inputs in which hotkey events will be ignored
-    const { hotkeyNavigationEngaged } = useValues(navigationLogic)
 
     useEventListener(
         'keydown',
         (event) => {
             const key = event.key
 
-            // Ignore if the key is pressed with a meta or control key (these are general browser commands; e.g. Cmd + R)
-            if (event.metaKey || event.ctrlKey || event.altKey) {
+            // Ignore explicit hotkey exceptions
+            if (exceptions.some((exception) => (event.target as Element)?.matches(exception))) {
                 return
             }
 
             // Ignore typing on inputs (default behavior); except Esc key
-            const isDOMInput = IGNORE_INPUTS.includes((event.target as HTMLElement).tagName.toLowerCase())
+            const isDOMInput =
+                IGNORE_INPUTS.includes((event.target as HTMLElement).tagName.toLowerCase()) ||
+                (event.target as HTMLElement).isContentEditable
             if (key !== 'Escape' && (isDOMInput || isToolbarInput(event, IGNORE_INPUTS))) {
                 return
             }
 
-            // Ignore if global hotkeys are engaged and this is not intended as a global action,
-            // currently this only encompasses global navigation keys
-            if (!enableOnGlobal && hotkeyNavigationEngaged) {
-                return
-            }
-
             for (const relevantKey of Object.keys(hotkeys)) {
-                const hotkey = hotkeys[relevantKey as AllHotKeys]
+                const hotkey = hotkeys[relevantKey as HotKey]
 
                 if (!hotkey || hotkey.disabled) {
                     continue
                 }
 
-                if (key.toLowerCase() === relevantKey) {
-                    event.preventDefault()
-                    hotkey.action()
+                // Ignore if the key is pressed with a meta or control key (these are general browser commands; e.g. Cmd + R) if the action doesn't support it
+                if (!hotkey.willHandleEvent && (event.metaKey || event.ctrlKey || event.altKey)) {
+                    continue
+                }
+                const normalizedKey = (key === ' ' ? 'space' : key.toLowerCase()) as HotKey
+                if (normalizedKey === relevantKey) {
+                    if (!hotkey.willHandleEvent) {
+                        event.preventDefault()
+                    }
+                    // don't capture: when posthog is uninitialized (the toolbar bundle on customer sites — capturing
+                    // there only warns in the customer's console), on held-key repeats (seeking by holding an arrow
+                    // counts once), or on ctrl/meta chords reaching willHandleEvent actions (they treat those as
+                    // browser shortcuts and no-op)
+                    if (
+                        posthog.__loaded &&
+                        !event.repeat &&
+                        !(hotkey.willHandleEvent && (event.metaKey || event.ctrlKey))
+                    ) {
+                        posthog.capture('keybind triggered', {
+                            keybind: formatTriggeredKeybind(event, normalizedKey),
+                            mechanism: 'hotkey',
+                        })
+                    }
+                    hotkey.action(event)
                     break
                 }
             }

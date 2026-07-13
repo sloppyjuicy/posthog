@@ -6,7 +6,7 @@ labels: performance
 
 ## In what situation are you experiencing subpar performance?
 
-*Please describe.*
+_Please describe._
 
 ## How to reproduce
 
@@ -17,10 +17,8 @@ labels: performance
 ## Environment
 
 - [ ] PostHog Cloud
-- [ ] self-hosted PostHog, version/commit: _please provide_
+- [ ] PostHog self-hosted with Kubernetes (deprecated, see ["Sunsetting Kubernetes support"](https://posthog.com/blog/sunsetting-helm-support-posthog)), version/commit: [please provide]
 
 ## Additional context
 
-
-
-#### *Thank you* for your performance issue report – we want PostHog to go supersonic!
+#### _Thank you_ for your performance issue report – we want PostHog to go supersonic!

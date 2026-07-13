@@ -4,11 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0150_increase_element_varchars"),
     ]
 
     operations = [
-        migrations.AddField(model_name="plugin", name="is_preinstalled", field=models.BooleanField(default=False),),
+        migrations.AddField(
+            model_name="plugin",
+            name="is_preinstalled",
+            field=models.BooleanField(default=False),
+        ),
     ]

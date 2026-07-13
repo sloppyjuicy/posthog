@@ -1,14 +1,13 @@
 import json
 from datetime import datetime, timedelta
-from typing import Dict, Literal, Optional, Tuple, Union
+from typing import Literal, Optional, Union
+
+from django.utils import timezone
 
 from dateutil.relativedelta import relativedelta
-from django.db.models.query_utils import Q
-from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from posthog.constants import (
-    DISTINCT_ID_FILTER,
     PERIOD,
     RETENTION_RECURRING,
     RETENTION_TYPE,
@@ -74,17 +73,23 @@ class RetentionDateDerivedMixin(PeriodMixin, TotalIntervalsMixin, DateMixin, Sel
         if self.period == "Hour":
             return self.date_to - tdelta
         elif self.period == "Week":
-            date_from = self.date_to - tdelta
-            return date_from - timedelta(days=date_from.isoweekday() % 7)
+            date_from: datetime = self.date_to - tdelta
+            week_start_alignment_days = date_from.isoweekday() % 7
+            if team := getattr(self, "team", None):
+                from posthog.models.team.team import WeekStartDay
+
+                if team.week_start_day == WeekStartDay.MONDAY:
+                    week_start_alignment_days = date_from.weekday()
+            return date_from - timedelta(days=week_start_alignment_days)
         else:
-            date_to = self.date_to.replace(hour=0, minute=0, second=0, microsecond=0)
+            date_to: datetime = self.date_to.replace(hour=0, minute=0, second=0, microsecond=0)
             return date_to - tdelta
 
     @cached_property
     def date_to(self) -> datetime:
         if self._date_to:
             if isinstance(self._date_to, str):
-                date_to = relative_date_parse(self._date_to)
+                date_to = relative_date_parse(self._date_to, self.team.timezone_info)  # type: ignore
             else:
                 date_to = self._date_to
         else:
@@ -92,7 +97,7 @@ class RetentionDateDerivedMixin(PeriodMixin, TotalIntervalsMixin, DateMixin, Sel
 
         date_to = date_to + self.period_increment
         if self.period == "Hour":
-            return date_to
+            return date_to.replace(minute=0, second=0, microsecond=0)
         else:
             return date_to.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -101,35 +106,10 @@ class RetentionDateDerivedMixin(PeriodMixin, TotalIntervalsMixin, DateMixin, Sel
         _, t1 = RetentionDateDerivedMixin.determine_time_delta(self.total_intervals, self.period)
         return t1
 
-    def reference_date_filter_Q(self, field: str = "timestamp") -> Q:
-        date_from = self.date_from
-        date_to = self.date_from + self.period_increment
-        date_from = self.date_from
-        if self._date_from == "all":
-            return Q()
-        if not date_from:
-            date_from = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0) - relativedelta(days=7)
-        filter = Q(**{"{}__gte".format(field): date_from})
-        if date_to:
-            filter &= Q(**{"{}__lte".format(field): date_to})
-        return filter
-
-    def recurring_date_filter_Q(self, field: str = "timestamp") -> Q:
-        date_from = self.date_from + self.selected_interval * self.period_increment
-        date_to = date_from + self.period_increment
-        if self._date_from == "all":
-            return Q()
-        if not date_from:
-            date_from = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0) - relativedelta(days=7)
-        filter = Q(**{"{}__gte".format(field): date_from})
-        if date_to:
-            filter &= Q(**{"{}__lte".format(field): date_to})
-        return filter
-
     @staticmethod
     def determine_time_delta(
         total_intervals: int, period: str
-    ) -> Tuple[Union[timedelta, relativedelta], Union[timedelta, relativedelta]]:
+    ) -> tuple[Union[timedelta, relativedelta], Union[timedelta, relativedelta]]:
         if period == "Hour":
             return timedelta(hours=total_intervals), timedelta(hours=1)
         elif period == "Week":

@@ -1,68 +1,87 @@
-import React from 'react'
 import { useActions, useValues } from 'kea'
-import { ActionStep } from '~/toolbar/elements/ActionStep'
-import { CalendarOutlined, PlusOutlined } from '@ant-design/icons'
-import { heatmapLogic } from '~/toolbar/elements/heatmapLogic'
-import { Button, Statistic, Row, Col } from 'antd'
-import { elementsLogic } from '~/toolbar/elements/elementsLogic'
+
+import { IconPlus } from '@posthog/icons'
+import { LemonButton } from '@posthog/lemon-ui'
+
+import { ElementClickStats } from 'lib/components/heatmaps/ElementClickStats'
+
 import { ActionsListView } from '~/toolbar/actions/ActionsListView'
+import { ActionStep } from '~/toolbar/actions/ActionStep'
+import { elementsLogic } from '~/toolbar/elements/elementsLogic'
+import { heatmapToolbarMenuLogic } from '~/toolbar/elements/heatmapToolbarMenuLogic'
+
+import { actionsTabLogic } from '../actions/actionsTabLogic'
+import { SelectorQualityWarning } from './SelectorQualityWarning'
 
 export function ElementInfo(): JSX.Element | null {
-    const { clickCount } = useValues(heatmapLogic)
+    const { clickCount: totalClickCount, dateRange } = useValues(heatmapToolbarMenuLogic)
 
-    const { hoverElementMeta, selectedElementMeta } = useValues(elementsLogic)
+    const { activeMeta } = useValues(elementsLogic)
     const { createAction } = useActions(elementsLogic)
-
-    const activeMeta = hoverElementMeta || selectedElementMeta
+    const { automaticActionCreationEnabled } = useValues(actionsTabLogic)
 
     if (!activeMeta) {
         return null
     }
 
-    const { element, position, count, actionStep } = activeMeta
+    const { element, position, count, clickCount, rageclickCount, deadclickCount, actionStep, actions } = activeMeta
 
     return (
         <>
-            <div style={{ padding: 15, borderLeft: '5px solid #8F98FF', background: 'hsla(235, 100%, 99%, 1)' }}>
+            <div className="p-3 border-l-[5px] border-l-warning bg-bg-light">
                 <h1 className="section-title">Selected Element</h1>
-                <ActionStep actionStep={actionStep} />
+                {actionStep && <ActionStep actionStep={actionStep} />}
+
+                <SelectorQualityWarning selector={actionStep?.selector} compact />
             </div>
 
             {position ? (
-                <div style={{ padding: 15, borderLeft: '5px solid #FF9870', background: 'hsla(19, 99%, 99%, 1)' }}>
+                <div className="p-3 border-l-[5px] border-l-danger bg-surface-primary text-primary">
                     <h1 className="section-title">Stats</h1>
-                    <p>
-                        <CalendarOutlined /> <u>Last 7 days</u>
-                    </p>
-                    <Row gutter={16}>
-                        <Col span={16}>
-                            <Statistic
-                                title="Clicks"
-                                value={count || 0}
-                                suffix={`/ ${clickCount} (${
-                                    clickCount === 0 ? '-' : Math.round(((count || 0) / clickCount) * 10000) / 100
-                                }%)`}
-                            />
-                        </Col>
-                        <Col span={8}>
-                            <Statistic title="Ranking" prefix="#" value={position || 0} />
-                        </Col>
-                    </Row>
+                    <ElementClickStats
+                        count={count || 0}
+                        totalCount={totalClickCount}
+                        rank={position || 0}
+                        clickCount={clickCount || 0}
+                        rageclickCount={rageclickCount || 0}
+                        deadclickCount={deadclickCount || 0}
+                        dateRange={dateRange ?? undefined}
+                    />
                 </div>
             ) : null}
 
-            <div style={{ padding: 15, borderLeft: '5px solid #94D674', background: 'hsla(100, 74%, 98%, 1)' }}>
-                <h1 className="section-title">Actions ({activeMeta.actions.length})</h1>
+            <div className="p-3 border-l-[5px] border-l-success bg-surface-secondary">
+                {!automaticActionCreationEnabled && (
+                    <>
+                        <h1 className="section-title">Actions ({actions?.length ?? 0})</h1>
 
-                {activeMeta.actions.length === 0 ? (
-                    <p>No actions include this element</p>
-                ) : (
-                    <ActionsListView actions={activeMeta.actions.map((a) => a.action)} />
+                        {!actions || actions.length === 0 ? (
+                            <p className="text-primary">No actions include this element</p>
+                        ) : (
+                            <ActionsListView actions={actions.map((a) => a.action)} />
+                        )}
+                    </>
                 )}
-
-                <Button size="small" onClick={() => createAction(element)}>
-                    <PlusOutlined /> Create a new action
-                </Button>
+                {automaticActionCreationEnabled ? (
+                    <LemonButton
+                        size="small"
+                        type="primary"
+                        status="alt"
+                        onClick={() => createAction(element)}
+                        icon={<IconPlus />}
+                    >
+                        Select element
+                    </LemonButton>
+                ) : (
+                    <LemonButton
+                        size="small"
+                        type="secondary"
+                        onClick={() => createAction(element)}
+                        icon={<IconPlus />}
+                    >
+                        Create a new action
+                    </LemonButton>
+                )}
             </div>
         </>
     )

@@ -1,0 +1,20 @@
+{
+    "name": "@posthog/products-early-access-features",
+    "scripts": {
+        "backend:test": "pytest -c ../../pytest.ini --rootdir ../.. backend/ -v --tb=short"
+    },
+    "dependencies": {
+        "kea": "catalog:",
+        "kea-forms": "catalog:",
+        "kea-loaders": "catalog:",
+        "kea-router": "catalog:",
+        "kea-subscriptions": "catalog:"
+    },
+    "peerDependencies": {
+        "@posthog/icons": "catalog:",
+        "@storybook/react": "catalog:",
+        "@types/react": "*",
+        "clsx": "*",
+        "react": "*"
+    }
+}

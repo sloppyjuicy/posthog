@@ -1,0 +1,83 @@
+import { useValues } from 'kea'
+
+import { LemonButton } from '@posthog/lemon-ui'
+
+import { IconHeatmap } from 'lib/lemon-ui/icons'
+import { addProductIntentForCrossSell } from 'lib/utils/product-intents'
+import { urls } from 'scenes/urls'
+
+import { ProductIntentContext, ProductKey, WebStatsBreakdown } from '~/queries/schema/schema-general'
+
+import { webAnalyticsLogic } from '../webAnalyticsLogic'
+
+interface HeatmapButtonProps {
+    breakdownBy: WebStatsBreakdown
+    value: unknown
+}
+
+// Currently can only support breakdown where the value is a pathname
+const VALID_BREAKDOWN_VALUES = new Set([
+    WebStatsBreakdown.Page,
+    WebStatsBreakdown.InitialPage,
+    WebStatsBreakdown.ExitPage,
+    WebStatsBreakdown.ExitClick,
+    WebStatsBreakdown.FrustrationMetrics,
+])
+
+export const HeatmapButton = ({ breakdownBy, value }: HeatmapButtonProps): JSX.Element => {
+    const { domainFilter: webAnalyticsSelectedDomain } = useValues(webAnalyticsLogic)
+
+    // Some breakdown strategies surface tuples or numbers in record[0] (e.g. Viewport),
+    // so guard before reaching string methods further down.
+    if (typeof value !== 'string' || value === '') {
+        return <></>
+    }
+
+    // Currently heatmaps only support pathnames,
+    // so we ignore the other breakdown types
+    if (!VALID_BREAKDOWN_VALUES.has(breakdownBy)) {
+        return <></>
+    }
+
+    // When there's no domain filter selected, display a disabled button with a tooltip
+    if (!webAnalyticsSelectedDomain || webAnalyticsSelectedDomain === 'all') {
+        return (
+            <LemonButton
+                disabledReason="Select a domain to view heatmaps"
+                icon={<IconHeatmap />}
+                type="tertiary"
+                size="xsmall"
+                tooltip="View heatmap for this page"
+                className="no-underline"
+            />
+        )
+    }
+
+    // Normalize domain and path then join with a slash
+    const domain = webAnalyticsSelectedDomain.endsWith('/')
+        ? webAnalyticsSelectedDomain.slice(0, -1)
+        : webAnalyticsSelectedDomain
+    const path = value.startsWith('/') ? value.slice(1) : value
+    const url = `${domain}/${path}`
+
+    return (
+        <LemonButton
+            to={urls.heatmapNew(`pageURL=${url}&dataURL=${url}`)}
+            icon={<IconHeatmap />}
+            type="tertiary"
+            size="xsmall"
+            tooltip="View heatmap for this page"
+            className="no-underline"
+            targetBlank
+            hideExternalLinkIcon={true}
+            onClick={(e: React.MouseEvent) => {
+                e.stopPropagation()
+                void addProductIntentForCrossSell({
+                    from: ProductKey.WEB_ANALYTICS,
+                    to: ProductKey.HEATMAPS,
+                    intent_context: ProductIntentContext.WEB_ANALYTICS_INSIGHT,
+                })
+            }}
+        />
+    )
+}

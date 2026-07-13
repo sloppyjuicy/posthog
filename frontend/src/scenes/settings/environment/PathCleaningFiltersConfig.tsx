@@ -1,0 +1,105 @@
+import { useActions, useValues } from 'kea'
+import { useState } from 'react'
+
+import { IconArrowRight } from '@posthog/icons'
+import { LemonInput, Link } from '@posthog/lemon-ui'
+
+import { PathCleanFilterAddItemButton } from 'lib/components/PathCleanFilters/PathCleanFilterAddItemButton'
+import { parseAliasToReadable } from 'lib/components/PathCleanFilters/PathCleanFilterItem'
+import { PathCleanFiltersTable } from 'lib/components/PathCleanFilters/PathCleanFiltersTable'
+import { PathCleaningRulesDebugger } from 'lib/components/PathCleanFilters/PathCleaningRulesDebugger'
+import { RestrictionScope, useRestrictedArea } from 'lib/components/RestrictedArea'
+import { TeamMembershipLevel } from 'lib/constants'
+import { isValidRegexp } from 'lib/utils/regexp'
+import { teamLogic } from 'scenes/teamLogic'
+import { userLogic } from 'scenes/userLogic'
+
+import { AvailableFeature, PathCleaningFilter } from '~/types'
+
+const cleanPathWithRegexes = (path: string, filters: PathCleaningFilter[]): string => {
+    return filters.reduce((text, filter) => {
+        // If for some reason we don't have a valid RegExp, don't attempt to clean the path
+        if (!isValidRegexp(filter.regex ?? '')) {
+            return text
+        }
+
+        return text.replace(new RegExp(filter.regex ?? '', 'gi'), filter.alias ?? '')
+    }, path)
+}
+
+export function PathCleaningFiltersConfig(): JSX.Element | null {
+    const [testValue, setTestValue] = useState('')
+
+    const { updateCurrentTeam } = useActions(teamLogic)
+    const { currentTeam } = useValues(teamLogic)
+    const { hasAvailableFeature } = useValues(userLogic)
+    const hasAdvancedPaths = hasAvailableFeature(AvailableFeature.PATHS_ADVANCED)
+    const restrictedReason = useRestrictedArea({
+        scope: RestrictionScope.Project,
+        minimumAccessLevel: TeamMembershipLevel.Admin,
+    })
+
+    if (!currentTeam) {
+        return null
+    }
+
+    if (!hasAdvancedPaths) {
+        return (
+            <p>
+                Advanced path cleaning is a premium feature. Check{' '}
+                <Link to="https://posthog.com/docs/product-analytics/paths#path-cleaning-rules">
+                    our path cleaning rules documentation
+                </Link>{' '}
+                to learn more about it.
+            </p>
+        )
+    }
+
+    const cleanedTestPath = cleanPathWithRegexes(testValue, currentTeam.path_cleaning_filters ?? [])
+    const readableTestPath = parseAliasToReadable(cleanedTestPath)
+
+    const updateFilters = (filters: PathCleaningFilter[]): void => {
+        updateCurrentTeam({ path_cleaning_filters: filters })
+    }
+
+    const onAddFilter = (filter: PathCleaningFilter): void => {
+        const filterWithOrder = {
+            ...filter,
+            order: (currentTeam.path_cleaning_filters || []).length,
+        }
+        updateFilters([...(currentTeam.path_cleaning_filters || []), filterWithOrder])
+    }
+
+    return (
+        <>
+            <div className="flex flex-col gap-4">
+                <PathCleanFiltersTable filters={currentTeam.path_cleaning_filters || []} setFilters={updateFilters} />
+                <div>
+                    <PathCleanFilterAddItemButton onAdd={onAddFilter} />
+                </div>
+            </div>
+
+            <p className="mt-4">Wanna test what your cleaned path will look like? Try them out here.</p>
+            <div className="flex flex-col sm:flex-row gap-2 items-center justify-center">
+                <LemonInput
+                    value={testValue}
+                    onChange={setTestValue}
+                    placeholder="Enter a path to test"
+                    size="medium"
+                    className="flex-1"
+                    disabledReason={restrictedReason}
+                />
+                <IconArrowRight />
+                <span className="inline-flex items-center justify-start p-2 font-mono text-xs flex-1 border rounded min-h-10">
+                    {readableTestPath}
+                </span>
+            </div>
+
+            <PathCleaningRulesDebugger
+                testPath={testValue}
+                filters={currentTeam.path_cleaning_filters ?? []}
+                finalResult={readableTestPath}
+            />
+        </>
+    )
+}

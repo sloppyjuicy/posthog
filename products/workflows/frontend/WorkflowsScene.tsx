@@ -1,0 +1,250 @@
+import { actions, kea, path, props, reducers, selectors, useActions, useValues } from 'kea'
+import { urlToAction } from 'kea-router'
+
+import { IconLetter, IconPlusSmall } from '@posthog/icons'
+import { LemonButton, LemonMenu, LemonMenuItems } from '@posthog/lemon-ui'
+
+import api from 'lib/api'
+import { AccessControlAction } from 'lib/components/AccessControlAction'
+import { RestrictionScope, useRestrictedArea } from 'lib/components/RestrictedArea'
+import { TeamMembershipLevel } from 'lib/constants'
+import { integrationsLogic } from 'lib/integrations/integrationsLogic'
+import { IconSlack, IconTwilio } from 'lib/lemon-ui/icons'
+import { LemonTab, LemonTabs } from 'lib/lemon-ui/LemonTabs'
+import { trackedActionToUrl } from 'lib/logic/scenes/trackedActionToUrl'
+import { addProductIntent } from 'lib/utils/product-intents'
+import { capitalizeFirstLetter } from 'lib/utils/strings'
+import { sceneConfigurations } from 'scenes/scenes'
+import { Scene, SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import { ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
+import { AccessControlLevel, AccessControlResourceType, Breadcrumb } from '~/types'
+
+import { MessageChannels } from './Channels/MessageChannels'
+import { optOutCategoriesLogic } from './OptOuts/optOutCategoriesLogic'
+import { OptOutScene } from './OptOuts/OptOutScene'
+import { MessageTemplatesTable } from './TemplateLibrary/MessageTemplatesTable'
+import { newWorkflowLogic } from './Workflows/newWorkflowLogic'
+import { NewWorkflowModal } from './Workflows/NewWorkflowModal'
+import { WorkflowsTable } from './Workflows/WorkflowsTable'
+import type { workflowsSceneLogicType } from './WorkflowsSceneType'
+
+const WORKFLOW_SCENE_TABS = ['workflows', 'library', 'channels', 'opt-outs'] as const
+export type WorkflowsSceneTab = (typeof WORKFLOW_SCENE_TABS)[number]
+
+export type WorkflowsSceneProps = {
+    tab?: WorkflowsSceneTab
+}
+
+export const workflowsSceneLogic = kea<workflowsSceneLogicType>([
+    props({} as WorkflowsSceneProps),
+    path(() => ['scenes', 'workflows', 'workflowsSceneLogic']),
+    actions({
+        setCurrentTab: (tab: WorkflowsSceneTab) => ({ tab }),
+    }),
+    reducers(() => ({
+        currentTab: [
+            'workflows' as WorkflowsSceneTab,
+            {
+                setCurrentTab: (_, { tab }) => tab,
+            },
+        ],
+    })),
+    selectors({
+        logicProps: [() => [(_, props) => props], (props) => props],
+        breadcrumbs: [
+            (s) => [s.currentTab],
+            (currentTab): Breadcrumb[] => {
+                return [
+                    {
+                        key: [Scene.Workflows, currentTab],
+                        name: capitalizeFirstLetter(currentTab.replaceAll('_', ' ')),
+                        iconType: 'workflows',
+                    },
+                ]
+            },
+        ],
+    }),
+    trackedActionToUrl(({ values }) => ({
+        setCurrentTab: () => [urls.workflows(values.currentTab)],
+    })),
+    urlToAction(({ actions, values }) => {
+        return {
+            [urls.workflows()]: () => {
+                if (values.currentTab !== 'workflows') {
+                    actions.setCurrentTab('workflows')
+                }
+            },
+            [urls.workflows(':tab' as WorkflowsSceneTab)]: ({ tab }) => {
+                let possibleTab: WorkflowsSceneTab = (tab as WorkflowsSceneTab) ?? 'workflows'
+                possibleTab = WORKFLOW_SCENE_TABS.includes(possibleTab) ? possibleTab : 'workflows'
+
+                if (possibleTab !== values.currentTab) {
+                    actions.setCurrentTab(possibleTab)
+                }
+            },
+        }
+    }),
+])
+
+export const scene: SceneExport<WorkflowsSceneProps> = {
+    component: WorkflowsScene,
+    logic: workflowsSceneLogic,
+    paramsToProps: ({ params: { tab } }) => ({ tab }),
+    productKey: ProductKey.WORKFLOWS,
+}
+
+export function WorkflowsScene(props: WorkflowsSceneProps = {}): JSX.Element {
+    const { currentTab } = useValues(workflowsSceneLogic(props))
+    const { openSetupModal } = useActions(integrationsLogic)
+    const { openNewCategoryModal } = useActions(optOutCategoriesLogic)
+    const { showNewWorkflowModal } = useActions(newWorkflowLogic)
+    const newChannelRestrictedReason = useRestrictedArea({
+        scope: RestrictionScope.Project,
+        minimumAccessLevel: TeamMembershipLevel.Admin,
+    })
+
+    const newChannelMenuItems: LemonMenuItems = [
+        {
+            label: (
+                <div className="flex gap-1 items-center">
+                    <IconLetter /> Email
+                </div>
+            ),
+            onClick: () => openSetupModal(undefined, 'email'),
+        },
+
+        {
+            label: (
+                <div className="flex gap-1 items-center">
+                    <IconSlack /> Slack
+                </div>
+            ),
+            disableClientSideRouting: true,
+            to: api.integrations.authorizeUrl({
+                kind: 'slack',
+                next: urls.workflows('channels'),
+            }),
+        },
+        {
+            label: (
+                <div className="flex gap-1 items-center">
+                    <IconTwilio /> Twilio
+                </div>
+            ),
+            onClick: () => openSetupModal(undefined, 'twilio'),
+        },
+    ]
+
+    const tabs: LemonTab<WorkflowsSceneTab>[] = [
+        {
+            label: 'Workflows',
+            key: 'workflows',
+            content: <WorkflowsTable />,
+            link: urls.workflows(),
+        },
+        {
+            label: 'Library',
+            key: 'library',
+            content: (
+                <>
+                    <MessageTemplatesTable />
+                </>
+            ),
+            link: urls.workflows('library'),
+        },
+        {
+            label: 'Channels',
+            key: 'channels',
+            content: <MessageChannels />,
+            link: urls.workflows('channels'),
+        },
+        {
+            label: 'Opt-outs',
+            key: 'opt-outs',
+            content: <OptOutScene />,
+            link: urls.workflows('opt-outs'),
+        },
+    ]
+
+    return (
+        <SceneContent className="workflows">
+            <SceneTitleSection
+                name={sceneConfigurations[Scene.Workflows].name}
+                description={sceneConfigurations[Scene.Workflows].description}
+                resourceType={{
+                    type: sceneConfigurations[Scene.Workflows].iconType || 'default_icon_type',
+                }}
+                actions={
+                    <>
+                        {currentTab === 'workflows' && (
+                            <AccessControlAction
+                                resourceType={AccessControlResourceType.Workflow}
+                                minAccessLevel={AccessControlLevel.Editor}
+                            >
+                                <LemonButton
+                                    data-attr="new-workflow"
+                                    onClick={() => {
+                                        void addProductIntent({
+                                            product_type: ProductKey.WORKFLOWS,
+                                            intent_context: ProductIntentContext.WORKFLOW_CREATED,
+                                        })
+                                        showNewWorkflowModal()
+                                    }}
+                                    type="primary"
+                                    size="small"
+                                >
+                                    New workflow
+                                </LemonButton>
+                            </AccessControlAction>
+                        )}
+                        {currentTab === 'library' && (
+                            <AccessControlAction
+                                resourceType={AccessControlResourceType.Workflow}
+                                minAccessLevel={AccessControlLevel.Editor}
+                            >
+                                <LemonButton
+                                    data-attr="new-message-button"
+                                    to={urls.workflowsLibraryTemplateNew()}
+                                    type="primary"
+                                    size="small"
+                                >
+                                    New template
+                                </LemonButton>
+                            </AccessControlAction>
+                        )}
+                        {currentTab === 'channels' && (
+                            <LemonMenu items={newChannelMenuItems} matchWidth>
+                                <LemonButton
+                                    data-attr="new-channel-button"
+                                    icon={<IconPlusSmall />}
+                                    size="small"
+                                    type="primary"
+                                    disabledReason={newChannelRestrictedReason}
+                                >
+                                    New channel
+                                </LemonButton>
+                            </LemonMenu>
+                        )}
+                        {currentTab === 'opt-outs' && (
+                            <LemonButton
+                                data-attr="new-optout-category"
+                                icon={<IconPlusSmall />}
+                                size="small"
+                                type="primary"
+                                onClick={() => openNewCategoryModal()}
+                            >
+                                New category
+                            </LemonButton>
+                        )}
+                    </>
+                }
+            />
+            <LemonTabs activeKey={currentTab} tabs={tabs} sceneInset data-attr="workflows-scene-tabs" />
+            <NewWorkflowModal />
+        </SceneContent>
+    )
+}

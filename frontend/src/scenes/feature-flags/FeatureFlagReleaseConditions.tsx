@@ -1,0 +1,747 @@
+import './FeatureFlag.scss'
+
+import clsx from 'clsx'
+import { useActions, useValues } from 'kea'
+import { Fragment } from 'react'
+
+import { IconCopy, IconFlag, IconInfo, IconPlus, IconTrash } from '@posthog/icons'
+import { LemonLabel, LemonSelect, LemonSnack, Link, Tooltip } from '@posthog/lemon-ui'
+
+import { allOperatorsToHumanName } from 'lib/components/DefinitionPopover/utils'
+import { EditableField } from 'lib/components/EditableField/EditableField'
+import { PropertyFilters } from 'lib/components/PropertyFilters/PropertyFilters'
+import { isPropertyFilterWithOperator } from 'lib/components/PropertyFilters/utils'
+import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { INSTANTLY_AVAILABLE_PROPERTIES } from 'lib/constants'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+import { GroupsAccessStatus, groupsAccessLogic } from 'lib/introductions/groupsAccessLogic'
+import { GroupsIntroductionOption } from 'lib/introductions/GroupsIntroductionOption'
+import { IconArrowDown, IconArrowUp, IconErrorOutline, IconOpenInNew, IconSubArrowRight } from 'lib/lemon-ui/icons'
+import { LemonBanner } from 'lib/lemon-ui/LemonBanner'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
+import { LemonDivider } from 'lib/lemon-ui/LemonDivider'
+import { LemonField } from 'lib/lemon-ui/LemonField'
+import { LemonRadio } from 'lib/lemon-ui/LemonRadio'
+import { LemonSlider } from 'lib/lemon-ui/LemonSlider'
+import { LemonTag } from 'lib/lemon-ui/LemonTag/LemonTag'
+import { Spinner } from 'lib/lemon-ui/Spinner/Spinner'
+import { dateFilterToText, dateStringToComponents } from 'lib/utils/dateFilters'
+import { clamp } from 'lib/utils/numbers'
+import { capitalizeFirstLetter, pluralize } from 'lib/utils/strings'
+import { FeatureFlagConditionWarning } from 'scenes/feature-flags/FeatureFlagConditionWarning'
+import { PercentageInput } from 'scenes/feature-flags/PercentageInput'
+import { urls } from 'scenes/urls'
+
+import { SceneSection } from '~/layout/scenes/components/SceneSection'
+import { groupsModel } from '~/models/groupsModel'
+import { getFilterLabel } from '~/taxonomy/helpers'
+import {
+    AnyPropertyFilter,
+    FeatureFlagBucketingIdentifier,
+    FeatureFlagGroupType,
+    PropertyFilterType,
+    PropertyOperator,
+} from '~/types'
+
+import { resolveAggregationGroupTypeIndex } from './aggregation'
+import { MATCHING_ESTIMATE_TOOLTIP } from './constants'
+import { featureFlagLogic } from './featureFlagLogic'
+import {
+    FeatureFlagReleaseConditionsLogicProps,
+    featureFlagReleaseConditionsLogic,
+    isDistinctIdFilter,
+} from './featureFlagReleaseConditionsLogic'
+
+function PropertyValueComponent({
+    property,
+    getDistinctIdName,
+}: {
+    property: AnyPropertyFilter
+    getDistinctIdName: (distinctId: string) => string
+}): JSX.Element {
+    if (property.type === PropertyFilterType.Cohort) {
+        return (
+            <LemonButton type="secondary" size="xsmall" to={urls.cohort(property.value)} sideIcon={<IconOpenInNew />}>
+                {property.cohort_name || `ID ${property.value}`}
+            </LemonButton>
+        )
+    }
+
+    if (property.value === PropertyOperator.IsNotSet || property.value === PropertyOperator.IsSet) {
+        return <></>
+    }
+    const propertyValues = Array.isArray(property.value) ? property.value : [property.value]
+    const isDistinctId = isDistinctIdFilter(property)
+
+    return (
+        <>
+            {propertyValues.map((val, idx) => (
+                <LemonSnack key={idx}>
+                    {isDistinctId ? getDistinctIdName(String(val)) : String(val)}
+                    <span>
+                        {isPropertyFilterWithOperator(property) &&
+                        ['is_date_before', 'is_date_after'].includes(property.operator) &&
+                        dateStringToComponents(String(val)) // check it's a relative date
+                            ? ` ( ${dateFilterToText(
+                                  String(val),
+                                  undefined,
+                                  '',
+                                  [],
+                                  false,
+                                  String(val).slice(-1) === 'h' ? 'MMMM D, YYYY HH:mm:ss' : 'MMMM D, YYYY',
+                                  true
+                              )} )`
+                            : ''}
+                    </span>
+                </LemonSnack>
+            ))}
+        </>
+    )
+}
+
+export function FeatureFlagReleaseConditions({
+    id,
+    readOnly,
+    excludeTitle,
+    filters,
+    onChange,
+    hideMatchOptions,
+    nonEmptyFeatureFlagVariants,
+    showTrashIconWithOneCondition = false,
+    removedLastConditionCallback,
+    evaluationRuntime,
+    isDisabled,
+}: FeatureFlagReleaseConditionsLogicProps & {
+    hideMatchOptions?: boolean
+    excludeTitle?: boolean
+    showTrashIconWithOneCondition?: boolean
+    removedLastConditionCallback?: () => void
+    isDisabled?: boolean
+}): JSX.Element {
+    const releaseConditionsLogic = featureFlagReleaseConditionsLogic({
+        id,
+        readOnly,
+        excludeTitle,
+        filters,
+        onChange,
+    })
+    const {
+        taxonomicGroupTypes,
+        propertySelectErrors,
+        affectedCounts,
+        totalCounts,
+        filtersTaxonomicOptions,
+        aggregationTargetName,
+        properties,
+        filterGroups,
+        getDistinctIdName,
+    } = useValues(releaseConditionsLogic)
+
+    const {
+        setAggregationGroupTypeIndex,
+        updateConditionSet,
+        duplicateConditionSet,
+        removeConditionSet,
+        addConditionSet,
+        moveConditionSetUp,
+        moveConditionSetDown,
+    } = useActions(releaseConditionsLogic)
+
+    const { showGroupsOptions, groupTypes, aggregationLabel } = useValues(groupsModel)
+    const { hasEarlyAccessFeatures, featureFlagKey, nonEmptyVariants, featureFlag } = useValues(featureFlagLogic)
+    const { setBucketingIdentifier, setFeatureFlag } = useActions(featureFlagLogic)
+
+    const { groupsAccessStatus } = useValues(groupsAccessLogic)
+
+    const realtimeCohortFlagTargeting = useFeatureFlag('REALTIME_COHORT_FLAG_TARGETING')
+
+    const featureFlagVariants = nonEmptyFeatureFlagVariants || nonEmptyVariants
+
+    // :KLUDGE: Match by select only allows Select.Option as children, so render groups option directly rather than as a child
+    const matchByGroupsIntroductionOption = GroupsIntroductionOption()
+
+    // Get flag key data for all flag dependencies
+    const { getFlagKey, flagKeysLoading } = useValues(releaseConditionsLogic)
+    const flagKeyData = (flagId: string): string => getFlagKey(flagId)
+
+    const hasNonInstantProperty = (properties: AnyPropertyFilter[]): boolean => {
+        return !!properties.find(
+            (property) =>
+                property.type === PropertyFilterType.Cohort ||
+                !INSTANTLY_AVAILABLE_PROPERTIES.includes(property.key || '')
+        )
+    }
+
+    const isEarlyAccessFeatureCondition = (group: FeatureFlagGroupType): boolean => {
+        return !!(
+            hasEarlyAccessFeatures &&
+            group.properties?.some((property) => property.key === '$feature_enrollment/' + featureFlagKey)
+        )
+    }
+
+    const includeGroupsIntroductionOption = (): boolean =>
+        [GroupsAccessStatus.HasAccess, GroupsAccessStatus.HasGroupTypes, GroupsAccessStatus.NoAccess].includes(
+            groupsAccessStatus
+        )
+
+    const renderReleaseConditionGroup = (group: FeatureFlagGroupType, index: number): JSX.Element => {
+        const rolloutValue = group.rollout_percentage ?? 100
+
+        return (
+            <div className="w-full" key={group.sort_key}>
+                {index > 0 && <div className="condition-set-separator my-1 py-0">OR</div>}
+                <div className="border rounded p-4 bg-surface-primary">
+                    <div className="flex items-center justify-between">
+                        <div className="flex items-center">
+                            <LemonSnack className="mr-2">Set {index + 1}</LemonSnack>
+                            <div>
+                                {group.properties?.length ? (
+                                    <>
+                                        {readOnly ? (
+                                            <>
+                                                Match <b>{aggregationTargetName(group.aggregation_group_type_index)}</b>{' '}
+                                                against <b>all</b> criteria
+                                            </>
+                                        ) : (
+                                            <>
+                                                Matching{' '}
+                                                <b>{aggregationTargetName(group.aggregation_group_type_index)}</b>{' '}
+                                                against the criteria
+                                            </>
+                                        )}
+                                    </>
+                                ) : (
+                                    <>
+                                        Condition set will match{' '}
+                                        <b>all {aggregationTargetName(group.aggregation_group_type_index)}</b>
+                                    </>
+                                )}
+                            </div>
+                        </div>
+                        {!readOnly && (
+                            <div className="flex">
+                                {filterGroups.length > 1 && (
+                                    <div className="flex mr-2">
+                                        <LemonButton
+                                            icon={<IconArrowDown />}
+                                            noPadding
+                                            tooltip="Move condition set down in precedence"
+                                            disabledReason={
+                                                index === filterGroups.length - 1
+                                                    ? 'Cannot move last condition set down'
+                                                    : null
+                                            }
+                                            onClick={() => moveConditionSetDown(index)}
+                                        />
+
+                                        <LemonButton
+                                            icon={<IconArrowUp />}
+                                            noPadding
+                                            tooltip="Move condition set up in precedence"
+                                            disabledReason={index === 0 ? 'Cannot move first condition set up' : null}
+                                            onClick={() => moveConditionSetUp(index)}
+                                        />
+                                    </div>
+                                )}
+                                <LemonButton
+                                    icon={<IconCopy />}
+                                    noPadding
+                                    tooltip="Duplicate condition set"
+                                    onClick={() => duplicateConditionSet(index)}
+                                />
+                                {!isEarlyAccessFeatureCondition(group) &&
+                                    (filterGroups.length > 1 || showTrashIconWithOneCondition) && (
+                                        <LemonButton
+                                            icon={<IconTrash />}
+                                            noPadding
+                                            tooltip="Remove condition set"
+                                            onClick={() => {
+                                                removeConditionSet(index)
+                                                if (filterGroups.length === 1) {
+                                                    removedLastConditionCallback?.()
+                                                }
+                                            }}
+                                        />
+                                    )}
+                            </div>
+                        )}
+                    </div>
+                    {!readOnly && (
+                        <div className="mt-3 max-w-md">
+                            <EditableField
+                                multiline
+                                name="description"
+                                value={group.description || ''}
+                                placeholder="Description (optional)"
+                                onSave={(value) => updateConditionSet(index, undefined, undefined, undefined, value)}
+                                saveOnBlur={true}
+                                maxLength={600}
+                                data-attr={`condition-set-${index}-description`}
+                                compactButtons
+                            />
+                        </div>
+                    )}
+                    {readOnly && group.description && <div className="mt-2 text-muted">{group.description}</div>}
+                    <LemonDivider className="my-3" />
+                    {!readOnly && hasNonInstantProperty(group.properties || []) && (
+                        <LemonBanner type="info" className="mt-3 mb-3">
+                            These properties aren't immediately available on first page load for unidentified persons.
+                            This feature flag requires that at least one event is sent prior to becoming available to
+                            your product or website.{' '}
+                            <Link to="https://posthog.com/docs/feature-flags/bootstrapping" target="_blank">
+                                {' '}
+                                Learn more about how to make feature flags available instantly.
+                            </Link>
+                        </LemonBanner>
+                    )}
+                    {!readOnly && (
+                        <FeatureFlagConditionWarning
+                            properties={properties}
+                            evaluationRuntime={evaluationRuntime}
+                            className="mt-3 mb-3"
+                        />
+                    )}
+                    {readOnly ? (
+                        <>
+                            {group.properties?.map((property, idx) => (
+                                <div className="feature-flag-property-display" key={idx}>
+                                    {idx === 0 ? (
+                                        <LemonButton
+                                            icon={<IconSubArrowRight className="arrow-right" />}
+                                            size="small"
+                                        />
+                                    ) : (
+                                        <LemonButton icon={<span className="text-sm">&</span>} size="small" />
+                                    )}
+                                    {property?.type !== PropertyFilterType.Cohort &&
+                                        property?.type !== PropertyFilterType.Flag &&
+                                        (() => {
+                                            const propertyLabel = getFilterLabel(
+                                                property.key,
+                                                property.type === PropertyFilterType.Person
+                                                    ? TaxonomicFilterGroupType.PersonProperties
+                                                    : TaxonomicFilterGroupType.EventProperties
+                                            )
+                                            return propertyLabel && propertyLabel !== property.key ? (
+                                                <span className="text-muted">{propertyLabel}</span>
+                                            ) : null
+                                        })()}
+                                    {property.type === PropertyFilterType.Flag &&
+                                        (() => {
+                                            const flagId = property.key || ''
+                                            return (
+                                                <Tooltip title={flagId}>
+                                                    <LemonButton
+                                                        to={urls.featureFlag(flagId)}
+                                                        size="small"
+                                                        className="p-0"
+                                                    >
+                                                        <LemonSnack>
+                                                            <IconFlag className="mr-1" />
+                                                            {flagKeysLoading ? 'Loading...' : flagKeyData(flagId)}
+                                                        </LemonSnack>
+                                                    </LemonButton>
+                                                </Tooltip>
+                                            )
+                                        })()}
+                                    {property.type !== PropertyFilterType.Flag && (
+                                        <LemonSnack>
+                                            {property.type === PropertyFilterType.Cohort ? 'Cohort' : property.key}
+                                        </LemonSnack>
+                                    )}
+                                    {isPropertyFilterWithOperator(property) ? (
+                                        <span>{allOperatorsToHumanName(property.operator)} </span>
+                                    ) : null}
+
+                                    <PropertyValueComponent property={property} getDistinctIdName={getDistinctIdName} />
+                                </div>
+                            ))}
+                        </>
+                    ) : (
+                        <div>
+                            <PropertyFilters
+                                orFiltering={true}
+                                pageKey={`feature-flag-${id}-${group.sort_key}-${filterGroups.length}-${
+                                    filters.aggregation_group_type_index ?? ''
+                                }`}
+                                propertyFilters={group?.properties}
+                                logicalRowDivider
+                                addText="Add condition"
+                                onChange={(properties) => updateConditionSet(index, undefined, properties)}
+                                taxonomicGroupTypes={taxonomicGroupTypes}
+                                taxonomicFilterOptionsFromProp={filtersTaxonomicOptions}
+                                hasRowOperator={false}
+                                sendAllKeyUpdates
+                                allowRelativeDateOptions
+                                excludedProperties={
+                                    featureFlagKey
+                                        ? {
+                                              [TaxonomicFilterGroupType.FeatureFlags]: [featureFlagKey],
+                                          }
+                                        : undefined
+                                }
+                                errorMessages={
+                                    propertySelectErrors?.[index]?.properties?.some((message) => !!message.value)
+                                        ? propertySelectErrors[index].properties?.map((message, index) => {
+                                              return message.value ? (
+                                                  <div
+                                                      key={index}
+                                                      className="text-danger flex items-center gap-1 text-sm Field--error"
+                                                  >
+                                                      <IconErrorOutline className="text-xl" /> {message.value}
+                                                  </div>
+                                              ) : (
+                                                  <Fragment key={index} />
+                                              )
+                                          })
+                                        : null
+                                }
+                                hideBehavioralCohorts={!realtimeCohortFlagTargeting}
+                            />
+                        </div>
+                    )}
+                    {(!readOnly || (readOnly && (group.properties?.length || 0) > 0)) && (
+                        <LemonDivider className="my-3" />
+                    )}
+                    {readOnly ? (
+                        <LemonTag
+                            type={
+                                filterGroups.length == 1
+                                    ? group.rollout_percentage == null || group.rollout_percentage == 100
+                                        ? 'highlight'
+                                        : group.rollout_percentage == 0
+                                          ? 'caution'
+                                          : 'none'
+                                    : 'none'
+                            }
+                        >
+                            <div className="text-sm ">
+                                Rolled out to{' '}
+                                {group.rollout_percentage != null ? (
+                                    <b className="tabular-nums">{group.rollout_percentage}</b>
+                                ) : (
+                                    <b className="tabular-nums">100</b>
+                                )}
+                                <b>%</b>
+                                <span> of </span>
+                                <b>{aggregationTargetName(group.aggregation_group_type_index)}</b>{' '}
+                                <span>in this set.</span>
+                            </div>
+                        </LemonTag>
+                    ) : (
+                        <div className="feature-flag-form-row gap-2">
+                            <div className="flex flex-wrap items-center gap-1">
+                                Roll out to{' '}
+                                <LemonSlider
+                                    value={rolloutValue}
+                                    onChange={(value) => {
+                                        updateConditionSet(index, value)
+                                    }}
+                                    min={0}
+                                    max={100}
+                                    step={1}
+                                    className="ml-1.5 w-20"
+                                />
+                                <LemonField.Pure error={propertySelectErrors?.[index]?.rollout_percentage} inline>
+                                    <PercentageInput
+                                        data-attr="rollout-percentage"
+                                        className="ml-2 mr-1.5 max-w-30"
+                                        value={rolloutValue}
+                                        onChange={(value) => updateConditionSet(index, value)}
+                                    />
+                                </LemonField.Pure>{' '}
+                                <div
+                                    className={clsx(
+                                        propertySelectErrors?.[index]?.rollout_percentage ? 'basis-full h-0' : ''
+                                    )}
+                                />
+                                of <b>{aggregationTargetName(group.aggregation_group_type_index)}</b> in this set.
+                                {(() => {
+                                    const targetIndex = group.aggregation_group_type_index
+                                    const pluralName = aggregationTargetName(targetIndex)
+                                    const singularName = aggregationLabel(
+                                        resolveAggregationGroupTypeIndex(
+                                            targetIndex,
+                                            filters.aggregation_group_type_index
+                                        ),
+                                        true
+                                    ).singular
+                                    const affected = group.sort_key ? affectedCounts[group.sort_key] : undefined
+                                    const total = group.sort_key ? totalCounts[group.sort_key] : undefined
+                                    if (affected === undefined || affected < 0 || total === undefined) {
+                                        return (
+                                            <div className="basis-full flex items-center mt-1">
+                                                <Spinner />
+                                            </div>
+                                        )
+                                    }
+                                    const rolloutPct = Number.isNaN(group.rollout_percentage)
+                                        ? 0
+                                        : (group.rollout_percentage ?? 100)
+                                    const receivingFlag = Math.floor((affected * clamp(rolloutPct, 0, 100)) / 100)
+                                    return (
+                                        <div className="basis-full flex flex-col mt-1 text-secondary tabular-nums">
+                                            <span>
+                                                Filters match: <b>~{pluralize(affected, singularName, pluralName)}</b>
+                                                {filters.aggregation_group_type_index == null && (
+                                                    <Tooltip title={MATCHING_ESTIMATE_TOOLTIP} interactive>
+                                                        <IconInfo className="text-muted text-xs ml-0.5" />
+                                                    </Tooltip>
+                                                )}
+                                            </span>
+                                            <span>
+                                                Rollout will be to{' '}
+                                                <b>~{pluralize(receivingFlag, singularName, pluralName)}</b> -{' '}
+                                                <b>{rolloutPct}%</b>
+                                            </span>
+                                        </div>
+                                    )
+                                })()}
+                            </div>
+                        </div>
+                    )}
+                    {featureFlagVariants.length > 0 && (
+                        <>
+                            <LemonDivider className="my-3" />
+                            {readOnly ? (
+                                <div>
+                                    All <b>{aggregationTargetName(group.aggregation_group_type_index)}</b> in this set{' '}
+                                    {group.variant ? (
+                                        <>
+                                            {' '}
+                                            will be in variant <b>{group.variant}</b>
+                                        </>
+                                    ) : (
+                                        <>have no variant override</>
+                                    )}
+                                </div>
+                            ) : (
+                                <div className="feature-flag-form-row">
+                                    <div className="centered">
+                                        <b>Optional override:</b> Set variant for all{' '}
+                                        <b>{aggregationTargetName(group.aggregation_group_type_index)}</b> in this set
+                                        to{' '}
+                                        <LemonSelect
+                                            placeholder="Select variant"
+                                            allowClear={true}
+                                            value={group.variant}
+                                            onChange={(value) => updateConditionSet(index, undefined, undefined, value)}
+                                            options={featureFlagVariants.map((variant) => ({
+                                                label: variant.key,
+                                                value: variant.key,
+                                            }))}
+                                            data-attr="feature-flags-variant-override-select"
+                                            truncateText={{ maxWidthClass: 'max-w-[7rem]' }}
+                                        />
+                                    </div>
+                                </div>
+                            )}
+                        </>
+                    )}
+                </div>
+            </div>
+        )
+    }
+
+    return (
+        <SceneSection
+            title={excludeTitle ? null : 'Release conditions'}
+            data-attr="feature-flag-release-conditions"
+            description={
+                !readOnly &&
+                !excludeTitle && (
+                    // span, not div: SceneSection renders the description inside a <p>
+                    <span className="block text-secondary mb-2">
+                        Specify users for flag release. Condition sets are evaluated top to bottom - the first matching
+                        set is used. A condition matches when all property filters pass AND the target falls within the
+                        rollout percentage.
+                    </span>
+                )
+            }
+        >
+            {isDisabled && !readOnly && (
+                <LemonBanner type="info" className="mb-3">
+                    This flag is currently <b>disabled</b>. These release conditions won't take effect until you enable
+                    it.
+                </LemonBanner>
+            )}
+            {!readOnly &&
+                !filterGroups.every(
+                    (group) => filterGroups.filter((g) => g.variant === group.variant && g.variant !== null).length < 2
+                ) && (
+                    <LemonBanner type="info" className="mt-3 mb-3">
+                        Multiple variant overrides detected. We use the variant override for the first condition set
+                        that matches.
+                    </LemonBanner>
+                )}
+            {!readOnly && showGroupsOptions && !hideMatchOptions && (
+                <div className="mb-4">
+                    <LemonLabel
+                        className="mb-2"
+                        info="Changing match criteria may remove existing variants or payloads."
+                    >
+                        Match by
+                    </LemonLabel>
+                    <LemonRadio
+                        data-attr="feature-flag-aggregation-filter"
+                        value={
+                            filters.aggregation_group_type_index != null
+                                ? 'group'
+                                : featureFlag.bucketing_identifier === FeatureFlagBucketingIdentifier.DEVICE_ID
+                                  ? 'device'
+                                  : 'user'
+                        }
+                        onChange={(value) => {
+                            const currentValue =
+                                filters.aggregation_group_type_index != null
+                                    ? 'group'
+                                    : featureFlag.bucketing_identifier === FeatureFlagBucketingIdentifier.DEVICE_ID
+                                      ? 'device'
+                                      : 'user'
+
+                            const applyChange = (targetValue: string): void => {
+                                if (targetValue === 'user') {
+                                    setAggregationGroupTypeIndex(null)
+                                    setBucketingIdentifier(FeatureFlagBucketingIdentifier.DISTINCT_ID)
+                                } else if (targetValue === 'device') {
+                                    setAggregationGroupTypeIndex(null)
+                                    // Atomically switch to device bucketing and disable persist across auth —
+                                    // these are incompatible, so applying both in one setFeatureFlag avoids any
+                                    // window where the closure-captured featureFlag could overwrite the new
+                                    // bucketing identifier.
+                                    setFeatureFlag({
+                                        ...featureFlag,
+                                        bucketing_identifier: FeatureFlagBucketingIdentifier.DEVICE_ID,
+                                        ensure_experience_continuity: false,
+                                    })
+                                } else if (targetValue === 'group') {
+                                    // Default to first group type when selecting Group
+                                    const firstGroupType = Array.from(groupTypes.values())[0]
+                                    if (firstGroupType) {
+                                        setAggregationGroupTypeIndex(firstGroupType.group_type_index)
+                                    }
+                                    setBucketingIdentifier(null)
+                                }
+                            }
+
+                            // Only confirm when changing bucketing on an existing flag
+                            const isExistingFlag = id !== 'new'
+                            const isChangingValue = value !== currentValue
+                            if (isExistingFlag && isChangingValue) {
+                                LemonDialog.open({
+                                    title: 'Change bucketing option?',
+                                    description:
+                                        'Changing the bucketing option will cause users to re-evaluate the flag and may cause changes in the evaluation results. Are you sure you want to continue?',
+                                    primaryButton: {
+                                        children: 'Continue',
+                                        onClick: () => applyChange(value),
+                                        size: 'small',
+                                    },
+                                    secondaryButton: {
+                                        children: 'Cancel',
+                                        type: 'tertiary',
+                                        size: 'small',
+                                    },
+                                })
+                            } else {
+                                applyChange(value)
+                            }
+                        }}
+                        options={[
+                            {
+                                value: 'user',
+                                label: 'User',
+                                description: 'Stable assignment for logged-in users based on their distinct ID.',
+                            },
+                            {
+                                value: 'device',
+                                label: (
+                                    <span>
+                                        Device{' '}
+                                        <LemonTag type="warning" size="small">
+                                            BETA
+                                        </LemonTag>
+                                    </span>
+                                ),
+                                description: (
+                                    <span>
+                                        Stable assignment per device. Good fit for experiments on anonymous users.{' '}
+                                        <Link
+                                            to="https://posthog.com/docs/feature-flags/device-bucketing"
+                                            target="_blank"
+                                        >
+                                            Learn more
+                                        </Link>
+                                    </span>
+                                ),
+                            },
+                            {
+                                value: 'group',
+                                label: 'Group',
+                                description:
+                                    'Stable assignment for everyone in an organization, company, or other custom group type.',
+                                disabledReason: hasEarlyAccessFeatures
+                                    ? 'This feature flag cannot be group-based, because it is linked to an early access feature.'
+                                    : groupTypes.size === 0
+                                      ? 'No group types defined. Set up group analytics first.'
+                                      : undefined,
+                            },
+                        ]}
+                        radioPosition="top"
+                    />
+                    {filters.aggregation_group_type_index != null && groupTypes.size > 0 && (
+                        <div className="mt-3 ml-6">
+                            <LemonSelect
+                                dropdownMatchSelectWidth={false}
+                                data-attr="feature-flag-group-type-select"
+                                value={filters.aggregation_group_type_index}
+                                onChange={(value) => {
+                                    // MatchByGroupsIntroductionOption
+                                    if (value == -2) {
+                                        return
+                                    }
+                                    if (value != null) {
+                                        setAggregationGroupTypeIndex(value)
+                                    }
+                                }}
+                                options={[
+                                    ...Array.from(groupTypes.values()).map((groupType) => ({
+                                        value: groupType.group_type_index,
+                                        label: capitalizeFirstLetter(
+                                            aggregationLabel(groupType.group_type_index).plural
+                                        ),
+                                    })),
+                                    ...(includeGroupsIntroductionOption()
+                                        ? [
+                                              {
+                                                  value: -2,
+                                                  label: 'MatchByGroupsIntroductionOption',
+                                                  labelInMenu: matchByGroupsIntroductionOption,
+                                              },
+                                          ]
+                                        : []),
+                                ]}
+                            />
+                        </div>
+                    )}
+                </div>
+            )}
+            <div className="FeatureConditionCard max-w-prose">
+                {filterGroups.map((group, index) => (
+                    <div key={group.sort_key || index}>{renderReleaseConditionGroup(group, index)}</div>
+                ))}
+            </div>
+            {!readOnly && (
+                <LemonButton
+                    type="secondary"
+                    className="mt-0 w-max"
+                    onClick={() => addConditionSet()}
+                    icon={<IconPlus />}
+                >
+                    Add condition set
+                </LemonButton>
+            )}
+        </SceneSection>
+    )
+}

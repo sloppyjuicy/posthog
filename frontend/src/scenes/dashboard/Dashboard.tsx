@@ -1,136 +1,152 @@
-import React from 'react'
-import { SceneLoading } from 'lib/utils'
-import { BindLogic, useActions, useValues } from 'kea'
-import { dashboardLogic } from 'scenes/dashboard/dashboardLogic'
-import { DashboardHeader } from 'scenes/dashboard/DashboardHeader'
-import { DashboardItems } from 'scenes/dashboard/DashboardItems'
-import { dashboardsModel } from '~/models/dashboardsModel'
-import { DateFilter } from 'lib/components/DateFilter/DateFilter'
-import { CalendarOutlined } from '@ant-design/icons'
 import './Dashboard.scss'
-import { useKeyboardHotkeys } from '../../lib/hooks/useKeyboardHotkeys'
-import { DashboardMode } from '../../types'
-import { DashboardEventSource } from '../../lib/utils/eventUsageLogic'
-import { TZIndicator } from 'lib/components/TimezoneAware'
-import { EmptyDashboardComponent } from './EmptyDashboardComponent'
-import { NotFound } from 'lib/components/NotFound'
-import { DashboardReloadAction, LastRefreshText } from 'scenes/dashboard/DashboardReloadAction'
 
-interface Props {
+import { BindLogic, useActions, useMountedLogic, useValues } from 'kea'
+
+import { AccessDenied } from 'lib/components/AccessDenied'
+import { NotFound } from 'lib/components/NotFound'
+import { useFileSystemLogView } from 'lib/hooks/useFileSystemLogView'
+import { useOnMountEffect } from 'lib/hooks/useOnMountEffect'
+import { cn } from 'lib/utils/css-classes'
+import { DashboardFilterBar } from 'scenes/dashboard/DashboardFilters'
+import { DashboardItems } from 'scenes/dashboard/DashboardItems'
+import { DashboardLogicProps, dashboardLogic } from 'scenes/dashboard/dashboardLogic'
+import { dataThemeLogic } from 'scenes/dataThemeLogic'
+import { InsightErrorState } from 'scenes/insights/EmptyStates'
+import { SceneExport } from 'scenes/sceneTypes'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneStickyBar } from '~/layout/scenes/components/SceneStickyBar'
+import { ProductKey } from '~/queries/schema/schema-general'
+import { DashboardPlacement, DashboardType, DataColorThemeModel, QueryBasedInsightModel } from '~/types'
+
+import { teamLogic } from '../teamLogic'
+import { AddInsightToDashboardModal } from './addInsightToDashboardModal/AddInsightToDashboardModal'
+import { addInsightToDashboardLogic } from './addInsightToDashboardModalLogic'
+import { DashboardHeader } from './DashboardHeader'
+import { DashboardOverridesBanner } from './DashboardOverridesBanner'
+import { DashboardPublicAccessBanner } from './DashboardPublicAccessBanner'
+import { DashboardZoomControl } from './DashboardZoomControl'
+import { EmptyDashboardComponent } from './EmptyDashboardComponent'
+
+interface DashboardProps {
     id?: string
-    shareToken?: string
-    internal?: boolean
+    dashboard?: DashboardType<QueryBasedInsightModel>
+    placement?: DashboardPlacement
+    themes?: DataColorThemeModel[]
+    /** When set, the "Edit dashboard" menu item links to the dashboard editor with a back button pointing here. */
+    backTo?: { url: string; name: string }
+    showCreateAnomalyAlertButton?: boolean
 }
 
-export function Dashboard({ id, shareToken, internal }: Props): JSX.Element {
+const parseDashboardId = (id: string | undefined): number => (typeof id === 'string' ? parseInt(id, 10) : NaN)
+
+// Wrapper needed because SceneComponent<DashboardLogicProps> requires the component to accept
+// DashboardLogicProps, but DashboardScene takes { backTo? } (logic props are bound separately).
+function DashboardSceneWrapper(): JSX.Element {
+    return <DashboardScene />
+}
+
+export const scene: SceneExport<DashboardLogicProps> = {
+    component: DashboardSceneWrapper,
+    logic: dashboardLogic,
+    paramsToProps: ({ params: { id, placement } }) => ({ id: parseDashboardId(id), placement }),
+    productKey: ProductKey.PRODUCT_ANALYTICS,
+}
+
+export function Dashboard({
+    id,
+    dashboard,
+    placement,
+    themes,
+    backTo,
+    showCreateAnomalyAlertButton,
+}: DashboardProps): JSX.Element {
+    useMountedLogic(dataThemeLogic({ themes }))
+
     return (
-        <BindLogic logic={dashboardLogic} props={{ id: id ? parseInt(id) : undefined, shareToken, internal }}>
-            <DashboardView />
+        <BindLogic logic={dashboardLogic} props={{ id: parseDashboardId(id), placement, dashboard }}>
+            <DashboardScene backTo={backTo} showCreateAnomalyAlertButton={showCreateAnomalyAlertButton} />
         </BindLogic>
     )
 }
 
-function DashboardView(): JSX.Element {
+function DashboardScene({
+    backTo,
+    showCreateAnomalyAlertButton,
+}: {
+    backTo?: { url: string; name: string }
+    showCreateAnomalyAlertButton?: boolean
+}): JSX.Element {
     const {
+        placement,
         dashboard,
-        allItemsLoading: loadingFirstTime,
-        items,
-        filters: dashboardFilters,
-        dashboardMode,
+        canEditDashboard,
+        tiles,
+        itemsLoading,
+        layoutEditMode,
+        dashboardFailedToLoad,
+        accessDeniedToDashboard,
     } = useValues(dashboardLogic)
-    const { dashboardsLoading } = useValues(dashboardsModel)
-    const { setDashboardMode, addGraph, setDates } = useActions(dashboardLogic)
+    const { layoutZoom } = useValues(dashboardLogic)
+    const { currentTeamId } = useValues(teamLogic)
+    const { reportDashboardViewed, abortAnyRunningQuery, setLayoutZoom } = useActions(dashboardLogic)
+    const { addInsightToDashboardModalVisible } = useValues(addInsightToDashboardLogic)
 
-    useKeyboardHotkeys(
-        dashboardMode === DashboardMode.Public || dashboardMode === DashboardMode.Internal
-            ? {}
-            : {
-                  e: {
-                      action: () =>
-                          setDashboardMode(
-                              dashboardMode === DashboardMode.Edit ? null : DashboardMode.Edit,
-                              DashboardEventSource.Hotkey
-                          ),
-                      disabled: dashboardMode !== null && dashboardMode !== DashboardMode.Edit,
-                  },
-                  f: {
-                      action: () =>
-                          setDashboardMode(
-                              dashboardMode === DashboardMode.Fullscreen ? null : DashboardMode.Fullscreen,
-                              DashboardEventSource.Hotkey
-                          ),
-                      disabled: dashboardMode !== null && dashboardMode !== DashboardMode.Fullscreen,
-                  },
-                  k: {
-                      action: () =>
-                          setDashboardMode(
-                              dashboardMode === DashboardMode.Sharing ? null : DashboardMode.Sharing,
-                              DashboardEventSource.Hotkey
-                          ),
-                      disabled: dashboardMode !== null && dashboardMode !== DashboardMode.Sharing,
-                  },
-                  n: {
-                      action: () => addGraph(),
-                      disabled: dashboardMode !== null && dashboardMode !== DashboardMode.Edit,
-                  },
-                  escape: {
-                      // Exit edit mode with Esc. Full screen mode is also exited with Esc, but this behavior is native to the browser.
-                      action: () => setDashboardMode(null, DashboardEventSource.Hotkey),
-                      disabled: dashboardMode !== DashboardMode.Edit,
-                  },
-              },
-        [setDashboardMode, dashboardMode]
-    )
+    useFileSystemLogView({
+        type: 'dashboard',
+        ref: dashboard?.id,
+        enabled: Boolean(currentTeamId && dashboard?.id && !dashboardFailedToLoad && !accessDeniedToDashboard),
+    })
 
-    if (dashboardsLoading || loadingFirstTime) {
-        return <SceneLoading />
-    }
+    useOnMountEffect(() => {
+        reportDashboardViewed()
 
-    if (!dashboard) {
+        // request cancellation of any running queries when this component is no longer in the dom
+        return () => abortAnyRunningQuery()
+    })
+
+    if (!dashboard && !itemsLoading && !dashboardFailedToLoad) {
         return <NotFound object="dashboard" />
     }
 
-    return (
-        <div className="dashboard">
-            {dashboardMode !== DashboardMode.Public && dashboardMode !== DashboardMode.Internal && <DashboardHeader />}
-            {items && items.length ? (
-                <div>
-                    <div className="dashboard-items-actions">
-                        <div className="left-item">
-                            {dashboardMode === DashboardMode.Public ? <LastRefreshText /> : <DashboardReloadAction />}
-                        </div>
+    if (accessDeniedToDashboard) {
+        return <AccessDenied object="dashboard" />
+    }
 
-                        {dashboardMode !== DashboardMode.Public && (
-                            <div
-                                className="right-item"
-                                style={{
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'flex-end',
-                                }}
-                            >
-                                <TZIndicator style={{ marginRight: 8, fontWeight: 'bold' }} />
-                                <DateFilter
-                                    defaultValue="Custom"
-                                    showCustom
-                                    dateFrom={dashboardFilters?.date_from ?? undefined}
-                                    dateTo={dashboardFilters?.date_to ?? undefined}
-                                    onChange={setDates}
-                                    makeLabel={(key) => (
-                                        <>
-                                            <CalendarOutlined />
-                                            <span className="hide-when-small"> {key}</span>
-                                        </>
-                                    )}
-                                />
-                            </div>
-                        )}
-                    </div>
-                    <DashboardItems />
-                </div>
+    return (
+        <SceneContent className={cn('dashboard')}>
+            {placement == DashboardPlacement.Dashboard && <DashboardHeader />}
+            {canEditDashboard && addInsightToDashboardModalVisible && <AddInsightToDashboardModal />}
+            <DashboardPublicAccessBanner dashboard={dashboard} placement={placement} />
+
+            {dashboardFailedToLoad ? (
+                <InsightErrorState title="There was an error loading this dashboard" />
+            ) : !tiles || tiles.length === 0 ? (
+                <EmptyDashboardComponent loading={itemsLoading} canEdit={canEditDashboard} />
             ) : (
-                <EmptyDashboardComponent />
+                <div
+                    className={cn({
+                        '-mt-4': placement == DashboardPlacement.ProjectHomepage,
+                    })}
+                >
+                    <DashboardOverridesBanner />
+
+                    <SceneStickyBar showBorderBottom={false} className="flex gap-2 space-y-0">
+                        <DashboardFilterBar backTo={backTo} />
+                        {layoutEditMode &&
+                            canEditDashboard &&
+                            [
+                                DashboardPlacement.Dashboard,
+                                DashboardPlacement.ProjectHomepage,
+                                DashboardPlacement.Builtin,
+                            ].includes(placement) && (
+                                <DashboardZoomControl layoutZoom={layoutZoom} setLayoutZoom={setLayoutZoom} />
+                            )}
+                    </SceneStickyBar>
+
+                    <DashboardItems showCreateAnomalyAlertButton={showCreateAnomalyAlertButton} />
+                </div>
             )}
-        </div>
+        </SceneContent>
     )
 }

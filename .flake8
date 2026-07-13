@@ -1,8 +1,0 @@
-[flake8]
-application-import-names = posthog
-import-order-style = pycharm
-
-max-line-length = 127
-max-complexity = 10
-
-select=E9,F63,F7,F82,W605

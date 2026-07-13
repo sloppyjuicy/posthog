@@ -1,0 +1,51 @@
+#!/bin/bash
+
+set -e
+
+# Check if flox is available
+if ! command -v flox &> /dev/null; then
+    echo "Error: flox not found. This script is optimized for flox environments."
+    exit 1
+fi
+
+# Determine the correct cache directory based on OS
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    PLAYWRIGHT_CACHE_DIR="$HOME/Library/Caches/ms-playwright"
+else
+    PLAYWRIGHT_CACHE_DIR="$HOME/.cache/ms-playwright"
+fi
+
+# Check if Playwright is installed
+if ! flox activate -- python -c "import playwright" &> /dev/null; then
+    echo "Installing Playwright via pip..."
+    flox activate -- pip install playwright
+    echo "Installing Playwright browsers..."
+    flox activate -- playwright install
+else
+    echo "Playwright is already installed"
+    
+    # Check if browsers are installed by looking for chromium
+    if [ ! -d "$PLAYWRIGHT_CACHE_DIR" ] || ! find "$PLAYWRIGHT_CACHE_DIR" -name "chrome-*" -o -name "headless_shell" -o -name "chromium-*" 2>/dev/null | grep -q .; then
+        echo "Playwright browsers not found, installing..."
+        flox activate -- playwright install
+    else
+        echo "Playwright browsers are already installed"
+    fi
+fi
+
+# Check if FFmpeg is installed and is version 5.x (matching Dockerfile)
+if ! flox activate -- command -v ffmpeg &> /dev/null; then
+    echo "Error: FFmpeg not found. It should be installed via the flox manifest (ffmpeg_5)."
+    echo "Try re-entering your flox environment or running: flox activate"
+    exit 1
+else
+    FFMPEG_VERSION=$(flox activate -- ffmpeg -version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    if [[ ! "$FFMPEG_VERSION" =~ ^5\. ]]; then
+        echo "Error: FFmpeg version $FFMPEG_VERSION found, but version 5.x is required (matching Dockerfile)."
+        echo "Try re-entering your flox environment or running: flox activate"
+        exit 1
+    fi
+    echo "FFmpeg $FFMPEG_VERSION is installed"
+fi
+
+echo "Video dependencies check complete"

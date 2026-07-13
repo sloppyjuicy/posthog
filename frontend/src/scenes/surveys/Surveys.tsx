@@ -1,0 +1,120 @@
+import { useActions, useValues } from 'kea'
+
+import { LemonButton } from '@posthog/lemon-ui'
+
+import { AccessControlAction } from 'lib/components/AccessControlAction'
+import { ActivityLog } from 'lib/components/ActivityLog/ActivityLog'
+import { Shortcut } from 'lib/components/Shortcuts/Shortcut'
+import { keyBinds } from 'lib/components/Shortcuts/shortcuts'
+import { LemonTabs } from 'lib/lemon-ui/LemonTabs'
+import { sceneConfigurations } from 'scenes/scenes'
+import { Scene, SceneExport } from 'scenes/sceneTypes'
+import { SurveyFeedbackButton } from 'scenes/surveys/components/SurveyFeedbackButton'
+import { SurveyNotificationsList } from 'scenes/surveys/components/SurveyNotificationsList'
+import { SurveysTable } from 'scenes/surveys/components/SurveysTable'
+import { urls } from 'scenes/urls'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import { ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
+import { AccessControlLevel, AccessControlResourceType, ActivityScope } from '~/types'
+
+import { SURVEY_CREATED_SOURCE } from './constants'
+import { DuplicateToProjectModal } from './DuplicateToProjectModal'
+import { SurveySettings, SurveysDisabledBanner } from './SurveySettings'
+import { SurveysTabs, surveysLogic } from './surveysLogic'
+
+export const scene: SceneExport = {
+    component: Surveys,
+    logic: surveysLogic,
+    productKey: ProductKey.SURVEYS,
+}
+
+function NewSurveyButton(): JSX.Element {
+    const { addProductIntent } = useActions(surveysLogic)
+
+    const trackAddNewClick = (): void => {
+        addProductIntent({
+            product_type: ProductKey.SURVEYS,
+            intent_context: ProductIntentContext.SURVEY_ADD_NEW,
+        })
+    }
+
+    return (
+        <AccessControlAction resourceType={AccessControlResourceType.Survey} minAccessLevel={AccessControlLevel.Editor}>
+            <Shortcut
+                name="NewSurvey"
+                keybind={[keyBinds.new]}
+                intent="New survey"
+                interaction="click"
+                scope={Scene.Surveys}
+            >
+                <LemonButton
+                    size="small"
+                    to={urls.surveyWizard()}
+                    type="primary"
+                    data-attr="new-survey"
+                    tooltip="New survey"
+                    onClick={trackAddNewClick}
+                >
+                    New survey
+                </LemonButton>
+            </Shortcut>
+        </AccessControlAction>
+    )
+}
+
+function Surveys(): JSX.Element {
+    const { tab } = useValues(surveysLogic)
+    const { setTab, handleMaxSurveyCreated } = useActions(surveysLogic)
+
+    return (
+        <SceneContent>
+            <SceneTitleSection
+                name={sceneConfigurations[Scene.Surveys].name}
+                description={sceneConfigurations[Scene.Surveys].description}
+                resourceType={{
+                    type: sceneConfigurations[Scene.Surveys].iconType || 'default_icon_type',
+                }}
+                actions={
+                    <>
+                        <SurveyFeedbackButton />
+                        <NewSurveyButton />
+                    </>
+                }
+                maxToolProps={{
+                    identifier: 'create_survey',
+                    initialMaxPrompt: 'Create a survey to collect ',
+                    suggestions: [
+                        'Create an NPS survey for customers who completed checkout',
+                        'Create a feedback survey asking about our new dashboard',
+                        'Create a product-market fit survey for trial users',
+                        'Create a quick satisfaction survey for support interactions',
+                    ],
+                    context: {},
+                    callback: (toolOutput) => handleMaxSurveyCreated(toolOutput, SURVEY_CREATED_SOURCE.MAX_AI),
+                }}
+            />
+            <SurveysDisabledBanner />
+            <LemonTabs
+                activeKey={tab}
+                onChange={(newTab) => setTab(newTab as SurveysTabs)}
+                tabs={[
+                    { key: SurveysTabs.Active, label: 'Active' },
+                    { key: SurveysTabs.Archived, label: 'Archived' },
+                    { key: SurveysTabs.Notifications, label: 'Notifications' },
+                    { key: SurveysTabs.History, label: 'History' },
+                    { key: SurveysTabs.Settings, label: 'Settings' },
+                ]}
+                sceneInset={true}
+            />
+            {tab === SurveysTabs.Settings && <SurveySettings />}
+            {tab === SurveysTabs.Notifications && <SurveyNotificationsList />}
+
+            {tab === SurveysTabs.History && <ActivityLog scope={ActivityScope.SURVEY} />}
+
+            {(tab === SurveysTabs.Active || tab === SurveysTabs.Archived) && <SurveysTable />}
+            <DuplicateToProjectModal />
+        </SceneContent>
+    )
+}

@@ -1,4 +1,37 @@
 #!/bin/bash
 set -e
 
-python manage.py runserver
+# Computed vars (need a fresh tempdir per invocation) — must stay in script
+export PROMETHEUS_MULTIPROC_DIR=$(mktemp -d)
+trap 'rm -rf "$PROMETHEUS_MULTIPROC_DIR"' EXIT
+
+
+# Cross-platform Docker host access
+# On macOS/Windows: Docker runs in a VM, use 127.0.0.1 for the host bind
+# On Linux: Use bridge gateway IP for container access while maintaining security
+if [[ -n "$HOST_BIND" ]]; then
+    echo "Using pre-configured HOST_BIND: $HOST_BIND"
+elif [[ "$OSTYPE" == "darwin"* ]] || [[ "$OSTYPE" == "msys" ]]; then
+    HOST_BIND="127.0.0.1"
+    echo "🍎 macOS/Windows detected, using secure localhost binding"
+else
+    # Linux - containers cannot reach host's 127.0.0.1, use bridge gateway
+    DOCKER_GATEWAY_IP=$(docker network inspect bridge --format='{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || echo "172.17.0.1")
+    HOST_BIND="$DOCKER_GATEWAY_IP"
+    echo "🐧 Linux detected, binding to Docker bridge gateway: $HOST_BIND"
+fi
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+python ${DEBUG:+ -m debugpy --listen 127.0.0.1:5678} -m granian \
+    --interface asgi \
+    posthog.asgi:application \
+    --reload \
+    --reload-paths ./posthog \
+    --reload-paths ./ee \
+    --reload-paths ./products \
+    --reload-paths ./frontend/src/products.json \
+    --reload-ignore-paths "$REPO_ROOT/products/agent_platform/services" \
+    --host $HOST_BIND \
+    --log-level debug \
+    --workers 1

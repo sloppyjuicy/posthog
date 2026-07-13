@@ -1,0 +1,669 @@
+import tk from 'timekeeper'
+
+import { OrganizationMembershipLevel } from 'lib/constants'
+import { dayjs } from 'lib/dayjs'
+
+import { billingJson } from '~/mocks/fixtures/_billing'
+import billingJsonWithFlatFee from '~/mocks/fixtures/_billing_with_flat_fee.json'
+
+import {
+    buildUsageLimitApproachingMessage,
+    buildUsageLimitExceededMessage,
+    canAccessBilling,
+    convertAmountToUsage,
+    convertLargeNumberToWords,
+    convertUsageToAmount,
+    formatDisplayUsage,
+    formatProductNames,
+    formatWithDecimals,
+    getMinimumBillingAccessLevel,
+    getProration,
+    getUsageLimitConsequence,
+    projectUsage,
+    summarizeUsage,
+} from './billing-utils'
+
+describe('summarizeUsage', () => {
+    it('should summarise usage', () => {
+        expect(summarizeUsage(0)).toEqual('0')
+        expect(summarizeUsage(999)).toEqual('999')
+        expect(summarizeUsage(1000)).toEqual('1 K')
+        expect(summarizeUsage(3345)).toEqual('3.35 K')
+        expect(summarizeUsage(3600)).toEqual('3.6 K')
+        expect(summarizeUsage(100000)).toEqual('100 K')
+        expect(summarizeUsage(999999)).toEqual('1 M')
+        expect(summarizeUsage(10000000)).toEqual('10 M')
+    })
+})
+
+describe('projectUsage', () => {
+    beforeEach(() => {
+        tk.freeze(new Date('2022-01-01'))
+    })
+    afterEach(() => {
+        tk.reset()
+    })
+    it('should projectUsage based on the remaining days', () => {
+        expect(
+            projectUsage(10000, {
+                current_period_start: dayjs().add(-100, 'hours'),
+                current_period_end: dayjs().add(100, 'hours'),
+                interval: 'month',
+            })
+        ).toEqual(20000)
+
+        expect(
+            projectUsage(10000, {
+                current_period_start: dayjs().add(-1, 'days'),
+                current_period_end: dayjs().add(30, 'days'),
+                interval: 'month',
+            })
+        ).toEqual(310000)
+    })
+
+    it('should not return infinity', () => {
+        expect(
+            projectUsage(10000, {
+                current_period_start: dayjs(),
+                current_period_end: dayjs().add(100, 'hours'),
+                interval: 'month',
+            })
+        ).toEqual(10000)
+    })
+})
+
+const amountToUsageMapping = [
+    { usage: 0, amount: '0.00' },
+    { usage: 1_000_000, amount: '0.00' },
+    { usage: 1_500_000, amount: '155.00' },
+    { usage: 2_000_000, amount: '310.00' },
+    { usage: 6_000_000, amount: '830.00' },
+    { usage: 10_000_000, amount: '1350.00' },
+    { usage: 230_000_000, amount: '10183.50' },
+]
+
+const amountToUsageMappingWithAddons = [
+    { usage: 0, amount: '0.00' },
+    { usage: 1_000_000, amount: '0.00' },
+    { usage: 1_409_086, amount: '155.78' },
+    { usage: 1_818_172, amount: '311.56' },
+    { usage: 4_888_063, amount: '842.89' },
+    { usage: 8_137_188, amount: '1362.75' },
+    { usage: 139_090_972, amount: '9914.62' },
+]
+
+// 20% discount
+const amountToUsageMappingWithPercentDiscount = [
+    { usage: 0, amount: '0.00' },
+    { usage: 1_000_000, amount: '0.00' },
+    { usage: 1_625_000, amount: '155.00' },
+    { usage: 2_500_000, amount: '300.00' },
+    { usage: 7_500_000, amount: '820.00' },
+    { usage: 17_500_000, amount: '1763.80' },
+    { usage: 352_500_000, amount: '8947.60' },
+]
+
+describe('convertUsageToAmount', () => {
+    it.each(amountToUsageMapping)('should convert usage to an amount based on the tiers', (mapping) => {
+        if (billingJson.products[0].tiers) {
+            expect(convertUsageToAmount(mapping.usage, [billingJson.products[0].tiers])).toEqual(mapping.amount)
+        }
+    })
+})
+describe('convertUsageToAmountWithAddons', () => {
+    it.each(amountToUsageMappingWithAddons)('should convert usage to an amount based on the tiers', (mapping) => {
+        if (billingJson.products[0].tiers) {
+            expect(
+                convertUsageToAmount(mapping.usage, [
+                    billingJson.products[0].tiers,
+                    billingJson.products[0].addons[0].tiers || [],
+                ])
+            ).toEqual(mapping.amount)
+        }
+    })
+})
+describe('convertAmountToUsage', () => {
+    it.each(amountToUsageMapping)('should convert amount to a usage based on the tiers', (mapping) => {
+        if (mapping.usage === 0) {
+            // Skip the 0 case as anything below a million is free
+            return
+        }
+        if (billingJson.products[0].tiers) {
+            expect(convertAmountToUsage(mapping.amount, [billingJson.products[0].tiers])).toEqual(mapping.usage)
+        }
+    })
+})
+describe('convertAmountToUsageWithAddons', () => {
+    it.each(amountToUsageMappingWithAddons)('should convert amount to a usage based on the tiers', (mapping) => {
+        if (mapping.usage === 0) {
+            // Skip the 0 case as anything below a million is free
+            return
+        }
+        if (billingJson.products[0].tiers) {
+            expect(
+                convertAmountToUsage(mapping.amount, [
+                    billingJson.products[0].tiers,
+                    billingJson.products[0].addons[0].tiers || [],
+                ])
+            ).toEqual(mapping.usage)
+        }
+    })
+})
+describe('convertUsageToAmountWithPercentDiscount', () => {
+    it.each(amountToUsageMappingWithPercentDiscount)(
+        'should convert usage to an amount based on the tiers',
+        (mapping) => {
+            const discountPercent = 20
+            if (billingJson.products[0].tiers) {
+                expect(convertUsageToAmount(mapping.usage, [billingJson.products[0].tiers], discountPercent)).toEqual(
+                    mapping.amount
+                )
+            }
+        }
+    )
+})
+
+const amountToUsageMappingWithFirstTierFlatFee = [
+    { usage: 5_000_000, amount: '200.00' },
+    { usage: 10_000_000, amount: '575.00' },
+    { usage: 30_000_000, amount: '1725.00' },
+]
+describe('amountToUsageMappingWithFirstTierFlatFee', () => {
+    it.each(amountToUsageMappingWithFirstTierFlatFee)(
+        'should convert usage to an amount based on the tiers',
+        (mapping) => {
+            if (billingJsonWithFlatFee.products[0].tiers) {
+                expect(convertUsageToAmount(mapping.usage, [billingJsonWithFlatFee.products[0].tiers])).toEqual(
+                    mapping.amount
+                )
+            }
+        }
+    )
+    it.each(amountToUsageMappingWithFirstTierFlatFee)(
+        'should convert amount to a usage based on the tiers',
+        (mapping) => {
+            if (billingJsonWithFlatFee.products[0].tiers) {
+                expect(convertAmountToUsage(mapping.amount, [billingJsonWithFlatFee.products[0].tiers])).toEqual(
+                    mapping.usage
+                )
+            }
+        }
+    )
+})
+describe('convertAmountToUsageWithPercentDiscount', () => {
+    it.each(amountToUsageMappingWithPercentDiscount)(
+        'should convert amount to a usage based on the tiers',
+        (mapping) => {
+            if (mapping.usage === 0) {
+                // Skip the 0 case as anything below a million is free
+                return
+            }
+            if (billingJson.products[0].tiers) {
+                const discountPercent = 20
+                expect(convertAmountToUsage(mapping.amount, [billingJson.products[0].tiers], discountPercent)).toEqual(
+                    mapping.usage
+                )
+            }
+        }
+    )
+})
+
+describe('convertLargeNumberToWords', () => {
+    it('should convert large numbers to words', () => {
+        expect(convertLargeNumberToWords(250, null, true, 'survey')).toEqual('First 250 surveys/mo')
+        expect(convertLargeNumberToWords(500, 250, true, 'survey')).toEqual('251-500')
+        expect(convertLargeNumberToWords(1000, 500, true, 'survey')).toEqual('501-1k')
+        expect(convertLargeNumberToWords(10000, 1000, true, 'survey')).toEqual('1-10k')
+        expect(convertLargeNumberToWords(10000000, 1000000, true, 'survey')).toEqual('1-10 million')
+    })
+})
+
+describe('getProration', () => {
+    it('should return proration amount and isProrated when all values are provided', () => {
+        const result = getProration({
+            timeRemainingInSeconds: 15,
+            timeTotalInSeconds: 30,
+            amountUsd: '100',
+            hasActiveSubscription: true,
+        })
+        expect(result).toEqual({
+            isProrated: true,
+            prorationAmount: '50.00',
+        })
+    })
+
+    it('should return 0 proration amount and false isProrated when amountUsd is not provided', () => {
+        const result = getProration({
+            timeRemainingInSeconds: 15,
+            timeTotalInSeconds: 30,
+            amountUsd: null,
+            hasActiveSubscription: true,
+        })
+        expect(result).toEqual({
+            isProrated: false,
+            prorationAmount: '0.00',
+        })
+    })
+
+    it('should return proration amount and false isProrated when subscription is not active', () => {
+        const result = getProration({
+            timeRemainingInSeconds: 15,
+            timeTotalInSeconds: 30,
+            amountUsd: '100',
+            hasActiveSubscription: false,
+        })
+        expect(result).toEqual({
+            isProrated: false,
+            prorationAmount: '50.00',
+        })
+    })
+
+    it('should handle zero timeTotalInSeconds gracefully', () => {
+        const result = getProration({
+            timeRemainingInSeconds: 15,
+            timeTotalInSeconds: 0,
+            amountUsd: '100',
+            hasActiveSubscription: true,
+        })
+        expect(result).toEqual({
+            isProrated: false,
+            prorationAmount: '0.00',
+        })
+    })
+
+    it('should handle zero timeRemainingInSeconds gracefully', () => {
+        const result = getProration({
+            timeRemainingInSeconds: 0,
+            timeTotalInSeconds: 30,
+            amountUsd: '100',
+            hasActiveSubscription: true,
+        })
+        expect(result).toEqual({
+            isProrated: true,
+            prorationAmount: '0.00',
+        })
+    })
+
+    it('should return 0 proration amount and false isProrated when amountUsd is an empty string', () => {
+        const result = getProration({
+            timeRemainingInSeconds: 15,
+            timeTotalInSeconds: 30,
+            amountUsd: '',
+            hasActiveSubscription: true,
+        })
+        expect(result).toEqual({
+            isProrated: false,
+            prorationAmount: '0.00',
+        })
+    })
+})
+
+describe('formatWithDecimals', () => {
+    it('should format very small numbers without scientific notation', () => {
+        // Test various small decimal places
+        expect(formatWithDecimals(0.0000001)).toEqual('0.0000001') // 7 decimal places
+        expect(formatWithDecimals(0.00000001)).toEqual('0.00000001') // 8 decimal places
+        expect(formatWithDecimals(0.000000001)).toEqual('0.000000001') // 9 decimal places
+        expect(formatWithDecimals(0.0000000001)).toEqual('0.0000000001') // 10 decimal places
+        expect(formatWithDecimals(0.00000000001)).toEqual('0') // 11 decimal places - falls back to 10 decimals if not specified, which would be 0.0000000000 so we return 0
+
+        // Edge case at the scientific notation threshold (1e-6)
+        expect(formatWithDecimals(0.000001)).toEqual('0.000001') // Exactly 1e-6
+        expect(formatWithDecimals(0.0000009)).toEqual('0.0000009') // Just below 1e-6
+    })
+
+    it('should remove trailing zeros', () => {
+        // These numbers naturally produce trailing zeros when using toFixed(10), which is the default
+        expect(formatWithDecimals(1 / 8000000)).toEqual('0.000000125') // 0.000000125 -> toFixed(10) = 0.0000001250
+        expect(formatWithDecimals(5 / 4000000)).toEqual('0.00000125') // 0.00000125 -> toFixed(10) = 0.0000012500
+        expect(formatWithDecimals(1 / 2000000)).toEqual('0.0000005') // 0.0000005 -> toFixed(10) = 0.0000005000
+    })
+
+    it('should handle normal numbers', () => {
+        // Normal numbers
+        expect(formatWithDecimals(0)).toEqual('0')
+        expect(formatWithDecimals(1)).toEqual('1')
+        expect(formatWithDecimals(0.1)).toEqual('0.1')
+        expect(formatWithDecimals(0.01)).toEqual('0.01')
+        expect(formatWithDecimals(100.25)).toEqual('100.25')
+
+        // With explicit decimals
+        expect(formatWithDecimals(10.567, 2)).toEqual('10.57')
+        expect(formatWithDecimals(0.000000625, 9)).toEqual('0.000000625')
+
+        // Negative numbers
+        expect(formatWithDecimals(-0.000000625)).toEqual('-0.000000625')
+    })
+})
+
+describe('formatDisplayUsage', () => {
+    it('should return empty string for null value', () => {
+        const product = { display_divisor: 1000, display_decimals: 2, display_unit: 'GB' } as any
+        expect(formatDisplayUsage(null, product)).toEqual('')
+    })
+
+    it('should return raw formatted number when no display config is set', () => {
+        const product = {} as any
+        expect(formatDisplayUsage(1234567, product)).toEqual('1,234,567')
+        expect(formatDisplayUsage(0, product)).toEqual('0')
+    })
+
+    it('should apply divisor, decimals, and unit (MB to GB)', () => {
+        const product = { display_divisor: 1000, display_decimals: 2, display_unit: 'GB' } as any
+        expect(formatDisplayUsage(27648, product)).toEqual('27.65 GB')
+        expect(formatDisplayUsage(1000, product)).toEqual('1.00 GB')
+        expect(formatDisplayUsage(500, product)).toEqual('0.50 GB')
+    })
+
+    it('should handle divisor without decimals', () => {
+        const product = { display_divisor: 1000, display_unit: 'GB' } as any
+        expect(formatDisplayUsage(27000, product)).toEqual('27 GB')
+    })
+
+    it('should handle decimals without divisor', () => {
+        const product = { display_decimals: 2, display_unit: 'units' } as any
+        expect(formatDisplayUsage(123, product)).toEqual('123.00 units')
+    })
+
+    it('should handle unit without divisor or decimals', () => {
+        const product = { display_unit: 'items' } as any
+        expect(formatDisplayUsage(500, product)).toEqual('500 items')
+    })
+
+    it('should pluralize regular words correctly', () => {
+        const product = { display_divisor: 100, display_decimals: 2, display_unit: 'coin' } as any
+        expect(formatDisplayUsage(3567, product)).toEqual('35.67 coins')
+        expect(formatDisplayUsage(100, product)).toEqual('1.00 coin') // singular when exactly 1
+        expect(formatDisplayUsage(50, product)).toEqual('0.50 coins')
+    })
+
+    it('should not pluralize abbreviations', () => {
+        const product = { display_divisor: 1000, display_decimals: 1, display_unit: 'MB' } as any
+        expect(formatDisplayUsage(5000, product)).toEqual('5.0 MB')
+        expect(formatDisplayUsage(1000, product)).toEqual('1.0 MB')
+    })
+
+    it('should use rounded value for pluralization', () => {
+        // When raw value rounds to 1.00, should use singular
+        const product = { display_divisor: 100, display_decimals: 2, display_unit: 'coin' } as any
+        expect(formatDisplayUsage(99.95, product)).toEqual('1.00 coin') // 0.9995 rounds to 1.00
+        expect(formatDisplayUsage(100.4, product)).toEqual('1.00 coin') // 1.004 rounds to 1.00
+        expect(formatDisplayUsage(99, product)).toEqual('0.99 coins') // 0.99 doesn't round to 1
+        expect(formatDisplayUsage(101, product)).toEqual('1.01 coins') // 1.01 doesn't round to 1
+    })
+
+    it('should use compact fallback when option is set and no display config', () => {
+        const product = { display_unit: null, display_decimals: null, display_divisor: null } as any
+        // Without compactFallback: full number with commas
+        expect(formatDisplayUsage(1234567, product)).toEqual('1,234,567')
+        // With compactFallback: uses compactNumber (same as summarizeUsage)
+        expect(formatDisplayUsage(1234567, product, { compactFallback: true })).toEqual(summarizeUsage(1234567))
+        expect(formatDisplayUsage(1000, product, { compactFallback: true })).toEqual(summarizeUsage(1000))
+        expect(formatDisplayUsage(500, product, { compactFallback: true })).toEqual(summarizeUsage(500))
+    })
+
+    it('should ignore compactFallback when display config is set', () => {
+        const product = { display_divisor: 1000, display_decimals: 2, display_unit: 'GB' } as any
+        // compactFallback has no effect when display formatting is configured
+        expect(formatDisplayUsage(27648, product, { compactFallback: true })).toEqual('27.65 GB')
+        expect(formatDisplayUsage(27648, product, { compactFallback: false })).toEqual('27.65 GB')
+    })
+})
+
+describe('formatProductNames', () => {
+    it('should return empty string for empty array', () => {
+        expect(formatProductNames([])).toEqual('')
+    })
+
+    it('should return single product name as-is', () => {
+        expect(formatProductNames(['Session replay'])).toEqual('Session replay')
+    })
+
+    it('should join two products with "and"', () => {
+        expect(formatProductNames(['Session replay', 'Feature flags & Experiments'])).toEqual(
+            'Session replay and Feature flags & Experiments'
+        )
+    })
+
+    it('should join three or more products with commas and "and"', () => {
+        expect(formatProductNames(['Product analytics', 'Session replay', 'Feature flags & Experiments'])).toEqual(
+            'Product analytics, Session replay and Feature flags & Experiments'
+        )
+    })
+})
+
+describe('getUsageLimitConsequence', () => {
+    it('should return specific message for Data warehouse', () => {
+        expect(getUsageLimitConsequence('Data warehouse')).toEqual('data will not be synced')
+    })
+
+    it('should return specific message for Feature flags & Experiments', () => {
+        expect(getUsageLimitConsequence('Feature flags & Experiments')).toEqual('feature flags will not evaluate')
+    })
+
+    it('should return specific message for PostHog AI', () => {
+        expect(getUsageLimitConsequence('PostHog AI')).toEqual('PostHog AI will be unavailable')
+    })
+
+    it('should return generic message for other products', () => {
+        expect(getUsageLimitConsequence('Session replay')).toEqual('data loss may occur')
+        expect(getUsageLimitConsequence('Product analytics')).toEqual('data loss may occur')
+        expect(getUsageLimitConsequence('Surveys')).toEqual('data loss may occur')
+    })
+})
+
+describe('buildUsageLimitExceededMessage', () => {
+    it('should return empty strings for empty array', () => {
+        expect(buildUsageLimitExceededMessage([])).toEqual({ title: '', message: '' })
+    })
+
+    it('should build message for single subscribed product', () => {
+        const result = buildUsageLimitExceededMessage([{ name: 'Session replay', subscribed: true }])
+        expect(result.title).toEqual('Usage limit exceeded')
+        expect(result.message).toEqual(
+            'You have exceeded the usage limit for Session replay. Please increase your billing limit or data loss may occur.'
+        )
+    })
+
+    it('should build message for single unsubscribed product', () => {
+        const result = buildUsageLimitExceededMessage([{ name: 'Session replay', subscribed: false }])
+        expect(result.message).toContain('upgrade your plan')
+    })
+
+    it('should build message for multiple products with unique consequences', () => {
+        const result = buildUsageLimitExceededMessage([
+            { name: 'Session replay', subscribed: true },
+            { name: 'Feature flags & Experiments', subscribed: true },
+        ])
+        expect(result.title).toEqual('Usage limits exceeded')
+        expect(result.message).toEqual(
+            'You have exceeded the usage limit for Session replay and Feature flags & Experiments. Please increase your billing limit or data loss may occur and feature flags will not evaluate.'
+        )
+    })
+
+    it('should build message for PostHog AI with specific consequence', () => {
+        const result = buildUsageLimitExceededMessage([{ name: 'PostHog AI', subscribed: true }])
+        expect(result.title).toEqual('Usage limit exceeded')
+        expect(result.message).toEqual(
+            'You have exceeded the usage limit for PostHog AI. Please increase your billing limit or PostHog AI will be unavailable.'
+        )
+    })
+
+    it('should build message for PostHog AI with other products', () => {
+        const result = buildUsageLimitExceededMessage([
+            { name: 'PostHog AI', subscribed: true },
+            { name: 'Session replay', subscribed: true },
+        ])
+        expect(result.title).toEqual('Usage limits exceeded')
+        expect(result.message).toEqual(
+            'You have exceeded the usage limit for PostHog AI and Session replay. Please increase your billing limit or PostHog AI will be unavailable and data loss may occur.'
+        )
+    })
+
+    it('should deduplicate consequences for products with same consequence', () => {
+        const result = buildUsageLimitExceededMessage([
+            { name: 'Session replay', subscribed: true },
+            { name: 'Product analytics', subscribed: true },
+        ])
+        expect(result.message).toEqual(
+            'You have exceeded the usage limit for Session replay and Product analytics. Please increase your billing limit or data loss may occur.'
+        )
+    })
+
+    it('should use upgrade message when any product is not subscribed', () => {
+        const result = buildUsageLimitExceededMessage([
+            { name: 'Session replay', subscribed: true },
+            { name: 'Feature flags & Experiments', subscribed: false },
+        ])
+        expect(result.message).toContain('upgrade your plan')
+    })
+
+    it.each([
+        {
+            hasBillingAccess: true,
+            subscribed: true,
+            expected: 'increase your billing limit',
+        },
+        {
+            hasBillingAccess: true,
+            subscribed: false,
+            expected: 'upgrade your plan',
+        },
+        {
+            hasBillingAccess: false,
+            subscribed: true,
+            expected: 'ask an organization admin to increase the billing limit',
+        },
+        {
+            hasBillingAccess: false,
+            subscribed: false,
+            expected: 'ask an organization admin to upgrade the plan',
+        },
+    ])(
+        'should use "$expected" when hasBillingAccess=$hasBillingAccess and subscribed=$subscribed',
+        ({ hasBillingAccess, subscribed, expected }) => {
+            const result = buildUsageLimitExceededMessage([{ name: 'Session replay', subscribed }], hasBillingAccess)
+            expect(result.message).toContain(expected)
+        }
+    )
+
+    it('should say "owner" when minimumBillingAccessLevel is Owner and user has no billing access', () => {
+        const result = buildUsageLimitExceededMessage(
+            [{ name: 'Session replay', subscribed: true }],
+            false,
+            OrganizationMembershipLevel.Owner
+        )
+        expect(result.message).toContain('ask an organization owner')
+    })
+
+    it('should default to admin message when hasBillingAccess is not provided', () => {
+        const result = buildUsageLimitExceededMessage([{ name: 'Session replay', subscribed: true }])
+        expect(result.message).toContain('increase your billing limit')
+    })
+})
+
+describe('buildUsageLimitApproachingMessage', () => {
+    it('should return empty strings for empty array', () => {
+        expect(buildUsageLimitApproachingMessage([])).toEqual({ title: '', message: '' })
+    })
+
+    it('should build message for single product', () => {
+        const result = buildUsageLimitApproachingMessage([
+            { name: 'Session replay', percentage_usage: 0.9, usage_key: 'recordings' },
+        ])
+        expect(result.title).toEqual('You will soon hit your usage limit')
+        expect(result.message).toEqual('You have currently used 90% of your Session replay allocation.')
+    })
+
+    it('should build message for multiple products', () => {
+        const result = buildUsageLimitApproachingMessage([
+            { name: 'Session replay', percentage_usage: 0.9, usage_key: 'recordings' },
+            { name: 'Feature flags & Experiments', percentage_usage: 0.87, usage_key: 'feature_flag_requests' },
+        ])
+        expect(result.title).toEqual('You will soon hit your usage limits')
+        expect(result.message).toEqual(
+            'You are approaching your usage limits: 90% of your Session replay allocation, 87% of your Feature flags & Experiments allocation.'
+        )
+    })
+
+    it.each([
+        { name: 'Session replay', usage_key: undefined, expected: 'Session replay allocation' },
+        { name: '', usage_key: 'signals_credits', expected: 'signals_credits allocation' },
+        { name: '', usage_key: undefined, expected: 'usage allocation' },
+    ])('should resolve label to "$expected" (name="$name", usage_key=$usage_key)', ({ name, usage_key, expected }) => {
+        const result = buildUsageLimitApproachingMessage([{ name, percentage_usage: 0.9, usage_key }])
+        expect(result.message).toContain(expected)
+    })
+
+    it('should format percentage with up to 2 decimal places', () => {
+        const result = buildUsageLimitApproachingMessage([
+            { name: 'Session replay', percentage_usage: 0.8567, usage_key: 'recordings' },
+        ])
+        expect(result.message).toContain('85.67%')
+    })
+
+    it.each([
+        {
+            hasBillingAccess: true,
+            expectedSuffix: false,
+        },
+        {
+            hasBillingAccess: false,
+            expectedSuffix: true,
+        },
+    ])(
+        'should include admin contact message when hasBillingAccess=$hasBillingAccess',
+        ({ hasBillingAccess, expectedSuffix }) => {
+            const result = buildUsageLimitApproachingMessage(
+                [{ name: 'Session replay', percentage_usage: 0.9, usage_key: 'recordings' }],
+                hasBillingAccess
+            )
+            if (expectedSuffix) {
+                expect(result.message).toContain('Please ask an organization admin to increase the billing limit.')
+            } else {
+                expect(result.message).not.toContain('organization admin')
+            }
+        }
+    )
+
+    it('should say "owner" when minimumBillingAccessLevel is Owner and user has no billing access', () => {
+        const result = buildUsageLimitApproachingMessage(
+            [{ name: 'Session replay', percentage_usage: 0.9, usage_key: 'recordings' }],
+            false,
+            OrganizationMembershipLevel.Owner
+        )
+        expect(result.message).toContain('ask an organization owner')
+    })
+
+    it('should default to no admin suffix when hasBillingAccess is not provided', () => {
+        const result = buildUsageLimitApproachingMessage([
+            { name: 'Session replay', percentage_usage: 0.9, usage_key: 'recordings' },
+        ])
+        expect(result.message).not.toContain('organization admin')
+    })
+})
+
+describe('getMinimumBillingAccessLevel', () => {
+    it('returns Admin when ownerOnlyBilling is false', () => {
+        expect(getMinimumBillingAccessLevel(false)).toBe(OrganizationMembershipLevel.Admin)
+    })
+
+    it('returns Owner when ownerOnlyBilling is true', () => {
+        expect(getMinimumBillingAccessLevel(true)).toBe(OrganizationMembershipLevel.Owner)
+    })
+})
+
+describe('canAccessBilling', () => {
+    it.each([
+        { level: OrganizationMembershipLevel.Owner, ownerOnly: false, expected: true },
+        { level: OrganizationMembershipLevel.Owner, ownerOnly: true, expected: true },
+        { level: OrganizationMembershipLevel.Admin, ownerOnly: false, expected: true },
+        { level: OrganizationMembershipLevel.Admin, ownerOnly: true, expected: false },
+        { level: OrganizationMembershipLevel.Member, ownerOnly: false, expected: false },
+        { level: OrganizationMembershipLevel.Member, ownerOnly: true, expected: false },
+        { level: null, ownerOnly: false, expected: false },
+        { level: null, ownerOnly: true, expected: false },
+    ])('returns $expected for level=$level, ownerOnly=$ownerOnly', ({ level, ownerOnly, expected }) => {
+        expect(canAccessBilling(level, ownerOnly)).toBe(expected)
+    })
+})

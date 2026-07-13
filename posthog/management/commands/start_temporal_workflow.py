@@ -1,0 +1,181 @@
+import asyncio
+import logging
+from uuid import uuid4
+
+from django.conf import settings
+from django.core.management.base import BaseCommand
+
+from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
+
+from posthog.temporal.ai import AI_WORKFLOWS
+from posthog.temporal.common.client import connect
+from posthog.temporal.delete_persons import WORKFLOWS as DELETE_PERSONS_WORKFLOWS
+from posthog.temporal.dlq_replay import WORKFLOWS as DLQ_REPLAY_WORKFLOWS
+from posthog.temporal.event_screenshots import WORKFLOWS as EVENT_SCREENSHOTS_WORKFLOWS
+from posthog.temporal.health_checks import WORKFLOWS as HEALTH_CHECK_WORKFLOWS
+from posthog.temporal.proxy_service import WORKFLOWS as PROXY_SERVICE_WORKFLOWS
+from posthog.temporal.quota_limiting import WORKFLOWS as QUOTA_LIMITING_WORKFLOWS
+from posthog.temporal.salesforce_enrichment import WORKFLOWS as SALESFORCE_ENRICHMENT_WORKFLOWS
+from posthog.temporal.session_replay.count_playlist_items import COUNT_PLAYLIST_ITEMS_WORKFLOWS
+from posthog.temporal.session_replay.delete_recordings import DELETE_RECORDINGS_WORKFLOWS
+from posthog.temporal.session_replay.enforce_max_replay_retention import ENFORCE_MAX_REPLAY_RETENTION_WORKFLOWS
+from posthog.temporal.session_replay.rasterize_recording import RASTERIZE_RECORDING_WORKFLOWS
+from posthog.temporal.session_replay.replay_count_metrics import REPLAY_COUNT_METRICS_WORKFLOWS
+from posthog.temporal.session_replay.summarization_sweep import SUMMARIZATION_SWEEP_WORKFLOWS
+from posthog.temporal.session_replay.surfacing_scoring_sweep import SURFACING_SCORING_SWEEP_WORKFLOWS
+from posthog.temporal.sync_events_retention import SYNC_EVENTS_RETENTION_WORKFLOWS
+from posthog.temporal.sync_person_distinct_ids import WORKFLOWS as SYNC_PERSON_DISTINCT_IDS_WORKFLOWS
+from posthog.temporal.tests.utils.workflow import WORKFLOWS as TEST_WORKFLOWS
+from posthog.temporal.usage_report import WORKFLOWS as USAGE_REPORTS_WORKFLOWS
+from posthog.temporal.weekly_digest import WORKFLOWS as WEEKLY_DIGEST_WORKFLOWS
+
+from products.batch_exports.backend.temporal import WORKFLOWS as BATCH_EXPORT_WORKFLOWS
+from products.warehouse_sources.backend.facade.temporal import WORKFLOWS as DATA_IMPORT_WORKFLOWS
+from products.web_analytics.backend.temporal import WORKFLOWS as WA_DIGEST_WORKFLOWS
+
+
+class Command(BaseCommand):
+    help = "Start Temporal Workflow"
+
+    def add_arguments(self, parser):
+        parser.add_argument("workflow", metavar="<WORKFLOW>", help="The name of the workflow to start")
+        parser.add_argument(
+            "inputs",
+            metavar="INPUTS",
+            nargs="*",
+            help="Inputs for the workflow to start",
+        )
+        parser.add_argument(
+            "--workflow-id",
+            default=str(uuid4()),
+            help=(
+                "Optionally, set an id for this workflow. If the ID is already in use, "
+                "the workflow will not start unless it failed. If not used, a random UUID "
+                "will be used as the workflow ID, which means the workflow will always start. "
+                "Set an ID in order to limit concurrency."
+            ),
+        )
+        parser.add_argument(
+            "--temporal-host",
+            default=settings.TEMPORAL_HOST,
+            help="Hostname for Temporal Scheduler",
+        )
+        parser.add_argument(
+            "--temporal-port",
+            default=settings.TEMPORAL_PORT,
+            help="Port for Temporal Scheduler",
+        )
+        parser.add_argument(
+            "--namespace",
+            default=settings.TEMPORAL_NAMESPACE,
+            help="Namespace to connect to",
+        )
+        parser.add_argument(
+            "--task-queue",
+            default=settings.TEMPORAL_TASK_QUEUE,
+            help=(
+                "Temporal task queue that will handle the Workflow. This should be a "
+                "task queue that is configured to run the Workflow, as different task "
+                "queues are used for different workflows."
+            ),
+        )
+        parser.add_argument(
+            "--server-root-ca-cert",
+            default=None,
+            help="Optional root server CA cert",
+        )
+        parser.add_argument(
+            "--client-cert",
+            default=settings.TEMPORAL_CLIENT_CERT,
+            help="Optional client cert",
+        )
+        parser.add_argument(
+            "--client-key",
+            default=settings.TEMPORAL_CLIENT_KEY,
+            help="Optional client key",
+        )
+        parser.add_argument(
+            "--max-attempts",
+            default=settings.TEMPORAL_WORKFLOW_MAX_ATTEMPTS,
+            help="Number of max attempts",
+        )
+        parser.add_argument(
+            "--use-pydantic-converter",
+            action="store_true",
+            default=settings.TEMPORAL_USE_PYDANTIC_CONVERTER,
+            help="Use Pydantic data converter",
+        )
+
+    def handle(self, *args, **options):
+        temporal_host = options["temporal_host"]
+        temporal_port = options["temporal_port"]
+        namespace = options["namespace"]
+        task_queue = options["task_queue"]
+        server_root_ca_cert = options.get("server_root_ca_cert", None)
+        client_cert = options.get("client_cert", None)
+        client_key = options.get("client_key", None)
+        workflow_id = options["workflow_id"]
+        workflow_name = options["workflow"]
+        use_pydantic_converter = options["use_pydantic_converter"]
+
+        if options["client_key"]:
+            options["client_key"] = "--SECRET--"
+
+        client = asyncio.run(
+            connect(
+                temporal_host,
+                temporal_port,
+                namespace,
+                server_root_ca_cert=server_root_ca_cert,
+                client_cert=client_cert,
+                client_key=client_key,
+                use_pydantic_converter=use_pydantic_converter,
+            )
+        )
+        retry_policy = RetryPolicy(maximum_attempts=int(options["max_attempts"]))
+
+        WORKFLOWS = (
+            BATCH_EXPORT_WORKFLOWS
+            + DATA_IMPORT_WORKFLOWS
+            + DLQ_REPLAY_WORKFLOWS
+            + PROXY_SERVICE_WORKFLOWS
+            + DELETE_PERSONS_WORKFLOWS
+            + USAGE_REPORTS_WORKFLOWS
+            + QUOTA_LIMITING_WORKFLOWS
+            + AI_WORKFLOWS
+            + SALESFORCE_ENRICHMENT_WORKFLOWS
+            + SYNC_PERSON_DISTINCT_IDS_WORKFLOWS
+            + TEST_WORKFLOWS
+            + COUNT_PLAYLIST_ITEMS_WORKFLOWS
+            + DELETE_RECORDINGS_WORKFLOWS
+            + ENFORCE_MAX_REPLAY_RETENTION_WORKFLOWS
+            + SYNC_EVENTS_RETENTION_WORKFLOWS
+            + RASTERIZE_RECORDING_WORKFLOWS
+            + REPLAY_COUNT_METRICS_WORKFLOWS
+            + SUMMARIZATION_SWEEP_WORKFLOWS
+            + WEEKLY_DIGEST_WORKFLOWS
+            + EVENT_SCREENSHOTS_WORKFLOWS
+            + HEALTH_CHECK_WORKFLOWS
+            + WA_DIGEST_WORKFLOWS
+            + SURFACING_SCORING_SWEEP_WORKFLOWS
+        )
+        try:
+            workflow = next(workflow for workflow in WORKFLOWS if workflow.is_named(workflow_name))
+        except StopIteration:
+            raise ValueError(f"No workflow with name '{workflow_name}'")
+        except AttributeError:
+            raise TypeError(
+                f"Workflow '{workflow_name}' is not a `PostHogWorkflow` that can invoked by `start_temporal_workflow`."
+            )
+
+        logging.info("Starting Temporal Workflow %s with ID %s", workflow_name, workflow_id)
+        asyncio.run(
+            client.start_workflow(
+                workflow_name,
+                workflow.parse_inputs(options["inputs"]),
+                id=workflow_id,
+                id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
+                task_queue=task_queue,
+                retry_policy=retry_policy,
+            )
+        )

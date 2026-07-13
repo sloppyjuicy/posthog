@@ -1,0 +1,390 @@
+import './CohortField.scss'
+
+import clsx from 'clsx'
+import { useActions, useValues } from 'kea'
+import { useEffect, useId, useRef } from 'react'
+
+import { DateFilter } from 'lib/components/DateFilter/DateFilter'
+import { PropertyValue } from 'lib/components/PropertyFilters/components/PropertyValue'
+import { PropertyFilters } from 'lib/components/PropertyFilters/PropertyFilters'
+import { PropertyKeyInfo } from 'lib/components/PropertyKeyInfo'
+import { TaxonomicFilterGroupType, TaxonomicFilterValue } from 'lib/components/TaxonomicFilter/types'
+import { TaxonomicPopover } from 'lib/components/TaxonomicPopover/TaxonomicPopover'
+import { dayjs } from 'lib/dayjs'
+import { LemonButton, LemonButtonWithDropdown } from 'lib/lemon-ui/LemonButton'
+import { LemonDivider } from 'lib/lemon-ui/LemonDivider'
+import { LemonInput } from 'lib/lemon-ui/LemonInput/LemonInput'
+import { formatDate } from 'lib/utils/datetime'
+import { cohortFieldLogic } from 'scenes/cohorts/CohortFilters/cohortFieldLogic'
+import {
+    BehavioralFilterKey,
+    CohortEventFiltersFieldProps,
+    CohortFieldBaseProps,
+    CohortNumberFieldProps,
+    CohortPersonPropertiesValuesFieldProps,
+    CohortRelativeAndExactTimeFieldProps,
+    CohortSelectorFieldProps,
+    CohortTaxonomicFieldProps,
+    CohortTextFieldProps,
+    FieldOptionsType,
+} from 'scenes/cohorts/CohortFilters/types'
+
+import { propertyDefinitionsModel } from '~/models/propertyDefinitionsModel'
+import {
+    AnyPropertyFilter,
+    PropertyDefinitionType,
+    PropertyFilterType,
+    PropertyFilterValue,
+    PropertyOperator,
+    PropertyType,
+} from '~/types'
+
+const useCohortFieldLogic = (props: CohortFieldBaseProps): { logic: ReturnType<typeof cohortFieldLogic.build> } => {
+    const generatedKey = useId()
+    const cohortFilterLogicKey = props.cohortFilterLogicKey || `cohort-filter-${generatedKey}`
+    return {
+        logic: cohortFieldLogic({ ...props, cohortFilterLogicKey }),
+    }
+}
+
+export function CohortSelectorField({
+    fieldKey,
+    cohortFilterLogicKey,
+    criteria,
+    fieldOptionGroupTypes,
+    placeholder,
+    onChange: _onChange,
+}: CohortSelectorFieldProps): JSX.Element {
+    const { logic } = useCohortFieldLogic({
+        fieldKey,
+        cohortFilterLogicKey,
+        criteria,
+        fieldOptionGroupTypes,
+        onChange: _onChange,
+    })
+
+    const { fieldOptionGroups, currentOption, value } = useValues(logic)
+    const { onChange } = useActions(logic)
+
+    return (
+        <LemonButtonWithDropdown
+            type="secondary"
+            sideIcon={undefined}
+            data-attr={`cohort-selector-field-${fieldKey}`}
+            dropdown={{
+                className: 'Popover__CohortField',
+                placement: 'bottom-start',
+                overlay: (
+                    <div className="CohortField__dropdown">
+                        {fieldOptionGroups.map(({ label, type: groupKey, values }, i) =>
+                            Object.keys(values).length != 0 ? (
+                                <div key={i}>
+                                    {i !== 0 && <LemonDivider />}
+                                    <h5>{label}</h5>
+                                    {Object.entries(values).map(([_value, option]) => (
+                                        <LemonButton
+                                            key={_value}
+                                            onClick={() => {
+                                                onChange({ [fieldKey]: _value })
+                                            }}
+                                            active={_value == value}
+                                            fullWidth
+                                            data-attr={`cohort-${groupKey}-${_value}-type`}
+                                        >
+                                            {option.label}
+                                        </LemonButton>
+                                    ))}
+                                </div>
+                            ) : null
+                        )}
+                    </div>
+                ),
+            }}
+        >
+            <span className="font-medium">
+                {currentOption?.label || <span className="text-secondary">{placeholder}</span>}
+            </span>
+        </LemonButtonWithDropdown>
+    )
+}
+
+/**
+ * Wraps CohortSelectorField to show date-only or math-only operators based on
+ * the selected person property's type. Without this, DateTime properties like
+ * "date_of_birth" would show irrelevant operators like "contains" or "maximum".
+ *
+ * The operator auto-reset when switching between DateTime and non-DateTime
+ * properties is handled in cohortEditLogic's setCriteria listener.
+ */
+export function CohortMathOperatorField(props: CohortSelectorFieldProps): JSX.Element {
+    const { getPropertyDefinition } = useValues(propertyDefinitionsModel)
+    const propertyKey = props.criteria?.key
+    const propertyType = props.criteria?.type
+    const definitionType =
+        propertyType === BehavioralFilterKey.PersonMetadata
+            ? PropertyDefinitionType.PersonMetadata
+            : PropertyDefinitionType.Person
+    const propDef = propertyKey ? getPropertyDefinition(propertyKey, definitionType) : null
+    const isDateTime = propDef?.property_type === PropertyType.DateTime
+
+    const fieldOptionGroupTypes = isDateTime
+        ? [FieldOptionsType.SingleFieldDateOperators]
+        : [FieldOptionsType.CohortMathOperators]
+
+    return <CohortSelectorField {...props} fieldOptionGroupTypes={fieldOptionGroupTypes} />
+}
+
+export function CohortTaxonomicField({
+    fieldKey,
+    groupTypeFieldKey = 'event_type',
+    cohortFilterLogicKey,
+    criteria,
+    taxonomicGroupTypes = [TaxonomicFilterGroupType.Events, TaxonomicFilterGroupType.Actions],
+    placeholder = 'Choose event',
+    onChange: _onChange,
+}: CohortTaxonomicFieldProps): JSX.Element {
+    const { logic } = useCohortFieldLogic({
+        fieldKey,
+        criteria,
+        cohortFilterLogicKey,
+        onChange: _onChange,
+    })
+
+    const { calculatedValue, calculatedValueLoading } = useValues(logic)
+    const { onChange } = useActions(logic)
+    const groupType = (criteria[groupTypeFieldKey] as TaxonomicFilterGroupType) ?? taxonomicGroupTypes[0]
+
+    return (
+        <TaxonomicPopover
+            className="CohortField"
+            groupType={groupType}
+            loading={calculatedValueLoading(groupType)}
+            value={calculatedValue(groupType) as TaxonomicFilterValue}
+            onChange={(v, g) => {
+                onChange({ [fieldKey]: v, [groupTypeFieldKey]: g })
+            }}
+            excludedProperties={{
+                [TaxonomicFilterGroupType.Events]: [null], // "All events" isn't supported by Cohorts currently
+            }}
+            groupTypes={taxonomicGroupTypes}
+            placeholder={placeholder}
+            data-attr={`cohort-taxonomic-field-${fieldKey}`}
+            renderValue={(value) =>
+                value ? (
+                    <PropertyKeyInfo value={value as string} type={groupType} />
+                ) : (
+                    <span className="text-secondary">{placeholder}</span>
+                )
+            }
+        />
+    )
+}
+
+export function CohortPersonPropertiesValuesField({
+    fieldKey,
+    criteria,
+    cohortFilterLogicKey,
+    onChange: _onChange,
+    propertyKey,
+    operator,
+}: CohortPersonPropertiesValuesFieldProps): JSX.Element {
+    const { logic } = useCohortFieldLogic({
+        fieldKey,
+        criteria,
+        cohortFilterLogicKey,
+        onChange: _onChange,
+    })
+    const { value } = useValues(logic)
+    const { onChange } = useActions(logic)
+
+    return (
+        <PropertyValue
+            key={`${propertyKey}_${operator}`}
+            operator={operator || PropertyOperator.Exact}
+            propertyKey={propertyKey as string}
+            type={PropertyFilterType.Person}
+            value={value as PropertyFilterValue}
+            onSet={(newValue: PropertyFilterValue) => {
+                onChange({ [fieldKey]: newValue })
+            }}
+            placeholder="Enter value..."
+        />
+    )
+}
+
+export function CohortEventFiltersField({
+    fieldKey,
+    criteria,
+    cohortFilterLogicKey,
+    onChange: _onChange,
+    groupIndex,
+    index,
+}: CohortEventFiltersFieldProps): JSX.Element {
+    const { logic } = useCohortFieldLogic({
+        fieldKey,
+        criteria,
+        cohortFilterLogicKey,
+        onChange: _onChange,
+    })
+    const { value } = useValues(logic)
+    const { onChange } = useActions(logic)
+    const componentRef = useRef<HTMLDivElement>(null)
+
+    const valueExists = ((value as AnyPropertyFilter[]) || []).length > 0
+
+    useEffect(() => {
+        // :TRICKY: We check parent has CohortCriteriaRow__Criteria__Field class and add basis-full class if value exists
+        // We need to do this because of how this list is generated, and we need to add a line-break programatically
+        // when the PropertyFilters take up too much space.
+        // Since the list of children is declared in the parent component, we can't add a class to the parent directly, without
+        // adding a lot of annoying complexity to the parent component.
+        // This is a hacky solution, but it works 🙈.
+
+        // find parent with className CohortCriteriaRow__Criteria__Field and add basis-full class if value exists
+        const parent = componentRef.current?.closest('.CohortCriteriaRow__Criteria__Field')
+        if (parent) {
+            if (valueExists) {
+                parent.classList.add('basis-full')
+            } else {
+                parent.classList.remove('basis-full')
+            }
+        }
+    }, [componentRef, value]) // oxlint-disable-line react-hooks/exhaustive-deps
+
+    return (
+        <div ref={componentRef}>
+            <PropertyFilters
+                propertyFilters={(value as AnyPropertyFilter[]) || []}
+                taxonomicGroupTypes={[
+                    TaxonomicFilterGroupType.EventProperties,
+                    TaxonomicFilterGroupType.EventFeatureFlags,
+                    TaxonomicFilterGroupType.Elements,
+                    TaxonomicFilterGroupType.HogQLExpression,
+                ]}
+                onChange={(newValue: AnyPropertyFilter[]) => {
+                    onChange({ [fieldKey]: newValue })
+                }}
+                pageKey={`${fieldKey}-${groupIndex}-${index}`}
+                eventNames={criteria?.key ? [criteria?.key] : []}
+                disablePopover
+                hasRowOperator={valueExists ? true : false}
+                sendAllKeyUpdates
+            />
+        </div>
+    )
+}
+
+const RELATIVE_DATE_REGEX = /^-\d+[hdwmqy]$/
+
+function computeLabelPrefix(dateFrom: string, dateTo: string | null): string {
+    const isRelativeFrom = RELATIVE_DATE_REGEX.test(dateFrom)
+    const isRelativeTo = dateTo !== null && RELATIVE_DATE_REGEX.test(dateTo)
+    const hasRange = !!dateFrom && !!dateTo
+    if (hasRange) {
+        const bothRelative = isRelativeFrom && isRelativeTo
+        const bothAbsolute = !isRelativeFrom && !isRelativeTo
+        return bothRelative || bothAbsolute ? 'between' : 'from'
+    }
+    if (!isRelativeFrom && dateFrom) {
+        return 'after'
+    }
+    return 'within'
+}
+
+export function CohortRelativeAndExactTimeField({
+    fieldKey,
+    criteria,
+    cohortFilterLogicKey,
+    onChange: _onChange,
+}: CohortRelativeAndExactTimeFieldProps): JSX.Element {
+    const { logic } = useCohortFieldLogic({
+        fieldKey,
+        criteria,
+        cohortFilterLogicKey,
+        onChange: _onChange,
+    })
+    const { value } = useValues(logic)
+    const { onChange } = useActions(logic)
+
+    const dateFromValue = String(value)
+    const dateToValue = criteria.explicit_datetime_to || null
+    const hasRange = !!dateFromValue && !!dateToValue
+    const prefix = computeLabelPrefix(dateFromValue, dateToValue)
+
+    return (
+        <div className="flex items-center gap-2">
+            <span className={clsx('CohortField', 'CohortField__CohortTextField')}>{prefix}</span>
+            <DateFilter
+                dateFrom={dateFromValue}
+                dateTo={dateToValue}
+                onChange={(fromDate, toDate) => {
+                    onChange({
+                        [fieldKey]: fromDate,
+                        // `|| null` rather than `?? null` so an empty-string `toDate` (some
+                        // callers pass '' to mean "no bound") is normalised to null too.
+                        explicit_datetime_to: toDate || null,
+                    })
+                }}
+                max={1000}
+                allowedRollingDateOptions={['days', 'weeks', 'months', 'years']}
+                showCustom
+                allowSingleAndRange
+                dateOptions={[
+                    {
+                        key: 'Last 7 days',
+                        values: ['-7d'],
+                        getFormattedDate: (date: dayjs.Dayjs): string => formatDate(date.subtract(7, 'd')),
+                        defaultInterval: 'day',
+                    },
+                    {
+                        key: 'Last 30 days',
+                        values: ['-30d'],
+                        getFormattedDate: (date: dayjs.Dayjs): string => formatDate(date.subtract(30, 'd')),
+                        defaultInterval: 'day',
+                    },
+                ]}
+                size="medium"
+                makeLabel={(_, startOfRange, endOfRange) => (
+                    <span className="hide-when-small">
+                        {hasRange && endOfRange !== undefined
+                            ? `Matches all values ${prefix} ${startOfRange} and ${endOfRange} if evaluated today.`
+                            : `Matches all values ${prefix} ${startOfRange} if evaluated today.`}
+                    </span>
+                )}
+            />
+        </div>
+    )
+}
+
+export function CohortTextField({ value }: CohortTextFieldProps): JSX.Element {
+    return <span className={clsx('CohortField', 'CohortField__CohortTextField')}>{value}</span>
+}
+
+export function CohortNumberField({
+    fieldKey,
+    cohortFilterLogicKey,
+    criteria,
+    onChange: _onChange,
+}: CohortNumberFieldProps): JSX.Element {
+    const { logic } = useCohortFieldLogic({
+        fieldKey,
+        cohortFilterLogicKey,
+        criteria,
+        onChange: _onChange,
+    })
+    const { value } = useValues(logic)
+    const { onChange } = useActions(logic)
+
+    return (
+        <LemonInput
+            type="number"
+            value={(value as number) ?? undefined}
+            onChange={(nextNumber) => {
+                onChange({ [fieldKey]: nextNumber })
+            }}
+            min={1}
+            step={1}
+            className={clsx('CohortField', 'CohortField__CohortNumberField')}
+        />
+    )
+}

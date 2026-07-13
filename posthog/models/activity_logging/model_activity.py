@@ -1,0 +1,181 @@
+from typing import Any
+
+from django.db import models
+
+from posthog.models.activity_logging.utils import activity_storage, get_changed_fields_local
+from posthog.models.signals import model_activity_signal
+
+
+def get_was_impersonated():
+    return activity_storage.get_was_impersonated()
+
+
+def get_current_user():
+    return activity_storage.get_user()
+
+
+def get_current_trigger():
+    return activity_storage.get_trigger()
+
+
+def is_impersonated_session(request):
+    """Lazy import to avoid circular import issues during Django setup"""
+    try:
+        from loginas.utils import is_impersonated_session as _is_impersonated_session
+
+        return _is_impersonated_session(request)
+    except ImportError:
+        return False
+
+
+class ModelActivityMixin(models.Model):
+    """
+    A mixin that automatically sends activity signals when a model is created or updated.
+    The model's class name will be used as the scope for activity logging.
+
+    Set `activity_logging_on_delete = True` on the model class to also log deletions.
+    """
+
+    activity_logging_on_delete: bool = False
+
+    class Meta:
+        # This is a mixin, so we don't need to create a table for it
+        abstract = True
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        change_type = "created" if self._state.adding else "updated"
+        should_log = True
+        before_update = None
+
+        # For updates, check if we need activity logging at all
+        if change_type == "updated":
+            should_log, before_update = self._should_log_activity_for_update(**kwargs)
+
+        super().save(*args, **kwargs)
+
+        if should_log:
+            model_activity_signal.send(
+                sender=self.__class__,
+                scope=self.__class__.__name__,
+                before_update=before_update,
+                after_update=self,
+                activity=change_type,
+                user=get_current_user(),
+                was_impersonated=get_was_impersonated(),
+            )
+
+    def delete(self, *args: Any, **kwargs: Any) -> Any:
+        if self.activity_logging_on_delete:
+            model_activity_signal.send(
+                sender=self.__class__,
+                scope=self.__class__.__name__,
+                before_update=self,
+                after_update=None,
+                activity="deleted",
+                user=get_current_user(),
+                was_impersonated=get_was_impersonated(),
+            )
+
+        return super().delete(*args, **kwargs)
+
+    def _get_before_update(self, **kwargs) -> Any:
+        before_update = None
+
+        if not self.pk:
+            return None
+
+        managers: list[models.Manager] = []
+        default_manager = getattr(self.__class__, "objects", None)
+        if isinstance(default_manager, models.Manager):
+            managers.append(default_manager)
+
+        soft_deleted_manager = getattr(self.__class__, "objects_including_soft_deleted", None)
+        if isinstance(soft_deleted_manager, models.Manager) and soft_deleted_manager not in managers:
+            managers.append(soft_deleted_manager)
+
+        for manager in managers:
+            before_update = manager.filter(pk=self.pk).first()
+            if before_update:
+                break
+
+        if before_update:
+            before_update._state.adding = False
+            before_update.pk = before_update.pk
+
+        return before_update
+
+    def _should_log_activity_for_update(self, **kwargs) -> tuple[bool, Any]:
+        from typing import cast
+
+        from posthog.models.activity_logging.activity_log import ActivityScope, signal_exclusions
+
+        model_name = cast(ActivityScope, self.__class__.__name__)
+        signal_excluded_fields = signal_exclusions.get(model_name, [])
+
+        if not signal_excluded_fields:
+            return True, self._get_before_update()
+
+        update_fields = kwargs.get("update_fields")
+        if update_fields and all(field in signal_excluded_fields for field in update_fields):
+            return False, None
+
+        before_update = self._get_before_update()
+        if not before_update:
+            return True, None
+
+        changed_fields = get_changed_fields_local(before_update, self)
+        should_log = len(changed_fields) > 0
+
+        return should_log, before_update
+
+
+class ActivityTriggerContext:
+    """Attributes signal-driven activity logging to an automated source (e.g. a workflow).
+
+    Model-signal activity handlers (like TaggedItem's) run deep inside ORM calls where no
+    Trigger can be passed explicitly, so this stashes one in the activity thread-local for
+    handlers to pick up via ``get_current_trigger()``. Always used as a context manager so
+    the trigger cannot leak into unrelated activity on a reused worker thread; a ``None``
+    trigger makes this a no-op.
+    """
+
+    def __init__(self, trigger):
+        self.trigger = trigger
+        self.previous = None
+
+    def __enter__(self):
+        if self.trigger is not None:
+            # Save and restore rather than clear on exit, so a nested context can't
+            # silently erase an enclosing context's attribution.
+            self.previous = activity_storage.get_trigger()
+            activity_storage.set_trigger(self.trigger)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.trigger is None:
+            return
+        if self.previous is not None:
+            activity_storage.set_trigger(self.previous)
+        else:
+            activity_storage.clear_trigger()
+
+
+class ImpersonatedContext:
+    # This is a context manager that sets the was_impersonated flag in the activity storage
+    # if the request is impersonated. Use this to call the model's save method with impersonated
+    # info from the request if you have a request available. This is pretty much a no-op if you
+    # don't have a request available.
+    def __init__(self, request):
+        # Local import breaks a cycle: models.oauth -> model_activity -> impersonation -> auth -> models.oauth
+        from posthog.helpers.impersonation import is_impersonated  # noqa: PLC0415
+
+        self.was_impersonated = is_impersonated(request)
+
+    def __enter__(self):
+        if self.was_impersonated:
+            activity_storage.set_was_impersonated(True)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.was_impersonated:
+            activity_storage.clear_was_impersonated()

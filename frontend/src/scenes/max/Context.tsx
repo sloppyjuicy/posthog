@@ -1,0 +1,430 @@
+import clsx from 'clsx'
+import { BindLogic, useActions, useValues } from 'kea'
+import { useMemo } from 'react'
+import React from 'react'
+
+import { IconAtSign, IconDashboard, IconGraph, IconNotebook, IconPageChart } from '@posthog/icons'
+import { LemonTag, Tooltip } from '@posthog/lemon-ui'
+
+import { TaxonomicPopover } from 'lib/components/TaxonomicPopover/TaxonomicPopover'
+import { IconAction, IconEvent } from 'lib/lemon-ui/icons'
+
+import { ModeSelector } from './components/ModeSelector'
+import { maxContextLogic } from './maxContextLogic'
+import { maxThreadLogic } from './maxThreadLogic'
+import {
+    MaxActionContext,
+    MaxDashboardContext,
+    MaxEventContext,
+    MaxInsightContext,
+    MaxNotebookContext,
+} from './maxTypes'
+import { posthogAiContextLogic } from './posthogAiContextLogic'
+
+function pluralize(count: number, word: string): string {
+    return `${count} ${word}${count > 1 ? 's' : ''}`
+}
+
+interface ContextTagItem {
+    type: string
+    name: string
+    icon: React.ReactElement
+}
+
+interface ContextSummaryProps {
+    insights?: MaxInsightContext[]
+    dashboards?: MaxDashboardContext[]
+    events?: MaxEventContext[]
+    actions?: MaxActionContext[]
+    notebooks?: MaxNotebookContext[]
+    useCurrentPageContext?: boolean
+}
+
+export function ContextSummary({
+    insights,
+    dashboards,
+    events,
+    actions,
+    notebooks,
+    useCurrentPageContext,
+}: ContextSummaryProps): JSX.Element | null {
+    const contextCounts = useMemo(() => {
+        const counts = {
+            insights: insights ? insights.length : 0,
+            dashboards: dashboards ? dashboards.length : 0,
+            currentPage: useCurrentPageContext ? 1 : 0,
+            events: events ? events.length : 0,
+            actions: actions ? actions.length : 0,
+            notebooks: notebooks ? notebooks.length : 0,
+        }
+        return counts
+    }, [insights, dashboards, useCurrentPageContext, events, actions, notebooks])
+
+    const totalCount =
+        contextCounts.insights +
+        contextCounts.dashboards +
+        contextCounts.currentPage +
+        contextCounts.events +
+        contextCounts.actions +
+        contextCounts.notebooks
+
+    const contextSummaryText = useMemo(() => {
+        const parts = []
+        if (contextCounts.currentPage > 0) {
+            parts.push('page')
+        }
+        if (contextCounts.dashboards > 0) {
+            parts.push(pluralize(contextCounts.dashboards, 'dashboard'))
+        }
+        if (contextCounts.insights > 0) {
+            parts.push(pluralize(contextCounts.insights, 'insight'))
+        }
+        if (contextCounts.events > 0) {
+            parts.push(pluralize(contextCounts.events, 'event'))
+        }
+        if (contextCounts.actions > 0) {
+            parts.push(pluralize(contextCounts.actions, 'action'))
+        }
+        if (contextCounts.notebooks > 0) {
+            parts.push(pluralize(contextCounts.notebooks, 'notebook'))
+        }
+
+        if (parts.length === 1) {
+            return parts[0]
+        }
+        if (parts.length === 2) {
+            return `${parts[0]} + ${parts[1]}`
+        }
+        return parts.join(' + ')
+    }, [contextCounts])
+
+    const allItems = useMemo(() => {
+        const items: ContextTagItem[] = []
+
+        if (dashboards) {
+            dashboards.forEach((dashboard) => {
+                items.push({
+                    type: 'dashboard',
+                    name: dashboard.name || `Dashboard ${dashboard.id}`,
+                    icon: <IconDashboard />,
+                })
+            })
+        }
+
+        if (insights) {
+            insights.forEach((insight) => {
+                items.push({
+                    type: 'insight',
+                    name: insight.name || `Insight ${insight.id}`,
+                    icon: <IconGraph />,
+                })
+            })
+        }
+
+        if (events) {
+            events.forEach((event) => {
+                items.push({
+                    type: 'event',
+                    name: event.name || `Event ${event.id}`,
+                    icon: <IconEvent />,
+                })
+            })
+        }
+
+        if (actions) {
+            actions.forEach((action) => {
+                items.push({
+                    type: 'action',
+                    name: action.name || `Action ${action.id}`,
+                    icon: <IconAction />,
+                })
+            })
+        }
+
+        if (notebooks) {
+            notebooks.forEach((notebook) => {
+                items.push({
+                    type: 'notebook',
+                    name: notebook.name || `Notebook ${notebook.id}`,
+                    icon: <IconNotebook />,
+                })
+            })
+        }
+
+        return items
+    }, [dashboards, insights, events, actions, notebooks])
+
+    if (totalCount === 0) {
+        return null
+    }
+
+    const tooltipContent = (
+        <div className="flex flex-col gap-1 max-w-xs">
+            {allItems.map((item, index) => (
+                <div key={index} className="flex items-center gap-1">
+                    {React.cloneElement(item.icon, { className: 'text-base' })}
+                    <span>{item.name}</span>
+                </div>
+            ))}
+        </div>
+    )
+
+    return (
+        <Tooltip title={tooltipContent} placement="bottom">
+            <div className="flex items-center gap-1 text-xs text-muted hover:text-default w-fit select-none mb-1.5">
+                <IconPageChart className="text-sm" />
+                <span className="italic">With {contextSummaryText}</span>
+            </div>
+        </Tooltip>
+    )
+}
+
+export function ContextTags({ size = 'default' }: { size?: 'small' | 'default' }): JSX.Element | null {
+    const { contextInsights, contextDashboards, contextEvents, contextActions, contextNotebooks, toolContextItems } =
+        useValues(maxContextLogic)
+    const {
+        removeContextInsight,
+        removeContextDashboard,
+        removeContextEvent,
+        removeContextAction,
+        removeContextNotebook,
+    } = useActions(maxContextLogic)
+
+    const allTags = useMemo(() => {
+        const tags: JSX.Element[] = []
+
+        // Collect tool context item names (these have precedence and shouldn't be duplicated)
+        const toolContextNames = new Set<string>()
+        toolContextItems.forEach((item) => {
+            toolContextNames.add(item.text.toLowerCase())
+        })
+
+        // Context items configuration
+        const contextConfigs = [
+            {
+                items: contextDashboards,
+                type: 'dashboard',
+                icon: IconDashboard,
+                removeAction: removeContextDashboard,
+                getName: (item: MaxDashboardContext) => item.name || `Dashboard ${item.id}`,
+            },
+            {
+                items: contextInsights,
+                type: 'insight',
+                icon: IconGraph,
+                removeAction: removeContextInsight,
+                getName: (item: MaxInsightContext) => item.name || `Insight ${item.id}`,
+            },
+            {
+                items: contextEvents,
+                type: 'event',
+                icon: IconEvent,
+                removeAction: removeContextEvent,
+                getName: (item: MaxEventContext) => item.name,
+            },
+            {
+                items: contextActions,
+                type: 'action',
+                icon: IconAction,
+                removeAction: removeContextAction,
+                getName: (item: MaxActionContext) => item.name || `Action ${item.id}`,
+            },
+            {
+                items: contextNotebooks,
+                type: 'notebook',
+                icon: IconNotebook,
+                removeAction: removeContextNotebook,
+                getName: (item: MaxNotebookContext) => item.name || `Notebook ${item.id}`,
+            },
+        ]
+
+        // Generate tags for each context type, skipping items already in tool context
+        contextConfigs.forEach(({ items, type, icon: IconComponent, removeAction, getName }) => {
+            if (items) {
+                items.forEach((item: any) => {
+                    const name = getName(item)
+                    // Skip if this item is already shown in tool context
+                    if (!name || toolContextNames.has(name.toLowerCase())) {
+                        return
+                    }
+                    tags.push(
+                        <Tooltip key={`${type}-${item.id}`} title={name}>
+                            <LemonTag
+                                key={`${type}-${item.id}`}
+                                icon={<IconComponent className="flex-shrink-0" />}
+                                onClose={() => removeAction(item.id)}
+                                closable
+                                closeOnClick
+                                className={clsx(
+                                    'flex items-center text-secondary',
+                                    size === 'small' ? 'max-w-20' : 'max-w-48'
+                                )}
+                            >
+                                <span className="truncate min-w-0 flex-1">{name}</span>
+                            </LemonTag>
+                        </Tooltip>
+                    )
+                })
+            }
+        })
+
+        return tags
+    }, [
+        size,
+        contextDashboards,
+        contextInsights,
+        contextEvents,
+        contextActions,
+        contextNotebooks,
+        toolContextItems,
+        removeContextDashboard,
+        removeContextInsight,
+        removeContextEvent,
+        removeContextAction,
+        removeContextNotebook,
+    ])
+
+    if (allTags.length === 0) {
+        return null
+    }
+
+    return <>{allTags}</>
+}
+
+export function ContextToolInfoTags({ size = 'default' }: { size?: 'small' | 'default' }): JSX.Element | null {
+    const { toolContextItems } = useValues(maxContextLogic)
+
+    if (toolContextItems.length === 0) {
+        return null
+    }
+
+    const tooltipContent =
+        toolContextItems.length === 1 ? (
+            'This context is auto-included from the current view'
+        ) : (
+            <div className="flex flex-col gap-1">
+                <div className="text-xs font-semibold mb-1">This context is auto-included from the current view:</div>
+                {toolContextItems.map((item, index) => (
+                    <div key={index} className="flex items-center gap-1.5">
+                        {item.icon}
+                        <span>{item.text}</span>
+                    </div>
+                ))}
+            </div>
+        )
+
+    return (
+        <Tooltip title={tooltipContent}>
+            <LemonTag
+                icon={toolContextItems[0].icon}
+                className={clsx(
+                    'flex items-center cursor-default border-dashed text-secondary',
+                    size === 'small' ? 'max-w-20' : 'max-w-48'
+                )}
+            >
+                <span className="truncate min-w-0 flex-1">
+                    {toolContextItems[0].text}
+                    {toolContextItems.length > 1 && <span className="ml-1">+{toolContextItems.length - 1}</span>}
+                </span>
+            </LemonTag>
+        </Tooltip>
+    )
+}
+
+/**
+ * Sandbox-runtime chips, rendered from the flat `posthogAiContextLogic.chipsForDisplay`. The X on
+ * each chip dispatches `detach(key)` — one removal path, no source distinction. Coexistence
+ * sibling to `ContextTags` (LangGraph).
+ */
+export function SandboxContextTags({ size = 'default' }: { size?: 'small' | 'default' }): JSX.Element | null {
+    const { chipsForDisplay } = useValues(posthogAiContextLogic)
+    const { detach } = useActions(posthogAiContextLogic)
+
+    if (chipsForDisplay.length === 0) {
+        return null
+    }
+
+    return (
+        <>
+            {chipsForDisplay.map((chip) => (
+                <Tooltip key={chip.key} title={chip.label}>
+                    <LemonTag
+                        icon={chip.icon as JSX.Element}
+                        onClose={() => detach(chip.key)}
+                        closable
+                        closeOnClick
+                        className={clsx('flex items-center text-secondary', size === 'small' ? 'max-w-20' : 'max-w-48')}
+                    >
+                        <span className="truncate min-w-0 flex-1">{chip.label}</span>
+                    </LemonTag>
+                </Tooltip>
+            ))}
+        </>
+    )
+}
+
+interface ContextDisplayProps {
+    size?: 'small' | 'default'
+}
+
+// Memoized: QuestionInput re-renders on every keystroke (local input state), and this subtree
+// (ModeSelector, TaxonomicPopover, context tags with tooltips) is its most expensive part while
+// being keystroke-independent. useValues subscriptions inside still trigger their own re-renders.
+export const ContextDisplay = React.memo(function ContextDisplay({
+    size = 'default',
+}: ContextDisplayProps): JSX.Element | null {
+    const { showContextUI, contextDisabledReason, conversation, sandboxConversationKey } = useValues(maxThreadLogic)
+    const isSandboxRuntime = conversation?.agent_runtime === 'sandbox'
+    const { hasData, contextOptions, taxonomicGroupTypes, mainTaxonomicGroupType, toolContextItems } =
+        useValues(maxContextLogic)
+    const { handleTaxonomicFilterChange } = useActions(maxContextLogic)
+
+    if (!showContextUI) {
+        return null
+    }
+
+    const hasToolContext = toolContextItems.length > 0
+
+    return (
+        <div className="px-2 w-full">
+            <div className="flex flex-wrap items-start gap-1 w-full">
+                <ModeSelector />
+                <Tooltip title={contextDisabledReason ?? 'Add context to help PostHog AI answer your question'}>
+                    {/* Wrapper span prevents Base UI's Tooltip.Trigger from merging
+                        props into TaxonomicPopover. Without it, mergeProps treats
+                        onChange as a DOM event handler and wraps it in a single-arg
+                        callback, dropping the groupType and item arguments. */}
+                    <span>
+                        <TaxonomicPopover
+                            size="xxsmall"
+                            type="tertiary"
+                            className="flex-shrink-0 border"
+                            groupType={mainTaxonomicGroupType}
+                            groupTypes={taxonomicGroupTypes}
+                            onChange={handleTaxonomicFilterChange}
+                            icon={<IconAtSign className="text-secondary" />}
+                            placeholder={!hasData && !hasToolContext ? 'Add context' : null}
+                            placeholderClass="text-secondary"
+                            maxContextOptions={contextOptions}
+                            width={450}
+                            disabledReason={contextDisabledReason}
+                        />
+                    </span>
+                </Tooltip>
+                {isSandboxRuntime ? (
+                    sandboxConversationKey ? (
+                        // Same key maxThreadLogic's connect() uses, so both resolve the same instance
+                        <BindLogic logic={posthogAiContextLogic} props={{ conversationId: sandboxConversationKey }}>
+                            <SandboxContextTags size={size} />
+                        </BindLogic>
+                    ) : null
+                ) : (
+                    <>
+                        <ContextToolInfoTags size={size} />
+                        <ContextTags size={size} />
+                    </>
+                )}
+            </div>
+        </div>
+    )
+})

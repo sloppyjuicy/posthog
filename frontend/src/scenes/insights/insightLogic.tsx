@@ -1,589 +1,841 @@
-import { kea } from 'kea'
-import { errorToast, objectsEqual, toParams, uuid } from 'lib/utils'
-import posthog from 'posthog-js'
-import { eventUsageLogic, InsightEventSource } from 'lib/utils/eventUsageLogic'
-import { insightLogicType } from './insightLogicType'
-import { DashboardItemType, FilterType, InsightLogicProps, InsightType, ItemMode, ViewType } from '~/types'
-import { captureInternalMetric } from 'lib/internalMetrics'
-import { Scene, sceneLogic } from 'scenes/sceneLogic'
+import { LogicWrapper, actions, connect, events, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
 import { router } from 'kea-router'
-import api from 'lib/api'
-import { toast } from 'react-toastify'
-import React from 'react'
-import { Link } from 'lib/components/Link'
-import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import posthog from 'posthog-js'
+
+import { LemonDialog, LemonInput } from '@posthog/lemon-ui'
+
+import { ApiError } from 'lib/api'
+import { tryShowMCPHint } from 'lib/components/MCPHint/mcpHintLogic'
+import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
 import { FEATURE_FLAGS } from 'lib/constants'
-import { filterTrendsClientSideParams, keyForInsightLogicProps } from 'scenes/insights/sharedUtils'
-import { cleanFilters } from 'scenes/insights/utils/cleanFilters'
+import { LemonField } from 'lib/lemon-ui/LemonField'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { accessLevelSatisfied } from 'lib/utils/accessControlUtils'
+import { deleteInsightWithUndo } from 'lib/utils/deleteWithUndo'
+import { InsightEventSource, eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { isEmptyObject, isObject } from 'lib/utils/guards'
+import { objectsEqual } from 'lib/utils/objects'
+import { isDashboardFilterEmpty } from 'scenes/dashboard/dashboardFilterEmpty'
+import { DashboardLoadAction, dashboardLogic } from 'scenes/dashboard/dashboardLogic'
+import { insightSceneLogic } from 'scenes/insights/insightSceneLogic'
+import { keyForInsightLogicProps } from 'scenes/insights/sharedUtils'
+import { summarizeInsight } from 'scenes/insights/summarizeInsight'
+import { savedInsightsLogic } from 'scenes/saved-insights/savedInsightsLogic'
+import { sceneLogic } from 'scenes/sceneLogic'
+import { Scene } from 'scenes/sceneTypes'
+import { mathsLogic } from 'scenes/trends/mathsLogic'
+import { IndexedTrendResult } from 'scenes/trends/types'
+import { urls } from 'scenes/urls'
+import { userLogic } from 'scenes/userLogic'
+
+import { getLastNewFolder, refreshTreeItem } from '~/layout/panel-layout/ProjectTree/projectTreeLogic'
+import { cohortsModel } from '~/models/cohortsModel'
 import { dashboardsModel } from '~/models/dashboardsModel'
-import { pollFunnel } from 'scenes/funnels/funnelUtils'
-import { preflightLogic } from 'scenes/PreflightCheck/logic'
-import { extractObjectDiffKeys } from './utils'
-import * as Sentry from '@sentry/browser'
+import { groupsModel } from '~/models/groupsModel'
+import { insightsModel } from '~/models/insightsModel'
+import { tagsModel } from '~/models/tagsModel'
+import { DashboardFilter, HogQLVariable, Node, TileFilters } from '~/queries/schema/schema-general'
+import {
+    convertDataTableNodeToDataVisualizationNode,
+    isFunnelsQuery,
+    isLifecycleQuery,
+    isNodeWithSource,
+    isPathsQuery,
+    isRetentionQuery,
+    isStickinessQuery,
+    isTrendsQuery,
+    isValidQueryForExperiment,
+} from '~/queries/utils'
+import {
+    AccessControlLevel,
+    AccessControlResourceType,
+    DashboardTile,
+    DashboardType,
+    InsightLogicProps,
+    InsightShortId,
+    ItemMode,
+    QueryBasedInsightModel,
+    SetInsightOptions,
+} from '~/types'
 
-const IS_TEST_MODE = process.env.NODE_ENV === 'test'
+import { insightAlertsLogic } from 'products/alerts/frontend/logic/insightAlertsLogic'
 
-/*
-InsightLogic maintains state for changing between insight features
-This includes handling the urls and view state
-*/
+import { teamLogic } from '../teamLogic'
+import { insightDataLogic, isInsightSceneInstance } from './insightDataLogic'
+import type { insightLogicType } from './insightLogicType'
+import { getInsightId } from './utils'
+import { insightsApi } from './utils/api'
 
-const SHOW_TIMEOUT_MESSAGE_AFTER = 15000
-export const defaultFilterTestAccounts = (): boolean => {
-    return localStorage.getItem('default_filter_test_accounts') === 'true' || false
-}
+export const UNSAVED_INSIGHT_MIN_REFRESH_INTERVAL_MINUTES = 3
 
-export const insightLogic = kea<insightLogicType>({
-    props: {} as InsightLogicProps,
-    key: keyForInsightLogicProps('new'),
+export const createEmptyInsight = (
+    shortId: InsightShortId | `new-${string}` | 'new'
+): Partial<QueryBasedInsightModel> => ({
+    short_id: shortId !== 'new' && !shortId.startsWith('new-') ? (shortId as InsightShortId) : undefined,
+    name: undefined,
+    description: '',
+    tags: [],
+    dashboards: [],
+    result: null,
+})
 
-    connect: {
+export const insightLogic: LogicWrapper<insightLogicType> = kea<insightLogicType>([
+    props({ filtersOverride: null, variablesOverride: null, tileFiltersOverride: null } as InsightLogicProps),
+    key((props) => keyForInsightLogicProps('new')(props)),
+    path((key) => ['scenes', 'insights', 'insightLogic', key]),
+    connect(() => ({
+        values: [
+            teamLogic,
+            ['currentTeamId', 'currentTeam'],
+            groupsModel,
+            ['aggregationLabel'],
+            cohortsModel,
+            ['cohortsById'],
+            mathsLogic,
+            ['mathDefinitions'],
+            userLogic,
+            ['user'],
+            featureFlagLogic,
+            ['featureFlags'],
+            sceneLogic,
+            ['activeSceneId'],
+        ],
+        actions: [tagsModel, ['loadTags'], teamLogic, ['addProductIntent']],
         logic: [eventUsageLogic, dashboardsModel],
-    },
+    })),
 
-    actions: () => ({
-        setActiveView: (type: ViewType) => ({ type }),
-        updateActiveView: (type: ViewType) => ({ type }),
-        setFilters: (filters: Partial<FilterType>) => ({ filters }),
-        startQuery: (queryId: string) => ({ queryId }),
-        endQuery: (queryId: string, view: ViewType, lastRefresh: string | null, exception?: Record<string, any>) => ({
-            queryId,
-            view,
-            lastRefresh,
-            exception,
-        }),
-        abortQuery: (queryId: string, view: ViewType, scene: Scene | null, exception?: Record<string, any>) => ({
-            queryId,
-            view,
-            scene,
-            exception,
-        }),
-        setMaybeShowTimeoutMessage: (showTimeoutMessage: boolean) => ({ showTimeoutMessage }),
-        setShowTimeoutMessage: (showTimeoutMessage: boolean) => ({ showTimeoutMessage }),
-        setShowErrorMessage: (showErrorMessage: boolean) => ({ showErrorMessage }),
-        setIsLoading: (isLoading: boolean) => ({ isLoading }),
-        setTimeout: (timeout: number | null) => ({ timeout }),
-        setLastRefresh: (lastRefresh: string | null) => ({ lastRefresh }),
-        setNotFirstLoad: () => {},
-        toggleControlsCollapsed: true,
-        saveNewTag: (tag: string) => ({ tag }),
-        deleteTag: (tag: string) => ({ tag }),
-        setInsight: (insight: Partial<DashboardItemType>, shouldMergeWithExisting: boolean = false) => ({
+    actions({
+        setInsight: (insight: Partial<QueryBasedInsightModel>, options: SetInsightOptions) => ({
             insight,
-            shouldMergeWithExisting,
+            options,
         }),
-        setInsightMode: (mode: ItemMode, source: InsightEventSource | null) => ({ mode, source }),
-        setInsightDescription: (description: string) => ({ description }),
-        saveInsight: true,
-        updateInsightFilters: (filters: FilterType) => ({ filters }),
-        setTagLoading: (tagLoading: boolean) => ({ tagLoading }),
-        fetchedResults: (filters: Partial<FilterType>) => ({ filters }),
-        loadInsight: (id: number, { doNotLoadResults }: { doNotLoadResults?: boolean } = {}) => ({
-            id,
-            doNotLoadResults,
+        saveAs: (redirectToViewMode?: boolean, persist?: boolean, folder?: string | null) => ({
+            redirectToViewMode,
+            persist,
+            folder,
         }),
-        loadResults: (refresh = false) => ({ refresh, queryId: uuid() }),
+        saveAsConfirmation: (name: string, redirectToViewMode = false, persist = true, folder?: string | null) => ({
+            name,
+            redirectToViewMode,
+            persist,
+            folder,
+        }),
+        saveInsight: (redirectToViewMode: boolean = true, folder: string | null = null) => ({
+            redirectToViewMode,
+            folder,
+        }),
+        saveInsightSuccess: true,
+        saveInsightFailure: true,
+        loadInsight: (
+            shortId: InsightShortId,
+            filtersOverride?: DashboardFilter | null,
+            variablesOverride?: Record<string, HogQLVariable> | null,
+            tileFiltersOverride?: DashboardFilter | null
+        ) => ({
+            shortId,
+            filtersOverride,
+            variablesOverride,
+            tileFiltersOverride,
+        }),
+        updateInsight: (insightUpdate: Partial<QueryBasedInsightModel>, callback?: () => void) => ({
+            insightUpdate,
+            callback,
+        }),
+        setInsightMetadata: (
+            metadataUpdate: Partial<Pick<QueryBasedInsightModel, 'name' | 'description' | 'tags' | 'favorited'>>
+        ) => ({
+            metadataUpdate,
+        }),
+        setInsightMetadataLocal: (
+            metadataUpdate: Partial<Pick<QueryBasedInsightModel, 'name' | 'description' | 'tags' | 'favorited'>>
+        ) => ({
+            metadataUpdate,
+        }),
+        highlightSeries: (series: IndexedTrendResult | null) => ({ series }),
+        setAccessDeniedToInsight: true,
+        handleInsightSuggested: (suggestedInsight: Node | null) => ({ suggestedInsight }),
+        onRejectSuggestedInsight: true,
+        onReapplySuggestedInsight: true,
+        setPreviousQuery: (previousQuery: Node | null) => ({ previousQuery }),
+        setSuggestedQuery: (suggestedQuery: Node | null) => ({ suggestedQuery }),
+        reloadSavedInsights: true,
+        duplicateInsight: (insight: QueryBasedInsightModel, redirectToInsight = false) => ({
+            insight,
+            redirectToInsight,
+        }),
+        deleteInsight: (dashboardId: number | null) => ({ dashboardId }),
+        confirmDeleteInsight: (dashboardId: number | null) => ({ dashboardId }),
+        setInsightFeedback: (feedback: 'liked' | 'disliked') => ({ feedback }),
     }),
-    loaders: ({ actions, cache, values, props }) => ({
+    loaders(({ actions, values, props }) => ({
         insight: [
+            props.cachedInsight ?? createEmptyInsight(props.dashboardItemId || 'new'),
             {
-                id: props.dashboardItemId,
-                tags: [],
-                filters: props.cachedResults ? props.filters || {} : {},
-                result: props.cachedResults || null,
-            } as Partial<DashboardItemType>,
-            {
-                loadInsight: async ({ id }) => {
-                    return await api.get(`api/insight/${id}`)
-                },
-                updateInsight: async (payload: Partial<DashboardItemType>, breakpoint) => {
-                    if (!Object.entries(payload).length) {
-                        return
-                    }
-                    const response = await api.update(`api/insight/${values.insight.id}`, payload)
-                    breakpoint()
-                    return { ...response, result: response.result || values.insight.result }
-                },
-                // using values.filters, query for new insight results
-                loadResults: async ({ refresh, queryId }, breakpoint) => {
-                    // fetch this now, as it might be different when we report below
-                    const scene = sceneLogic.isMounted() ? sceneLogic.values.scene : null
-
-                    // If a query is in progress, debounce before making the second query
-                    if (cache.abortController) {
-                        await breakpoint(300)
-                        cache.abortController.abort()
-                    }
-                    cache.abortController = new AbortController()
-
-                    const { filters } = values
-                    const insight = (filters.insight as ViewType | undefined) || ViewType.TRENDS
-                    const params = { ...filters, ...(refresh ? { refresh: true } : {}) }
-
-                    const dashboardItemId = props.dashboardItemId
-                    actions.startQuery(queryId)
-                    if (dashboardItemId) {
-                        dashboardsModel.actions.updateDashboardRefreshStatus(dashboardItemId, true, null)
-                    }
-
-                    let response
+                loadInsight: async (
+                    { shortId, filtersOverride, variablesOverride, tileFiltersOverride },
+                    breakpoint
+                ) => {
+                    await breakpoint(100)
                     try {
-                        if (
-                            insight === ViewType.TRENDS ||
-                            insight === ViewType.STICKINESS ||
-                            insight === ViewType.LIFECYCLE
-                        ) {
-                            response = await api.get(
-                                `api/insight/trend/?${toParams(filterTrendsClientSideParams(params))}`,
-                                cache.abortController.signal
-                            )
-                        } else if (insight === ViewType.SESSIONS || filters?.session) {
-                            response = await api.get(
-                                `api/insight/session/?${toParams(filterTrendsClientSideParams(params))}`,
-                                cache.abortController.signal
-                            )
-                        } else if (insight === ViewType.RETENTION) {
-                            response = await api.get(
-                                `api/insight/retention/?${toParams(params)}`,
-                                cache.abortController.signal
-                            )
-                        } else if (insight === ViewType.FUNNELS) {
-                            response = await pollFunnel(params)
-                        } else if (insight === ViewType.PATHS) {
-                            response = await api.create(`api/insight/path`, params)
-                        } else {
-                            throw new Error(`Can not load insight of type ${insight}`)
+                        const insight = await insightsApi.getByShortId(
+                            shortId,
+                            undefined,
+                            'async',
+                            filtersOverride,
+                            variablesOverride,
+                            tileFiltersOverride
+                        )
+
+                        if (!insight) {
+                            throw new Error(`Insight with shortId ${shortId} not found`)
                         }
-                    } catch (e) {
-                        if (e.name === 'AbortError') {
-                            actions.abortQuery(queryId, insight, scene, e)
+
+                        const convertedQuery = convertDataTableNodeToDataVisualizationNode(insight.query ?? null)
+
+                        return {
+                            ...insight,
+                            query: convertedQuery,
                         }
-                        breakpoint()
-                        cache.abortController = null
-                        actions.endQuery(queryId, insight, null, e)
-                        if (dashboardItemId) {
-                            dashboardsModel.actions.updateDashboardRefreshStatus(dashboardItemId, false, null)
+                    } catch (error: any) {
+                        if (error.status === 403 && error.code === 'permission_denied') {
+                            actions.setAccessDeniedToInsight()
                         }
-                        if (filters.insight === ViewType.FUNNELS) {
-                            eventUsageLogic.actions.reportFunnelCalculated(
-                                filters.events?.length || 0,
-                                filters.actions?.length || 0,
-                                filters.interval || '',
-                                filters.funnel_viz_type,
-                                false,
-                                e.message
-                            )
-                        }
+                        throw error
+                    }
+                },
+                updateInsight: async ({ insightUpdate, callback }, breakpoint) => {
+                    if (!Object.entries(insightUpdate).length) {
                         return values.insight
                     }
-                    breakpoint()
-                    cache.abortController = null
-                    actions.endQuery(
-                        queryId,
-                        (values.filters.insight as ViewType) || ViewType.TRENDS,
-                        response.last_refresh
-                    )
-                    if (dashboardItemId) {
-                        dashboardsModel.actions.updateDashboardRefreshStatus(
-                            dashboardItemId,
-                            false,
-                            response.last_refresh
-                        )
+                    // Resolve the numeric ID. When updateInsight races with loadInsight
+                    // (e.g. adding to a dashboard right after save), values.insight.id
+                    // may still be undefined. Fall back to resolving via short_id.
+                    const insightId =
+                        values.insight.id ||
+                        (values.insight.short_id ? await getInsightId(values.insight.short_id) : undefined)
+                    if (!insightId) {
+                        throw new Error('Cannot update insight: unable to resolve insight id')
                     }
-                    if (filters.insight === ViewType.FUNNELS) {
-                        eventUsageLogic.actions.reportFunnelCalculated(
-                            filters.events?.length || 0,
-                            filters.actions?.length || 0,
-                            filters.interval || '',
-                            filters.funnel_viz_type,
-                            true
-                        )
+                    const response = await insightsApi.update(insightId, insightUpdate)
+                    // Call the callback before breakpoint so it fires even if a newer loader
+                    // action was dispatched while the API call was in flight. The API call
+                    // succeeded, so the callback (e.g. navigation after adding to dashboard)
+                    // should run regardless.
+                    callback?.()
+                    breakpoint()
+                    const updatedInsight: QueryBasedInsightModel = {
+                        ...response,
+                        result: response.result || values.insight.result,
                     }
 
-                    return {
-                        ...values.insight,
-                        result: response.result,
-                        next: response.next,
-                        filters,
-                    } as Partial<DashboardItemType>
+                    const removedDashboards = (values.insight.dashboards || []).filter(
+                        (d) => !updatedInsight.dashboards?.includes(d)
+                    )
+                    dashboardsModel.actions.updateDashboardInsight(updatedInsight, removedDashboards)
+                    values.insight.short_id && refreshTreeItem('insight', String(values.insight.short_id))
+                    return updatedInsight
+                },
+                setInsightMetadata: async ({ metadataUpdate }, breakpoint) => {
+                    // new insight
+                    if (values.insight.short_id == null) {
+                        return { ...values.insight, ...metadataUpdate }
+                    }
+
+                    const beforeUpdates: Record<string, any> = {}
+                    for (const key of Object.keys(metadataUpdate)) {
+                        beforeUpdates[key] = values.savedInsight[key as keyof QueryBasedInsightModel]
+                    }
+
+                    const response = await insightsApi.update(values.insight.id as number, metadataUpdate)
+                    await breakpoint(300)
+
+                    actions.reloadSavedInsights()
+                    dashboardsModel.findMounted()?.actions.updateDashboardInsight(response)
+                    actions.loadTags()
+
+                    refreshTreeItem('insight', values.insight.short_id)
+                    lemonToast.success(`Updated insight`, {
+                        button: {
+                            label: 'Undo',
+                            dataAttr: 'edit-insight-undo',
+                            action: async () => {
+                                const response = await insightsApi.update(values.insight.id as number, beforeUpdates)
+                                actions.reloadSavedInsights()
+                                dashboardsModel.findMounted()?.actions.updateDashboardInsight(response)
+                                actions.setInsight(response, { overrideQuery: false, fromPersistentApi: true })
+                                lemonToast.success('Insight change reverted')
+                            },
+                        },
+                    })
+
+                    return response
                 },
             },
         ],
-    }),
-    reducers: ({ props }) => ({
+    })),
+    reducers(({ props }) => ({
+        highlightedSeries: [
+            null as IndexedTrendResult | null,
+            {
+                highlightSeries: (_, { series }) => series,
+            },
+        ],
         insight: {
-            loadInsight: (state, { id }) =>
-                id === state.id
+            loadInsight: (state, { shortId }) =>
+                shortId === state.short_id
                     ? state
                     : {
                           // blank slate if switched to a new insight
-                          id,
+                          short_id: shortId,
                           tags: [],
                           result: null,
-                          filters: {},
+                          query: null,
                       },
-            setInsight: (state, { insight, shouldMergeWithExisting }) =>
-                shouldMergeWithExisting
-                    ? {
-                          ...state,
-                          ...insight,
-                      }
-                    : insight,
-            updateInsightFilters: (state, { filters }) => ({ ...state, filters }),
+            setInsight: (state, { insight }) => {
+                // Preserve the user-edited name when loading new data for the same insight,
+                // but not when switching to a brand new insight
+                const isSameInsight = insight.short_id && insight.short_id === state.short_id
+                if (!insight.name && state.name && isSameInsight) {
+                    return {
+                        ...insight,
+                        name: state.name,
+                    }
+                }
+                return { ...insight }
+            },
+            // Note: setInsightMetadata state updates are handled by the loader
+            setInsightMetadataLocal: (state, { metadataUpdate }) => ({ ...state, ...metadataUpdate }),
+            [dashboardsModel.actionTypes.updateDashboardInsight]: (
+                state: Partial<QueryBasedInsightModel>,
+                {
+                    insight,
+                    extraDashboardIds,
+                    sourceDashboardId,
+                }: { insight: QueryBasedInsightModel; extraDashboardIds?: number[]; sourceDashboardId?: number }
+            ) => {
+                // Dashboard refresh responses merge that dashboard's filters into `query`; only the embedded
+                // insight for that dashboard (`props.dashboardId`) should apply them. Other dashboards or
+                // non-dashboard views should ignore this action when `sourceDashboardId` is set.
+                if (sourceDashboardId != null) {
+                    if (props.dashboardId !== sourceDashboardId) {
+                        return state
+                    }
+                }
+                const targetDashboards = (insight?.dashboards || []).concat(extraDashboardIds || [])
+                const updateIsForThisDashboard =
+                    insight?.short_id === state.short_id &&
+                    props.dashboardId &&
+                    targetDashboards.includes(props.dashboardId)
+                if (updateIsForThisDashboard) {
+                    return { ...state, ...insight }
+                }
+                return state
+            },
+            [insightsModel.actionTypes.renameInsightSuccess]: (state, { item }) => {
+                if (item.id === state.id) {
+                    // Also sync query (display-option saves); preserve result — bare PATCHes return result: null.
+                    return {
+                        ...state,
+                        name: item.name,
+                        description: item.description,
+                        query: (item.query ?? state.query) as QueryBasedInsightModel['query'],
+                    }
+                }
+                return state
+            },
+            [insightsModel.actionTypes.insightsAddedToDashboard]: (
+                state: Partial<QueryBasedInsightModel>,
+                { dashboardId, insightIds }: { dashboardId: number; insightIds: number[] }
+            ) => {
+                if (state.id != null && insightIds.includes(state.id)) {
+                    return { ...state, dashboards: [...(state.dashboards || []), dashboardId] }
+                }
+                return state
+            },
+            [dashboardsModel.actionTypes.tileRemovedFromDashboard]: (
+                state: Partial<QueryBasedInsightModel>,
+                { tile, dashboardId }: { tile?: DashboardTile<QueryBasedInsightModel>; dashboardId?: number }
+            ) => {
+                if (tile?.insight?.id === state.id) {
+                    return { ...state, dashboards: state.dashboards?.filter((d: number) => d !== dashboardId) }
+                }
+                return state
+            },
+            [dashboardsModel.actionTypes.deleteDashboardSuccess]: (
+                state: Partial<QueryBasedInsightModel>,
+                { dashboard }: { dashboard: DashboardType<QueryBasedInsightModel> }
+            ) => {
+                const { id } = dashboard
+                return { ...state, dashboards: state.dashboards?.filter((d: number) => d !== id) }
+            },
         },
-        showTimeoutMessage: [false, { setShowTimeoutMessage: (_, { showTimeoutMessage }) => showTimeoutMessage }],
-        maybeShowTimeoutMessage: [
+        accessDeniedToInsight: [false, { setAccessDeniedToInsight: () => true }],
+        /** The insight's state as it is in the database. */
+        savedInsight: [
+            () => props.cachedInsight || ({} as Partial<QueryBasedInsightModel>),
+            {
+                setInsight: (state, { insight, options: { fromPersistentApi } }) =>
+                    fromPersistentApi ? { ...insight, query: insight.query || null } : state,
+                loadInsightSuccess: (_, { insight }) => ({
+                    ...insight,
+                    query: insight.query || null,
+                }),
+                updateInsightSuccess: (_, { insight }) => ({
+                    ...insight,
+                    query: insight.query || null,
+                }),
+                setInsightMetadataSuccess: (state, { insight }) => ({
+                    ...state,
+                    name: insight.name,
+                    description: insight.description,
+                    tags: insight.tags,
+                    favorited: insight.favorited,
+                }),
+                [insightsModel.actionTypes.renameInsightSuccess]: (state, { item }) =>
+                    item.id === state.id
+                        ? { ...state, name: item.name, description: item.description, query: item.query ?? state.query }
+                        : state,
+            },
+        ],
+        insightLoading: [
             false,
             {
-                // Only show timeout message if timer is still running
-                setShowTimeoutMessage: (_, { showTimeoutMessage }) => showTimeoutMessage,
-                endQuery: (_, { exception }) => !!exception && exception.status !== 500,
-                startQuery: () => false,
-                setActiveView: () => false,
+                loadInsight: () => true,
+                loadInsightSuccess: () => false,
+                loadInsightFailure: () => false,
             },
         ],
-        showErrorMessage: [false, { setShowErrorMessage: (_, { showErrorMessage }) => showErrorMessage }],
-        maybeShowErrorMessage: [
+        insightSaving: [
             false,
             {
-                endQuery: (_, { exception }) => exception?.status >= 400,
-                startQuery: () => false,
-                setActiveView: () => false,
+                saveInsight: () => true,
+                saveInsightSuccess: () => false,
+                saveInsightFailure: () => false,
             },
         ],
-        timeout: [null as number | null, { setTimeout: (_, { timeout }) => timeout }],
-        lastRefresh: [
-            null as string | null,
-            {
-                setLastRefresh: (_, { lastRefresh }) => lastRefresh,
-                setActiveView: () => null,
-            },
-        ],
-        isLoading: [
+        isSavingTags: [
             false,
             {
-                setIsLoading: (_, { isLoading }) => isLoading,
+                setInsightMetadata: (_, { metadataUpdate }) => !!metadataUpdate.tags,
+                setInsightMetadataSuccess: () => false,
+                setInsightMetadataFailure: () => false,
             },
         ],
-        /* filters contains the in-flight filters, might not (yet?) be the same as insight.filters */
-        filters: [
-            () => props.filters || ({} as Partial<FilterType>),
+        previousQuery: [
+            null as Node | null,
             {
-                setFilters: (state, { filters }) => cleanFilters(filters, state),
-                loadInsightSuccess: (state, { insight }) =>
-                    Object.keys(state).length === 0 && insight.filters ? insight.filters : state,
-                loadResultsSuccess: (state, { insight }) =>
-                    Object.keys(state).length === 0 && insight.filters ? insight.filters : state,
+                setPreviousQuery: (_, { previousQuery }) => previousQuery,
+                saveInsight: () => null,
             },
         ],
-        /*
-        isFirstLoad determines if this is the first graph being shown after the component is mounted (used for analytics)
-        */
-        isFirstLoad: [
-            true,
+        suggestedQuery: [
+            null as Node | null,
             {
-                setNotFirstLoad: () => false,
+                setSuggestedQuery: (_, { suggestedQuery }) => suggestedQuery,
+                saveInsight: () => null,
             },
         ],
-        controlsCollapsed: [
-            false,
+        insightFeedback: [
+            null as 'liked' | 'disliked' | null,
             {
-                toggleControlsCollapsed: (state) => !state,
+                persist: true,
+                prefix: `${window.POSTHOG_APP_CONTEXT?.current_team?.id}_`,
             },
-        ],
-        queryStartTimes: [
-            {} as Record<string, number>,
             {
-                startQuery: (state, { queryId }) => ({ ...state, [queryId]: new Date().getTime() }),
+                setInsightFeedback: (_, { feedback }) => feedback,
             },
         ],
-        lastInsightModeSource: [
-            null as InsightEventSource | null,
-            {
-                setInsightMode: (_, { source }) => source,
-            },
-        ],
-        insightMode: [
-            ItemMode.View as ItemMode,
-            {
-                setInsightMode: (_, { mode }) => mode,
-            },
-        ],
-        tagLoading: [
-            false,
-            {
-                setTagLoading: (_, { tagLoading }) => tagLoading,
-            },
-        ],
-    }),
-    selectors: {
-        loadedFilters: [(s) => [s.insight], (insight) => insight.filters],
+    })),
+    selectors({
         insightProps: [() => [(_, props) => props], (props): InsightLogicProps => props],
-        insightName: [(s) => [s.insight], (insight) => insight.name],
-        activeView: [(s) => [s.filters], (filters) => filters.insight || ViewType.TRENDS],
-        loadedView: [
-            (s) => [s.insight, s.activeView],
-            ({ filters }, activeView) => filters?.insight || activeView || ViewType.TRENDS,
+        query: [
+            (s) => [(state) => insightDataLogic.findMounted(s.insightProps(state))?.values.query || null],
+            (node): Node | null => node,
         ],
-        clickhouseFeaturesEnabled: [
-            () => [preflightLogic.selectors.preflight],
-            (preflight) => !!preflight?.is_clickhouse_enabled,
+        isInDashboardContext: [() => [(_, props) => props], ({ dashboardId }) => !!dashboardId],
+        hasDashboardItemId: [
+            () => [(_, props) => props],
+            (props: InsightLogicProps) =>
+                !!props.dashboardItemId && props.dashboardItemId !== 'new' && !props.dashboardItemId.startsWith('new-'),
         ],
-    },
-    listeners: ({ actions, selectors, values, props }) => ({
-        setFilters: async ({ filters }, breakpoint, _, previousState) => {
-            const { fromDashboard } = router.values.hashParams
-            const previousFilters = selectors.filters(previousState)
-            if (objectsEqual(previousFilters, filters)) {
-                return
-            }
+        isInExperimentContext: [
+            () => [router.selectors.location],
+            ({ pathname }) => /^.*\/experiments\/\d+$/.test(pathname),
+        ],
+        isInViewMode: [() => [router.selectors.location], ({ pathname }) => /\/insights\/[a-zA-Z0-9]+$/.test(pathname)],
+        derivedName: [
+            (s) => [s.query, s.aggregationLabel, s.cohortsById, s.mathDefinitions],
+            (query, aggregationLabel, cohortsById, mathDefinitions) =>
+                summarizeInsight(query, {
+                    aggregationLabel,
+                    cohortsById,
+                    mathDefinitions,
+                }).slice(0, 400),
+        ],
+        insightName: [(s) => [s.insight, s.derivedName], (insight, derivedName) => insight.name ?? derivedName],
+        insightId: [(s) => [s.insight], (insight) => insight?.id || null],
+        canEditInsight: [
+            (s) => [s.insight],
+            (insight) =>
+                insight.user_access_level
+                    ? accessLevelSatisfied(
+                          AccessControlResourceType.Insight,
+                          insight.user_access_level,
+                          AccessControlLevel.Editor
+                      )
+                    : true,
+        ],
+        insightChanged: [
+            (s) => [s.insight, s.savedInsight],
+            (insight, savedInsight): boolean => {
+                return (
+                    (insight.name || '') !== (savedInsight.name || '') ||
+                    (insight.description || '') !== (savedInsight.description || '') ||
+                    !objectsEqual(insight.tags || [], savedInsight.tags || [])
+                )
+            },
+        ],
+        showPersonsModal: [
+            (s) => [s.query, s.insightProps, s.featureFlags],
+            (query: Record<string, any>, insightProps: InsightLogicProps): boolean => {
+                const theQuery = query || insightProps?.query
+                return !theQuery || !theQuery.hidePersonsModal
+            },
+        ],
+        supportsCreatingExperiment: [
+            (s) => [s.insight, s.activeSceneId],
+            (insight: QueryBasedInsightModel, activeSceneId: Scene) =>
+                insight?.query &&
+                isValidQueryForExperiment(insight.query) &&
+                ![
+                    Scene.Experiment,
+                    Scene.Experiments,
+                    Scene.ExperimentsSharedMetric,
+                    Scene.ExperimentsSharedMetrics,
+                ].includes(activeSceneId),
+        ],
+        isUsingPathsV1: [
+            (s) => [s.featureFlags],
+            (featureFlags) => !featureFlags[FEATURE_FLAGS.PRODUCT_ANALYTICS_PATHS_V2],
+        ],
+        isUsingPathsV2: [
+            (s) => [s.featureFlags],
+            (featureFlags) => featureFlags[FEATURE_FLAGS.PRODUCT_ANALYTICS_PATHS_V2],
+        ],
+        hasOverrides: [
+            () => [
+                (_, props) => props.filtersOverride,
+                (_, props) => props.variablesOverride,
+                (_, props) => props.tileFiltersOverride,
+            ],
+            (
+                filtersOverride: DashboardFilter | null,
+                variablesOverride: Record<string, HogQLVariable> | null,
+                tileFiltersOverride: TileFilters | null
+            ) => {
+                return (
+                    !isDashboardFilterEmpty(filtersOverride) ||
+                    (isObject(variablesOverride) && !isEmptyObject(variablesOverride)) ||
+                    !isDashboardFilterEmpty(tileFiltersOverride)
+                )
+            },
+        ],
+        editingDisabledReason: [
+            (s) => [s.hasOverrides],
+            (hasOverrides) => (hasOverrides ? 'Discard overrides to edit the insight.' : null),
+        ],
+    }),
+    listeners(({ actions, values, props }) => ({
+        saveInsight: async ({ redirectToViewMode, folder }) => {
+            const insightNumericId =
+                values.insight.id || (values.insight.short_id ? await getInsightId(values.insight.short_id) : undefined)
+            const { name, description, favorited, deleted, dashboards, tags } = values.insight
 
-            const changedKeysObj: Record<string, any> = extractObjectDiffKeys(previousFilters, filters)
+            let savedInsight: QueryBasedInsightModel
 
-            eventUsageLogic.actions.reportInsightViewed(
-                filters,
-                values.isFirstLoad,
-                Boolean(fromDashboard),
-                0,
-                changedKeysObj
-            )
-            actions.setNotFirstLoad()
-
-            const filterLength = (filter?: Partial<FilterType>): number =>
-                (filter?.events?.length || 0) + (filter?.actions?.length || 0)
-
-            const insightChanged = values.loadedFilters?.insight && filters.insight !== values.loadedFilters?.insight
-
-            const backendFilterChanged = !objectsEqual(
-                Object.assign({}, values.filters, { layout: undefined, hiddenLegendKeys: undefined }),
-                Object.assign({}, values.loadedFilters, { layout: undefined, hiddenLegendKeys: undefined })
-            )
-
-            // Auto-reload when setting filters
-            if (
-                backendFilterChanged &&
-                (values.filters.insight !== ViewType.FUNNELS ||
-                    // Auto-reload on funnels if with clickhouse
-                    values.clickhouseFeaturesEnabled ||
-                    // Or if tabbing to the funnels insight
-                    insightChanged ||
-                    // If user started from empty state (<2 steps) and added a new step
-                    (filterLength(values.loadedFilters) === 1 && filterLength(values.filters) === 2))
-            ) {
-                actions.loadResults()
-            }
-
-            // tests will wait for all breakpoints to finish
-            await breakpoint(IS_TEST_MODE ? 1 : 10000)
-            eventUsageLogic.actions.reportInsightViewed(
-                filters,
-                values.isFirstLoad,
-                Boolean(fromDashboard),
-                10,
-                changedKeysObj
-            )
-        },
-        startQuery: () => {
-            actions.setShowTimeoutMessage(false)
-            actions.setShowErrorMessage(false)
-            values.timeout && clearTimeout(values.timeout || undefined)
-            const view = values.activeView
-            actions.setTimeout(
-                window.setTimeout(() => {
-                    if (values && view == values.activeView) {
-                        actions.setShowTimeoutMessage(true)
-                        const tags = {
-                            insight: values.activeView,
-                            scene: sceneLogic.isMounted() ? sceneLogic.values.scene : null,
-                        }
-                        posthog.capture('insight timeout message shown', tags)
-                        captureInternalMetric({ method: 'incr', metric: 'insight_timeout', value: 1, tags })
-                    }
-                }, SHOW_TIMEOUT_MESSAGE_AFTER)
-            )
-            actions.setIsLoading(true)
-        },
-        abortQuery: ({ queryId, view, scene, exception }) => {
-            const duration = new Date().getTime() - values.queryStartTimes[queryId]
-            const tags = {
-                insight: view,
-                scene: scene,
-                success: !exception,
-                ...exception,
-            }
-
-            posthog.capture('insight aborted', { ...tags, duration })
-            captureInternalMetric({ method: 'timing', metric: 'insight_abort_time', value: duration, tags })
-        },
-        endQuery: ({ queryId, view, lastRefresh, exception }) => {
-            if (values.timeout) {
-                clearTimeout(values.timeout)
-            }
-            if (view === values.activeView) {
-                actions.setShowTimeoutMessage(values.maybeShowTimeoutMessage)
-                actions.setShowErrorMessage(values.maybeShowErrorMessage)
-                actions.setLastRefresh(lastRefresh || null)
-                actions.setIsLoading(false)
-
-                const duration = new Date().getTime() - values.queryStartTimes[queryId]
-                const tags = {
-                    insight: values.activeView,
-                    scene: sceneLogic.isMounted() ? sceneLogic.values.scene : null,
-                    success: !exception,
-                    ...exception,
+            try {
+                // We don't want to send ALL the insight properties back to the API, so only grabbing fields that might have changed
+                const insightRequest: Partial<QueryBasedInsightModel> = {
+                    name,
+                    derived_name: values.derivedName,
+                    description,
+                    favorited,
+                    query: values.query,
+                    deleted,
+                    saved: true,
+                    dashboards,
+                    tags,
                 }
 
-                posthog.capture('insight loaded', { ...tags, duration })
-                captureInternalMetric({ method: 'timing', metric: 'insight_load_time', value: duration, tags })
-                if (values.maybeShowErrorMessage) {
-                    posthog.capture('insight error message shown', { ...tags, duration })
-                }
-            }
-        },
-        setActiveView: ({ type }) => {
-            actions.setFilters(cleanFilters({ ...values.filters, insight: type as InsightType }, values.filters))
-            actions.setShowTimeoutMessage(false)
-            actions.setShowErrorMessage(false)
-            if (values.timeout) {
-                clearTimeout(values.timeout)
-            }
-        },
-        toggleControlsCollapsed: async () => {
-            eventUsageLogic.actions.reportInsightsControlsCollapseToggle(values.controlsCollapsed)
-        },
-        saveNewTag: async ({ tag }, breakpoint) => {
-            actions.setTagLoading(true)
-            if (values.insight.tags?.includes(tag)) {
-                errorToast(undefined, 'Oops! Your insight already has that tag.')
-                actions.setTagLoading(false)
-                return
-            }
-            actions.setInsight({ ...values.insight, tags: [...(values.insight.tags || []), tag] })
-            await breakpoint(100)
-            actions.setTagLoading(false)
-        },
-        deleteTag: async ({ tag }, breakpoint) => {
-            await breakpoint(100)
-            actions.setInsight({ ...values.insight, tags: values.insight.tags?.filter((_tag) => _tag !== tag) })
-        },
-        saveInsight: async () => {
-            const savedInsight = await api.update(`api/insight/${values.insight.id}`, {
-                ...values.insight,
-                saved: true,
-            })
-            actions.setInsight({ ...savedInsight, result: savedInsight.result || values.insight.result })
-            actions.setInsightMode(ItemMode.View, InsightEventSource.InsightHeader)
-            toast(
-                <div data-attr="success-toast">
-                    Insight saved!&nbsp;
-                    <Link to={'/saved_insights'}>Click here to see your list of saved insights</Link>
-                </div>
-            )
-        },
-        loadInsightSuccess: async ({ payload, insight }) => {
-            // loaded `/api/insight`, but it didn't have `results`, so make another query
-            if (!insight.result && values.filters && !payload?.doNotLoadResults) {
-                actions.loadResults()
-            }
-        },
-        // called when search query was successful
-        loadResultsSuccess: async ({ insight }, breakpoint) => {
-            if (props.doNotPersist) {
-                return
-            }
-            if (!insight.id) {
-                const createdInsight = await api.create('api/insight', {
-                    filters: insight.filters,
+                savedInsight = insightNumericId
+                    ? await insightsApi.update(insightNumericId, insightRequest)
+                    : await insightsApi.create({
+                          ...insightRequest,
+                          _create_in_folder: folder ?? getLastNewFolder(),
+                      })
+                actions.reloadSavedInsights() // Load insights afresh
+
+                const alertsLogic = insightAlertsLogic.findMounted({
+                    insightLogicProps: props,
+                    insightId: insightNumericId,
                 })
-                breakpoint()
-                actions.setInsight({ ...insight, ...createdInsight, result: createdInsight.result || insight.result })
-                if (props.syncWithUrl) {
-                    router.actions.replace('/insights', router.values.searchParams, {
-                        ...router.values.hashParams,
-                        fromItem: createdInsight.id,
-                    })
-                }
-            } else if (insight.filters) {
-                // This auto-saves new filters into the insight.
-                // Exceptions:
-                if (
-                    // - not saved if "saved insights" feature flag is enabled and we're in view mode
-                    !(
-                        featureFlagLogic.values.featureFlags[FEATURE_FLAGS.SAVED_INSIGHTS] &&
-                        values.insightMode === ItemMode.View
-                    ) &&
-                    // - not saved if on the history "insight" for some reason
-                    (insight.filters.insight as ViewType) !== ViewType.HISTORY &&
-                    // - not saved if we came from a dashboard --> there's a separate "save" button for that
-                    !router.values.hashParams.fromDashboard
-                ) {
-                    const filterLength = Object.keys(insight.filters).length
-                    if (filterLength === 0 || (filterLength === 1 && 'from_dashboard' in insight.filters)) {
-                        Sentry.captureException(
-                            new Error(
-                                filterLength === 0
-                                    ? 'Would save empty filters'
-                                    : `Would save filters with just "from_dashboard"`
-                            ),
-                            {
-                                extra: {
-                                    filters_to_save: JSON.stringify(insight.filters),
-                                    insight: JSON.stringify(insight),
-                                    filters: JSON.stringify(values.filters),
-                                },
-                            }
-                        )
-                    } else {
-                        actions.updateInsight({ filters: insight.filters })
-                    }
-                }
-            }
-        },
-    }),
-    actionToUrl: ({ values, props }) => ({
-        setFilters: () => {
-            if (props.syncWithUrl) {
-                return ['/insights', values.filters, router.values.hashParams, { replace: true }]
-            }
-        },
-    }),
-    urlToAction: ({ actions, values, props }) => ({
-        '/insights': (_: any, searchParams: Record<string, any>, hashParams: Record<string, any>) => {
-            if (props.syncWithUrl) {
-                if (searchParams.insight === 'HISTORY' || !hashParams.fromItem) {
-                    if (values.insightMode !== ItemMode.Edit) {
-                        actions.setInsightMode(ItemMode.Edit, null)
-                    }
-                } else if (hashParams.fromItem) {
-                    if (!values.insight?.id || values.insight?.id !== hashParams.fromItem) {
-                        // Do not load the result if missing, as setFilters below will do so anyway.
-                        actions.loadInsight(hashParams.fromItem, { doNotLoadResults: true })
-                    }
-                }
 
-                const cleanSearchParams = cleanFilters(searchParams, values.filters)
-                if (!objectsEqual(cleanSearchParams, values.filters)) {
-                    actions.setFilters(cleanSearchParams)
+                if (alertsLogic != null) {
+                    if (alertsLogic.values.alerts.length > 0) {
+                        alertsLogic.actions.loadAlerts()
+                    }
                 }
-            }
-        },
-    }),
-    events: ({ actions, cache, props, values }) => ({
-        afterMount: () => {
-            if (!props.cachedResults) {
-                if (props.dashboardItemId && !props.filters) {
-                    actions.loadInsight(props.dashboardItemId)
+                // remove draft query from local storage
+                localStorage.removeItem(`draft-query-${values.currentTeamId}`)
+                actions.saveInsightSuccess()
+            } catch (e) {
+                actions.saveInsightFailure()
+                if (e instanceof ApiError) {
+                    lemonToast.error(e.detail ?? 'Could not save insight')
                 } else {
-                    actions.loadResults()
+                    lemonToast.error('Could not save insight')
+                }
+                throw e
+            }
+
+            // the backend can't return the result for a query based insight,
+            // and so we shouldn't copy the result from `values.insight` as it might be stale
+            const result = savedInsight.result || (values.query ? values.insight.result : null)
+            actions.setInsight({ ...savedInsight, result: result }, { fromPersistentApi: true, overrideQuery: true })
+            eventUsageLogic.actions.reportInsightSaved(
+                savedInsight,
+                values.query,
+                insightNumericId === undefined,
+                'save'
+            )
+            lemonToast.success(`Insight saved${dashboards?.length === 1 ? ' & added to dashboard' : ''}`, {
+                button: {
+                    label: 'View Insights list',
+                    action: () => router.actions.push(urls.savedInsights()),
+                },
+            })
+            const insightName = savedInsight.name || savedInsight.derived_name
+            tryShowMCPHint('insights.create', {
+                derivedPrompt: insightName ? `Build an insight called ${insightName}` : undefined,
+            })
+
+            dashboardsModel.findMounted()?.actions.updateDashboardInsight(savedInsight)
+
+            // Properly track activation events
+            const tasksToComplete: SetupTaskId[] = [SetupTaskId.CreateFirstInsight]
+            const query = isNodeWithSource(savedInsight.query) ? savedInsight.query.source : savedInsight.query
+
+            if (isTrendsQuery(query)) {
+                tasksToComplete.push(SetupTaskId.ExploreTrendsInsight)
+            } else if (isFunnelsQuery(query)) {
+                tasksToComplete.push(SetupTaskId.CreateFunnel)
+            } else if (isRetentionQuery(query)) {
+                tasksToComplete.push(SetupTaskId.ExploreRetentionInsight)
+            } else if (isPathsQuery(query)) {
+                tasksToComplete.push(SetupTaskId.ExplorePathsInsight)
+            } else if (isStickinessQuery(query)) {
+                tasksToComplete.push(SetupTaskId.ExploreStickinessInsight)
+            } else if (isLifecycleQuery(query)) {
+                tasksToComplete.push(SetupTaskId.ExploreLifecycleInsight)
+            }
+
+            globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(tasksToComplete)
+
+            // reload dashboards with updated insight
+            // since filters on dashboard might be different from filters on insight
+            // we need to trigger dashboard reload to pick up results for updated insight
+            savedInsight.dashboard_tiles?.forEach(({ dashboard_id }) =>
+                dashboardLogic
+                    .findMounted({ id: dashboard_id })
+                    ?.actions.loadDashboard({ action: DashboardLoadAction.Update })
+            )
+
+            if (redirectToViewMode) {
+                if (!insightNumericId && dashboards?.length === 1) {
+                    // redirect new insights added to dashboard to the dashboard
+                    router.actions.push(urls.dashboard(dashboards[0], savedInsight.short_id))
+                } else if (insightNumericId) {
+                    if (isInsightSceneInstance(props)) {
+                        insightSceneLogic
+                            .findMounted()
+                            ?.actions.setInsightMode(ItemMode.View, InsightEventSource.InsightHeader)
+                    }
+                } else {
+                    router.actions.push(urls.insightView(savedInsight.short_id))
+                }
+            } else if (!insightNumericId) {
+                // If we've just saved a new insight without redirecting to view mode, we need to redirect to edit mode
+                // so that we aren't stuck on /insights/new
+                router.actions.push(urls.insightEdit(savedInsight.short_id))
+            }
+        },
+        saveAs: async ({ redirectToViewMode, persist, folder }) => {
+            LemonDialog.openForm({
+                title: 'Save as new insight',
+                initialValues: {
+                    name:
+                        values.insight.name || values.insight.derived_name
+                            ? `${values.insight.name || values.insight.derived_name} (copy)`
+                            : '',
+                },
+                content: (
+                    <LemonField name="name">
+                        <LemonInput data-attr="insight-name" placeholder="Please enter the new name" autoFocus />
+                    </LemonField>
+                ),
+                errors: {
+                    name: (name) => (!name ? 'You must enter a name' : undefined),
+                },
+                onSubmit: async ({ name }) => actions.saveAsConfirmation(name, redirectToViewMode, persist, folder),
+            })
+        },
+        saveAsConfirmation: async ({ name, redirectToViewMode, persist, folder }) => {
+            const insight = await insightsApi.create({
+                name,
+                query: values.query,
+                saved: true,
+                _create_in_folder: folder ?? getLastNewFolder(),
+            })
+
+            if (router.values.location.pathname.includes(urls.sqlEditor())) {
+                lemonToast.info(`You're now viewing ${values.insight.name || values.insight.derived_name || name}`)
+            } else {
+                lemonToast.info(
+                    `You're now working on a copy of ${values.insight.name || values.insight.derived_name || name}`
+                )
+            }
+
+            if (persist) {
+                eventUsageLogic.actions.reportInsightSaved(insight, values.query, true, 'save_as')
+            }
+            actions.reloadSavedInsights() // Load insights afresh
+
+            if (redirectToViewMode) {
+                router.actions.push(urls.insightView(insight.short_id))
+            } else {
+                router.actions.push(urls.insightEdit(insight.short_id))
+            }
+        },
+        onRejectSuggestedInsight: () => {
+            if (values.previousQuery) {
+                const insightDataLogicInstance = insightDataLogic.findMounted(values.insightProps)
+                if (insightDataLogicInstance) {
+                    insightDataLogicInstance.actions.setQuery(values.previousQuery)
+                }
+                actions.setPreviousQuery(null)
+            } else {
+            }
+        },
+        handleInsightSuggested: ({ suggestedInsight }) => {
+            if (suggestedInsight) {
+                const insightDataLogicInstance = insightDataLogic.findMounted(values.insightProps)
+                if (insightDataLogicInstance) {
+                    const currentQuery = insightDataLogicInstance.values.query
+                    actions.setPreviousQuery(currentQuery)
+                    actions.setSuggestedQuery(suggestedInsight)
                 }
             }
         },
-        beforeUnmount: () => {
-            cache.abortController?.abort()
-            if (values.timeout) {
-                clearTimeout(values.timeout)
+        onReapplySuggestedInsight: () => {
+            // Reapply the Max AI suggestion
+            if (values.suggestedQuery) {
+                const insightDataLogicInstance = insightDataLogic.findMounted(values.insightProps)
+                if (insightDataLogicInstance) {
+                    const currentQuery = insightDataLogicInstance.values.query
+                    actions.setPreviousQuery(currentQuery)
+                    insightDataLogicInstance.actions.setQuery(values.suggestedQuery)
+                }
+            } else {
             }
-            toast.dismiss()
         },
-    }),
-})
+        reloadSavedInsights: () => {
+            for (const logic of savedInsightsLogic.findAllMounted()) {
+                logic.actions.loadInsights()
+            }
+        },
+        duplicateInsight: async ({ insight, redirectToInsight }) => {
+            let insightToDuplicate = insight
+            if (insight.short_id) {
+                try {
+                    const cleanInsight = await insightsApi.getByShortId(insight.short_id)
+                    if (cleanInsight) {
+                        insightToDuplicate = cleanInsight
+                    }
+                } catch {
+                    // Fall through to duplicate the original insight
+                }
+            }
+            const newInsight = await insightsApi.duplicate(insightToDuplicate)
+            for (const logic of savedInsightsLogic.findAllMounted()) {
+                logic.actions.addInsight(newInsight)
+            }
+            redirectToInsight && router.actions.push(urls.insightEdit(newInsight.short_id))
+        },
+        deleteInsight: ({ dashboardId }) => {
+            LemonDialog.open({
+                title: 'Delete insight?',
+                description: 'Are you sure you want to delete this insight? This action can be undone.',
+                primaryButton: {
+                    children: 'Delete',
+                    status: 'danger',
+                    onClick: () => actions.confirmDeleteInsight(dashboardId),
+                },
+                secondaryButton: { children: 'Cancel' },
+            })
+        },
+        confirmDeleteInsight: async ({ dashboardId }) => {
+            const { insight, currentTeamId } = values
+            await deleteInsightWithUndo({
+                object: insight as QueryBasedInsightModel,
+                endpoint: `projects/${currentTeamId}/insights`,
+                callback: (undo: boolean) => {
+                    if (undo && dashboardId) {
+                        dashboardsModel
+                            .findMounted()
+                            ?.actions.updateDashboardInsight(
+                                { ...(insight as QueryBasedInsightModel), deleted: false },
+                                [dashboardId]
+                            )
+                    }
+                    actions.reloadSavedInsights()
+                },
+            })
+            if (dashboardId) {
+                router.actions.push(urls.dashboard(dashboardId))
+                dashboardsModel.actions.updateDashboardInsight(
+                    { ...(insight as QueryBasedInsightModel), deleted: true, dashboards: [] },
+                    [dashboardId]
+                )
+            } else {
+                router.actions.push(urls.savedInsights())
+            }
+        },
+        setInsightFeedback: ({ feedback }) => {
+            const eventName = `customer-analytics-insight-${feedback}`
+            posthog.capture(eventName, {
+                insight_id: values.insight.short_id,
+                insight_name: values.insight.name,
+                dashboard_id: values.insightProps.dashboardId,
+            })
+            lemonToast.success(`Insight ${feedback}`)
+        },
+    })),
+    events(({ props, actions }) => ({
+        afterMount: () => {
+            if (!props.dashboardItemId || props.dashboardItemId === 'new' || props.dashboardItemId.startsWith('new-')) {
+                return
+            }
+
+            if (!props.doNotLoad && !props.cachedInsight) {
+                actions.loadInsight(
+                    props.dashboardItemId as InsightShortId,
+                    props.filtersOverride,
+                    props.variablesOverride,
+                    props.tileFiltersOverride
+                )
+            }
+        },
+    })),
+])

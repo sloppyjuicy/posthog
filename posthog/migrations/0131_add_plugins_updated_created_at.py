@@ -6,7 +6,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0130_dashboard_creation_mode"),
     ]
@@ -18,12 +17,20 @@ class Migration(migrations.Migration):
             field=models.DateTimeField(auto_now_add=True, default=datetime.datetime(2020, 1, 1, 0, 0)),
             preserve_default=False,
         ),
-        migrations.AddField(model_name="plugin", name="updated_at", field=models.DateTimeField(auto_now=True),),
+        migrations.AddField(
+            model_name="plugin",
+            name="updated_at",
+            field=models.DateTimeField(auto_now=True),
+        ),
         migrations.AddField(
             model_name="pluginconfig",
             name="created_at",
             field=models.DateTimeField(auto_now_add=True, default=datetime.datetime(2020, 1, 1, 0, 0)),
             preserve_default=False,
         ),
-        migrations.AddField(model_name="pluginconfig", name="updated_at", field=models.DateTimeField(auto_now=True),),
+        migrations.AddField(
+            model_name="pluginconfig",
+            name="updated_at",
+            field=models.DateTimeField(auto_now=True),
+        ),
     ]

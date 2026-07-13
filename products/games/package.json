@@ -1,0 +1,15 @@
+{
+    "name": "@posthog/products-games",
+    "dependencies": {
+        "kea": "catalog:",
+        "kea-loaders": "catalog:",
+        "kea-router": "catalog:"
+    },
+    "peerDependencies": {
+        "@posthog/icons": "catalog:",
+        "@types/react": "*",
+        "clsx": "*",
+        "fuse.js": "*",
+        "react": "*"
+    }
+}

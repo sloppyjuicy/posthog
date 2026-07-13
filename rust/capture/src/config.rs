@@ -1,0 +1,525 @@
+use std::collections::HashSet;
+use std::{net::SocketAddr, num::NonZeroU32};
+
+use common_continuous_profiling::ContinuousProfilingConfig;
+use envconfig::Envconfig;
+use tracing::Level;
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum CaptureMode {
+    Events,
+    Recordings,
+    Ai,
+}
+
+impl CaptureMode {
+    pub fn as_tag(&self) -> &'static str {
+        match self {
+            CaptureMode::Events => "events",
+            CaptureMode::Recordings => "recordings",
+            CaptureMode::Ai => "ai",
+        }
+    }
+}
+
+impl std::str::FromStr for CaptureMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_ref() {
+            "events" => Ok(CaptureMode::Events),
+            "recordings" => Ok(CaptureMode::Recordings),
+            "ai" => Ok(CaptureMode::Ai),
+            _ => Err(format!("Unknown Capture Type: {s}")),
+        }
+    }
+}
+
+/// Compression algorithm applied at the Kafka message payload (envelope) level,
+/// independent of the broker-level `compression.codec` setting.
+/// Enables Warpstream billing reduction by storing compressed bytes.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub enum EnvelopeCompression {
+    #[default]
+    None,
+    Lz4,
+}
+
+impl std::str::FromStr for EnvelopeCompression {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_ref() {
+            "none" => Ok(EnvelopeCompression::None),
+            "lz4" => Ok(EnvelopeCompression::Lz4),
+            _ => Err(format!("Unknown EnvelopeCompression: {s}")),
+        }
+    }
+}
+
+/// Routing mode for AI capture events between the primary cluster and a
+/// secondary (e.g. WarpStream) cluster. Only consulted in `CaptureMode::Ai`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub enum AiSinkMode {
+    /// All AI events stay on the primary sink (current behavior).
+    #[default]
+    Primary,
+    /// Only tokens listed in `ai_secondary_allowlist_tokens` go to the
+    /// secondary sink; everything else stays on the primary.
+    SecondaryAllowlist,
+    /// All AI events go to the secondary sink.
+    Secondary,
+}
+
+impl std::str::FromStr for AiSinkMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_ref() {
+            "primary" => Ok(AiSinkMode::Primary),
+            "secondary_allowlist" | "secondary-allowlist" => Ok(AiSinkMode::SecondaryAllowlist),
+            "secondary" => Ok(AiSinkMode::Secondary),
+            _ => Err(format!("Unknown AiSinkMode: {s}")),
+        }
+    }
+}
+
+/// Resolved AI routing policy: the configured `AiSinkMode` with the token
+/// allowlist it needs attached to the one variant that uses it. Built from the
+/// raw `ai_sink_mode` + `ai_secondary_allowlist_tokens` config in `setup` and
+/// carried by `SplitKafkaSink`, so routing needs nothing but the event's token.
+#[derive(Debug, Clone)]
+pub enum AiRouting {
+    Primary,
+    SecondaryAllowlist(HashSet<String>),
+    Secondary,
+}
+
+impl AiRouting {
+    /// Whether an AI event for `token` should be routed to the secondary sink.
+    /// `Primary` never does; `Secondary` always does; `SecondaryAllowlist` routes
+    /// only allowlisted tokens.
+    pub fn routes_to_secondary(&self, token: &str) -> bool {
+        match self {
+            AiRouting::Primary => false,
+            AiRouting::Secondary => true,
+            AiRouting::SecondaryAllowlist(allowlist) => allowlist.contains(token),
+        }
+    }
+}
+
+#[derive(Envconfig, Clone)]
+pub struct Config {
+    #[envconfig(default = "false")]
+    pub print_sink: bool,
+
+    #[envconfig(default = "false")]
+    pub noop_sink: bool,
+
+    #[envconfig(default = "127.0.0.1:3000")]
+    pub address: SocketAddr,
+
+    pub redis_url: String,
+
+    #[envconfig(default = "100")]
+    pub redis_response_timeout_ms: u64,
+
+    #[envconfig(default = "5000")]
+    pub redis_connection_timeout_ms: u64,
+
+    #[envconfig(default = "false")]
+    pub global_rate_limit_enabled: bool,
+
+    /// When true, the global rate limiter evaluates and emits metrics/logs
+    /// but does not enforce (events pass through as if not limited).
+    #[envconfig(default = "false")]
+    pub global_rate_limit_dry_run: bool,
+
+    /// Sliding window interval to apply global rate limiting threshold to
+    #[envconfig(default = "60")]
+    pub global_rate_limit_window_interval_secs: u64,
+
+    /// Max staleness before re-sync with Redis (seconds)
+    #[envconfig(default = "15")]
+    pub global_rate_limit_sync_interval_secs: u64,
+
+    /// Background task cadence for pipeline reads + writes (milliseconds)
+    #[envconfig(default = "1000")]
+    pub global_rate_limit_tick_interval_ms: u64,
+
+    // --- Token+DistinctId limiter config ---
+    /// Per-(token, distinct_id) rate limit threshold per window interval
+    /// Note: default is too high to trigger limiting in production
+    #[envconfig(default = "300000")]
+    pub global_rate_limit_token_distinctid_threshold: u64,
+
+    /// CSV list of key=value pairs for custom per-(token, distinct_id) thresholds
+    pub global_rate_limit_token_distinctid_overrides_csv: Option<String>,
+
+    /// Max local cache entries for the per-(token, distinct_id) limiter
+    #[envconfig(default = "5000000")]
+    pub global_rate_limit_token_distinctid_local_cache_max_entries: u64,
+
+    // --- Token-only limiter config (not currently used in production, retained for new_token()) ---
+    /// Per-token rate limit threshold per window interval
+    /// Note: default is too high to trigger limiting in production
+    #[envconfig(default = "5000000")]
+    pub global_rate_limit_token_threshold: u64,
+
+    /// CSV list of key=value pairs for custom per-token thresholds
+    pub global_rate_limit_token_overrides_csv: Option<String>,
+
+    /// Max local cache entries for the per-token limiter
+    #[envconfig(default = "300000")]
+    pub global_rate_limit_token_local_cache_max_entries: u64,
+
+    /// Optional dedicated Redis URL for global rate limiter.
+    /// If set, creates a separate Redis client for the limiter.
+    /// Falls back to the shared redis_url if unset.
+    pub global_rate_limit_redis_url: Option<String>,
+
+    /// Optional Redis reader URL for global rate limiter (replica).
+    /// When set alongside global_rate_limit_redis_url, creates a ReadWriteClient
+    /// that routes reads to replicas and writes to the primary.
+    pub global_rate_limit_redis_reader_url: Option<String>,
+
+    /// Response timeout for dedicated global rate limiter Redis (milliseconds).
+    /// Defaults to redis_response_timeout_ms if unset.
+    pub global_rate_limit_redis_response_timeout_ms: Option<u64>,
+
+    /// Connection timeout for dedicated global rate limiter Redis (milliseconds).
+    /// Defaults to redis_connection_timeout_ms if unset.
+    pub global_rate_limit_redis_connection_timeout_ms: Option<u64>,
+
+    // Event restrictions configuration (reads from Redis, synced by Django)
+    #[envconfig(default = "false")]
+    pub event_restrictions_enabled: bool,
+
+    /// Redis URL for event restrictions (separate from main redis_url)
+    pub event_restrictions_redis_url: Option<String>,
+
+    #[envconfig(default = "30")]
+    pub event_restrictions_refresh_interval_secs: u64,
+
+    #[envconfig(default = "300")]
+    pub event_restrictions_fail_open_after_secs: u64,
+
+    pub otel_url: Option<String>,
+
+    #[envconfig(default = "false")]
+    pub overflow_enabled: bool,
+
+    #[envconfig(default = "false")]
+    pub overflow_preserve_partition_locality: bool,
+
+    #[envconfig(default = "100")]
+    pub overflow_per_second_limit: NonZeroU32,
+
+    #[envconfig(default = "1000")]
+    pub overflow_burst_limit: NonZeroU32,
+
+    pub ingestion_force_overflow_by_token_distinct_id: Option<String>, // Comma-delimited keys
+
+    pub drop_events_by_token_distinct_id: Option<String>, // "<token>:<distinct_id or *>,<distinct_id or *>;<token>..."
+
+    #[envconfig(default = "false")]
+    pub enable_historical_rerouting: bool,
+
+    #[envconfig(default = "1")]
+    pub historical_rerouting_threshold_days: i64,
+
+    #[envconfig(nested = true)]
+    pub kafka: KafkaConfig,
+
+    #[envconfig(default = "1.0")]
+    pub otel_sampling_rate: f64,
+
+    #[envconfig(default = "capture")]
+    pub otel_service_name: String,
+
+    // Used for integration tests
+    #[envconfig(default = "true")]
+    pub export_prometheus: bool,
+    pub redis_key_prefix: Option<String>,
+
+    #[envconfig(default = "events")]
+    pub capture_mode: CaptureMode,
+
+    pub concurrency_limit: Option<usize>,
+
+    #[envconfig(default = "false")]
+    pub s3_fallback_enabled: bool,
+    pub s3_fallback_bucket: Option<String>,
+    pub s3_fallback_endpoint: Option<String>,
+
+    #[envconfig(default = "")]
+    pub s3_fallback_prefix: String,
+
+    #[envconfig(default = "false")]
+    pub is_mirror_deploy: bool,
+
+    #[envconfig(default = "info")]
+    pub log_level: Level,
+
+    // deploy var [0.0..100.0] to sample behavior of interest for verbose logging
+    #[envconfig(default = "0.0")]
+    pub verbose_sample_percent: f32,
+
+    // AI endpoint size limits
+    #[envconfig(default = "26214400")] // 25MB in bytes
+    pub ai_max_sum_of_parts_bytes: usize,
+
+    // AI endpoint S3 blob storage configuration
+    pub ai_s3_bucket: Option<String>,
+    #[envconfig(default = "llma/")]
+    pub ai_s3_prefix: String,
+    pub ai_s3_endpoint: Option<String>,
+    #[envconfig(default = "us-east-1")]
+    pub ai_s3_region: String,
+    pub ai_s3_access_key_id: Option<String>,
+    pub ai_s3_secret_access_key: Option<String>,
+
+    // HMAC-SHA256 key shared with the AI gateway. When set, $ai_generation events
+    // carrying a valid PostHog-Ai-Gateway-* signature are stamped verified and
+    // exempted from the llm_events quota limiter. Unset disables verification
+    // (all $ai_gateway* props are stripped as untrusted).
+    pub ai_gateway_signing_secret: Option<String>,
+
+    // --- AI secondary sink (e.g. WarpStream cluster) routing ---
+    /// `primary` keeps all AI events on the primary sink; `secondary_allowlist`
+    /// sends only `ai_secondary_allowlist_tokens` to the secondary; `secondary`
+    /// sends every AI event to the secondary. Only consulted in `CaptureMode::Ai`.
+    #[envconfig(default = "primary")]
+    pub ai_sink_mode: AiSinkMode,
+
+    /// Comma-separated tokens routed to the secondary AI sink when
+    /// `ai_sink_mode = secondary_allowlist`.
+    pub ai_secondary_allowlist_tokens: Option<String>,
+
+    /// Secondary AI Kafka cluster connection. When `ai_sink_mode` is not
+    /// `primary`, `ai_secondary_kafka_hosts` and `ai_secondary_kafka_topic` are
+    /// required; the secondary producer inherits all other tuning from `kafka`.
+    pub ai_secondary_kafka_hosts: Option<String>,
+    pub ai_secondary_kafka_topic: Option<String>,
+    #[envconfig(default = "false")]
+    pub ai_secondary_kafka_tls: bool,
+    #[envconfig(default = "")]
+    pub ai_secondary_kafka_client_id: String,
+
+    // HTTP/1 header read timeout in milliseconds - closes connections that don't
+    // send complete headers within this duration (slow loris protection).
+    // Set env var to enable; unset to disable.
+    pub http1_header_read_timeout_ms: Option<u64>,
+
+    // Body chunk read timeout in milliseconds. If a client stops sending data
+    // for this duration mid-upload, the request is aborted with 408 to avoid
+    // pointless gateway retries of stalled mobile requests that can't succeed.
+    // Set env var to enable; unset to disable (existing behavior).
+    pub body_chunk_read_timeout_ms: Option<u64>,
+
+    // Initial buffer size for body reads in KB. The buffer starts at this size
+    // (or the request limit, whichever is smaller) and grows as needed.
+    #[envconfig(default = "256")]
+    pub body_read_chunk_size_kb: usize,
+
+    #[envconfig(nested = true)]
+    pub continuous_profiling: ContinuousProfilingConfig,
+
+    /// Comma-separated list of active v1 sinks (e.g. "msk" or "msk,ws").
+    /// Parsed by `v1::sinks::load_sinks()` after `Config::init_from_env()`.
+    /// Empty string means the v1 sink layer is disabled.
+    #[envconfig(default = "")]
+    pub capture_v1_sinks: String,
+
+    /// Maximum compressed (wire) body size the v1 endpoint will accept (bytes).
+    #[envconfig(default = "10485760")]
+    pub capture_v1_max_compressed_body_bytes: usize,
+
+    /// Maximum decompressed body size the v1 endpoint will accept (bytes).
+    #[envconfig(default = "52428800")]
+    pub capture_v1_max_decompressed_body_bytes: usize,
+
+    /// Batch size threshold for parallel scatter-gather serialization; 0 disables fanout.
+    #[envconfig(default = "8")]
+    pub capture_v1_scatter_gather_min_batch: usize,
+}
+
+#[derive(Envconfig, Clone)]
+pub struct KafkaConfig {
+    #[envconfig(default = "20")]
+    pub kafka_producer_linger_ms: u32, // Maximum time between producer batches during low traffic
+    #[envconfig(default = "400")]
+    pub kafka_producer_queue_mib: u32, // Size of the in-memory producer queue in mebibytes
+    #[envconfig(default = "20000")]
+    pub kafka_message_timeout_ms: u32, // Time before we stop retrying producing a message: 20 seconds
+    #[envconfig(default = "1000000")]
+    pub kafka_producer_message_max_bytes: u32, // message.max.bytes - max kafka message size we will produce
+    #[envconfig(default = "none")]
+    pub kafka_compression_codec: String, // none, gzip, snappy, lz4, zstd
+    /// Application-level compression for session replay (snapshot) Kafka payloads.
+    /// Independent of broker-level compression; consumers must detect and decompress.
+    /// Set to "lz4" to enable. Default "none" for safe rollout and rollback.
+    #[envconfig(default = "none")]
+    pub kafka_replay_envelope_compression: EnvelopeCompression,
+    pub kafka_hosts: String,
+    #[envconfig(default = "events_plugin_ingestion")]
+    pub kafka_topic: String,
+    #[envconfig(default = "ingestion-traces")]
+    pub kafka_traces_topic: String,
+    #[envconfig(default = "ingestion-metrics")]
+    pub kafka_metrics_topic: String,
+    #[envconfig(default = "events_plugin_ingestion_overflow")]
+    pub kafka_overflow_topic: String,
+    #[envconfig(default = "events_plugin_ingestion_historical")]
+    pub kafka_historical_topic: String,
+    #[envconfig(default = "ingestion-clientwarnings-main-1")]
+    pub kafka_client_ingestion_warning_topic: String,
+    #[envconfig(default = "error_tracking_events")]
+    pub kafka_error_tracking_topic: String,
+    #[envconfig(default = "heatmaps_ingestion")]
+    pub kafka_heatmaps_topic: String,
+    #[envconfig(default = "session_recording_snapshot_item_overflow")]
+    pub kafka_replay_overflow_topic: String,
+    #[envconfig(default = "events_plugin_ingestion_dlq")]
+    pub kafka_dlq_topic: String,
+    #[envconfig(default = "false")]
+    pub kafka_tls: bool,
+    #[envconfig(default = "")]
+    pub kafka_client_id: String,
+    #[envconfig(default = "2")]
+    pub kafka_producer_max_retries: u32,
+    #[envconfig(default = "all")]
+    pub kafka_producer_acks: String,
+    // interval between metadata refreshes from the Kafka brokers
+    #[envconfig(default = "20000")]
+    pub kafka_topic_metadata_refresh_interval_ms: u32,
+    // default is 3x metadata refresh interval so we maintain that here
+    #[envconfig(default = "60000")]
+    pub kafka_metadata_max_age_ms: u32,
+    #[envconfig(default = "60000")] // lib default, can tweak in env overrides
+    pub kafka_socket_timeout_ms: u32,
+    #[envconfig(default = "10000")] // librdkafka default
+    pub kafka_producer_batch_num_messages: u32, // batch.num.messages - max messages per batch
+    #[envconfig(default = "1000000")] // librdkafka default
+    pub kafka_producer_batch_size: u32, // batch.size - max batch size in bytes
+    #[envconfig(default = "1000000")] // librdkafka default
+    pub kafka_producer_max_in_flight_requests: u32, // max.in.flight.requests.per.connection
+    #[envconfig(default = "10")] // librdkafka default
+    pub kafka_producer_sticky_partitioning_linger_ms: u32, // sticky.partitioning.linger.ms
+    #[envconfig(default = "false")] // librdkafka default
+    pub kafka_producer_enable_idempotence: bool, // enable.idempotence
+    #[envconfig(default = "murmur2_random")]
+    pub kafka_producer_partitioner: String, // partitioner
+    #[envconfig(default = "")]
+    pub kafka_broker_address_family: String, // broker.address.family - v4, v6, any; empty = don't set
+    #[envconfig(default = "true")] // librdkafka default
+    pub kafka_log_connection_close: bool, // log.connection.close
+    #[envconfig(default = "100000")] // librdkafka default
+    pub kafka_producer_queue_buffering_max_messages: u32, // queue.buffering.max.messages
+    #[envconfig(default = "1000")] // librdkafka default
+    pub kafka_retry_backoff_max_ms: u32, // retry.backoff.max.ms
+    #[envconfig(default = "0")] // librdkafka default (OS auto-tune)
+    pub kafka_socket_send_buffer_bytes: u32, // socket.send.buffer.bytes
+    #[envconfig(default = "0")] // librdkafka default (OS auto-tune)
+    pub kafka_socket_receive_buffer_bytes: u32, // socket.receive.buffer.bytes
+
+    // Traces-cluster overrides (consumed by capture-logs). When unset, the
+    // traces producer reuses the corresponding `kafka_*` value above.
+    pub kafka_traces_hosts: Option<String>,
+    pub kafka_traces_tls: Option<bool>,
+    pub kafka_traces_client_id: Option<String>,
+    pub kafka_traces_compression_codec: Option<String>,
+    pub kafka_traces_producer_acks: Option<String>,
+    pub kafka_traces_producer_linger_ms: Option<u32>,
+    pub kafka_traces_producer_queue_mib: Option<u32>,
+    pub kafka_traces_message_timeout_ms: Option<u32>,
+    pub kafka_traces_producer_message_max_bytes: Option<u32>,
+    pub kafka_traces_producer_max_retries: Option<u32>,
+    pub kafka_traces_topic_metadata_refresh_interval_ms: Option<u32>,
+    pub kafka_traces_metadata_max_age_ms: Option<u32>,
+
+    // Metrics-cluster overrides (consumed by capture-logs). When unset, the
+    // metrics producer reuses the corresponding `kafka_*` value above.
+    pub kafka_metrics_hosts: Option<String>,
+    pub kafka_metrics_tls: Option<bool>,
+    pub kafka_metrics_client_id: Option<String>,
+    pub kafka_metrics_compression_codec: Option<String>,
+    pub kafka_metrics_producer_acks: Option<String>,
+    pub kafka_metrics_producer_linger_ms: Option<u32>,
+    pub kafka_metrics_producer_queue_mib: Option<u32>,
+    pub kafka_metrics_message_timeout_ms: Option<u32>,
+    pub kafka_metrics_producer_message_max_bytes: Option<u32>,
+    pub kafka_metrics_producer_max_retries: Option<u32>,
+    pub kafka_metrics_topic_metadata_refresh_interval_ms: Option<u32>,
+    pub kafka_metrics_metadata_max_age_ms: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AiRouting, AiSinkMode};
+    use std::str::FromStr;
+
+    #[test]
+    fn ai_sink_mode_from_str() {
+        // Locks the AI_SINK_MODE env contract: accepted spellings (incl. the
+        // dash/underscore allowlist alias), case-insensitivity, and rejection
+        // of anything else.
+        let ok = [
+            ("primary", AiSinkMode::Primary),
+            ("PRIMARY", AiSinkMode::Primary),
+            ("secondary", AiSinkMode::Secondary),
+            (" Secondary ", AiSinkMode::Secondary),
+            ("secondary_allowlist", AiSinkMode::SecondaryAllowlist),
+            ("secondary-allowlist", AiSinkMode::SecondaryAllowlist),
+            ("Secondary_Allowlist", AiSinkMode::SecondaryAllowlist),
+        ];
+        for (input, expected) in ok {
+            assert_eq!(
+                AiSinkMode::from_str(input).unwrap(),
+                expected,
+                "input={input}"
+            );
+        }
+
+        for bad in ["", "secondaryallowlist", "warpstream", "allowlist"] {
+            assert!(
+                AiSinkMode::from_str(bad).is_err(),
+                "expected err for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ai_routing_routes_to_secondary() {
+        // Locks the routing decision: a flipped arm or the allowlist being
+        // consulted in the wrong variant would send AI traffic to the wrong
+        // cluster mid-cutover.
+        use std::collections::HashSet;
+        let allowlist: HashSet<String> = ["tok_a".to_string()].into_iter().collect();
+
+        // (routing, token, expected_secondary)
+        let cases = [
+            (AiRouting::Primary, "tok_a", false),
+            (AiRouting::Secondary, "tok_a", true),
+            (AiRouting::Secondary, "unlisted", true),
+            (
+                AiRouting::SecondaryAllowlist(allowlist.clone()),
+                "tok_a",
+                true,
+            ),
+            (AiRouting::SecondaryAllowlist(allowlist), "unlisted", false),
+            (
+                AiRouting::SecondaryAllowlist(HashSet::new()),
+                "tok_a",
+                false,
+            ),
+        ];
+        for (routing, token, expected) in cases {
+            assert_eq!(
+                routing.routes_to_secondary(token),
+                expected,
+                "routing={routing:?} token={token}"
+            );
+        }
+    }
+}

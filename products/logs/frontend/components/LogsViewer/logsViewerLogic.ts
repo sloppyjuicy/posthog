@@ -1,0 +1,534 @@
+import { actions, connect, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+import { subscriptions } from 'kea-subscriptions'
+import posthog from 'posthog-js'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import { dayjs } from 'lib/dayjs'
+import { copyToClipboard } from 'lib/utils/copyToClipboard'
+import { uuid } from 'lib/utils/dom'
+
+import { logsViewerConfigLogic } from 'products/logs/frontend/components/LogsViewer/config/logsViewerConfigLogic'
+import { logsViewerDataLogic } from 'products/logs/frontend/components/LogsViewer/data/logsViewerDataLogic'
+import { logsViewerFiltersLogic } from 'products/logs/frontend/components/LogsViewer/Filters/logsViewerFiltersLogic'
+
+import { LogsOrderBy, ParsedLogMessage } from '../../types'
+import { attributeLookupExpression, LogsColumnConfig } from './config/columns'
+import { logDetailsModalLogic } from './LogDetailsModal/logDetailsModalLogic'
+import type { logsViewerLogicType } from './logsViewerLogicType'
+import { logsViewerSettingsLogic } from './logsViewerSettingsLogic'
+
+export interface VisibleLogsTimeRange {
+    date_from: string
+    date_to: string
+}
+
+export interface VisibleRowRange {
+    startIndex: number
+    stopIndex: number
+}
+
+export type LogCursor = number | null
+
+export interface LogsViewerLogicProps {
+    id: string
+}
+
+function tryOpenLinkedLog(
+    logs: ParsedLogMessage[],
+    linkToLogId: string | null,
+    logsLoading: boolean,
+    actions: {
+        setCursor: (index: number) => void
+        openLogDetails: (log: ParsedLogMessage) => void
+        requestScrollToCursor: () => void
+        setLinkToLogId: (id: string | null) => void
+        clearLinkToLogId: () => void
+    }
+): void {
+    if (!linkToLogId || logsLoading) {
+        return
+    }
+    const index = logs.findIndex((log) => log.uuid === linkToLogId)
+    if (index !== -1) {
+        actions.setCursor(index)
+        actions.openLogDetails(logs[index])
+        actions.requestScrollToCursor()
+        actions.setLinkToLogId(null)
+    } else {
+        lemonToast.warning('Log not found')
+        actions.clearLinkToLogId()
+    }
+}
+
+export const logsViewerLogic = kea<logsViewerLogicType>([
+    path((id) => ['products', 'logs', 'frontend', 'components', 'LogsViewer', 'logsViewerLogic', id]),
+    props({} as LogsViewerLogicProps),
+    key((props) => props.id),
+    connect(({ id }: LogsViewerLogicProps) => ({
+        values: [
+            logsViewerSettingsLogic,
+            ['timezone', 'wrapBody', 'prettifyJson'],
+            logDetailsModalLogic({ id }),
+            ['isLogDetailsOpen'],
+            logsViewerDataLogic({ id }),
+            ['parsedLogs as logs', 'logsLoading'],
+            logsViewerConfigLogic({ id }),
+            ['orderBy', 'columns', 'customColumns'],
+        ],
+        actions: [
+            logsViewerSettingsLogic,
+            ['setTimezone', 'setWrapBody', 'setPrettifyJson'],
+            logDetailsModalLogic({ id }),
+            ['openLogDetails', 'closeLogDetails'],
+            logsViewerFiltersLogic({ id }),
+            ['addFilter'],
+            logsViewerDataLogic({ id }),
+            ['setLogs', 'clearLogs'],
+            logsViewerConfigLogic({ id }),
+            ['setColumns', 'addColumn', 'removeColumn', 'setColumnWidth', 'moveColumn'],
+        ],
+    })),
+
+    actions({
+        // Pinning
+        togglePinLog: (log: ParsedLogMessage) => ({ log }),
+
+        // Focus (for keyboard shortcuts)
+        setFocused: (isFocused: boolean) => ({ isFocused }),
+
+        // Cursor (vim-style navigation position)
+        setCursor: (cursor: LogCursor) => ({ cursor }),
+        setCursorIndex: (index: number | null) => ({ index }),
+        userSetCursorIndex: (index: number | null) => ({ index }), // User-initiated (click on row)
+        resetCursor: true,
+        moveCursorDown: (shiftSelect?: boolean) => ({ shiftSelect: shiftSelect ?? false }),
+        moveCursorUp: (shiftSelect?: boolean) => ({ shiftSelect: shiftSelect ?? false }),
+        requestScrollToCursor: true, // Signals React to scroll to current cursor position
+
+        // Expansion
+        toggleExpandLog: (logId: string) => ({ logId }),
+
+        // Deep linking - position cursor at a specific log by ID
+        setLinkToLogId: (linkToLogId: string | null) => ({ linkToLogId }),
+        clearLinkToLogId: true,
+
+        // Copy link to log
+        copyLinkToLog: (logId: string) => ({ logId }),
+
+        // Attribute breakdowns (per-log)
+        toggleAttributeBreakdown: (logId: string, attributeKey: string) => ({ logId, attributeKey }),
+
+        // Show/hide an attribute as a column in the log list (facade over the typed column model)
+        toggleAttributeColumn: (attributeKey: string) => ({ attributeKey }),
+
+        // Row height recomputation (triggered by child components when content changes)
+        recomputeRowHeights: (logIds?: string[]) => ({ logIds }),
+
+        // Multi-select
+        toggleSelectLog: (logId: string) => ({ logId }),
+        setSelectedLogIds: (selectedLogIds: Record<string, boolean>) => ({ selectedLogIds }),
+        selectLogRange: (fromIndex: number, toIndex: number) => ({ fromIndex, toIndex }),
+        selectAll: (logsToSelect?: ParsedLogMessage[]) => ({ logsToSelect }),
+        clearSelection: true,
+
+        // Per-row prettify
+        togglePrettifyLog: (logId: string) => ({ logId }),
+
+        // Scroll position in the virtualized list (the range of rows currently in
+        // the viewport). Drives the brush overlay on the sparkline.
+        setVisibleRowRange: (startIndex: number, stopIndex: number) => ({ startIndex, stopIndex }),
+    }),
+
+    reducers(() => ({
+        pinnedLogs: [
+            {} as Record<string, ParsedLogMessage>,
+            { persist: true },
+            {
+                togglePinLog: (state, { log }) => {
+                    if (state[log.uuid]) {
+                        const { [log.uuid]: _, ...rest } = state
+                        return rest
+                    }
+                    return { ...state, [log.uuid]: log }
+                },
+            },
+        ],
+
+        isFocused: [
+            false,
+            {
+                setFocused: (_, { isFocused }) => isFocused,
+            },
+        ],
+
+        cursor: [
+            null as LogCursor,
+            { persist: true },
+            {
+                setCursor: (_, { cursor }) => cursor,
+                setCursorIndex: (_, { index }) => index,
+                userSetCursorIndex: (_, { index }) => index,
+                resetCursor: () => null,
+                clearLogs: () => null,
+            },
+        ],
+
+        expandedLogIds: [
+            {} as Record<string, boolean>,
+            { persist: true },
+            {
+                toggleExpandLog: (state, { logId }) => {
+                    if (state[logId]) {
+                        const { [logId]: _, ...rest } = state
+                        return rest
+                    }
+                    return { ...state, [logId]: true }
+                },
+                clearLogs: () => ({}),
+            },
+        ],
+
+        linkToLogId: [
+            null as string | null,
+            {
+                setLinkToLogId: (_, { linkToLogId }) => linkToLogId,
+                clearLinkToLogId: () => null,
+                moveCursorDown: () => null,
+                moveCursorUp: () => null,
+                userSetCursorIndex: () => null,
+            },
+        ],
+
+        expandedAttributeBreakdowns: [
+            {} as Record<string, string[]>,
+            {
+                toggleAttributeBreakdown: (state, { logId, attributeKey }) => {
+                    const current = state[logId] || []
+                    if (current.includes(attributeKey)) {
+                        const updated = current.filter((k) => k !== attributeKey)
+                        if (updated.length === 0) {
+                            const { [logId]: _, ...rest } = state
+                            return rest
+                        }
+                        return { ...state, [logId]: updated }
+                    }
+                    return { ...state, [logId]: [...current, attributeKey] }
+                },
+            },
+        ],
+
+        // Tracks requests to recompute row heights - VirtualizedLogsList watches this
+        recomputeRowHeightsRequest: [
+            null as { logIds?: string[]; timestamp: number } | null,
+            {
+                recomputeRowHeights: (_, { logIds }) => ({ logIds, timestamp: Date.now() }),
+            },
+        ],
+
+        // Tracks requests to scroll to cursor - VirtualizedLogsList watches this timestamp
+        scrollToCursorRequest: [
+            0,
+            {
+                requestScrollToCursor: () => Date.now(),
+            },
+        ],
+
+        // Multi-select state
+        selectedLogIds: [
+            {} as Record<string, boolean>,
+            {
+                toggleSelectLog: (state, { logId }) => {
+                    if (state[logId]) {
+                        const { [logId]: _, ...rest } = state
+                        return rest
+                    }
+                    return { ...state, [logId]: true }
+                },
+                setSelectedLogIds: (_, { selectedLogIds }) => selectedLogIds,
+                clearSelection: () => ({}),
+                clearLogs: () => ({}),
+                setLogs: () => ({}),
+            },
+        ],
+
+        prettifiedLogIds: [
+            new Set<string>(),
+            {
+                togglePrettifyLog: (state, { logId }) => {
+                    const next = new Set(state)
+                    if (next.has(logId)) {
+                        next.delete(logId)
+                    } else {
+                        next.add(logId)
+                    }
+                    return next
+                },
+                clearLogs: () => new Set<string>(),
+                setLogs: () => new Set<string>(),
+            },
+        ],
+
+        visibleRowRange: [
+            null as VisibleRowRange | null,
+            {
+                setVisibleRowRange: (_, { startIndex, stopIndex }) => ({ startIndex, stopIndex }),
+                clearLogs: () => null,
+                setLogs: () => null,
+            },
+        ],
+    })),
+
+    selectors({
+        id: [(_, p) => [p.id], (id: string): string => id],
+
+        pinnedLogsArray: [(s) => [s.pinnedLogs], (pinnedLogs): ParsedLogMessage[] => Object.values(pinnedLogs)],
+
+        // Convenience selectors for cursor components
+        cursorIndex: [(s) => [s.cursor], (cursor): number | null => cursor],
+
+        cursorLogId: [
+            (s) => [s.cursor, s.logs],
+            (cursor: LogCursor, logs: ParsedLogMessage[]): string | null =>
+                cursor !== null && cursor >= 0 && cursor < logs.length ? logs[cursor].uuid : null,
+        ],
+
+        // Keyboard nav enabled when focused OR log details is open (so j/k still work while viewing details)
+        keyboardNavEnabled: [
+            (s) => [s.isFocused, s.isLogDetailsOpen],
+            (isFocused: boolean, isLogDetailsOpen: boolean): boolean => isFocused || isLogDetailsOpen,
+        ],
+
+        visibleLogsTimeRange: [
+            (state) => [state.logs, state.orderBy],
+            (logs: ParsedLogMessage[], orderBy: LogsOrderBy): VisibleLogsTimeRange | null => {
+                if (logs.length === 0) {
+                    return null
+                }
+                const firstTimestamp = logs[0].timestamp
+                const lastTimestamp = logs[logs.length - 1].timestamp
+
+                if (orderBy === 'latest') {
+                    return {
+                        date_from: dayjs(lastTimestamp).toISOString(),
+                        date_to: dayjs(firstTimestamp).add(1, 'millisecond').toISOString(),
+                    }
+                }
+                return {
+                    date_from: dayjs(firstTimestamp).toISOString(),
+                    date_to: dayjs(lastTimestamp).add(1, 'millisecond').toISOString(),
+                }
+            },
+        ],
+
+        // Date range covered by the currently-visible (scrolled-into-view) rows.
+        // Returns null when no rows are rendered or the indices don't line up with
+        // loaded logs. The values are always ordered date_from <= date_to regardless
+        // of `orderBy`.
+        visibleRowDateRange: [
+            (state) => [state.visibleRowRange, state.logs],
+            (visibleRowRange: VisibleRowRange | null, logs: ParsedLogMessage[]): VisibleLogsTimeRange | null => {
+                if (!visibleRowRange || logs.length === 0) {
+                    return null
+                }
+                const startIndex = Math.max(0, Math.min(visibleRowRange.startIndex, logs.length - 1))
+                const stopIndex = Math.max(0, Math.min(visibleRowRange.stopIndex, logs.length - 1))
+                const a = logs[startIndex]?.timestamp
+                const b = logs[stopIndex]?.timestamp
+                if (!a || !b) {
+                    return null
+                }
+                const ta = dayjs(a)
+                const tb = dayjs(b)
+                const [earlier, later] = ta.isBefore(tb) ? [ta, tb] : [tb, ta]
+                return {
+                    date_from: earlier.toISOString(),
+                    date_to: later.toISOString(),
+                }
+            },
+        ],
+
+        logsCount: [(s) => [s.logs], (logs: ParsedLogMessage[]): number => logs.length],
+
+        // Attribute keys shown as columns (custom columns carry the key as their name) —
+        // consumed by the export logic for CSV/server export column lists
+        attributeColumns: [
+            (s) => [s.columns],
+            (columns: LogsColumnConfig[]): string[] =>
+                columns
+                    .filter((column) => column.type === 'custom')
+                    .map((column) => column.name ?? column.expression ?? ''),
+        ],
+
+        isAttributeColumn: [
+            (s) => [s.columns],
+            (columns: LogsColumnConfig[]) =>
+                (attributeKey: string): boolean =>
+                    columns.some((column) => column.type === 'custom' && column.name === attributeKey),
+        ],
+
+        // Selection selectors
+        isSelectionActive: [
+            (s) => [s.selectedLogIds],
+            (selectedLogIds): boolean => Object.keys(selectedLogIds).length > 0,
+        ],
+        selectedCount: [(s) => [s.selectedLogIds], (selectedLogIds): number => Object.keys(selectedLogIds).length],
+        selectedLogsArray: [
+            (s) => [s.selectedLogIds, s.logs],
+            (selectedLogIds, logs): ParsedLogMessage[] => logs.filter((log) => selectedLogIds[log.uuid]),
+        ],
+    }),
+
+    listeners(({ actions, values }) => ({
+        togglePinLog: ({ log }) => {
+            if (values.pinnedLogs[log.uuid]) {
+                posthog.capture('logs log pinned')
+            }
+        },
+        toggleSelectLog: ({ logId }) => {
+            if (values.selectedLogIds[logId]) {
+                posthog.capture('logs log selected')
+            } else {
+                posthog.capture('logs log unselected')
+            }
+        },
+        clearSelection: () => {
+            posthog.capture('logs clear selection', { count: values.selectedCount })
+        },
+        toggleExpandLog: ({ logId }) => {
+            const isNowExpanded = values.expandedLogIds[logId]
+            posthog.capture(isNowExpanded ? 'logs log expanded' : 'logs log collapsed')
+            actions.recomputeRowHeights([logId])
+        },
+        closeLogDetails: () => {
+            // Restore focus to logs viewer when modal closes
+            actions.setFocused(true)
+        },
+        togglePrettifyLog: ({ logId }) => {
+            actions.recomputeRowHeights([logId])
+        },
+        toggleAttributeBreakdown: ({ logId }) => {
+            actions.recomputeRowHeights([logId])
+        },
+        moveCursorDown: ({ shiftSelect }) => {
+            const { logs, cursor } = values
+            if (logs.length === 0) {
+                return
+            }
+
+            if (cursor === null) {
+                actions.setCursor(0)
+                if (shiftSelect && logs[0]) {
+                    actions.setSelectedLogIds({ ...values.selectedLogIds, [logs[0].uuid]: true })
+                }
+                return
+            }
+
+            if (cursor < logs.length - 1) {
+                const newIndex = cursor + 1
+                actions.setCursor(newIndex)
+                if (shiftSelect && logs[newIndex]) {
+                    actions.setSelectedLogIds({ ...values.selectedLogIds, [logs[newIndex].uuid]: true })
+                }
+            }
+        },
+        moveCursorUp: ({ shiftSelect }) => {
+            const { logs, cursor } = values
+            if (logs.length === 0) {
+                return
+            }
+
+            if (cursor === null) {
+                const lastIndex = logs.length - 1
+                actions.setCursor(lastIndex)
+                if (shiftSelect && logs[lastIndex]) {
+                    actions.setSelectedLogIds({ ...values.selectedLogIds, [logs[lastIndex].uuid]: true })
+                }
+                return
+            }
+
+            if (cursor > 0) {
+                const newIndex = cursor - 1
+                actions.setCursor(newIndex)
+                if (shiftSelect && logs[newIndex]) {
+                    actions.setSelectedLogIds({ ...values.selectedLogIds, [logs[newIndex].uuid]: true })
+                }
+            }
+        },
+        copyLinkToLog: ({ logId }) => {
+            posthog.capture('logs link copied')
+            const url = new URL(window.location.href)
+            // Linked logs only open in the Viewer tab, so always point the shared link there
+            // regardless of which tab the link was copied from.
+            url.searchParams.set('activeTab', 'viewer')
+            url.searchParams.set('linkToLogId', logId)
+            if (values.visibleLogsTimeRange) {
+                url.searchParams.set(
+                    'dateRange',
+                    JSON.stringify({
+                        date_from: values.visibleLogsTimeRange.date_from,
+                        date_to: values.visibleLogsTimeRange.date_to,
+                        explicitDate: true,
+                    })
+                )
+            }
+            if (values.logsCount > 0) {
+                url.searchParams.set('initialLogsLimit', String(values.logsCount))
+            }
+            void copyToClipboard(url.toString(), 'link to log')
+        },
+        selectLogRange: ({ fromIndex, toIndex }) => {
+            posthog.capture('logs range selected', { count: Math.abs(toIndex - fromIndex) + 1 })
+            const minIndex = Math.min(fromIndex, toIndex)
+            const maxIndex = Math.max(fromIndex, toIndex)
+            const newSelection: Record<string, boolean> = { ...values.selectedLogIds }
+            for (let i = minIndex; i <= maxIndex; i++) {
+                const log = values.logs[i]
+                if (log) {
+                    newSelection[log.uuid] = true
+                }
+            }
+            actions.setSelectedLogIds(newSelection)
+        },
+        selectAll: ({ logsToSelect }) => {
+            const logs = logsToSelect ?? values.logs
+            posthog.capture('logs select all', { count: logs.length })
+            const newSelection: Record<string, boolean> = {}
+            for (const log of logs) {
+                newSelection[log.uuid] = true
+            }
+            actions.setSelectedLogIds(newSelection)
+        },
+        toggleAttributeColumn: ({ attributeKey }) => {
+            const existing = values.columns.find((column) => column.type === 'custom' && column.name === attributeKey)
+            if (existing) {
+                actions.removeColumn(existing.id)
+            } else {
+                actions.addColumn({
+                    id: uuid(),
+                    type: 'custom',
+                    name: attributeKey,
+                    expression: attributeLookupExpression(attributeKey),
+                })
+                posthog.capture('logs column added', { attribute_key: attributeKey })
+            }
+        },
+    })),
+
+    subscriptions(({ actions, values }) => ({
+        cursorIndex: (cursorIndex) => {
+            if (cursorIndex !== null) {
+                actions.requestScrollToCursor()
+            }
+        },
+        logs: (logs: ParsedLogMessage[]) => {
+            actions.recomputeRowHeights()
+            tryOpenLinkedLog(logs, values.linkToLogId, values.logsLoading, actions)
+        },
+        linkToLogId: (linkToLogId: string | null) => {
+            if (linkToLogId) {
+                tryOpenLinkedLog(values.logs, linkToLogId, values.logsLoading, actions)
+            }
+        },
+    })),
+])

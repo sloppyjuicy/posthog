@@ -1,0 +1,261 @@
+import { useValues } from 'kea'
+import { useState } from 'react'
+
+import { INTERNAL_EXCEPTION_PROPERTY_KEYS } from '@posthog/products-error-tracking/frontend/utils'
+
+import { eventPropertyFilteringLogic } from 'lib/components/EventPropertyTabs/eventPropertyFilteringLogic'
+import { HTMLElementsDisplay } from 'lib/components/HTMLElementsDisplay/HTMLElementsDisplay'
+import { dayjs } from 'lib/dayjs'
+import { LemonTab, LemonTabs, LemonTabsProps } from 'lib/lemon-ui/LemonTabs'
+import { isKeyOf } from 'lib/utils/guards'
+
+import { CORE_FILTER_DEFINITIONS_BY_GROUP, POSTHOG_EVENT_PROMOTED_PROPERTIES } from '~/taxonomy/taxonomy'
+import { EventType, RecordingEventType, SurveyEventProperties } from '~/types'
+
+import { AutocaptureImageTab, hasAutocaptureImage } from '../AutocapturePreviewImage/AutocapturePreviewImage'
+import { ErrorEventType } from '../Errors/types'
+
+export type ErrorPropertyTabEvent = EventType | RecordingEventType | ErrorEventType
+
+export interface TabContentComponentFnProps {
+    event: ErrorPropertyTabEvent
+    properties: Record<string, any>
+    promotedKeys?: string[]
+    tabKey: EventPropertyTabKey
+}
+
+type EventPropertyTabKey =
+    | 'properties'
+    | 'flags'
+    | 'image'
+    | 'elements'
+    | '$set_properties'
+    | '$set_once_properties'
+    | 'raw'
+    | 'conversation'
+    | 'evaluation'
+    | 'tag'
+    | 'exception_properties'
+    | 'error_display'
+    | 'debug_properties'
+    | 'metadata'
+    | 'survey_response'
+    | 'mcp'
+
+export const EventPropertyTabs = ({
+    event,
+    tabContentComponentFn,
+    ...lemonTabsProps
+}: {
+    event: ErrorPropertyTabEvent
+    tabContentComponentFn: (props: TabContentComponentFnProps) => JSX.Element
+    dataAttr?: LemonTabsProps<EventPropertyTabKey>['data-attr']
+    size?: LemonTabsProps<EventPropertyTabKey>['size']
+    barClassName?: LemonTabsProps<EventPropertyTabKey>['barClassName']
+}): JSX.Element => {
+    const isAIGenerationEvent = event.event === '$ai_generation'
+    const isAIConversationEvent = isAIGenerationEvent || event.event === '$ai_span' || event.event === '$ai_trace'
+    const isAIEvaluationEvent = event.event === '$ai_evaluation'
+    const isAITagEvent = event.event === '$ai_tag'
+
+    const isErrorEvent = event.event === '$exception'
+    const isSurveyResponseEvent = event.event === 'survey sent' && !!event.properties?.[SurveyEventProperties.SURVEY_ID]
+    const isMcpEvent =
+        typeof event.event === 'string' &&
+        (event.event.startsWith('mcp_') || event.event.startsWith('$mcp_') || event.event.startsWith('mcp '))
+
+    const { filterProperties } = useValues(eventPropertyFilteringLogic)
+
+    const [activeTab, setActiveTab] = useState<EventPropertyTabKey>(
+        isAIConversationEvent
+            ? 'conversation'
+            : isAIEvaluationEvent
+              ? 'evaluation'
+              : isAITagEvent
+                ? 'tag'
+                : isErrorEvent
+                  ? 'error_display'
+                  : isSurveyResponseEvent
+                    ? 'survey_response'
+                    : isMcpEvent
+                      ? 'mcp'
+                      : 'properties'
+    )
+
+    const promotedKeys = isKeyOf(event.event, POSTHOG_EVENT_PROMOTED_PROPERTIES)
+        ? POSTHOG_EVENT_PROMOTED_PROPERTIES[event.event]
+        : []
+
+    let properties: Record<string, any> = {}
+    const featureFlagProperties: Record<string, any> = {}
+    const errorProperties: Record<string, any> = {}
+    const debugProperties: Record<string, any> = {}
+    let setProperties: Record<string, any> = {}
+    let setOnceProperties: Record<string, any> = {}
+
+    for (const key of Object.keys(event.properties)) {
+        if (!CORE_FILTER_DEFINITIONS_BY_GROUP.events[key] || !CORE_FILTER_DEFINITIONS_BY_GROUP.events[key].system) {
+            if (CORE_FILTER_DEFINITIONS_BY_GROUP.event_properties[key]?.used_for_debug) {
+                debugProperties[key] = event.properties[key]
+            } else if (key.startsWith('$feature') || key === '$active_feature_flags') {
+                featureFlagProperties[key] = event.properties[key]
+            } else if (key === '$set') {
+                setProperties = event.properties[key] ?? {}
+            } else if (key === '$set_once') {
+                setOnceProperties = event.properties[key] ?? {}
+            } else if (INTERNAL_EXCEPTION_PROPERTY_KEYS.includes(key)) {
+                errorProperties[key] = event.properties[key]
+            } else {
+                properties[key] = event.properties[key]
+            }
+        }
+    }
+    properties = {
+        ...('timestamp' in event ? { $timestamp: dayjs(event.timestamp).toISOString() } : {}),
+        ...filterProperties(properties),
+    }
+
+    const tabs: (LemonTab<EventPropertyTabKey> | null | false)[] = [
+        isErrorEvent && {
+            key: 'error_display',
+            label: 'Exception',
+            content: tabContentComponentFn({ event, properties: event.properties, tabKey: 'error_display' }),
+        },
+        isSurveyResponseEvent && {
+            key: 'survey_response',
+            label: 'Survey response',
+            content: tabContentComponentFn({ event, properties: event.properties, tabKey: 'survey_response' }),
+        },
+        isMcpEvent && {
+            key: 'mcp',
+            label: 'MCP analytics',
+            content: tabContentComponentFn({ event, properties: event.properties, tabKey: 'mcp' }),
+        },
+        isAIConversationEvent
+            ? {
+                  key: 'conversation',
+                  label: 'Conversation',
+                  content: tabContentComponentFn({ event, properties: event.properties, tabKey: 'conversation' }),
+              }
+            : null,
+        isAIEvaluationEvent
+            ? {
+                  key: 'evaluation',
+                  label: 'Evaluation',
+                  content: tabContentComponentFn({ event, properties: event.properties, tabKey: 'evaluation' }),
+              }
+            : null,
+        isAITagEvent
+            ? {
+                  key: 'tag',
+                  label: 'Tag',
+                  content: tabContentComponentFn({ event, properties: event.properties, tabKey: 'tag' }),
+              }
+            : null,
+        {
+            key: 'properties',
+            label: 'Properties',
+            content: tabContentComponentFn({ event, properties, promotedKeys, tabKey: 'properties' }),
+        },
+        {
+            key: 'metadata',
+            label: 'Metadata',
+            content: tabContentComponentFn({
+                event,
+                promotedKeys,
+                properties: {
+                    event: event.event,
+                    distinct_id: event.distinct_id,
+                    timestamp: event.timestamp,
+                },
+                tabKey: 'metadata',
+            }),
+        },
+        {
+            key: 'flags',
+            label: 'Flags',
+            content: tabContentComponentFn({ event, properties: featureFlagProperties, promotedKeys, tabKey: 'flags' }),
+        },
+        event.elements && event.elements.length > 0
+            ? {
+                  key: 'elements',
+                  label: 'Elements',
+                  content: (
+                      <HTMLElementsDisplay
+                          size="xsmall"
+                          elements={event.elements}
+                          selectedText={event.properties['$selected_content']}
+                      />
+                  ),
+              }
+            : null,
+        event.elements && hasAutocaptureImage(event.elements)
+            ? {
+                  key: 'image',
+                  label: 'Image',
+                  content: <AutocaptureImageTab elements={event.elements} properties={event.properties} />,
+              }
+            : null,
+        Object.keys(setProperties).length > 0
+            ? {
+                  key: '$set_properties',
+                  label: 'Person properties',
+                  content: tabContentComponentFn({
+                      properties: setProperties,
+                      event,
+                      promotedKeys,
+                      tabKey: '$set_properties',
+                  }),
+              }
+            : null,
+        Object.keys(setOnceProperties).length > 0
+            ? {
+                  key: '$set_once_properties',
+                  label: 'Set once person properties',
+                  content: tabContentComponentFn({
+                      properties: setOnceProperties,
+                      event,
+                      promotedKeys,
+                      tabKey: '$set_once_properties',
+                  }),
+              }
+            : null,
+        Object.keys(errorProperties).length > 0
+            ? {
+                  key: 'exception_properties',
+                  label: 'Exception properties',
+                  content: tabContentComponentFn({
+                      properties: errorProperties,
+                      event,
+                      promotedKeys,
+                      tabKey: 'exception_properties',
+                  }),
+              }
+            : null,
+        Object.keys(debugProperties).length > 0
+            ? {
+                  key: 'debug_properties',
+                  label: 'Debug properties',
+                  content: tabContentComponentFn({
+                      properties: debugProperties,
+                      event,
+                      promotedKeys,
+                      tabKey: 'debug_properties',
+                  }),
+              }
+            : null,
+        {
+            key: 'raw',
+            label: 'Raw',
+            content: tabContentComponentFn({ event, properties, tabKey: 'raw' }),
+        },
+    ]
+    return (
+        <LemonTabs
+            {...lemonTabsProps}
+            activeKey={activeTab}
+            onChange={(newKey: EventPropertyTabKey) => setActiveTab(newKey)}
+            tabs={tabs}
+        />
+    )
+}

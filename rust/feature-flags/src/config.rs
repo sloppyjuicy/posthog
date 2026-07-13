@@ -1,0 +1,1893 @@
+use common_continuous_profiling::ContinuousProfilingConfig;
+use common_cookieless::CookielessConfig;
+use common_types::TeamId;
+use envconfig::Envconfig;
+use once_cell::sync::Lazy;
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::num::ParseIntError;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use tracing::Level;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlexBool(pub bool);
+
+impl FromStr for FlexBool {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(FlexBool(true)),
+            "false" | "0" | "no" | "off" | "" => Ok(FlexBool(false)),
+            _ => Err(format!("Invalid boolean value: {s}")),
+        }
+    }
+}
+
+impl From<FlexBool> for bool {
+    fn from(flex: FlexBool) -> Self {
+        flex.0
+    }
+}
+
+impl Deref for FlexBool {
+    type Target = bool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceMode {
+    All,         // default — both fleets (current behavior)
+    Flags,       // /flags and /decide only
+    Definitions, // /flags/definitions only
+}
+
+impl FromStr for ServiceMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "all" => Ok(ServiceMode::All),
+            "flags" => Ok(ServiceMode::Flags),
+            "definitions" => Ok(ServiceMode::Definitions),
+            _ => Err(format!(
+                "Invalid SERVICE_MODE: '{s}'. Expected 'all', 'flags', or 'definitions'"
+            )),
+        }
+    }
+}
+
+/// Tri-state controller for the /flags bot filter. Classification runs iff
+/// mode != Disabled; short-circuit happens iff mode == Enforced. Default is
+/// LogOnly so the filter ships observable-but-inert, then operators flip to
+/// Enforced once dashboards confirm the per-category rejection profile is sane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BotFilterMode {
+    /// Skip the bot check entirely — no classification, no canonical-log
+    /// stamp, no metric. Use to back out of an unexpected interaction with
+    /// the rest of the pipeline.
+    Disabled,
+    /// Classify, stamp `is_bot`/`bot_category`/`bot_source` on the canonical
+    /// log, bump `flags_bot_detected_total{mode="log_only"}`, then continue
+    /// through the normal pipeline. Safe-rollout default.
+    LogOnly,
+    /// Classify, stamp the canonical log, bump
+    /// `flags_bot_detected_total{mode="enforced"}`, and return the minimal
+    /// envelope without running auth/billing/eval.
+    Enforced,
+}
+
+impl FromStr for BotFilterMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "disabled" => Ok(BotFilterMode::Disabled),
+            "log_only" | "log-only" => Ok(BotFilterMode::LogOnly),
+            "enforced" | "enforce" => Ok(BotFilterMode::Enforced),
+            _ => Err(format!(
+                "Invalid FLAGS_BOT_FILTER_MODE: '{s}'. Expected 'disabled', 'log_only', or 'enforced'"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeamIdCollection {
+    All,
+    None,
+    TeamIds(Vec<i32>),
+}
+
+#[derive(Debug)]
+pub enum ParseTeamIdsError {
+    InvalidRange(String),
+    InvalidNumber(ParseIntError),
+}
+
+impl std::fmt::Display for ParseTeamIdsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseTeamIdsError::InvalidRange(r) => write!(f, "Invalid range: {r}"),
+            ParseTeamIdsError::InvalidNumber(e) => write!(f, "Invalid number: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ParseTeamIdsError {}
+
+impl TeamIdCollection {
+    pub fn includes_team(&self, team_id: i32) -> bool {
+        match self {
+            TeamIdCollection::All => true,
+            TeamIdCollection::None => false,
+            TeamIdCollection::TeamIds(ids) => ids.contains(&team_id),
+        }
+    }
+}
+
+impl FromStr for TeamIdCollection {
+    type Err = ParseTeamIdsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("all") || s == "*" {
+            Ok(TeamIdCollection::All)
+        } else if s.eq_ignore_ascii_case("none") {
+            Ok(TeamIdCollection::None)
+        } else {
+            let mut team_ids = Vec::new();
+            for part in s.split(',').map(|p| p.trim()) {
+                if part.contains(':') {
+                    let mut bounds = part.split(':');
+                    let (Some(start_str), Some(end_str)) = (bounds.next(), bounds.next()) else {
+                        return Err(ParseTeamIdsError::InvalidRange(part.to_string()));
+                    };
+                    if bounds.next().is_some() {
+                        return Err(ParseTeamIdsError::InvalidRange(part.to_string()));
+                    }
+                    let start = start_str
+                        .parse::<i32>()
+                        .map_err(ParseTeamIdsError::InvalidNumber)?;
+                    let end = end_str
+                        .parse::<i32>()
+                        .map_err(ParseTeamIdsError::InvalidNumber)?;
+                    if end < start {
+                        return Err(ParseTeamIdsError::InvalidRange(part.to_string()));
+                    }
+                    for id in start..=end {
+                        team_ids.push(id);
+                    }
+                } else {
+                    let id = part
+                        .parse::<i32>()
+                        .map_err(ParseTeamIdsError::InvalidNumber)?;
+                    team_ids.push(id);
+                }
+            }
+            Ok(TeamIdCollection::TeamIds(team_ids))
+        }
+    }
+}
+
+/// Flag definitions rate limits configuration
+/// Parses JSON from LOCAL_EVAL_RATE_LIMITS environment variable
+/// Format: {"team_id": "rate_string", ...}
+/// Example: {"123": "1200/minute", "456": "2400/hour"}
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FlagDefinitionsRateLimits(pub HashMap<TeamId, String>);
+
+impl FromStr for FlagDefinitionsRateLimits {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+
+        // Empty string means no custom rate limits
+        if s.is_empty() {
+            return Ok(FlagDefinitionsRateLimits::default());
+        }
+
+        // Parse JSON into HashMap<String, String>
+        let parsed: HashMap<String, String> = serde_json::from_str(s)
+            .map_err(|e| format!("Failed to parse rate limits as JSON: {e}"))?;
+
+        // Convert string keys to TeamId
+        let mut rate_limits = HashMap::new();
+        for (team_id_str, rate_string) in parsed {
+            let team_id = team_id_str
+                .parse::<TeamId>()
+                .map_err(|e| format!("Invalid team ID '{team_id_str}': {e}"))?;
+            rate_limits.insert(team_id, rate_string);
+        }
+
+        Ok(FlagDefinitionsRateLimits(rate_limits))
+    }
+}
+
+/// Comma-separated list of team IDs that bypass rate limiting.
+/// Matches Django's RATE_LIMITING_ALLOW_LIST_TEAMS setting.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RateLimitingAllowList(pub HashSet<TeamId>);
+
+impl FromStr for RateLimitingAllowList {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(RateLimitingAllowList::default());
+        }
+
+        let mut team_ids = HashSet::new();
+        for part in s.split(',').map(|p| p.trim()) {
+            if part.is_empty() {
+                continue;
+            }
+            let team_id = part.parse::<TeamId>().map_err(|e| {
+                format!("Invalid team ID '{part}' in RATE_LIMITING_ALLOW_LIST_TEAMS: {e}")
+            })?;
+            team_ids.insert(team_id);
+        }
+
+        Ok(RateLimitingAllowList(team_ids))
+    }
+}
+
+/// Per-team /flags request/response body logging config.
+/// Parses JSON from FLAGS_LOG_BODIES_TEAMS environment variable, also refreshed
+/// at runtime from posthog_instancesetting (key:
+/// `constance:posthog:FLAGS_LOG_BODIES_TEAMS`).
+///
+/// Format: {"team_id": ["pattern", ...], ...}
+/// Each team must specify at least one pattern; the response's `flags` map is
+/// filtered to keys matching any pattern. To capture every flag (rare and
+/// noisy), use `["*"]` explicitly.
+/// Patterns support `*` wildcards (e.g., "my-feature", "checkout-*", "*-targeting-*").
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BodyLogTeams(pub HashMap<TeamId, Vec<String>>);
+
+// Caps on the parsed `FLAGS_LOG_BODIES_TEAMS` shape. Mirrors the pattern in
+// `MAX_FLAGS_RATE_LIMIT_OVERRIDES`: the setting is admin-gated, but a typo
+// or paste of a large blob would otherwise fan out across every pod and
+// flood Loki silently.
+
+/// Matches `MAX_FLAGS_RATE_LIMIT_OVERRIDES`; well above any realistic
+/// per-cluster opt-in count.
+pub const MAX_BODY_LOG_TEAMS: usize = 100;
+/// Realistic teams configure <10 patterns; 50 leaves headroom without
+/// inviting blob-pasting.
+pub const MAX_BODY_LOG_PATTERNS_PER_TEAM: usize = 50;
+/// Longest production flag-key is ~80 chars; 256 bytes leaves room for
+/// `*` prefixes and suffixes.
+pub const MAX_BODY_LOG_PATTERN_LEN: usize = 256;
+
+impl FromStr for BodyLogTeams {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+
+        if s.is_empty() {
+            return Ok(BodyLogTeams::default());
+        }
+
+        let parsed: HashMap<String, Vec<String>> = serde_json::from_str(s)
+            .map_err(|e| format!("Failed to parse FLAGS_LOG_BODIES_TEAMS as JSON: {e}"))?;
+
+        if parsed.len() > MAX_BODY_LOG_TEAMS {
+            return Err(format!(
+                "Too many FLAGS_LOG_BODIES_TEAMS entries: {} (max {MAX_BODY_LOG_TEAMS})",
+                parsed.len()
+            ));
+        }
+
+        let mut out = HashMap::new();
+        for (team_id_str, patterns) in parsed {
+            if patterns.is_empty() {
+                return Err(format!(
+                    "Team {team_id_str} has no patterns; specify at least one (use [\"*\"] to log every flag)"
+                ));
+            }
+            if patterns.len() > MAX_BODY_LOG_PATTERNS_PER_TEAM {
+                return Err(format!(
+                    "Too many patterns for team {team_id_str}: {} (max {MAX_BODY_LOG_PATTERNS_PER_TEAM})",
+                    patterns.len()
+                ));
+            }
+            if let Some(p) = patterns.iter().find(|p| p.len() > MAX_BODY_LOG_PATTERN_LEN) {
+                return Err(format!(
+                    "Pattern too long for team {team_id_str}: {} bytes (max {MAX_BODY_LOG_PATTERN_LEN})",
+                    p.len()
+                ));
+            }
+            let team_id = team_id_str.parse::<TeamId>().map_err(|e| {
+                format!("Invalid team ID '{team_id_str}' in FLAGS_LOG_BODIES_TEAMS: {e}")
+            })?;
+            out.insert(team_id, patterns);
+        }
+
+        Ok(BodyLogTeams(out))
+    }
+}
+
+/// Per-token rate limit overrides for the /flags endpoint.
+/// Parses JSON from FLAGS_TOKEN_RATE_LIMIT_OVERRIDES environment variable.
+/// Format: {"token_string": "rate_string", ...}
+/// Example: {"phc_abc123": "1200/minute", "phc_xyz789": "2400/hour"}
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FlagsTokenRateLimitOverrides(pub HashMap<String, String>);
+
+/// Maximum number of per-token rate limit overrides allowed.
+pub const MAX_FLAGS_RATE_LIMIT_OVERRIDES: usize = 100;
+
+impl FromStr for FlagsTokenRateLimitOverrides {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+
+        if s.is_empty() {
+            return Ok(FlagsTokenRateLimitOverrides::default());
+        }
+
+        let parsed: HashMap<String, String> = serde_json::from_str(s).map_err(|e| {
+            format!("Failed to parse FLAGS_TOKEN_RATE_LIMIT_OVERRIDES as JSON: {e}")
+        })?;
+
+        if parsed.len() > MAX_FLAGS_RATE_LIMIT_OVERRIDES {
+            return Err(format!(
+                "Too many FLAGS_TOKEN_RATE_LIMIT_OVERRIDES entries: {} (max {MAX_FLAGS_RATE_LIMIT_OVERRIDES})",
+                parsed.len()
+            ));
+        }
+
+        Ok(FlagsTokenRateLimitOverrides(parsed))
+    }
+}
+
+#[derive(Envconfig, Clone, Debug)]
+pub struct Config {
+    #[envconfig(nested = true)]
+    pub continuous_profiling: ContinuousProfilingConfig,
+
+    #[envconfig(default = "127.0.0.1:3001")]
+    pub address: SocketAddr,
+
+    #[envconfig(default = "postgres://posthog:posthog@localhost:5432/posthog")]
+    pub write_database_url: String,
+
+    #[envconfig(default = "postgres://posthog:posthog@localhost:5432/posthog")]
+    pub read_database_url: String,
+
+    #[envconfig(default = "postgres://posthog:posthog@localhost:5432/posthog_persons")]
+    pub persons_write_database_url: String,
+
+    #[envconfig(default = "postgres://posthog:posthog@localhost:5432/posthog_persons")]
+    pub persons_read_database_url: String,
+
+    // Optional connection to the behavioral_cohorts database for realtime cohort membership.
+    // When empty, realtime cohort evaluation is disabled (graceful degradation).
+    #[envconfig(default = "")]
+    pub behavioral_cohorts_read_database_url: String,
+
+    // Decryption keys for encrypted remote-config flag payloads (comma-separated, ordered:
+    // Django encrypts with the first key, this service only decrypts and tries all of them).
+    // Empty falls back to SECRET_KEY, matching Django's FLAGS_SECRET_KEYS default for
+    // self-hosted. See flags::flag_payload_decryptor.
+    #[envconfig(from = "FLAGS_SECRET_KEYS", default = "")]
+    pub flags_secret_keys: String,
+
+    // Django SECRET_KEY, used only as the FLAGS_SECRET_KEYS fallback (self-hosted).
+    #[envconfig(from = "SECRET_KEY", default = "")]
+    pub secret_key: String,
+
+    // Team-scoped gate for realtime cohort evaluation. When "none" (default), the
+    // realtime cohort block in prepare_flag_evaluation_state is skipped entirely, even
+    // if the behavioral cohorts DB is configured and cohorts with CohortType::Realtime
+    // exist. Set to "all", specific team IDs, or ranges to enable realtime cohort
+    // membership lookups on the hot path for those teams.
+    #[envconfig(from = "REALTIME_COHORT_EVALUATION_TEAM_IDS", default = "none")]
+    pub realtime_cohort_evaluation_team_ids: TeamIdCollection,
+
+    // Cache TTL for realtime cohort membership lookups (seconds).
+    #[envconfig(from = "COHORT_MEMBERSHIP_CACHE_TTL_SECONDS", default = "60")]
+    pub cohort_membership_cache_ttl_seconds: u64,
+
+    // Max entries in the cohort membership cache.
+    // Each entry represents one (team_id, person_uuid) pair with a map of cohort memberships.
+    #[envconfig(from = "COHORT_MEMBERSHIP_CACHE_MAX_ENTRIES", default = "500000")]
+    pub cohort_membership_cache_max_entries: u64,
+
+    #[envconfig(default = "1000")]
+    pub max_concurrency: usize,
+
+    // Database connection pool settings:
+    // - High traffic: Increase max_pg_connections (e.g., 20-50)
+    // - Bursty traffic: Increase idle_timeout_secs to keep connections warm
+    // - Set min_connections > 0 to pre-warm pools at startup and avoid cold-start latency
+    // - Total connections depend on configuration:
+    //   - With persons DB routing: 4 pools × max_pg_connections
+    //   - Without persons DB routing: 2 pools × max_pg_connections (persons pools alias to non-persons)
+    #[envconfig(default = "10")]
+    pub max_pg_connections: u32,
+
+    // Minimum connections to maintain in each pool
+    // Set > 0 to pre-warm connections at startup for faster first requests
+    // Production recommendation: Set to 2-5 to avoid cold start on deploy
+    #[envconfig(default = "0")]
+    pub min_non_persons_reader_connections: u32,
+
+    #[envconfig(default = "0")]
+    pub min_non_persons_writer_connections: u32,
+
+    #[envconfig(default = "0")]
+    pub min_persons_reader_connections: u32,
+
+    #[envconfig(default = "0")]
+    pub min_persons_writer_connections: u32,
+
+    #[envconfig(default = "redis://localhost:6379/")]
+    pub redis_url: String,
+
+    #[envconfig(default = "")]
+    pub redis_reader_url: String,
+
+    // Dedicated Redis for feature flags (critical path: team cache + flags cache)
+    // When empty, falls back to shared Redis URLs above
+    #[envconfig(default = "")]
+    pub flags_redis_url: String,
+
+    #[envconfig(default = "")]
+    pub flags_redis_reader_url: String,
+
+    // Controls whether to read from dedicated Redis cache
+    // false = Mode 2: dual-write to both caches, read from shared (warming phase)
+    // true = Mode 3: read and write dedicated Redis only (cutover complete)
+    #[envconfig(default = "false")]
+    pub flags_redis_enabled: FlexBool,
+
+    // Kill-switch for the flag-definitions self-heal path. When enabled, a
+    // /flags/definitions cache miss enqueues a (debounced) rebuild request that a
+    // Celery worker drains and rebuilds. Default on; set to "false" to instantly
+    // stop enqueuing if it ever misbehaves in prod.
+    #[envconfig(from = "FLAG_DEFINITIONS_SELF_HEAL_ENABLED", default = "true")]
+    pub flag_definitions_self_heal_enabled: FlexBool,
+
+    // S3 configuration for HyperCache fallback
+    #[envconfig(default = "posthog")]
+    pub object_storage_bucket: String,
+
+    #[envconfig(default = "us-east-1")]
+    pub object_storage_region: String,
+
+    #[envconfig(default = "")]
+    pub object_storage_endpoint: String,
+
+    // Redis timeout settings (in milliseconds)
+    #[envconfig(default = "100")]
+    pub redis_response_timeout_ms: u64,
+
+    #[envconfig(default = "5000")]
+    pub redis_connection_timeout_ms: u64,
+
+    // Maximum time for a /flags request before the server aborts it (milliseconds).
+    // Must be below Envoy's route timeout (5s) so the server cleans up resources
+    // (connections, queries) before Envoy kills the downstream connection.
+    #[envconfig(default = "4500")]
+    pub request_timeout_ms: u64,
+
+    // How long to wait for a connection from the pool before timing out.
+    // Must be well under request_timeout_ms so there's still time for query + response.
+    // With Envoy at 5s and request_timeout at 4.5s, 2s leaves room for a query + serialization.
+    #[envconfig(default = "2")]
+    pub acquire_timeout_secs: u64,
+
+    // Close connections that have been idle for this many seconds
+    // - Set to 0 to disable (connections never close due to idle)
+    // - Increase for bursty traffic to avoid reconnection overhead (e.g., 600-900)
+    // - Decrease to free resources more aggressively (e.g., 60-120)
+    #[envconfig(default = "300")]
+    pub idle_timeout_secs: u64,
+
+    // Test connection health before returning from pool
+    // - Set to true for production to catch stale connections
+    // - Set to false in tests or very stable environments for slight performance gain
+    #[envconfig(default = "true")]
+    pub test_before_acquire: FlexBool,
+
+    // PostgreSQL statement_timeout for non-persons reader queries (milliseconds)
+    // - Set to 0 to use database default (typically unlimited)
+    // - Flag definitions and team lookups should complete well under 2s (P99 hold time is 5ms)
+    // - Default: 2000ms (2 seconds)
+    // - This timeout is enforced server-side and properly kills queries
+    #[envconfig(default = "2000")]
+    pub non_persons_reader_statement_timeout_ms: u64,
+
+    // PostgreSQL statement_timeout for persons reader queries (milliseconds)
+    // - Set to 0 to use database default (typically unlimited)
+    // - Person and cohort queries should complete well under 3s (P99 hold time is 25ms)
+    // - Default: 3000ms (3 seconds)
+    // - This timeout is enforced server-side and properly kills queries
+    #[envconfig(default = "3000")]
+    pub persons_reader_statement_timeout_ms: u64,
+
+    // PostgreSQL statement_timeout for writer database queries (milliseconds)
+    // - Set to 0 to use database default (typically unlimited)
+    // - Hash key override writes have retry logic (2 attempts, 100ms backoff)
+    // - 3s per attempt with retries gives 6s total before failure
+    // - Default: 3000ms (3 seconds)
+    // - This timeout is enforced server-side and properly kills queries
+    #[envconfig(default = "3000")]
+    pub writer_statement_timeout_ms: u64,
+
+    // How often to report database pool metrics (seconds)
+    // - Decrease for more granular monitoring (e.g., 10-15)
+    // - Increase to reduce metric volume (e.g., 60-120)
+    #[envconfig(default = "30")]
+    pub db_monitor_interval_secs: u64,
+
+    // How often to report cohort cache metrics (seconds)
+    // - Decrease for more granular monitoring (e.g., 10-15)
+    // - Increase to reduce metric volume (e.g., 60-120)
+    #[envconfig(default = "30")]
+    pub cohort_cache_monitor_interval_secs: u64,
+
+    // How often to report flag definitions cache metrics (seconds)
+    // - Decrease for more granular monitoring (e.g., 10-15)
+    // - Increase to reduce metric volume (e.g., 60-120)
+    #[envconfig(from = "FLAG_DEFINITIONS_CACHE_MONITOR_INTERVAL_SECS", default = "30")]
+    pub flag_definitions_cache_monitor_interval_secs: u64,
+
+    // Pool utilization percentage that triggers warnings (0.0-1.0)
+    // - Lower values (e.g., 0.7) provide earlier warnings
+    // - Higher values (e.g., 0.9) reduce alert noise
+    #[envconfig(default = "0.8")]
+    pub db_pool_warn_utilization: f64,
+
+    // How long to cache billing quota checks (seconds)
+    // - Lower values ensure fresh quota data but increase Redis load
+    // - Higher values reduce Redis queries but may allow brief overages
+    #[envconfig(default = "5")]
+    pub billing_limiter_cache_ttl_secs: u64,
+
+    // OpenTelemetry exporter timeout (seconds)
+    // - Increase if OTEL endpoint is slow or remote
+    // - Decrease to fail fast and avoid blocking
+    #[envconfig(default = "3")]
+    pub otel_export_timeout_secs: u64,
+
+    #[envconfig(from = "MAXMIND_DB_PATH", default = "")]
+    pub maxmind_db_path: String,
+
+    #[envconfig(default = "false")]
+    pub enable_metrics: bool,
+
+    #[envconfig(from = "TEAM_IDS_TO_TRACK", default = "all")]
+    pub team_ids_to_track: TeamIdCollection,
+
+    /// Maximum memory capacity for the cohort cache in bytes.
+    ///
+    /// The cache uses memory-based eviction to prevent unbounded memory growth.
+    /// Each cached cohort's memory footprint is estimated based on its serialized
+    /// JSON filter and query sizes (not exact heap usage, but proportional to it).
+    /// When the cache exceeds this limit, least recently used entries are evicted.
+    ///
+    /// Default: 268435456 bytes (256 MB)
+    /// Environment variable: COHORT_CACHE_CAPACITY_BYTES
+    ///
+    /// Common values:
+    /// - 134217728 (128 MB) - For memory-constrained environments
+    /// - 268435456 (256 MB) - Default, good balance
+    /// - 536870912 (512 MB) - For high-traffic instances with many teams
+    ///
+    /// Note: Individual cache entries cannot exceed ~4 GB (u32::MAX) due to the
+    /// weigher's u32 return type, though the total cache capacity can exceed this.
+    /// In practice, individual cohorts rarely exceed 1 MB, so this is not a concern.
+    #[envconfig(from = "COHORT_CACHE_CAPACITY_BYTES", default = "268435456")]
+    pub cohort_cache_capacity_bytes: u64,
+
+    #[envconfig(from = "CACHE_TTL_SECONDS", default = "300")]
+    pub cache_ttl_seconds: u64,
+
+    /// Maximum memory for the in-memory flag definitions cache (deserialized + regex-compiled).
+    /// Default: 134217728 bytes (128 MB)
+    #[envconfig(from = "FLAG_DEFINITIONS_CACHE_CAPACITY_BYTES", default = "134217728")]
+    pub flag_definitions_cache_capacity_bytes: u64,
+
+    /// TTL for in-memory flag definitions cache entries.
+    /// Etag-keyed entries ensure correctness, so TTL is purely for memory reclamation.
+    /// Default: 90 seconds
+    #[envconfig(from = "FLAG_DEFINITIONS_CACHE_TTL_SECONDS", default = "90")]
+    pub flag_definitions_cache_ttl_seconds: u64,
+
+    #[envconfig(from = "GROUP_TYPE_CACHE_TTL_SECONDS", default = "300")]
+    pub group_type_cache_ttl_seconds: u64,
+
+    #[envconfig(from = "GROUP_TYPE_CACHE_MAX_ENTRIES", default = "50000")]
+    pub group_type_cache_max_entries: u64,
+
+    // cookieless, should match the values in plugin-server/src/types.ts, except we don't use sessions here
+    #[envconfig(from = "COOKIELESS_DISABLED", default = "false")]
+    pub cookieless_disabled: bool,
+
+    #[envconfig(from = "COOKIELESS_FORCE_STATELESS", default = "false")]
+    pub cookieless_force_stateless: bool,
+
+    #[envconfig(from = "COOKIELESS_IDENTIFIES_TTL_SECONDS", default = "345600")]
+    pub cookieless_identifies_ttl_seconds: u64,
+
+    #[envconfig(from = "COOKIELESS_SALT_TTL_SECONDS", default = "345600")]
+    pub cookieless_salt_ttl_seconds: u64,
+
+    #[envconfig(from = "COOKIELESS_REDIS_HOST", default = "localhost")]
+    pub cookieless_redis_host: String,
+
+    #[envconfig(from = "COOKIELESS_REDIS_PORT", default = "6379")]
+    pub cookieless_redis_port: u64,
+
+    #[envconfig(from = "NEW_ANALYTICS_CAPTURE_ENDPOINT", default = "/i/v0/e/")]
+    pub new_analytics_capture_endpoint: String,
+
+    #[envconfig(from = "NEW_ANALYTICS_CAPTURE_EXCLUDED_TEAM_IDS", default = "none")]
+    pub new_analytics_capture_excluded_team_ids: TeamIdCollection,
+
+    #[envconfig(from = "ELEMENT_CHAIN_AS_STRING_EXCLUDED_TEAMS", default = "none")]
+    pub element_chain_as_string_excluded_teams: TeamIdCollection,
+
+    #[envconfig(from = "DEBUG", default = "false")]
+    pub debug: FlexBool,
+
+    #[envconfig(from = "FLAGS_SESSION_REPLAY_QUOTA_CHECK", default = "false")]
+    pub flags_session_replay_quota_check: bool,
+
+    // Flag definitions rate limiting
+    // Default rate limit for all teams (requests per minute)
+    // Can be overridden per-team using LOCAL_EVAL_RATE_LIMITS
+    #[envconfig(from = "FLAG_DEFINITIONS_DEFAULT_RATE_PER_MINUTE", default = "600")]
+    pub flag_definitions_default_rate_per_minute: u32,
+
+    // Per-team rate limit overrides for flag definitions endpoint (shared with Django)
+    // JSON format: {"team_id": "rate_string", ...}
+    // Example: {"123": "1200/minute", "456": "2400/hour"}
+    #[envconfig(from = "LOCAL_EVAL_RATE_LIMITS", default = "")]
+    pub flag_definitions_rate_limits: FlagDefinitionsRateLimits,
+
+    // Per-credential rate limit for the remote_config endpoint (requests per minute).
+    // Matches Django's RemoteConfigThrottle default of 600/minute. Django's per-project
+    // REMOTE_CONFIG_RATE_LIMITS override is not ported: it can't apply to a per-credential
+    // bucket, is rarely set, and was already mis-keyed (team id vs project id) in Django.
+    #[envconfig(from = "REMOTE_CONFIG_DEFAULT_RATE_PER_MINUTE", default = "600")]
+    pub remote_config_default_rate_per_minute: u32,
+
+    // Teams that bypass rate limiting entirely (comma-separated team IDs)
+    // Matches Django's RATE_LIMITING_ALLOW_LIST_TEAMS behavior
+    #[envconfig(from = "RATE_LIMITING_ALLOW_LIST_TEAMS", default = "")]
+    pub rate_limiting_allow_list_teams: RateLimitingAllowList,
+
+    // Per-team /flags body logging. JSON: {"team_id": ["flag-key-pattern", ...], ...}
+    // Mirrors Django's FLAGS_LOG_BODIES_TEAMS dynamic setting; refreshed every ~60s
+    // from posthog_instancesetting at runtime.
+    #[envconfig(from = "FLAGS_LOG_BODIES_TEAMS", default = "")]
+    pub flags_log_bodies_teams: BodyLogTeams,
+
+    // Maximum request body bytes to include in body-log events.
+    // Bodies larger than this are truncated; truncated/original_size_bytes fields
+    // record what happened. Response side is naturally bounded by the per-flag
+    // filter when one is set.
+    #[envconfig(from = "FLAGS_LOG_BODIES_REQUEST_MAX_BYTES", default = "65536")]
+    pub flags_log_bodies_request_max_bytes: usize,
+
+    // OpenTelemetry configuration
+    #[envconfig(from = "OTEL_EXPORTER_OTLP_ENDPOINT")]
+    pub otel_url: Option<String>,
+
+    #[envconfig(from = "OTEL_TRACES_SAMPLER_ARG", default = "0.001")]
+    pub otel_sampling_rate: f64,
+
+    #[envconfig(from = "OTEL_SERVICE_NAME", default = "posthog-feature-flags")]
+    pub otel_service_name: String,
+
+    #[envconfig(from = "OTEL_LOG_LEVEL", default = "info")]
+    pub otel_log_level: Level,
+
+    // Tri-state controller for the /flags bot filter. See [`BotFilterMode`]
+    // for the per-variant semantics. Defaults to `log_only` so the filter
+    // ships observable-but-inert; operators flip to `enforced` once the
+    // rejection profile in `flags_bot_detected_total{mode="log_only"}` looks
+    // correct, or to `disabled` to back out of an interaction entirely.
+    #[envconfig(from = "FLAGS_BOT_FILTER_MODE", default = "log_only")]
+    pub bot_filter_mode: BotFilterMode,
+
+    // Rate limiting configuration for /flags endpoint (token-based)
+    // Enable/disable token-based rate limiting (defaults to off to match /decide)
+    #[envconfig(from = "FLAGS_RATE_LIMIT_ENABLED", default = "false")]
+    pub flags_rate_limit_enabled: FlexBool,
+
+    // Token bucket capacity (maximum burst size / enforce threshold).
+    // Set to 625 so the warn tier (80%) lands at 500, matching the legacy
+    // log-only threshold that operators' dashboards already track.
+    #[envconfig(from = "FLAGS_BUCKET_CAPACITY", default = "625")]
+    pub flags_bucket_capacity: u32,
+
+    // Token bucket replenish rate (tokens per second)
+    // Matches Python's DecideRateThrottle default of 10.0
+    #[envconfig(from = "FLAGS_BUCKET_REPLENISH_RATE", default = "10.0")]
+    pub flags_bucket_replenish_rate: f64,
+
+    // IP-based rate limiting configuration
+    // Provides defense-in-depth against DDoS attacks with rotating fake tokens
+    // This limits ALL requests per IP address, regardless of token validity
+    #[envconfig(from = "FLAGS_IP_RATE_LIMIT_ENABLED", default = "false")]
+    pub flags_ip_rate_limit_enabled: FlexBool,
+
+    // IP rate limit burst size (maximum requests per IP / enforce threshold).
+    // Set to 1250 so the warn tier (80%) lands at 1000, matching the legacy
+    // log-only threshold.
+    #[envconfig(from = "FLAGS_IP_BURST_SIZE", default = "1250")]
+    pub flags_ip_burst_size: u32,
+
+    // IP rate limit replenish rate (requests per second per IP)
+    // Set higher than token bucket rate to account for multiple users behind same IP
+    #[envconfig(from = "FLAGS_IP_REPLENISH_RATE", default = "50.0")]
+    pub flags_ip_replenish_rate: f64,
+
+    // Warn-tier ratio: the warn threshold is derived as this fraction of the enforce
+    // capacity for both token and IP limiters. E.g., 0.8 means warn at 80% of enforce.
+    // Set to 0.0 to disable the warn tier entirely.
+    #[envconfig(from = "FLAGS_WARN_CAPACITY_RATIO", default = "0.8")]
+    pub flags_warn_capacity_ratio: f64,
+
+    // Log-only mode for rate limiting (defaults to true for safe rollout)
+    // When true, rate limits are checked and violations logged, but requests are not blocked
+    // This allows gathering metrics to tune limits before enforcing them
+    // DEPRECATED: set FLAGS_RATE_LIMIT_LOG_ONLY=false and use FLAGS_WARN_CAPACITY_RATIO instead
+    #[envconfig(from = "FLAGS_RATE_LIMIT_LOG_ONLY", default = "true")]
+    pub flags_rate_limit_log_only: FlexBool,
+
+    // Log-only mode for IP-based rate limiting (defaults to true for safe rollout)
+    // DEPRECATED: set FLAGS_IP_RATE_LIMIT_LOG_ONLY=false and use FLAGS_WARN_CAPACITY_RATIO instead
+    #[envconfig(from = "FLAGS_IP_RATE_LIMIT_LOG_ONLY", default = "true")]
+    pub flags_ip_rate_limit_log_only: FlexBool,
+
+    // Per-token rate limit overrides for the /flags endpoint
+    // JSON format: {"token_string": "rate_string", ...}
+    // Example: {"phc_abc123": "1200/minute", "phc_xyz789": "2400/hour"}
+    #[envconfig(from = "FLAGS_TOKEN_RATE_LIMIT_OVERRIDES", default = "")]
+    pub flags_token_rate_limit_overrides: FlagsTokenRateLimitOverrides,
+
+    // How often to clean up stale rate limiter entries (seconds)
+    // The governor crate's keyed rate limiters accumulate entries for every unique key.
+    // Without periodic cleanup, this leads to unbounded memory growth.
+    // This interval controls how often retain_recent() is called to remove stale entries.
+    #[envconfig(from = "RATE_LIMITER_CLEANUP_INTERVAL_SECS", default = "60")]
+    pub rate_limiter_cleanup_interval_secs: u64,
+
+    // Experience continuity optimization
+    // When enabled, skip hash key override lookups for flags that don't need them:
+    // - Flags at 100% rollout with no multivariate variants OR where a single variant is at 100%
+    // These flags return the same value regardless of user bucketing, so the lookup is wasted work.
+    #[envconfig(from = "OPTIMIZE_EXPERIENCE_CONTINUITY_LOOKUPS", default = "true")]
+    pub optimize_experience_continuity_lookups: FlexBool,
+
+    // Internal request token for non-billable requests
+    // When provided via Authorization header and matches this token, the request is not billed
+    #[envconfig(from = "INTERNAL_REQUEST_TOKEN")]
+    pub internal_request_token: Option<String>,
+
+    // Hard ceiling on page size for the internal batch flag evaluation endpoint
+    // (static cohort generation); requests above it are rejected with 400. This is a
+    // safety cap, not a recommended page size: a page evaluates persons sequentially, so
+    // the Django caller should page well below this to stay within the request timeout.
+    #[envconfig(from = "BATCH_FLAG_EVAL_MAX_LIMIT", default = "10000")]
+    pub batch_flag_eval_max_limit: i64,
+
+    // Request timeout for the internal batch flag evaluation endpoint.
+    // Separate from REQUEST_TIMEOUT_MS because a batch page evaluates up to
+    // BATCH_FLAG_EVAL_MAX_LIMIT persons sequentially.
+    #[envconfig(from = "BATCH_FLAG_EVAL_TIMEOUT_MS", default = "120000")]
+    pub batch_flag_eval_timeout_ms: u64,
+
+    // Redis compression configuration
+    // When enabled, uses zstd compression for Redis values above threshold
+    // The `default_test_config()` sets this to true for test/development scenarios.
+    #[envconfig(from = "REDIS_COMPRESSION_ENABLED", default = "false")]
+    pub redis_compression_enabled: FlexBool,
+
+    // Number of times to retry creating a Redis client before giving up
+    // Helps handle transient network issues during startup
+    // Set to 0 to disable retries (fail immediately on first error)
+    #[envconfig(from = "REDIS_CLIENT_RETRY_COUNT", default = "3")]
+    pub redis_client_retry_count: u32,
+
+    // Threshold for parallel flag evaluation
+    // Below this count, flags are evaluated sequentially (faster for small counts)
+    // Above this count, flags are evaluated in parallel using rayon
+    // Default: 100 (sequential is faster for typical workloads of ~50 flags)
+    #[envconfig(from = "PARALLEL_EVAL_THRESHOLD", default = "100")]
+    pub parallel_eval_threshold: usize,
+
+    // Maximum number of large-flag batches evaluated concurrently on the Rayon pool.
+    // Bounds the rayon::spawn queue to prevent unbounded queueing latency and
+    // preserve per-batch work-stealing parallelism.
+    // 0 = auto (derived from rayon thread count).
+    #[envconfig(from = "MAX_CONCURRENT_BATCH_EVALS", default = "0")]
+    pub max_concurrent_batch_evals: usize,
+
+    // Maximum time (ms) to wait for a Rayon semaphore permit before failing fast.
+    // When the wait exceeds this threshold, the request returns 504 so that
+    // ingress can retry it on a less-loaded pod.
+    // 0 = no timeout (await indefinitely, backwards-compatible).
+    #[envconfig(from = "RAYON_SEMAPHORE_TIMEOUT_MS", default = "0")]
+    pub rayon_semaphore_timeout_ms: u64,
+
+    // When true, skip all writes to PostgreSQL and Redis.
+    // Used to safely deploy and test the personhog migration path
+    // without risking any data mutations.
+    #[envconfig(from = "SKIP_WRITES", default = "false")]
+    pub skip_writes: FlexBool,
+
+    // Explicit core count for thread pool sizing. Overrides available_parallelism()
+    // which reads the CFS quota (K8s CPU limit), not the CPU request.
+    // 0 = auto (use available_parallelism).
+    #[envconfig(from = "THREAD_POOL_CORES", default = "0")]
+    pub thread_pool_cores: usize,
+
+    // In-memory negative cache for invalid API tokens. Prevents repeated
+    // Redis/S3/PG lookups for tokens that don't correspond to any team.
+    #[envconfig(from = "TEAM_NEGATIVE_CACHE_CAPACITY", default = "10000")]
+    pub team_negative_cache_capacity: u64,
+
+    #[envconfig(from = "TEAM_NEGATIVE_CACHE_TTL_SECONDS", default = "30")]
+    pub team_negative_cache_ttl_seconds: u64,
+
+    // TTL for the Redis-backed per-token auth cache (positive hits).
+    // Starts at 5 minutes as a conservative default; increase once invalidation
+    // signals are proven reliable in production.
+    #[envconfig(from = "AUTH_TOKEN_CACHE_TTL_SECONDS", default = "300")]
+    pub auth_token_cache_ttl_seconds: u64,
+
+    // When true, skip the PostgreSQL fallback for team token lookups.
+    // HyperCache (Redis/S3) is treated as the source of truth — a cache
+    // miss means the token is invalid. Transient errors (Redis/S3 timeouts)
+    // bypass the fallback entirely and are not negative-cached.
+    // Gated for safe rollout.
+    #[envconfig(from = "SKIP_PG_TEAM_FALLBACK", default = "false")]
+    pub skip_pg_team_fallback: FlexBool,
+
+    #[envconfig(from = "SERVICE_MODE", default = "all")]
+    pub service_mode: ServiceMode,
+
+    // BillingAggregator tuning knobs. `BillingAggregatorConfig::validate`
+    // rejects zero values at boot — see the module docs on
+    // `src/billing/aggregator.rs` for the durability trade-offs that hang
+    // off these knobs.
+    //
+    // How often the flusher drains the in-memory map (milliseconds). Must
+    // stay well below `CACHE_BUCKET_SIZE` (120s) so bucket rollover doesn't
+    // collapse counts. Also directly bounds the worst-case crash-loss
+    // window: a SIGKILL or OOM-kill past the shutdown grace period loses
+    // up to one interval of records per pod.
+    #[envconfig(from = "FLAGS_BILLING_FLUSH_INTERVAL_MS", default = "10000")]
+    pub billing_flush_interval_ms: u64,
+
+    // Safety cap on pending entries — tripwire, not a working-set estimate.
+    #[envconfig(from = "FLAGS_BILLING_MAX_PENDING_ENTRIES", default = "500000")]
+    pub billing_max_pending_entries: usize,
+
+    // Maximum `HIncrBy` commands per pipeline round-trip during a flush.
+    #[envconfig(from = "FLAGS_BILLING_PER_FLUSH_BATCH_SIZE", default = "200")]
+    pub billing_per_flush_batch_size: usize,
+
+    // Upper bound on the graceful-shutdown flush (milliseconds). Should stay
+    // comfortably within the pod's `terminationGracePeriodSeconds`.
+    #[envconfig(from = "FLAGS_BILLING_SHUTDOWN_FLUSH_TIMEOUT_MS", default = "15000")]
+    pub billing_shutdown_flush_timeout_ms: u64,
+}
+
+/// Thread counts for Tokio (async I/O) and Rayon (CPU-bound parallel evaluation).
+///
+/// Tokio handles request I/O (DB, Redis, network) and lightweight sequential flag
+/// evaluation. Workers spend most of their time in `.await`, so half the core count
+/// is sufficient. Rayon handles CPU-bound parallel batch evaluation for large flag
+/// sets (>= PARALLEL_EVAL_THRESHOLD). Because `rayon::spawn` + `oneshot` frees the
+/// Tokio worker, the two pools never compete for the same work — but they do share
+/// the CFS budget.
+///
+/// We give Rayon the full core count and Tokio half, accepting ~50% oversubscription
+/// (e.g. 3 + 6 = 9 threads on 6 cores). This is safe because Tokio threads are mostly
+/// idle (parked in `.await`), so actual concurrent CPU demand rarely exceeds the core
+/// count. Canary testing on EU (6-core pods) showed that a strict 50/50 split
+/// (3 Tokio + 3 Rayon = 6 threads, 0% CFS throttling) starved the Rayon pool: p99
+/// parallel batch time was ~1900ms vs the fleet's ~240ms, while CPU utilization sat
+/// at only 1.3 of 6 cores. The fleet runs 12 threads on 6 cores (7–30% throttling)
+/// with no issues, confirming moderate oversubscription is well-tolerated.
+pub struct ThreadCounts {
+    pub tokio_workers: usize,
+    pub rayon_threads: usize,
+}
+
+impl ThreadCounts {
+    /// Build thread counts from an explicit core count, falling back to
+    /// `available_parallelism()` when `override_cores` is 0.
+    pub fn new(override_cores: usize) -> Self {
+        let detected = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        let cores = if override_cores > 0 {
+            override_cores
+        } else {
+            detected
+        };
+
+        eprintln!(
+            "thread pool core count resolved: override_cores={}, detected_cores={}, effective_cores={}",
+            override_cores, detected, cores,
+        );
+
+        Self::from_cores(cores)
+    }
+
+    /// Default concurrency limit for the Rayon batch dispatcher.
+    ///
+    /// Targets ~3 Rayon threads per concurrent batch so each batch gets
+    /// meaningful work-stealing parallelism. With fewer threads per batch,
+    /// `into_par_iter` degrades toward sequential execution.
+    pub fn default_max_concurrent_batch_evals(&self) -> usize {
+        // Integer ceil(rayon_threads / 3): keeps ~3 threads per batch.
+        //   6 threads → 2 batches  (3 threads each)
+        //   8 threads → 3 batches  (~2.7 threads each)
+        //  12 threads → 4 batches  (3 threads each)
+        self.rayon_threads.div_ceil(3).max(1)
+    }
+
+    fn from_cores(cores: usize) -> Self {
+        let tokio_workers = (cores / 2).max(1);
+        let rayon_threads = cores.max(1);
+
+        Self {
+            tokio_workers,
+            rayon_threads,
+        }
+    }
+}
+
+impl Config {
+    const MAX_RESPONSE_TIMEOUT_MS: u64 = 30_000; // 30 seconds
+    const MAX_CONNECTION_TIMEOUT_MS: u64 = 60_000; // 60 seconds
+
+    /// Validate and fix timeout configuration, logging warnings and applying defaults for invalid values
+    ///
+    /// This method checks timeout values and relationships, applying safe defaults when invalid
+    /// configurations are detected. It never fails - it logs warnings and corrects problems.
+    pub fn validate_and_fix_timeouts(&mut self) {
+        let mut fixed = false;
+
+        // Note: Zero values are now valid - they mean "no timeout" (blocks indefinitely)
+        // The RedisClient will skip setting the timeout when Duration::ZERO is provided
+
+        // Fix excessive values
+        if self.redis_response_timeout_ms > Self::MAX_RESPONSE_TIMEOUT_MS {
+            tracing::warn!(
+                "Redis response timeout ({}ms) exceeds maximum recommended value ({}ms), capping at maximum",
+                self.redis_response_timeout_ms,
+                Self::MAX_RESPONSE_TIMEOUT_MS
+            );
+            self.redis_response_timeout_ms = Self::MAX_RESPONSE_TIMEOUT_MS;
+            fixed = true;
+        }
+
+        if self.redis_connection_timeout_ms > Self::MAX_CONNECTION_TIMEOUT_MS {
+            tracing::warn!(
+                "Redis connection timeout ({}ms) exceeds maximum recommended value ({}ms), capping at maximum",
+                self.redis_connection_timeout_ms,
+                Self::MAX_CONNECTION_TIMEOUT_MS
+            );
+            self.redis_connection_timeout_ms = Self::MAX_CONNECTION_TIMEOUT_MS;
+            fixed = true;
+        }
+
+        if fixed {
+            tracing::info!(
+                "Using Redis timeouts: response={}ms, connection={}ms",
+                self.redis_response_timeout_ms,
+                self.redis_connection_timeout_ms
+            );
+        }
+    }
+
+    /// Baseline config for the integration test harness.
+    ///
+    /// Diverges from production defaults in one billing-critical way:
+    /// `billing_flush_interval_ms` is 100 (vs 10_000 in production). Tests
+    /// that poll Redis for an aggregator write expect a flush inside their
+    /// ~1s budget; tests that assert *absence* of a write sleep ≥ 500ms
+    /// (several flush windows) before reading. If you raise this default,
+    /// audit `test_skip_writes_suppresses_billing_redis_counter` and
+    /// `test_flag_definitions_billing_counter` — their negative-case sleeps
+    /// must cover at least one full flush window.
+    pub fn default_test_config() -> Self {
+        Self {
+            continuous_profiling: ContinuousProfilingConfig::default(),
+            address: SocketAddr::from_str("127.0.0.1:0").unwrap(),
+            redis_url: "redis://localhost:6379/".to_string(),
+            redis_reader_url: "".to_string(),
+            flags_redis_url: "".to_string(),
+            flags_redis_reader_url: "".to_string(),
+            flags_redis_enabled: FlexBool(false),
+            flag_definitions_self_heal_enabled: FlexBool(false),
+            redis_response_timeout_ms: 100,
+            redis_connection_timeout_ms: 5000,
+            write_database_url: "postgres://posthog:posthog@localhost:5432/test_posthog"
+                .to_string(),
+            read_database_url: "postgres://posthog:posthog@localhost:5432/test_posthog".to_string(),
+            persons_write_database_url: "postgres://posthog:posthog@localhost:5432/posthog_persons"
+                .to_string(),
+            persons_read_database_url: "postgres://posthog:posthog@localhost:5432/posthog_persons"
+                .to_string(),
+            behavioral_cohorts_read_database_url:
+                "postgres://posthog:posthog@localhost:5432/test_posthog".to_string(),
+            flags_secret_keys: String::new(),
+            secret_key: "test-secret-key-at-least-32-bytes-long".to_string(),
+            realtime_cohort_evaluation_team_ids: TeamIdCollection::None,
+            cohort_membership_cache_ttl_seconds: 60,
+            cohort_membership_cache_max_entries: 50_000,
+            max_concurrency: 1000,
+            max_pg_connections: 10,
+            min_non_persons_reader_connections: 0,
+            min_non_persons_writer_connections: 0,
+            min_persons_reader_connections: 0,
+            min_persons_writer_connections: 0,
+            request_timeout_ms: 30_000,
+            acquire_timeout_secs: 5,
+            idle_timeout_secs: 300,
+            test_before_acquire: FlexBool(true),
+            non_persons_reader_statement_timeout_ms: 2000,
+            persons_reader_statement_timeout_ms: 3000,
+            writer_statement_timeout_ms: 3000,
+            db_monitor_interval_secs: 30,
+            cohort_cache_monitor_interval_secs: 30,
+            flag_definitions_cache_monitor_interval_secs: 30,
+            db_pool_warn_utilization: 0.8,
+            billing_limiter_cache_ttl_secs: 5,
+            otel_export_timeout_secs: 3,
+            maxmind_db_path: "".to_string(),
+            enable_metrics: false,
+            team_ids_to_track: TeamIdCollection::All,
+            cohort_cache_capacity_bytes: 268_435_456, // 256 MB
+            flag_definitions_cache_capacity_bytes: 134_217_728, // 128 MB
+            flag_definitions_cache_ttl_seconds: 90,
+            cache_ttl_seconds: 300,
+            group_type_cache_ttl_seconds: 300,
+            group_type_cache_max_entries: 50_000,
+            cookieless_disabled: false,
+            cookieless_force_stateless: false,
+            cookieless_identifies_ttl_seconds: 345600,
+            cookieless_salt_ttl_seconds: 345600,
+            cookieless_redis_host: "localhost".to_string(),
+            cookieless_redis_port: 6379,
+            new_analytics_capture_endpoint: "/i/v0/e/".to_string(),
+            new_analytics_capture_excluded_team_ids: TeamIdCollection::None,
+            element_chain_as_string_excluded_teams: TeamIdCollection::None,
+            debug: FlexBool(false),
+            flags_session_replay_quota_check: false,
+            flag_definitions_default_rate_per_minute: 600,
+            flag_definitions_rate_limits: FlagDefinitionsRateLimits::default(),
+            remote_config_default_rate_per_minute: 600,
+            rate_limiting_allow_list_teams: RateLimitingAllowList::default(),
+            flags_log_bodies_teams: BodyLogTeams::default(),
+            flags_log_bodies_request_max_bytes: 65_536,
+            otel_url: None,
+            otel_sampling_rate: 1.0,
+            otel_service_name: "posthog-feature-flags".to_string(),
+            otel_log_level: Level::ERROR,
+            object_storage_bucket: "posthog".to_string(),
+            object_storage_region: "us-east-1".to_string(),
+            object_storage_endpoint: "".to_string(),
+            // `Enforced` so tests exercise the bot short-circuit envelope.
+            // Tests wanting prod posture override to `LogOnly` explicitly.
+            bot_filter_mode: BotFilterMode::Enforced,
+            flags_rate_limit_enabled: FlexBool(false),
+            flags_bucket_capacity: 625,
+            flags_bucket_replenish_rate: 10.0,
+            flags_ip_rate_limit_enabled: FlexBool(false),
+            flags_ip_burst_size: 1250,
+            flags_ip_replenish_rate: 100.0,
+            flags_warn_capacity_ratio: 0.8,
+            flags_rate_limit_log_only: FlexBool(true),
+            flags_ip_rate_limit_log_only: FlexBool(true),
+            flags_token_rate_limit_overrides: FlagsTokenRateLimitOverrides::default(),
+            rate_limiter_cleanup_interval_secs: 60,
+            redis_compression_enabled: FlexBool(true),
+            redis_client_retry_count: 3,
+            optimize_experience_continuity_lookups: FlexBool(true),
+            parallel_eval_threshold: 100,
+            max_concurrent_batch_evals: 0,
+            rayon_semaphore_timeout_ms: 0,
+            skip_writes: FlexBool(false),
+            thread_pool_cores: 0,
+            team_negative_cache_capacity: 10_000,
+            team_negative_cache_ttl_seconds: 30,
+            skip_pg_team_fallback: FlexBool(false),
+            service_mode: ServiceMode::All,
+            auth_token_cache_ttl_seconds: 300,
+            internal_request_token: None,
+            batch_flag_eval_max_limit: 10_000,
+            batch_flag_eval_timeout_ms: 120_000,
+            billing_flush_interval_ms: 100,
+            billing_max_pending_entries: 500_000,
+            billing_per_flush_batch_size: 200,
+            billing_shutdown_flush_timeout_ms: 15_000,
+        }
+    }
+
+    pub fn get_maxmind_db_path(&self) -> PathBuf {
+        if self.maxmind_db_path.is_empty() {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("share")
+                .join("GeoLite2-City.mmdb")
+        } else {
+            PathBuf::from(&self.maxmind_db_path)
+        }
+    }
+
+    pub fn get_redis_reader_url(&self) -> &str {
+        if self.redis_reader_url.is_empty() {
+            &self.redis_url
+        } else {
+            &self.redis_reader_url
+        }
+    }
+
+    pub fn get_redis_writer_url(&self) -> &str {
+        &self.redis_url
+    }
+
+    /// Get the Redis URL for flags cache reads (critical path: team cache + flags cache)
+    /// Returns None if dedicated flags Redis is not configured
+    pub fn get_flags_redis_reader_url(&self) -> Option<&str> {
+        if !self.flags_redis_reader_url.is_empty() {
+            Some(&self.flags_redis_reader_url)
+        } else if !self.flags_redis_url.is_empty() {
+            Some(&self.flags_redis_url)
+        } else {
+            None
+        }
+    }
+
+    /// Get the Redis URL for flags cache writes (critical path: team cache + flags cache)
+    /// Returns None if dedicated flags Redis is not configured
+    pub fn get_flags_redis_writer_url(&self) -> Option<&str> {
+        if !self.flags_redis_url.is_empty() {
+            Some(&self.flags_redis_url)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_redis_cookieless_url(&self) -> String {
+        format!(
+            "redis://{}:{}",
+            self.cookieless_redis_host, self.cookieless_redis_port
+        )
+    }
+
+    pub fn get_cookieless_config(&self) -> CookielessConfig {
+        CookielessConfig {
+            disabled: self.cookieless_disabled,
+            force_stateless_mode: self.cookieless_force_stateless,
+            identifies_ttl_seconds: self.cookieless_identifies_ttl_seconds,
+            salt_ttl_seconds: self.cookieless_salt_ttl_seconds,
+        }
+    }
+
+    pub fn get_billing_aggregator_config(&self) -> crate::billing::BillingAggregatorConfig {
+        crate::billing::BillingAggregatorConfig {
+            flush_interval: std::time::Duration::from_millis(self.billing_flush_interval_ms),
+            max_pending_entries: self.billing_max_pending_entries,
+            per_flush_batch_size: self.billing_per_flush_batch_size,
+            shutdown_flush_timeout: std::time::Duration::from_millis(
+                self.billing_shutdown_flush_timeout_ms,
+            ),
+            jitter_override: None,
+        }
+    }
+
+    /// Check if persons database routing is enabled
+    pub fn is_persons_db_routing_enabled(&self) -> bool {
+        !self.persons_read_database_url.is_empty() && !self.persons_write_database_url.is_empty()
+    }
+
+    pub fn is_behavioral_cohorts_db_configured(&self) -> bool {
+        !self.behavioral_cohorts_read_database_url.is_empty()
+    }
+
+    /// Get the database URL for persons reads, falling back to the default read URL
+    pub fn get_persons_read_database_url(&self) -> String {
+        if self.persons_read_database_url.is_empty() {
+            self.read_database_url.clone()
+        } else {
+            self.persons_read_database_url.clone()
+        }
+    }
+
+    /// Get the database URL for persons writes, falling back to the default write URL
+    pub fn get_persons_write_database_url(&self) -> String {
+        if self.persons_write_database_url.is_empty() {
+            self.write_database_url.clone()
+        } else {
+            self.persons_write_database_url.clone()
+        }
+    }
+}
+
+pub static DEFAULT_TEST_CONFIG: Lazy<Config> = Lazy::new(Config::default_test_config);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        std::env::set_var("DEBUG", "false");
+        let config = Config::init_from_env().unwrap();
+        assert_eq!(
+            config.address,
+            SocketAddr::from_str("127.0.0.1:3001").unwrap()
+        );
+        assert_eq!(
+            config.write_database_url,
+            "postgres://posthog:posthog@localhost:5432/posthog"
+        );
+        assert_eq!(
+            config.read_database_url,
+            "postgres://posthog:posthog@localhost:5432/posthog"
+        );
+        assert_eq!(config.max_concurrency, 1000);
+        assert_eq!(config.max_pg_connections, 10);
+        assert_eq!(config.min_non_persons_reader_connections, 0);
+        assert_eq!(config.min_non_persons_writer_connections, 0);
+        assert_eq!(config.min_persons_reader_connections, 0);
+        assert_eq!(config.min_persons_writer_connections, 0);
+        assert_eq!(config.redis_url, "redis://localhost:6379/");
+        assert_eq!(config.team_ids_to_track, TeamIdCollection::All);
+        assert_eq!(
+            config.new_analytics_capture_excluded_team_ids,
+            TeamIdCollection::None
+        );
+        assert_eq!(
+            config.element_chain_as_string_excluded_teams,
+            TeamIdCollection::None
+        );
+        assert_eq!(config.new_analytics_capture_endpoint, "/i/v0/e/");
+        assert_eq!(config.debug, FlexBool(false));
+        assert!(!config.flags_session_replay_quota_check);
+        assert_eq!(config.skip_writes, FlexBool(false));
+        // Bot filter ships in LogOnly mode by default — pin the safe
+        // posture so a future env-var rename / refactor can't silently
+        // flip it back to Enforced.
+        assert_eq!(config.bot_filter_mode, BotFilterMode::LogOnly);
+    }
+
+    #[test]
+    fn test_default_test_config() {
+        let config = Config::default_test_config();
+        assert_eq!(config.address, SocketAddr::from_str("127.0.0.1:0").unwrap());
+        assert_eq!(
+            config.write_database_url,
+            "postgres://posthog:posthog@localhost:5432/test_posthog"
+        );
+        assert_eq!(
+            config.read_database_url,
+            "postgres://posthog:posthog@localhost:5432/test_posthog"
+        );
+        assert_eq!(config.max_concurrency, 1000);
+        assert_eq!(config.max_pg_connections, 10);
+        assert_eq!(config.min_non_persons_reader_connections, 0);
+        assert_eq!(config.min_non_persons_writer_connections, 0);
+        assert_eq!(config.min_persons_reader_connections, 0);
+        assert_eq!(config.min_persons_writer_connections, 0);
+        assert_eq!(config.redis_url, "redis://localhost:6379/");
+        assert_eq!(config.team_ids_to_track, TeamIdCollection::All);
+        assert_eq!(
+            config.new_analytics_capture_excluded_team_ids,
+            TeamIdCollection::None
+        );
+        assert_eq!(
+            config.element_chain_as_string_excluded_teams,
+            TeamIdCollection::None
+        );
+    }
+
+    #[test]
+    fn test_default_test_config_static() {
+        let config = &*DEFAULT_TEST_CONFIG;
+        assert_eq!(config.address, SocketAddr::from_str("127.0.0.1:0").unwrap());
+        assert_eq!(
+            config.write_database_url,
+            "postgres://posthog:posthog@localhost:5432/test_posthog"
+        );
+        assert_eq!(
+            config.read_database_url,
+            "postgres://posthog:posthog@localhost:5432/test_posthog"
+        );
+        assert_eq!(config.max_concurrency, 1000);
+        assert_eq!(config.max_pg_connections, 10);
+        assert_eq!(config.min_non_persons_reader_connections, 0);
+        assert_eq!(config.min_non_persons_writer_connections, 0);
+        assert_eq!(config.min_persons_reader_connections, 0);
+        assert_eq!(config.min_persons_writer_connections, 0);
+        assert_eq!(config.redis_url, "redis://localhost:6379/");
+        assert_eq!(config.team_ids_to_track, TeamIdCollection::All);
+        assert_eq!(
+            config.new_analytics_capture_excluded_team_ids,
+            TeamIdCollection::None
+        );
+        assert_eq!(
+            config.element_chain_as_string_excluded_teams,
+            TeamIdCollection::None
+        );
+    }
+
+    #[test]
+    fn test_team_ids_to_track_all() {
+        let team_ids: TeamIdCollection = "all".parse().unwrap();
+        assert_eq!(team_ids, TeamIdCollection::All);
+    }
+
+    #[test]
+    fn test_team_ids_to_track_wildcard() {
+        let team_ids: TeamIdCollection = "*".parse().unwrap();
+        assert_eq!(team_ids, TeamIdCollection::All);
+    }
+
+    #[test]
+    fn test_team_ids_to_track_none() {
+        let team_ids: TeamIdCollection = "none".parse().unwrap();
+        assert_eq!(team_ids, TeamIdCollection::None);
+    }
+
+    #[test]
+    fn test_team_ids_to_track_single_ids() {
+        let team_ids: TeamIdCollection = "1,5,7,13".parse().unwrap();
+        assert_eq!(team_ids, TeamIdCollection::TeamIds(vec![1, 5, 7, 13]));
+    }
+
+    #[test]
+    fn test_team_ids_to_track_ranges() {
+        let team_ids: TeamIdCollection = "1:3".parse().unwrap();
+        assert_eq!(team_ids, TeamIdCollection::TeamIds(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn test_team_ids_to_track_mixed() {
+        let team_ids: TeamIdCollection = "1:3,5,7:9".parse().unwrap();
+        assert_eq!(
+            team_ids,
+            TeamIdCollection::TeamIds(vec![1, 2, 3, 5, 7, 8, 9])
+        );
+    }
+
+    #[test]
+    fn test_invalid_range() {
+        let result: Result<TeamIdCollection, _> = "5:3".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_number() {
+        let result: Result<TeamIdCollection, _> = "abc".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_flag_definitions_rate_limits_empty() {
+        let limits: FlagDefinitionsRateLimits = "".parse().unwrap();
+        assert_eq!(limits.0.len(), 0);
+    }
+
+    #[test]
+    fn test_flag_definitions_rate_limits_valid_json() {
+        let json = r#"{"123": "1200/minute", "456": "2400/hour"}"#;
+        let limits: FlagDefinitionsRateLimits = json.parse().unwrap();
+        assert_eq!(limits.0.len(), 2);
+        assert_eq!(limits.0.get(&123), Some(&"1200/minute".to_string()));
+        assert_eq!(limits.0.get(&456), Some(&"2400/hour".to_string()));
+    }
+
+    #[test]
+    fn test_flag_definitions_rate_limits_single_team() {
+        let json = r#"{"789": "100/second"}"#;
+        let limits: FlagDefinitionsRateLimits = json.parse().unwrap();
+        assert_eq!(limits.0.len(), 1);
+        assert_eq!(limits.0.get(&789), Some(&"100/second".to_string()));
+    }
+
+    #[test]
+    fn test_flag_definitions_rate_limits_invalid_json() {
+        let result: Result<FlagDefinitionsRateLimits, _> = "not json".parse();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to parse rate limits"));
+    }
+
+    #[test]
+    fn test_flag_definitions_rate_limits_invalid_team_id() {
+        let json = r#"{"abc": "600/minute"}"#;
+        let result: Result<FlagDefinitionsRateLimits, _> = json.parse();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid team ID"));
+    }
+
+    #[test]
+    fn test_flag_definitions_rate_limits_negative_team_id() {
+        let json = r#"{"-123": "600/minute"}"#;
+        let result: Result<FlagDefinitionsRateLimits, _> = json.parse();
+        // Negative numbers are technically valid i32, so this should succeed
+        assert!(result.is_ok());
+        let limits = result.unwrap();
+        assert_eq!(limits.0.get(&-123), Some(&"600/minute".to_string()));
+    }
+
+    #[test]
+    fn test_flag_definitions_rate_limits_whitespace() {
+        let json = r#"  {"123": "600/minute"}  "#;
+        let limits: FlagDefinitionsRateLimits = json.parse().unwrap();
+        assert_eq!(limits.0.len(), 1);
+        assert_eq!(limits.0.get(&123), Some(&"600/minute".to_string()));
+    }
+
+    #[test]
+    fn test_rate_limiting_allow_list_empty() {
+        let list: RateLimitingAllowList = "".parse().unwrap();
+        assert!(list.0.is_empty());
+    }
+
+    #[test]
+    fn test_rate_limiting_allow_list_single_id() {
+        let list: RateLimitingAllowList = "23047".parse().unwrap();
+        assert_eq!(list.0.len(), 1);
+        assert!(list.0.contains(&23047));
+    }
+
+    #[test]
+    fn test_rate_limiting_allow_list_multiple_ids() {
+        let list: RateLimitingAllowList = "23047,12345,67890".parse().unwrap();
+        assert_eq!(list.0.len(), 3);
+        assert!(list.0.contains(&23047));
+        assert!(list.0.contains(&12345));
+        assert!(list.0.contains(&67890));
+    }
+
+    #[test]
+    fn test_rate_limiting_allow_list_whitespace() {
+        let list: RateLimitingAllowList = " 23047 , 12345 ".parse().unwrap();
+        assert_eq!(list.0.len(), 2);
+        assert!(list.0.contains(&23047));
+        assert!(list.0.contains(&12345));
+    }
+
+    #[test]
+    fn test_rate_limiting_allow_list_trailing_comma() {
+        let list: RateLimitingAllowList = "23047,".parse().unwrap();
+        assert_eq!(list.0.len(), 1);
+        assert!(list.0.contains(&23047));
+    }
+
+    #[test]
+    fn test_rate_limiting_allow_list_invalid_id() {
+        let result: Result<RateLimitingAllowList, _> = "23047,abc".parse();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Invalid team ID 'abc' in RATE_LIMITING_ALLOW_LIST_TEAMS"));
+    }
+
+    #[test]
+    fn test_validate_and_fix_timeouts_valid_config() {
+        let mut config = Config::default_test_config();
+        let original_response = config.redis_response_timeout_ms;
+        let original_connection = config.redis_connection_timeout_ms;
+        config.validate_and_fix_timeouts();
+        // Should not change valid config
+        assert_eq!(config.redis_response_timeout_ms, original_response);
+        assert_eq!(config.redis_connection_timeout_ms, original_connection);
+    }
+
+    #[test]
+    fn test_validate_and_fix_timeouts_zero_values_allowed() {
+        let mut config = Config::default_test_config();
+        // Zero values are allowed - they mean "no timeout"
+        config.redis_response_timeout_ms = 0;
+        config.redis_connection_timeout_ms = 0;
+        config.validate_and_fix_timeouts();
+        // Should preserve zero values
+        assert_eq!(config.redis_response_timeout_ms, 0);
+        assert_eq!(config.redis_connection_timeout_ms, 0);
+    }
+
+    #[test]
+    fn test_validate_and_fix_timeouts_excessive_response_timeout() {
+        let mut config = Config::default_test_config();
+        config.redis_response_timeout_ms = 31_000; // > 30 seconds max
+        config.redis_connection_timeout_ms = 40_000; // Allow connection timeout to be higher
+        config.validate_and_fix_timeouts();
+        // Should cap at maximum
+        assert_eq!(
+            config.redis_response_timeout_ms,
+            Config::MAX_RESPONSE_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn test_validate_and_fix_timeouts_excessive_connection_timeout() {
+        let mut config = Config::default_test_config();
+        config.redis_connection_timeout_ms = 61_000; // > 60 seconds max
+        config.validate_and_fix_timeouts();
+        // Should cap at maximum
+        assert_eq!(
+            config.redis_connection_timeout_ms,
+            Config::MAX_CONNECTION_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn test_validate_and_fix_timeouts_any_relationship_allowed() {
+        let mut config = Config::default_test_config();
+
+        // Test 1: Equal values are allowed
+        config.redis_response_timeout_ms = 1000;
+        config.redis_connection_timeout_ms = 1000;
+        config.validate_and_fix_timeouts();
+        assert_eq!(config.redis_response_timeout_ms, 1000);
+        assert_eq!(config.redis_connection_timeout_ms, 1000);
+
+        // Test 2: Response > Connection is also allowed (no relationship validation)
+        config.redis_response_timeout_ms = 5000;
+        config.redis_connection_timeout_ms = 1000;
+        config.validate_and_fix_timeouts();
+        assert_eq!(config.redis_response_timeout_ms, 5000);
+        assert_eq!(config.redis_connection_timeout_ms, 1000);
+
+        // Test 3: Response < Connection is allowed
+        config.redis_response_timeout_ms = 100;
+        config.redis_connection_timeout_ms = 5000;
+        config.validate_and_fix_timeouts();
+        assert_eq!(config.redis_response_timeout_ms, 100);
+        assert_eq!(config.redis_connection_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn test_timeout_values_apply_to_redis_client() {
+        use std::time::Duration;
+
+        let config = Config::default_test_config();
+
+        // Verify that config values would translate correctly to Duration
+        let response_timeout = Duration::from_millis(config.redis_response_timeout_ms);
+        let connection_timeout = Duration::from_millis(config.redis_connection_timeout_ms);
+
+        assert_eq!(response_timeout, Duration::from_millis(100));
+        assert_eq!(connection_timeout, Duration::from_millis(5000));
+
+        // Verify zero values work (treated as None/no timeout)
+        let mut zero_config = Config::default_test_config();
+        zero_config.redis_response_timeout_ms = 0;
+        zero_config.redis_connection_timeout_ms = 0;
+        zero_config.validate_and_fix_timeouts();
+
+        assert_eq!(zero_config.redis_response_timeout_ms, 0);
+        assert_eq!(zero_config.redis_connection_timeout_ms, 0);
+    }
+}
+
+#[cfg(test)]
+mod service_mode_tests {
+    use super::*;
+
+    #[test]
+    fn test_service_mode_from_str() {
+        assert_eq!("all".parse::<ServiceMode>().unwrap(), ServiceMode::All);
+        assert_eq!("flags".parse::<ServiceMode>().unwrap(), ServiceMode::Flags);
+        assert_eq!(
+            "definitions".parse::<ServiceMode>().unwrap(),
+            ServiceMode::Definitions
+        );
+        // case insensitive
+        assert_eq!("ALL".parse::<ServiceMode>().unwrap(), ServiceMode::All);
+        assert_eq!("Flags".parse::<ServiceMode>().unwrap(), ServiceMode::Flags);
+        assert_eq!(
+            "DEFINITIONS".parse::<ServiceMode>().unwrap(),
+            ServiceMode::Definitions
+        );
+    }
+
+    #[test]
+    fn test_service_mode_invalid() {
+        assert!("invalid".parse::<ServiceMode>().is_err());
+        assert!("".parse::<ServiceMode>().is_err());
+    }
+
+    #[test]
+    fn test_service_mode_default() {
+        let config = Config::default_test_config();
+        assert_eq!(config.service_mode, ServiceMode::All);
+    }
+
+    #[test]
+    fn test_bot_filter_mode_from_str() {
+        // Canonical spellings.
+        assert_eq!(
+            "disabled".parse::<BotFilterMode>().unwrap(),
+            BotFilterMode::Disabled
+        );
+        assert_eq!(
+            "log_only".parse::<BotFilterMode>().unwrap(),
+            BotFilterMode::LogOnly
+        );
+        assert_eq!(
+            "enforced".parse::<BotFilterMode>().unwrap(),
+            BotFilterMode::Enforced
+        );
+        // Aliases — operators often reach for the simpler form.
+        assert_eq!(
+            "log-only".parse::<BotFilterMode>().unwrap(),
+            BotFilterMode::LogOnly
+        );
+        assert_eq!(
+            "enforce".parse::<BotFilterMode>().unwrap(),
+            BotFilterMode::Enforced
+        );
+        // Case-insensitive + whitespace-tolerant (mirrors ServiceMode).
+        assert_eq!(
+            "LOG_ONLY".parse::<BotFilterMode>().unwrap(),
+            BotFilterMode::LogOnly
+        );
+        assert_eq!(
+            "  Enforced  ".parse::<BotFilterMode>().unwrap(),
+            BotFilterMode::Enforced
+        );
+    }
+
+    #[test]
+    fn test_bot_filter_mode_invalid() {
+        assert!("".parse::<BotFilterMode>().is_err());
+        assert!("on".parse::<BotFilterMode>().is_err());
+        assert!("off".parse::<BotFilterMode>().is_err());
+        assert!("true".parse::<BotFilterMode>().is_err());
+    }
+
+    /// Pin the `Config → BillingAggregatorConfig` field mapping. A swap of
+    /// `from_millis`/`from_secs`, or a transposition of `flush_interval` and
+    /// `shutdown_flush_timeout`, would silently change the production
+    /// flush cadence by 1000×.
+    #[test]
+    fn get_billing_aggregator_config_maps_fields_correctly() {
+        use std::time::Duration;
+        let mut config = Config::default_test_config();
+        config.billing_flush_interval_ms = 250;
+        config.billing_max_pending_entries = 99;
+        config.billing_per_flush_batch_size = 7;
+        config.billing_shutdown_flush_timeout_ms = 5_000;
+
+        let bcfg = config.get_billing_aggregator_config();
+
+        assert_eq!(bcfg.flush_interval, Duration::from_millis(250));
+        assert_eq!(bcfg.max_pending_entries, 99);
+        assert_eq!(bcfg.per_flush_batch_size, 7);
+        assert_eq!(bcfg.shutdown_flush_timeout, Duration::from_millis(5_000));
+        assert_eq!(bcfg.jitter_override, None);
+    }
+}
+
+#[cfg(test)]
+mod thread_counts_tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::single_core(1, 1, 1)]
+    #[case::two_cores(2, 1, 2)]
+    #[case::four_cores(4, 2, 4)]
+    #[case::six_cores(6, 3, 6)]
+    #[case::eight_cores(8, 4, 8)]
+    #[case::sixteen_cores(16, 8, 16)]
+    fn test_thread_allocation(
+        #[case] cores: usize,
+        #[case] expected_tokio: usize,
+        #[case] expected_rayon: usize,
+    ) {
+        let counts = ThreadCounts::from_cores(cores);
+        assert_eq!(counts.tokio_workers, expected_tokio);
+        assert_eq!(counts.rayon_threads, expected_rayon);
+    }
+
+    #[test]
+    fn test_both_pools_always_have_at_least_one_thread() {
+        for cores in 1..=128 {
+            let counts = ThreadCounts::from_cores(cores);
+            assert!(
+                counts.tokio_workers >= 1,
+                "tokio must have >= 1 thread for {cores} cores"
+            );
+            assert!(
+                counts.rayon_threads >= 1,
+                "rayon must have >= 1 thread for {cores} cores"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rayon_gets_full_core_count() {
+        for cores in 1..=128 {
+            let counts = ThreadCounts::from_cores(cores);
+            assert_eq!(
+                counts.rayon_threads, cores,
+                "rayon should get full core count for {cores} cores"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tokio_gets_half_cores() {
+        for cores in 2..=128 {
+            let counts = ThreadCounts::from_cores(cores);
+            assert_eq!(
+                counts.tokio_workers,
+                cores / 2,
+                "tokio should get half the cores for {cores} cores"
+            );
+        }
+    }
+
+    #[test]
+    fn test_new_with_override_uses_override() {
+        let counts = ThreadCounts::new(8);
+        assert_eq!(counts.rayon_threads, 8);
+        assert_eq!(counts.tokio_workers, 4);
+    }
+
+    #[test]
+    fn test_new_with_zero_falls_back_to_detected() {
+        let counts = ThreadCounts::new(0);
+        // Should fall back to available_parallelism, which is always >= 1
+        assert!(counts.rayon_threads >= 1);
+        assert!(counts.tokio_workers >= 1);
+    }
+}
+
+#[cfg(test)]
+mod timeout_behavior_tests {
+    #[test]
+    fn test_is_timeout_correctly_identifies_timeout_errors() {
+        use common_redis::CustomRedisError;
+
+        // Test that CustomRedisError::Timeout is correctly identified
+        let timeout_err = CustomRedisError::Timeout;
+
+        // Verify timeout errors are recognized as timeouts
+        assert!(
+            matches!(timeout_err, CustomRedisError::Timeout),
+            "CustomRedisError::Timeout should match Timeout variant"
+        );
+
+        // Verify timeout errors are transient (not unrecoverable)
+        assert!(
+            !timeout_err.is_unrecoverable_error(),
+            "Timeout errors should be recoverable"
+        );
+
+        // Verify timeout errors use WaitAndRetry strategy
+        assert!(
+            matches!(
+                timeout_err.retry_method(),
+                common_redis::RetryMethod::WaitAndRetry
+            ),
+            "Timeout errors should use WaitAndRetry strategy"
+        );
+    }
+
+    #[test]
+    fn test_non_timeout_io_errors_not_identified_as_timeout() {
+        use common_redis::{CustomRedisError, RedisErrorKind};
+
+        // Create a non-timeout IoError
+        let io_err =
+            CustomRedisError::from_redis_kind(RedisErrorKind::IoError, "connection refused");
+
+        // Should not be converted to CustomRedisError::Timeout
+        match io_err {
+            CustomRedisError::Timeout => {
+                panic!("Non-timeout IoError should not be identified as timeout");
+            }
+            CustomRedisError::Redis(_) => {
+                // Expected - it's a Redis error but not a timeout
+            }
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn test_redis_timeout_integration() {
+        use common_redis::{Client, CompressionConfig, RedisClient, RedisValueFormat};
+        use std::time::Duration;
+
+        // This test requires a running Redis instance
+        // Set REDIS_URL environment variable to customize, defaults to localhost
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
+        // Test 1: Very short timeout should fail quickly with timeout error
+        let short_timeout_client = RedisClient::with_config(
+            redis_url.clone(),
+            CompressionConfig::disabled(),
+            RedisValueFormat::default(),
+            Some(Duration::from_millis(1)), // 1ms - too short for any operation
+            Some(Duration::from_millis(100)),
+        )
+        .await;
+
+        // With such a short timeout, we might fail during connection or during operation
+        // Either way, we're testing that timeouts work
+        match short_timeout_client {
+            Ok(client) => {
+                // If connection succeeded, try an operation
+                let result = client.get("test_timeout_key".to_string()).await;
+
+                // Should timeout (or not find the key - that's fine too)
+                if let Err(e) = result {
+                    println!("Got expected error with short timeout: {e:?}");
+                    // We got some error - that's expected with 1ms timeout
+                }
+            }
+            Err(e) => {
+                // Connection itself timed out - that's also valid
+                println!("Connection with short timeout failed as expected: {e:?}");
+            }
+        }
+
+        // Test 2: Reasonable timeout should allow successful connection
+        let normal_client = RedisClient::with_config(
+            redis_url,
+            CompressionConfig::disabled(),
+            RedisValueFormat::default(),
+            Some(Duration::from_millis(5000)), // 5 seconds - plenty of time
+            Some(Duration::from_millis(5000)),
+        )
+        .await;
+
+        match normal_client {
+            Ok(client) => {
+                // Connection worked - test a simple operation
+                let test_key = format!(
+                    "test_timeout_integration_{}",
+                    chrono::Utc::now().timestamp()
+                );
+                let test_value = "timeout_test_value".to_string();
+
+                // Should succeed with reasonable timeout
+                let set_result = client.set(test_key.clone(), test_value.clone()).await;
+                assert!(
+                    set_result.is_ok(),
+                    "Set operation should succeed with reasonable timeout"
+                );
+
+                // Clean up
+                drop(client.del(test_key).await);
+            }
+            Err(e) => {
+                println!("WARNING: Integration test skipped - could not connect to Redis: {e:?}");
+                println!("To run this test, ensure Redis is running at $REDIS_URL (default: redis://localhost:6379)");
+            }
+        }
+    }
+}

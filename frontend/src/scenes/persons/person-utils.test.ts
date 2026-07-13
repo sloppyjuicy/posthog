@@ -1,0 +1,329 @@
+import { uuid } from 'lib/utils/dom'
+import { urls } from 'scenes/urls'
+
+import { PersonType } from '~/types'
+
+import {
+    asDisplay,
+    asLink,
+    coercePropertyValue,
+    getPersonColorIndex,
+    parsePersonFromHogQLRow,
+    pickBestPersonDistinctId,
+    scoreDistinctId,
+} from './person-utils'
+
+describe('coercePropertyValue', () => {
+    it.each<{ input: Parameters<typeof coercePropertyValue>[0]; expected: ReturnType<typeof coercePropertyValue> }>([
+        // numeric strings
+        { input: '42', expected: 42 },
+        { input: '3.14', expected: 3.14 },
+        { input: '-1', expected: -1 },
+        { input: '0', expected: 0 },
+        { input: '1e5', expected: 100000 },
+
+        // empty string passes through unchanged
+        { input: '', expected: '' },
+
+        // Infinity passes through as string (JSON.stringify(Infinity) === "null")
+        { input: 'Infinity', expected: 'Infinity' },
+        { input: '-Infinity', expected: '-Infinity' },
+
+        // boolean strings (case-insensitive)
+        { input: 'true', expected: true },
+        { input: 'TRUE', expected: true },
+        { input: 'True', expected: true },
+        { input: 'false', expected: false },
+        { input: 'FALSE', expected: false },
+
+        // null string
+        { input: 'null', expected: null },
+        { input: 'NULL', expected: null },
+
+        // NaN stays as string
+        { input: 'NaN', expected: 'NaN' },
+
+        // regular strings pass through
+        { input: 'hello', expected: 'hello' },
+        { input: 'user@example.com', expected: 'user@example.com' },
+        { input: ' true', expected: ' true' },
+
+        // non-string types pass through
+        { input: true, expected: true },
+        { input: false, expected: false },
+        { input: null, expected: null },
+        { input: 123, expected: 123 },
+    ])('coerces $input to $expected', ({ input, expected }) => {
+        expect(coercePropertyValue(input)).toBe(expected)
+    })
+})
+
+describe('the person header', () => {
+    describe('linking to a person', () => {
+        const personLinksTestCases = [
+            { distinctIds: ['a uuid'], expectedLink: urls.personByDistinctId('a uuid'), name: 'with one id' },
+            {
+                distinctIds: ['the first uuid', 'a uuid'],
+                expectedLink: urls.personByDistinctId('the first uuid'),
+                name: 'with more than one id',
+            },
+            {
+                distinctIds: [],
+                expectedLink: undefined,
+                name: 'with no ids',
+            },
+            {
+                distinctIds: ['a+dicey/@!'],
+                expectedLink: urls.personByDistinctId('a+dicey/@!'),
+                name: 'with no ids',
+            },
+            {
+                // Anonymous ID first, identified ID second — the link should use the identified one
+                distinctIds: ['03b16e4c0b14ef-00000000000000-1633685d-13c680-17878af3ba9d1c', 'user@example.com'],
+                expectedLink: urls.personByDistinctId('user@example.com'),
+                name: 'preferring an identified ID over an anonymous one',
+            },
+        ]
+
+        it.each(personLinksTestCases.map((testCase) => [testCase.name, testCase]))(
+            'returns a link %s',
+            (_, testCase) => {
+                expect(asLink({ distinct_ids: testCase.distinctIds, properties: {} })).toEqual(testCase.expectedLink)
+            }
+        )
+
+        it('returns undefined for a person without a profile', () => {
+            expect(asLink({ distinct_ids: ['a uuid'] })).toBeUndefined()
+        })
+    })
+
+    const displayTestCases = [
+        {
+            isIdentified: true,
+            props: {
+                email: 'person@example.net',
+            },
+            personDisplay: 'person@example.net',
+
+            describe: 'when person is identified',
+            testName: 'if only email in person properties, shows identified people by email',
+        },
+        {
+            isIdentified: true,
+            props: {
+                name: 'Mr Potato-head',
+            },
+            personDisplay: 'Mr Potato-head',
+
+            describe: 'when person is identified',
+            testName: 'if only name in person properties, shows identified people by name',
+        },
+        {
+            isIdentified: true,
+            props: {
+                username: 'mr.potato.head',
+            },
+            personDisplay: 'mr.potato.head',
+
+            describe: 'when person is identified',
+            testName: 'if only username in person properties, shows identified people by username',
+        },
+        {
+            isIdentified: true,
+            props: {
+                email: 'person@example.com',
+                name: 'Mr Person',
+                username: 'mr.potato.head',
+            },
+            personDisplay: 'person@example.com',
+
+            describe: 'when person is identified',
+            testName: 'if there is a choice in person properties, shows identified people by email',
+        },
+        {
+            isIdentified: true,
+            distinctIds: ['03b16e4c0b14ef-00000000000000-1633685d-13c680-17878af3ba9d1c'],
+            props: {
+                email: null,
+            },
+            personDisplay: '03b16e4c0b14ef-00000…c680-17878af3ba9d1c',
+
+            describe: 'when person is identified',
+            testName: 'if there are no person properties, shows identified people by distinct ID',
+        },
+        {
+            isIdentified: true,
+            distinctIds: ['03b16e4c0b14ef-00000000000000-1633685d-13c680-17878af3ba9d1c', '1234abc'],
+            props: {
+                email: null,
+            },
+            personDisplay: '1234abc',
+            describe: 'when person is identified',
+            testName:
+                'if there are no person properties, shows identified people by distinct ID, preferring non-anon IDs',
+        },
+        {
+            isIdentified: true,
+            // The second ID has an "@" and a "." but is NOT an email
+            distinctIds: [
+                '03b16e4c0b14ef-00000000000000-1633685d-13c680-17878af3ba9d1c',
+                '1234.abc@',
+                'juliatusk@gmail.com',
+            ],
+            props: {
+                email: null,
+            },
+            personDisplay: 'juliatusk@gmail.com',
+            describe: 'when person is identified',
+            testName:
+                'if there are no person properties, shows identified people by distinct ID, preferring email-like',
+        },
+        {
+            isIdentified: false,
+            distinctIds: ['03b16e4c0b14ef-00000000000000-1633685d-13c680-17878af3babcde'],
+            props: {
+                email: null,
+            },
+            personDisplay: '03b16e4c0b14ef-00000…c680-17878af3babcde',
+
+            describe: 'when person is unidentified',
+            testName: 'if there are no person properties, shows people by distinct ID',
+        },
+        {
+            isIdentified: false,
+            distinctIds: ['03b16e4c0b14ef-00000000000000-1633685d-13c680-17878af3bzyxwv'],
+            props: {
+                email: 'example@person.com',
+                name: 'is not preferred over email',
+            },
+            personDisplay: 'example@person.com',
+
+            describe: 'when person is unidentified',
+            testName: 'if there are no person properties, shows people by distinct ID',
+        },
+    ]
+
+    it.each(displayTestCases.map((testCase) => [testCase.describe, testCase]))('displays person %s', (_, testCase) => {
+        const person: Pick<PersonType, 'distinct_ids' | 'properties'> = {
+            distinct_ids: testCase.distinctIds || [uuid()],
+            properties: testCase.props,
+        }
+
+        expect(asDisplay(person)).toEqual(testCase.personDisplay)
+    })
+
+    describe('color index', () => {
+        it('returns undefined for null/undefined identifier', () => {
+            expect(getPersonColorIndex(null)).toBeUndefined()
+            expect(getPersonColorIndex(undefined)).toBeUndefined()
+        })
+
+        it('returns a number between 0 and 15', () => {
+            for (let i = 0; i < 26; i++) {
+                const letter = String.fromCharCode(97 + i) // a-z
+                const idx = getPersonColorIndex(`user-1234${letter}`)
+                expect(idx).toBeGreaterThanOrEqual(0)
+                expect(idx).toBeLessThanOrEqual(15)
+            }
+        })
+
+        it('returns consistent index for the same identifier', () => {
+            const index1 = getPersonColorIndex('user-abc-123')
+            const index2 = getPersonColorIndex('user-abc-123')
+            expect(index1).toEqual(index2)
+        })
+
+        it('returns different indices for identifiers starting with the same character', () => {
+            // This is the key test: identifiers starting with same char should get different colors
+            const index1 = getPersonColorIndex('0abc123')
+            const index2 = getPersonColorIndex('0xyz789')
+            const index3 = getPersonColorIndex('0different')
+
+            // At least two of these should be different (with good hash distribution)
+            const uniqueIndices = new Set([index1, index2, index3])
+            expect(uniqueIndices.size).toBe(3)
+        })
+    })
+})
+
+describe('parsePersonFromHogQLRow', () => {
+    it('parses a complete row into a PersonType', () => {
+        const row = ['uuid-1', ['did-1', 'did-2'], '{"email":"a@b.com"}', true, '2024-01-01', '2024-06-01']
+        const person = parsePersonFromHogQLRow(row)
+        expect(person).toEqual({
+            id: 'uuid-1',
+            uuid: 'uuid-1',
+            distinct_ids: ['did-1', 'did-2'],
+            properties: { email: 'a@b.com' },
+            is_identified: true,
+            created_at: '2024-01-01',
+            last_seen_at: '2024-06-01',
+        })
+    })
+
+    it('handles empty/null properties gracefully', () => {
+        const row = ['uuid-1', [], '', false, null, null]
+        const person = parsePersonFromHogQLRow(row)
+        expect(person.properties).toEqual({})
+        expect(person.is_identified).toBe(false)
+    })
+
+    it('handles malformed JSON properties gracefully', () => {
+        const row = ['uuid-1', [], '{not valid json', false, null, null]
+        const person = parsePersonFromHogQLRow(row)
+        expect(person.properties).toEqual({})
+    })
+})
+
+describe('scoreDistinctId', () => {
+    it.each([
+        { id: 'user@example.com', expected: 2, label: 'email gets highest score' },
+        { id: 'juliatusk@gmail.com', expected: 2, label: 'gmail email gets highest score' },
+        {
+            id: '03b16e4c0b14ef-00000000000000-1633685d-13c680-17878af3ba9d1c',
+            expected: 0,
+            label: 'posthog-js anon ID gets lowest score',
+        },
+        { id: 'user123', expected: 1, label: 'custom ID gets middle score' },
+        { id: 'my-custom-id', expected: 1, label: 'hyphenated custom ID gets middle score' },
+        {
+            id: '550e8400-e29b-41d4-a716-446655440000',
+            expected: 1,
+            label: 'standard UUID (36 chars) gets middle score',
+        },
+    ])('$label: $id → $expected', ({ id, expected }) => {
+        expect(scoreDistinctId(id)).toBe(expected)
+    })
+})
+
+describe('pickBestPersonDistinctId', () => {
+    const anonId = '03b16e4c0b14ef-00000000000000-1633685d-13c680-17878af3ba9d1c'
+    it.each([
+        { distinctIds: undefined, expected: undefined, label: 'undefined returns undefined' },
+        { distinctIds: [], expected: undefined, label: 'empty array returns undefined' },
+        { distinctIds: ['only-one'], expected: 'only-one', label: 'single ID is returned as-is' },
+        {
+            distinctIds: [anonId, 'user@example.com'],
+            expected: 'user@example.com',
+            label: 'prefers an email over an anonymous ID regardless of position',
+        },
+        {
+            distinctIds: [anonId, 'custom-123'],
+            expected: 'custom-123',
+            label: 'prefers a custom ID over an anonymous ID',
+        },
+        {
+            distinctIds: ['custom-123', anonId, 'user@example.com'],
+            expected: 'user@example.com',
+            label: 'prefers an email over both custom and anonymous IDs',
+        },
+    ])('$label', ({ distinctIds, expected }) => {
+        expect(pickBestPersonDistinctId(distinctIds)).toBe(expected)
+    })
+
+    it('does not mutate the input array', () => {
+        const distinctIds = [anonId, 'user@example.com']
+        pickBestPersonDistinctId(distinctIds)
+        expect(distinctIds).toEqual([anonId, 'user@example.com'])
+    })
+})

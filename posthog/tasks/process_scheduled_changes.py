@@ -1,0 +1,378 @@
+import os
+import json
+import socket
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from django.core.exceptions import ObjectDoesNotExist, ValidationError
+from django.db import IntegrityError, OperationalError, transaction
+from django.utils import timezone
+
+import structlog
+from celery import current_task
+from croniter import croniter  # type: ignore[import-untyped,unused-ignore]
+from dateutil.relativedelta import relativedelta
+from prometheus_client import Counter
+
+from posthog.exceptions_capture import capture_exception
+
+from products.approvals.backend.exceptions import ApprovalRequired
+from products.approvals.backend.scheduled_changes import apply_gated_scheduled_change, regate_recurring_scheduled_change
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+from products.feature_flags.backend.models.scheduled_change import ScheduledChange
+
+logger = structlog.get_logger(__name__)
+
+models = {"FeatureFlag": FeatureFlag}
+
+# Maximum number of retry attempts before marking as permanently failed
+MAX_RETRY_ATTEMPTS = 5
+
+# Cap for the catch-up loop when skipping missed recurring executions.
+# Prevents runaway iteration if a schedule has been dormant for a long time.
+MAX_CATCHUP_ITERATIONS = 1000
+
+# Prometheus metric for tracking missed scheduled executions
+SCHEDULED_CHANGE_MISSED_EXECUTIONS = Counter(
+    "posthog_scheduled_change_missed_executions_total",
+    "Number of scheduled change executions that were skipped due to delayed processing",
+    ["interval"],
+)
+
+
+def is_unrecoverable_error(exception: Exception) -> bool:
+    """
+    Determine if an exception represents an unrecoverable error that should not be retried.
+
+    Unrecoverable errors include:
+    - Validation errors (bad payload, invalid data)
+    - Missing objects (feature flag doesn't exist)
+    - Database constraint violations
+    - Business logic errors
+
+    Recoverable errors (should retry):
+    - Database connection timeouts
+    - Network connectivity issues
+    - Temporary service unavailability
+    """
+    # Exception types that indicate permanent failures
+    unrecoverable_types = (
+        ValidationError,
+        ObjectDoesNotExist,
+        IntegrityError,
+        ValueError,  # Bad payload structure
+        KeyError,  # Missing required payload fields
+        TypeError,  # Wrong data types in payload
+    )
+
+    # Check for specific error messages that indicate permanent failures
+    error_message = str(exception).lower()
+    permanent_error_indicators = [
+        "invalid payload",
+        "unrecognized operation",
+        "does not exist",
+        "constraint",
+        "foreign key",
+        "unique constraint",
+    ]
+
+    if any(indicator in error_message for indicator in permanent_error_indicators):
+        return True
+
+    return isinstance(exception, unrecoverable_types)
+
+
+def compute_next_run(current: datetime, interval: str) -> datetime:
+    """
+    Compute the next scheduled run time based on recurrence interval.
+
+    Uses relativedelta for reliable date arithmetic:
+    - Daily: adds exactly 1 day
+    - Weekly: adds exactly 7 days
+    - Monthly: adds 1 month, handling month-end edge cases
+      (e.g., Jan 31 + 1 month = Feb 28/29, not Mar 3)
+    - Yearly: adds 1 year, handling leap year edge cases
+      (e.g., Feb 29 + 1 year = Feb 28 in non-leap years)
+
+    Args:
+        current: The current scheduled_at datetime
+        interval: One of 'daily', 'weekly', 'monthly', 'yearly' (validated at API layer via
+            ScheduledChange.RecurrenceInterval). We use str instead of Literal here
+            because Django's TextChoices fields return str at runtime, not the enum type.
+
+    Returns:
+        The next scheduled datetime
+
+    Raises:
+        ValueError: If interval is not a recognized value
+    """
+    if interval == "daily":
+        return current + relativedelta(days=1)
+    elif interval == "weekly":
+        return current + relativedelta(weeks=1)
+    elif interval == "monthly":
+        return current + relativedelta(months=1)
+    elif interval == "yearly":
+        return current + relativedelta(years=1)
+    raise ValueError(f"Unknown recurrence interval: {interval}")
+
+
+UTC_ZONE_INFO = ZoneInfo("UTC")
+
+
+def resolve_schedule_timezone(tz_name: str | None) -> ZoneInfo:
+    """
+    Resolve a stored timezone name to a ZoneInfo, falling back to UTC for NULL or invalid values.
+
+    Pre-resolving once per scheduled change keeps the catch-up loop off the exception path when
+    a row carries a malformed timezone string.
+    """
+    if not tz_name:
+        return UTC_ZONE_INFO
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        return UTC_ZONE_INFO
+
+
+def compute_next_run_cron(cron_expr: str, current: datetime, tz: ZoneInfo = UTC_ZONE_INFO) -> datetime:
+    """
+    Compute the next scheduled run time from a cron expression.
+
+    croniter resolves cron fields in the tzinfo of the datetime argument. Wall-clock fields
+    like "0 9 * * 1-5" are meaningful in a local timezone, not UTC — so when a row records
+    the timezone it was authored in, we localize before evaluating and convert the result
+    back to UTC for storage. Rows predating the timezone column resolve to UTC and keep
+    their historical UTC interpretation unchanged.
+
+    Args:
+        cron_expr: A standard 5-field cron expression (e.g., "0 9 * * 1-5" for weekdays at 9am).
+        current: The reference datetime to compute the next run from. Must be tz-aware.
+        tz: Timezone in which to interpret the cron's wall-clock fields. Defaults to UTC.
+
+    Returns:
+        The next datetime matching the cron expression after `current`, in UTC.
+    """
+    reference = current.astimezone(tz)
+    next_run = croniter(cron_expr, reference).get_next(datetime)
+    return next_run.astimezone(UTC)
+
+
+def process_scheduled_changes() -> None:
+    try:
+        with transaction.atomic():
+            scheduled_changes = (
+                # Scope the row lock to the ScheduledChange rows only (of=("self",)) — a bare
+                # select_related would widen select_for_update's lock to the joined change_request /
+                # created_by rows, adding contention with the approve flow that mutates ChangeRequest.
+                ScheduledChange.objects.select_for_update(nowait=True, of=("self",))
+                # No select_related("change_request"): apply_gated_scheduled_change always re-fetches
+                # the bound CR under select_for_update (the prefetched copy can be stale), and the
+                # rest of the loop only reads change_request_id — a local column needing no join.
+                .select_related("created_by")
+                .filter(
+                    executed_at__isnull=True,
+                    scheduled_at__lte=timezone.now(),
+                )
+                .order_by("scheduled_at")[:10000]
+            )
+
+            for scheduled_change in scheduled_changes:
+                # Skip paused recurring schedules (is_recurring=false but has a recurrence config).
+                # A schedule is paused when is_recurring is false yet it still carries either a
+                # recurrence_interval or a cron_expression — the config is retained so it can be resumed.
+                has_recurrence_config = scheduled_change.recurrence_interval or scheduled_change.cron_expression
+                is_paused = not scheduled_change.is_recurring and has_recurrence_config
+                if is_paused:
+                    continue
+
+                # Skip recurring schedules that have passed their end_date without executing.
+                # This prevents a stale schedule from firing one last time after the window has closed.
+                now = timezone.now()
+                if scheduled_change.end_date and scheduled_change.end_date <= now and has_recurrence_config:
+                    scheduled_change.executed_at = now
+                    scheduled_change.save()
+                    continue
+
+                try:
+                    # Execute the change on the model instance
+                    model = models[scheduled_change.model_name]
+                    instance = model.objects.get(id=scheduled_change.record_id, team_id=scheduled_change.team_id)
+
+                    # Approval-aware dispatch: a scheduled change whose payload flips a policy-gated
+                    # field carries a bound ChangeRequest created at scheduling time. We only apply
+                    # it through the approved path once that CR is approved; if it is still pending
+                    # when the fire window closes, the CR is expired and the change is skipped. An
+                    # unbound (ungated) change dispatches through the serializer as before.
+                    if apply_gated_scheduled_change(scheduled_change, instance):
+                        instance.scheduled_changes_dispatcher(
+                            scheduled_change.payload,
+                            scheduled_change.created_by,
+                            scheduled_change_id=scheduled_change.id,
+                        )
+
+                    # Handle recurring vs one-time schedules.
+                    # A recurring schedule uses either a cron expression or a fixed recurrence interval.
+                    is_recurring_schedule = scheduled_change.is_recurring and (
+                        scheduled_change.cron_expression or scheduled_change.recurrence_interval
+                    )
+                    if is_recurring_schedule:
+                        # Compute next run time, handling delayed execution
+                        cron_expr = scheduled_change.cron_expression
+                        interval = scheduled_change.recurrence_interval
+                        tz = resolve_schedule_timezone(scheduled_change.timezone)
+
+                        if cron_expr:
+                            next_run = compute_next_run_cron(cron_expr, scheduled_change.scheduled_at, tz)
+                            interval_label = "cron"
+                        else:
+                            assert interval is not None
+                            next_run = compute_next_run(scheduled_change.scheduled_at, interval)
+                            interval_label = interval
+
+                        # If task execution was delayed and next_run is still in the past, skip ahead
+                        # to avoid immediate re-trigger or missed executions piling up
+                        now = timezone.now()
+                        skipped_count = 0
+                        while next_run <= now and skipped_count < MAX_CATCHUP_ITERATIONS:
+                            if cron_expr:
+                                next_run = compute_next_run_cron(cron_expr, next_run, tz)
+                            else:
+                                assert interval is not None
+                                next_run = compute_next_run(next_run, interval)
+                            skipped_count += 1
+
+                        # If we hit the cap and next_run is still in the past, jump directly
+                        # to the first occurrence after now to prevent an infinite re-execution loop.
+                        if next_run <= now:
+                            logger.error(
+                                "Recurring schedule hit catch-up cap; jumping to next occurrence after now",
+                                scheduled_change_id=scheduled_change.id,
+                                skipped_count=skipped_count,
+                                interval=interval_label,
+                            )
+                            if cron_expr:
+                                next_run = compute_next_run_cron(cron_expr, now, tz)
+                            else:
+                                assert interval is not None
+                                next_run = compute_next_run(now, interval)
+
+                        # Log and track if we skipped executions due to delayed processing
+                        # (skipped_count > 1 means we skipped more than just advancing to the next run)
+                        if skipped_count > 1:
+                            missed_count = skipped_count - 1
+                            logger.warning(
+                                "Recurring schedule skipped executions due to delayed processing",
+                                scheduled_change_id=scheduled_change.id,
+                                missed_count=missed_count,
+                                interval=interval_label,
+                                next_run=next_run.isoformat(),
+                            )
+                            SCHEDULED_CHANGE_MISSED_EXECUTIONS.labels(interval=interval_label).inc(missed_count)
+
+                        # Check if end_date has passed - if so, mark as completed
+                        if scheduled_change.end_date and next_run > scheduled_change.end_date:
+                            scheduled_change.executed_at = now
+                            scheduled_change.last_executed_at = now
+                            scheduled_change.save()
+                        else:
+                            # A bound ChangeRequest is single-use; the next occurrence needs its own
+                            # approval. Always re-gate against the flag's current state and rebind
+                            # (None when no policy now applies, so the next fire dispatches ungated).
+                            # Re-gating must run *before* scheduled_at/last_executed_at are written:
+                            #   1. A row born ungated (change_request_id is None, no policy matched at
+                            #      creation) must still be re-evaluated — a policy enabled since then
+                            #      has to gate every future occurrence, so we can't skip re-gating on a
+                            #      null binding.
+                            #   2. Re-gating can raise PolicyConflict; running it first lets that
+                            #      exception propagate before the advanced scheduled_at is persisted, so
+                            #      the failure handler stops advancing the schedule rather than silently
+                            #      skipping the conflicting occurrence.
+                            try:
+                                new_change_request = regate_recurring_scheduled_change(scheduled_change, instance)
+                            except ApprovalRequired:
+                                # A pending/approved CR for the same flag+action already exists (a
+                                # second schedule, or an immediate edit awaiting approval), so this
+                                # occurrence can't be given its own gate yet. Defer instead of
+                                # advancing: advancing would require either a fresh CR (which the
+                                # conflict forbids) or a null binding, and a null binding dispatches
+                                # the next fire ungated — the exact bypass this gating closes. Leave
+                                # the row untouched (scheduled_at unchanged) so the next sweep
+                                # re-gates it, and don't route through the failure handler, so a
+                                # transient duplicate doesn't retry the schedule to exhaustion and
+                                # mark it permanently failed. It self-heals once the conflicting CR
+                                # resolves. PolicyConflict is deliberately not caught — that's a
+                                # genuine, non-transient conflict the failure handler should record.
+                                logger.info(
+                                    "Deferring recurring scheduled change; a conflicting change request is awaiting approval",
+                                    scheduled_change_id=scheduled_change.id,
+                                )
+                                continue
+                            scheduled_change.change_request = new_change_request
+                            scheduled_change.scheduled_at = next_run
+                            scheduled_change.last_executed_at = now
+                            scheduled_change.save()
+                    else:
+                        # One-time schedule: mark as completed
+                        # Note: We intentionally don't set last_executed_at for one-time schedules
+                        # because executed_at already serves as the completion timestamp. last_executed_at
+                        # is an audit field for recurring schedules to track "when did the last recurrence run"
+                        # while executed_at=NULL (schedule still active).
+                        scheduled_change.executed_at = timezone.now()
+                        scheduled_change.save()
+
+                except Exception as e:
+                    # Build comprehensive failure context (only info not already in ScheduledChange columns)
+                    failure_context: dict[str, str | int | bool] = {
+                        "error": str(e),
+                        "error_type": e.__class__.__name__,
+                    }
+
+                    # Add execution context
+                    if current_task and hasattr(current_task, "request") and current_task.request:
+                        task_id = getattr(current_task.request, "id", None)
+                        worker_hostname = getattr(current_task.request, "hostname", None)
+                        if task_id is not None:
+                            failure_context["task_id"] = str(task_id)
+                        if worker_hostname is not None:
+                            failure_context["worker_hostname"] = str(worker_hostname)
+
+                    # Add system context
+                    try:
+                        failure_context["hostname"] = os.getenv("HOSTNAME") or socket.gethostname()
+                    except:
+                        failure_context["hostname"] = "unknown"
+
+                    # Increment failure count first
+                    scheduled_change.failure_count += 1
+
+                    # Determine if we will retry based on error type and failure count
+                    is_unrecoverable = is_unrecoverable_error(e)
+                    has_exceeded_max_retries = scheduled_change.failure_count >= MAX_RETRY_ATTEMPTS
+                    will_retry = not is_unrecoverable and not has_exceeded_max_retries
+
+                    # Add retry status to failure context
+                    failure_context["will_retry"] = will_retry
+                    failure_context["retry_count"] = scheduled_change.failure_count
+                    failure_context["max_retries"] = MAX_RETRY_ATTEMPTS
+
+                    if has_exceeded_max_retries:
+                        failure_context["retry_exhausted"] = True
+
+                    if is_unrecoverable:
+                        failure_context["error_classification"] = "unrecoverable"
+                    else:
+                        failure_context["error_classification"] = "recoverable"
+
+                    scheduled_change.failure_reason = json.dumps(failure_context)
+
+                    # Only mark as permanently failed if we won't retry
+                    if not will_retry:
+                        scheduled_change.executed_at = timezone.now()
+                    # For recoverable errors under retry limit, leave executed_at=NULL to allow retries
+
+                    scheduled_change.save()
+                    capture_exception(e)
+    except OperationalError:
+        # Failed to obtain the lock
+        pass

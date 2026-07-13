@@ -1,5 +1,4 @@
-import React from 'react'
-
+// Kept in a separate file and not ./strings.ts because this one requires .tsx extension
 export default function stringWithWBR(text: string, splitAt = 30): JSX.Element {
     const addWBRAfter = [',', '.', '/', '\\']
     const naturalSplit = [' ', '-']

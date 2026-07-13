@@ -1,0 +1,33 @@
+{
+    "name": "@posthog/products-workflows",
+    "scripts": {
+        "backend:test": "pytest -c ../../pytest.ini --rootdir ../.. backend/ -v --tb=short"
+    },
+    "dependencies": {
+        "kea": "catalog:",
+        "kea-forms": "catalog:",
+        "kea-loaders": "catalog:",
+        "kea-router": "catalog:",
+        "kea-subscriptions": "catalog:",
+        "posthog-js": "catalog:",
+        "use-debounce": "catalog:",
+        "zod": "^4.0.0"
+    },
+    "devDependencies": {
+        "@storybook/react": "catalog:",
+        "@testing-library/react": "*",
+        "kea-test-utils": "catalog:"
+    },
+    "peerDependencies": {
+        "@posthog/brand": "catalog:",
+        "@posthog/icons": "catalog:",
+        "@types/react": "*",
+        "@xyflow/react": "*",
+        "clsx": "*",
+        "elkjs": "*",
+        "fast-deep-equal": "*",
+        "fuse.js": "*",
+        "react": "*",
+        "rrule": "*"
+    }
+}

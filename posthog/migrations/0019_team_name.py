@@ -4,13 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0018_funnel_deleted"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name="team", name="name", field=models.CharField(blank=True, max_length=200, null=True),
+            model_name="team",
+            name="name",
+            field=models.CharField(blank=True, max_length=200, null=True),
         ),
     ]

@@ -1,0 +1,560 @@
+import '~/queries/utils'
+
+import { actions, afterMount, beforeUnmount, connect, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+import posthog from 'posthog-js'
+
+import { keyForSource } from '@posthog/replay-shared'
+import { SnapshotSourceType, SnapshotStore, SourceLoadingState } from '@posthog/replay-shared'
+
+import api, { RecordingDeletedError } from 'lib/api'
+import 'lib/dayjs'
+import { parseEncodedSnapshots } from 'scenes/session-recordings/player/snapshot-processing/process-all-snapshots'
+import { windowIdRegistryLogic } from 'scenes/session-recordings/player/windowIdRegistryLogic'
+
+import {
+    RecordingSnapshot,
+    SessionRecordingId,
+    SessionRecordingSnapshotParams,
+    SessionRecordingSnapshotSource,
+    SessionRecordingSnapshotSourceResponse,
+} from '~/types'
+
+import { SeekTarget, planNextBatch } from './snapshot-store/planNextBatch'
+import type { snapshotDataLogicType } from './snapshotDataLogicType'
+
+const DEFAULT_V2_POLLING_INTERVAL_MS: number = 10000
+const MAX_V2_POLLING_INTERVAL_MS = 60000
+const POLLING_INACTIVITY_TIMEOUT_MS = 5 * MAX_V2_POLLING_INTERVAL_MS
+
+export interface SnapshotLogicProps {
+    sessionRecordingId: SessionRecordingId
+    // allows disabling polling for new sources in tests
+    blobV2PollingDisabled?: boolean
+    accessToken?: string
+}
+
+// Reactivity note (#53893): `cache.store` (SnapshotStore) lives outside Kea, so any listener that mutates it (markFetched, setSources) MUST dispatch `storeUpdated()` afterwards, and any selector reading it MUST depend on `storeVersion`.
+export const snapshotDataLogic = kea<snapshotDataLogicType>([
+    path((key) => ['scenes', 'session-recordings', 'snapshotLogic', key]),
+    props({} as SnapshotLogicProps),
+    key(({ sessionRecordingId }) => sessionRecordingId || 'no-session-recording-id'),
+    connect((props: SnapshotLogicProps) => ({
+        actions: [windowIdRegistryLogic({ sessionRecordingId: props.sessionRecordingId }), ['registerWindowId']],
+        values: [
+            windowIdRegistryLogic({ sessionRecordingId: props.sessionRecordingId }),
+            ['uuidToIndex', 'getWindowId'],
+        ],
+    })),
+    actions({
+        setSnapshots: (snapshots: RecordingSnapshot[]) => ({ snapshots }),
+        loadSnapshots: true,
+        // Terminal: a source kept failing to load and retries are exhausted. Distinct from the
+        // per-attempt loadSnapshotsForSourceFailure so the player can show an error even when other
+        // sources already loaded (otherwise seeks into the missing range buffer forever).
+        snapshotSourceLoadExhausted: true,
+        loadSnapshotSources: (breakpointLength?: number) => ({ breakpointLength }),
+        loadNextSnapshotSource: true,
+        loadSnapshotsForSource: (sources: Pick<SessionRecordingSnapshotSource, 'source' | 'blob_key'>[]) => ({
+            sources,
+        }),
+        maybeStartPolling: true,
+        startPolling: true,
+        stopPolling: true,
+        setPollingInterval: (intervalMs: number) => ({ intervalMs }),
+        resetPollingInterval: true,
+        setTargetTimestamp: (timestamp: number | null, windowId?: number) => ({ timestamp, windowId }),
+        updatePlaybackPosition: (timestamp: number, windowId?: number) => ({ timestamp, windowId }),
+        setPlayerActive: (active: boolean) => ({ active }),
+        loadAllSources: true,
+        // dispatch after any mutation to cache.store — it lives outside Kea's reactivity and needs explicit invalidation
+        storeUpdated: true,
+    }),
+    reducers(() => ({
+        storeUpdateCount: [
+            0,
+            {
+                storeUpdated: (state: number) => state + 1,
+            },
+        ],
+        seekTarget: [
+            null as SeekTarget | null,
+            {
+                setTargetTimestamp: (_: SeekTarget | null, { timestamp, windowId }) =>
+                    timestamp === null ? null : { timestamp, windowId },
+            },
+        ],
+        loadAllMode: [
+            false,
+            {
+                loadAllSources: () => true,
+            },
+        ],
+        loadingSources: [
+            [] as Pick<SessionRecordingSnapshotSource, 'source' | 'blob_key' | 'start_timestamp' | 'end_timestamp'>[],
+            {
+                loadSnapshotsForSource: (_, { sources }) => sources,
+                loadSnapshotsForSourceSuccess: () => [],
+                loadSnapshotsForSourceFailure: () => [],
+            },
+        ],
+        pollingInterval: [
+            DEFAULT_V2_POLLING_INTERVAL_MS,
+            {
+                setPollingInterval: (_, { intervalMs }) => intervalMs,
+                resetPollingInterval: () => DEFAULT_V2_POLLING_INTERVAL_MS,
+            },
+        ],
+        isPolling: [
+            false,
+            {
+                startPolling: () => true,
+                stopPolling: () => false,
+            },
+        ],
+        snapshotLoadError: [
+            null as Error | null,
+            {
+                loadSnapshotsForSource: () => null,
+                loadSnapshotsForSourceSuccess: () => null,
+                loadSnapshotsForSourceFailure: (_, { errorObject }) => errorObject ?? null,
+            },
+        ],
+    })),
+    loaders(({ values, props, cache, actions }) => ({
+        snapshotSources: [
+            null as SessionRecordingSnapshotSource[] | null,
+            {
+                loadSnapshotSources: async ({ breakpointLength }, breakpoint) => {
+                    // Always breakpoint before the API call so orphaned loaders
+                    // from StrictMode's unmounted logic get cancelled.
+                    await breakpoint(breakpointLength || 1)
+
+                    const headers: Record<string, string> = {}
+                    if (props.accessToken) {
+                        headers.Authorization = `Bearer ${props.accessToken}`
+                    }
+
+                    const response = await api.recordings.listSnapshotSources(props.sessionRecordingId, headers)
+
+                    if (!response || !response.sources) {
+                        // A null/malformed body is a failed load, not a recording with no sources —
+                        // returning [] here would silently dead-end with no error and no polling.
+                        throw new Error('Malformed response listing snapshot sources')
+                    }
+                    const anyBlobV2 = response.sources.some((s) => s.source === SnapshotSourceType.blob_v2)
+
+                    if (anyBlobV2) {
+                        return response.sources.filter((s) => s.source === SnapshotSourceType.blob_v2)
+                    }
+                    return response.sources.filter((s) => s.source !== SnapshotSourceType.blob_v2)
+                },
+            },
+        ],
+        snapshotsForSource: [
+            null as SessionRecordingSnapshotSourceResponse | null,
+            {
+                loadSnapshotsForSource: async ({ sources }, breakpoint) => {
+                    let params: SessionRecordingSnapshotParams
+
+                    const source = sources[0]
+
+                    if (source.source === SnapshotSourceType.blob_v2_lts) {
+                        if (!source.blob_key) {
+                            throw new Error('Missing key')
+                        }
+                        params = { blob_key: source.blob_key, source: 'blob_v2_lts' }
+                    } else if (source.source === SnapshotSourceType.blob_v2) {
+                        // they all have to be blob_v2
+                        if (sources.some((s) => s.source !== SnapshotSourceType.blob_v2)) {
+                            throw new Error('Unsupported source for multiple sources')
+                        }
+                        params = {
+                            source: 'blob_v2',
+                            // so the caller has to make sure these are in order!
+                            start_blob_key: sources[0].blob_key,
+                            end_blob_key: sources[sources.length - 1].blob_key,
+                        }
+                    } else if (source.source === SnapshotSourceType.file) {
+                        // no need to load a file source, it is already loaded
+                        return { source }
+                    } else {
+                        throw new Error(`Unsupported source: ${source.source}`)
+                    }
+
+                    await breakpoint(1)
+
+                    const headers: Record<string, string> = {}
+                    if (props.accessToken) {
+                        headers.Authorization = `Bearer ${props.accessToken}`
+                    }
+
+                    const response = await api.recordings.getSnapshots(
+                        props.sessionRecordingId,
+                        { decompress: false, ...params },
+                        headers
+                    )
+
+                    breakpoint()
+
+                    // Create a local copy of the registry state for synchronous lookups during parsing
+                    const localWindowIds: Record<string, number> = { ...values.uuidToIndex }
+                    const newUuids: string[] = []
+                    const registerWindowIdCallback = (uuid: string): number => {
+                        if (uuid in localWindowIds) {
+                            return localWindowIds[uuid]
+                        }
+                        const index = Object.keys(localWindowIds).length + 1
+                        localWindowIds[uuid] = index
+                        newUuids.push(uuid)
+                        return index
+                    }
+
+                    // sorting is very cheap for already sorted lists
+                    const parsedSnapshots = (
+                        await parseEncodedSnapshots(
+                            response,
+                            props.sessionRecordingId,
+                            posthog,
+                            registerWindowIdCallback
+                        )
+                    ).sort((a, b) => a.timestamp - b.timestamp)
+
+                    breakpoint()
+
+                    // Sync any newly discovered window IDs to the shared registry
+                    for (const uuid of newUuids) {
+                        actions.registerWindowId(uuid)
+                    }
+                    cache.pendingBatch = { sources, snapshots: parsedSnapshots }
+
+                    return { sources }
+                },
+            },
+        ],
+    })),
+    listeners(({ values, actions, cache, props, selectors }) => ({
+        setTargetTimestamp: ({ timestamp, windowId }, _breakpoint, __, previousState) => {
+            if (timestamp === null) {
+                return
+            }
+            cache.playbackPosition = timestamp
+            cache.playbackWindowId = windowId
+            const previousTarget = selectors.seekTarget(previousState)
+            if (previousTarget?.timestamp !== timestamp || previousTarget?.windowId !== windowId) {
+                // A genuinely new target grants fresh retries after the permanent-failure cap.
+                cache.loadFailureCount = 0
+            }
+            actions.loadNextSnapshotSource()
+        },
+
+        updatePlaybackPosition: ({ timestamp, windowId }) => {
+            cache.playbackPosition = timestamp
+            cache.playbackWindowId = windowId
+            // Trigger loading if the buffer ahead needs filling
+            actions.loadNextSnapshotSource()
+        },
+
+        setPlayerActive: ({ active }) => {
+            cache.playerActive = active
+            if (active) {
+                actions.loadNextSnapshotSource()
+            }
+        },
+
+        loadAllSources: () => {
+            actions.loadNextSnapshotSource()
+        },
+
+        // Sources can become playable (promotion) without any new fetch completing, and polling only arms once everything is loaded — so the poll gate re-checks on every store mutation; it is fully guarded and inert mid-fetch.
+        storeUpdated: () => {
+            actions.maybeStartPolling()
+        },
+
+        setSnapshots: ({ snapshots }: { snapshots: RecordingSnapshot[] }) => {
+            if (cache.store) {
+                const fileSource = { source: SnapshotSourceType.file } as SessionRecordingSnapshotSource
+                cache.store.setSources([fileSource])
+                cache.store.markFetched(0, snapshots)
+                cache.pendingBatch = { snapshots, sources: [fileSource] }
+                actions.storeUpdated()
+            }
+
+            // Set sources first, then trigger the success action
+            // Otherwise processSnapshotsAsync will see null sources
+            actions.loadSnapshotSourcesSuccess([{ source: SnapshotSourceType.file }])
+            actions.loadSnapshotsForSourceSuccess({
+                source: { source: SnapshotSourceType.file },
+            })
+        },
+
+        loadSnapshots: () => {
+            // This kicks off the loading chain
+            if (!values.snapshotSourcesLoading) {
+                actions.loadSnapshotSources()
+            }
+        },
+
+        loadSnapshotSourcesSuccess: ({ snapshotSources }) => {
+            const currentSourceKeys = snapshotSources
+                .map((s) => s.blob_key)
+                .filter(Boolean)
+                .sort()
+            const previousSourceKeys = cache.previousSourceKeys || []
+
+            const sourcesChanged =
+                currentSourceKeys.length !== previousSourceKeys.length ||
+                currentSourceKeys.some((key, i) => key !== previousSourceKeys[i])
+
+            cache.previousSourceKeys = currentSourceKeys
+
+            // Close the poll cycle on both branches, or maybeStartPolling's isPolling gate blocks every future poll after the first unchanged response.
+            actions.stopPolling()
+            if (sourcesChanged) {
+                actions.resetPollingInterval()
+                cache.lastSourcesChangeTime = Date.now()
+                cache.store?.setSources(snapshotSources)
+                actions.storeUpdated()
+            } else {
+                const currentInterval = values.pollingInterval
+                const newInterval = Math.min(currentInterval * 2, MAX_V2_POLLING_INTERVAL_MS)
+                actions.setPollingInterval(newInterval)
+            }
+
+            actions.loadNextSnapshotSource()
+        },
+
+        loadSnapshotsForSourceSuccess: ({ snapshotsForSource }) => {
+            cache.loadFailureCount = 0
+            const sources = values.snapshotSources
+            if (!sources) {
+                return
+            }
+
+            const pending = cache.pendingBatch
+            cache.pendingBatch = null
+            const allBatchSnapshots: RecordingSnapshot[] = pending?.snapshots || []
+            const loadedSources: Pick<SessionRecordingSnapshotSource, 'source' | 'blob_key'>[] = pending?.sources ||
+                snapshotsForSource.sources || [snapshotsForSource.source]
+
+            if (!allBatchSnapshots.length && sources.length === 1 && sources[0].source !== SnapshotSourceType.file) {
+                posthog.capture('recording_snapshots_v2_empty_response', { source: sources[0] })
+            }
+
+            // Build ordered list of (sourceIndex, endMs) for the loaded sources
+            const sourceEntries: { sourceIndex: number; endMs: number }[] = []
+            for (const loaded of loadedSources) {
+                const sourceIndex = sources.findIndex((s) => keyForSource(s) === keyForSource(loaded))
+                if (sourceIndex < 0) {
+                    continue
+                }
+                const entry = cache.store?.getEntry(sourceIndex)
+                if (!entry) {
+                    continue
+                }
+                sourceEntries.push({ sourceIndex, endMs: entry.endMs })
+            }
+            sourceEntries.sort((a, b) => a.endMs - b.endMs)
+
+            // Split snapshots across sources by timestamp range
+            const buckets = new Map<number, RecordingSnapshot[]>()
+            for (const se of sourceEntries) {
+                buckets.set(se.sourceIndex, [])
+            }
+            let seIdx = 0
+            for (const snap of allBatchSnapshots) {
+                if (sourceEntries.length === 0) {
+                    break
+                }
+                while (seIdx < sourceEntries.length - 1 && snap.timestamp > sourceEntries[seIdx].endMs) {
+                    seIdx++
+                }
+                buckets.get(sourceEntries[seIdx].sourceIndex)?.push(snap)
+            }
+            for (const se of sourceEntries) {
+                // fetched, not loaded — sources become playable only once a processing pass promotes them
+                cache.store?.markFetched(se.sourceIndex, buckets.get(se.sourceIndex)!)
+            }
+            actions.storeUpdated()
+
+            actions.loadNextSnapshotSource()
+        },
+
+        loadSnapshotsForSourceFailure: async (_, breakpoint) => {
+            cache.loadFailureCount = (cache.loadFailureCount ?? 0) + 1
+            if (cache.loadFailureCount > 3) {
+                // Give up loudly: nothing else retries this source, so without a terminal action the
+                // player would buffer forever whenever playback reaches the missing range.
+                actions.snapshotSourceLoadExhausted()
+                return
+            }
+            await breakpoint(cache.loadFailureCount * 2000)
+            actions.loadNextSnapshotSource()
+        },
+
+        maybeStartPolling: () => {
+            // file playback has no recording id and nothing server-side to poll
+            if (!props.sessionRecordingId) {
+                return
+            }
+            if (props.blobV2PollingDisabled || !values.allSourcesLoaded || values.isPolling || document.hidden) {
+                return
+            }
+
+            const lastChangeTime = cache.lastSourcesChangeTime || Date.now()
+            const timeSinceLastChange = Date.now() - lastChangeTime
+
+            if (timeSinceLastChange >= POLLING_INACTIVITY_TIMEOUT_MS) {
+                return
+            }
+
+            actions.startPolling()
+            actions.loadSnapshotSources(values.pollingInterval)
+        },
+
+        loadNextSnapshotSource: async (_, breakpoint) => {
+            if (!cache.playerActive) {
+                return
+            }
+            if (values.snapshotsForSourceLoading) {
+                return
+            }
+
+            await breakpoint(1)
+
+            const sources = values.snapshotSources
+            if (!sources?.length) {
+                return
+            }
+
+            if (!cache.store) {
+                return
+            }
+            const batch = planNextBatch(cache.store, {
+                target: values.seekTarget,
+                loadAll: values.loadAllMode,
+                playbackPosition: cache.playbackPosition,
+                playbackWindowId: cache.playbackWindowId,
+            })
+            if (!batch) {
+                actions.maybeStartPolling()
+                return
+            }
+            const batchSources = batch.sourceIndices.map((i: number) => sources[i]).filter(Boolean)
+            if (batchSources.length > 0) {
+                return actions.loadSnapshotsForSource(batchSources)
+            }
+            actions.maybeStartPolling()
+        },
+    })),
+    selectors(({ cache }) => ({
+        snapshotsLoading: [
+            (s) => [s.snapshotSourcesLoading, s.snapshotsForSourceLoading, s.storeVersion],
+            (snapshotSourcesLoading: boolean, snapshotsForSourceLoading: boolean, _storeVersion: number): boolean => {
+                // Keyed on loaded-source state (not snapshot arrays, which the coordinator releases after processing), so a fully-watchable recording doesn't flap back to loading during source polls.
+                const hasLoadedAnySource = cache.store?.hasLoadedAnySource ?? false
+                return !hasLoadedAnySource && (snapshotSourcesLoading || snapshotsForSourceLoading)
+            },
+        ],
+
+        snapshotsLoaded: [(s) => [s.snapshotSources], (snapshotSources): boolean => !!snapshotSources],
+
+        isLoadingSnapshots: [
+            (s) => [s.loadingSources],
+            (loadingSources): boolean => {
+                return loadingSources.length > 0
+            },
+        ],
+
+        allSourcesLoaded: [
+            (s) => [s.snapshotSources, s.storeVersion],
+            (snapshotSources, _storeVersion: number): boolean => {
+                if (!snapshotSources || snapshotSources.length === 0) {
+                    return false
+                }
+                return cache.store?.allLoaded ?? false
+            },
+        ],
+
+        storeVersion: [
+            (s) => [s.storeUpdateCount, s.snapshotSources],
+            (): number => {
+                return cache.store?.version ?? 0
+            },
+        ],
+
+        snapshotStore: [
+            (s) => [s.storeVersion],
+            (): SnapshotStore => {
+                // Always created in afterMount; storeUpdated() ensures
+                // this selector re-evaluates with the real instance.
+                return cache.store ?? new SnapshotStore()
+            },
+        ],
+
+        sourceLoadingStates: [
+            (s) => [s.storeVersion],
+            (): SourceLoadingState[] => {
+                return cache.store?.getSourceStates() ?? []
+            },
+        ],
+
+        isRecordingDeleted: [
+            (s) => [s.snapshotLoadError],
+            (snapshotLoadError): boolean => {
+                return snapshotLoadError instanceof RecordingDeletedError
+            },
+        ],
+
+        recordingDeletedAt: [
+            (s) => [s.snapshotLoadError],
+            (snapshotLoadError): number | null => {
+                if (snapshotLoadError instanceof RecordingDeletedError) {
+                    return snapshotLoadError.deletedAt
+                }
+                return null
+            },
+        ],
+
+        recordingDeletedBy: [
+            (s) => [s.snapshotLoadError],
+            (snapshotLoadError): string | null => {
+                if (snapshotLoadError instanceof RecordingDeletedError) {
+                    return snapshotLoadError.deletedBy
+                }
+                return null
+            },
+        ],
+    })),
+    afterMount(({ actions, cache }) => {
+        cache.playerActive = true
+        cache.store = new SnapshotStore()
+        actions.storeUpdated()
+
+        cache.disposables.add(() => {
+            const handleVisibilityChange = (): void => {
+                if (document.hidden) {
+                    actions.stopPolling()
+                } else {
+                    actions.maybeStartPolling()
+                }
+            }
+
+            document.addEventListener('visibilitychange', handleVisibilityChange)
+
+            return () => {
+                document.removeEventListener('visibilitychange', handleVisibilityChange)
+            }
+        }, 'visibilityChangeHandler')
+    }),
+    beforeUnmount(({ cache }) => {
+        cache.playerActive = false
+        cache.store = undefined
+        cache.pendingBatch = undefined
+        cache.previousSourceKeys = undefined
+        cache.lastSourcesChangeTime = undefined
+        cache.playbackPosition = undefined
+        cache.playbackWindowId = undefined
+        cache.loadFailureCount = undefined
+    }),
+])

@@ -1,7 +1,7 @@
-import React from 'react'
-
 // draw a beam around an element
-export function FocusRect({ rect }: { rect: DOMRect }): JSX.Element {
+import { ElementRect } from '~/toolbar/types'
+
+export function FocusRect({ rect }: { rect: ElementRect }): JSX.Element {
     const widths = [0, rect.left + window.pageXOffset, rect.left + window.pageXOffset + rect.width, window.innerWidth]
     const heights = [
         0,
@@ -37,16 +37,15 @@ export function FocusRect({ rect }: { rect: DOMRect }): JSX.Element {
             {rects.map((r) => (
                 <div
                     key={r.id}
+                    className="absolute z-10 transition-opacity duration-300"
+                    // eslint-disable-next-line react/forbid-dom-props
                     style={{
-                        position: 'absolute',
                         top: r.y,
                         left: r.x,
                         width: r.w,
                         height: r.h,
-                        zIndex: 10,
                         background: r.bg,
                         backgroundBlendMode: 'multiply',
-                        transition: 'opacity 0.3s',
                     }}
                 />
             ))}

@@ -1,0 +1,116 @@
+import { actions, afterMount, connect, kea, path, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+
+import api from 'lib/api'
+import { lemonToast } from 'lib/lemon-ui/LemonToast'
+import { deleteWithUndo } from 'lib/utils/deleteWithUndo'
+import { teamLogic } from 'scenes/teamLogic'
+
+import type { messageTemplatesLogicType } from './messageTemplatesLogicType'
+import { MessageTemplate } from './types'
+
+export type { MessageTemplate }
+
+export const messageTemplatesLogic = kea<messageTemplatesLogicType>([
+    path(['products', 'workflows', 'frontend', 'library', 'messageTemplatesLogic']),
+    connect(() => ({
+        values: [teamLogic, ['currentTeamIdStrict']],
+    })),
+    actions({
+        setSearch: (search: string) => ({ search }),
+        setCreatedByFilter: (createdBy: number | null) => ({ createdBy }),
+    }),
+    reducers({
+        search: ['' as string, { setSearch: (_, { search }) => search }],
+        createdByFilter: [null as number | null, { setCreatedByFilter: (_, { createdBy }) => createdBy }],
+    }),
+    loaders(({ values, actions }) => ({
+        templates: [
+            [] as MessageTemplate[],
+            {
+                loadTemplates: async () => {
+                    const response = await api.messaging.getTemplates()
+                    return response.results
+                },
+                deleteTemplate: async (template: MessageTemplate) => {
+                    await deleteWithUndo({
+                        endpoint: `environments/${values.currentTeamIdStrict}/messaging_templates`,
+                        object: {
+                            id: template.id,
+                            name: template.name,
+                        },
+                        callback: (undo) => {
+                            if (undo) {
+                                actions.loadTemplates()
+                            }
+                        },
+                    })
+                    return values.templates.filter((t: MessageTemplate) => t.id !== template.id)
+                },
+                createTemplate: async ({ template }: { template: Partial<MessageTemplate> }) => {
+                    try {
+                        const newTemplate = await api.messaging.createTemplate(template)
+                        lemonToast.success('Template created successfully')
+                        return [...values.templates, newTemplate]
+                    } catch {
+                        lemonToast.error('Failed to create template')
+                        return values.templates
+                    }
+                },
+                updateTemplate: async ({
+                    templateId,
+                    template,
+                }: {
+                    templateId: string
+                    template: Partial<MessageTemplate>
+                }) => {
+                    try {
+                        const updatedTemplate = await api.messaging.updateTemplate(templateId, template)
+                        lemonToast.success('Template updated successfully')
+                        return values.templates.map((t: MessageTemplate) => (t.id === templateId ? updatedTemplate : t))
+                    } catch {
+                        lemonToast.error('Failed to update template')
+                        return values.templates
+                    }
+                },
+                duplicateTemplate: async (template: MessageTemplate) => {
+                    try {
+                        const duplicatedTemplate = await api.messaging.createTemplate({
+                            name: `${template.name} (copy)`,
+                            description: template.description,
+                            content: template.content,
+                        })
+                        lemonToast.success('Template duplicated successfully')
+                        return [...values.templates, duplicatedTemplate]
+                    } catch {
+                        lemonToast.error('Failed to duplicate template')
+                        return values.templates
+                    }
+                },
+            },
+        ],
+    })),
+    selectors({
+        filteredTemplates: [
+            (s) => [s.templates, s.search, s.createdByFilter],
+            (templates: MessageTemplate[], search: string, createdByFilter: number | null): MessageTemplate[] => {
+                let filtered = templates
+                if (search) {
+                    const lowerSearch = search.toLowerCase()
+                    filtered = filtered.filter(
+                        (t) =>
+                            (t.name ?? '').toLowerCase().includes(lowerSearch) ||
+                            (t.description ?? '').toLowerCase().includes(lowerSearch)
+                    )
+                }
+                if (createdByFilter !== null) {
+                    filtered = filtered.filter((t) => t.created_by?.id === createdByFilter)
+                }
+                return filtered
+            },
+        ],
+    }),
+    afterMount(({ actions }) => {
+        actions.loadTemplates()
+    }),
+])

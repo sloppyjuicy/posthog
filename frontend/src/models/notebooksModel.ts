@@ -1,0 +1,213 @@
+import { BuiltLogic, actions, connect, kea, listeners, path, reducers } from 'kea'
+import { loaders } from 'kea-loaders'
+import { router } from 'kea-router'
+import posthog from 'posthog-js'
+
+import api from 'lib/api'
+import { EditorFocusPosition, JSONContent } from 'lib/components/RichContentEditor/types'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { deleteWithUndo } from 'lib/utils/deleteWithUndo'
+import { addProductIntent } from 'lib/utils/product-intents'
+import { notebookLogic } from 'scenes/notebooks/Notebook/notebookLogic'
+import type { notebookLogicType } from 'scenes/notebooks/Notebook/notebookLogicType'
+import { notebookPanelLogic } from 'scenes/notebooks/NotebookPanel/notebookPanelLogic'
+import { LOCAL_NOTEBOOK_TEMPLATES } from 'scenes/notebooks/NotebookTemplates/notebookTemplates'
+import { NotebookListItemType, NotebookNodeType, NotebookTarget } from 'scenes/notebooks/types'
+import { defaultNotebookContent } from 'scenes/notebooks/utils'
+import { projectLogic } from 'scenes/projectLogic'
+import { urls } from 'scenes/urls'
+
+import { deleteFromTree, getLastNewFolder, refreshTreeItem } from '~/layout/panel-layout/ProjectTree/projectTreeLogic'
+import { InsightVizNode, Node, ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
+import { DashboardType, QueryBasedInsightModel } from '~/types'
+
+import type { notebooksModelType } from './notebooksModelType'
+
+// Queue for operations that arrive before the Notebook component mounts its
+// kea logic. `openNotebook` pushes here; `notebookLogic.afterMount` drains.
+const pendingNotebookOperations = new Map<string, ((logic: BuiltLogic<notebookLogicType>) => void)[]>()
+
+export function drainPendingNotebookOperations(shortId: string): void {
+    const ops = pendingNotebookOperations.get(shortId)
+    if (!ops?.length) {
+        return
+    }
+    pendingNotebookOperations.delete(shortId)
+    const logic = notebookLogic.findMounted({ shortId })
+    if (logic) {
+        for (const op of ops) {
+            op(logic)
+        }
+    }
+}
+
+export const SCRATCHPAD_NOTEBOOK: NotebookListItemType = {
+    id: 'scratchpad',
+    short_id: 'scratchpad',
+    title: 'My scratchpad',
+    created_at: '',
+    created_by: null,
+}
+
+export const openNotebook = async (
+    notebookId: string,
+    target: NotebookTarget,
+    autofocus: EditorFocusPosition | undefined = undefined,
+    onOpen?: (logic: BuiltLogic<notebookLogicType>) => void
+): Promise<void> => {
+    const thePanelLogic = notebookPanelLogic.findMounted()
+
+    if (thePanelLogic && target === NotebookTarget.Popover) {
+        thePanelLogic.actions.selectNotebook(notebookId, { autofocus })
+    } else {
+        if (router.values.location.pathname === urls.notebook('new')) {
+            router.actions.replace(urls.notebook(notebookId))
+        } else {
+            router.actions.push(urls.notebook(notebookId))
+        }
+    }
+
+    if (onOpen) {
+        const mountedLogic = notebookLogic.findMounted({ shortId: notebookId })
+        if (mountedLogic) {
+            onOpen(mountedLogic)
+        } else {
+            const ops = pendingNotebookOperations.get(notebookId) || []
+            ops.push(onOpen)
+            pendingNotebookOperations.set(notebookId, ops)
+        }
+    }
+}
+
+export const notebooksModel = kea<notebooksModelType>([
+    path(['scenes', 'notebooks', 'Notebook', 'notebooksModel']),
+    actions({
+        createNotebook: (
+            location: NotebookTarget,
+            title?: string,
+            content?: JSONContent[],
+            onCreate?: (notebook: BuiltLogic<notebookLogicType>) => void,
+            shortId?: string
+        ) => ({
+            title,
+            location,
+            content,
+            onCreate,
+            shortId,
+        }),
+        receiveNotebookUpdate: (notebook: NotebookListItemType) => ({ notebook }),
+        loadNotebooks: true,
+        deleteNotebook: (shortId: NotebookListItemType['short_id'], title?: string) => ({ shortId, title }),
+        createNotebookFromDashboard: (dashboard: DashboardType<QueryBasedInsightModel>) => ({ dashboard }),
+    }),
+    connect(() => ({
+        values: [projectLogic, ['currentProjectId'], featureFlagLogic, ['featureFlags']],
+    })),
+
+    reducers({
+        scratchpadNotebook: [SCRATCHPAD_NOTEBOOK],
+    }),
+
+    loaders(({ values }) => ({
+        notebooks: [
+            [] as NotebookListItemType[],
+            {
+                createNotebook: async ({ title, location, content, onCreate, shortId }) => {
+                    const useMarkdownNotebook = !!values.featureFlags[FEATURE_FLAGS.MARKDOWN_NOTEBOOKS]
+                    const notebook = await api.notebooks.create({
+                        title,
+                        content: defaultNotebookContent(title, content, { markdown: useMarkdownNotebook }),
+                        _create_in_folder: getLastNewFolder(),
+                        ...(shortId ? { short_id: shortId } : {}),
+                    })
+
+                    await openNotebook(notebook.short_id, location, 'end', (logic) => {
+                        onCreate?.(logic)
+                    })
+
+                    // Client-scoped name on purpose: the server-side `notebook created` event
+                    // (emitted for every creation path) is the source of truth for counts. This
+                    // one keeps the browser/session context for UI-funnel analysis without
+                    // double-counting UI creations.
+                    posthog.capture(`notebook created (client)`, {
+                        short_id: notebook.short_id,
+                        is_markdown: useMarkdownNotebook,
+                    })
+
+                    void addProductIntent({
+                        product_type: ProductKey.NOTEBOOKS,
+                        intent_context: ProductIntentContext.NOTEBOOK_CREATED,
+                    })
+
+                    return [notebook, ...values.notebooks]
+                },
+
+                deleteNotebook: async ({ shortId, title }) => {
+                    await deleteWithUndo({
+                        endpoint: `projects/${values.currentProjectId}/notebooks`,
+                        object: { name: title || shortId, id: shortId },
+                        callback: (undo) => {
+                            if (undo) {
+                                refreshTreeItem('notebook', shortId)
+                            } else {
+                                deleteFromTree('notebook', shortId)
+                            }
+                        },
+                    })
+
+                    const panelLogic = notebookPanelLogic.findMounted()
+
+                    if (panelLogic && panelLogic.values.selectedNotebook === shortId) {
+                        panelLogic.actions.selectNotebook(SCRATCHPAD_NOTEBOOK.short_id, { silent: true })
+                    }
+
+                    return values.notebooks.filter((n) => n.short_id !== shortId)
+                },
+
+                receiveNotebookUpdate: ({ notebook }) => {
+                    if (notebook.is_template) {
+                        return values.notebooks
+                    }
+                    return values.notebooks.filter((n) => n.short_id !== notebook.short_id).concat([notebook])
+                },
+            },
+        ],
+        notebookTemplates: [
+            LOCAL_NOTEBOOK_TEMPLATES,
+            {
+                // In the future we can load these from remote
+            },
+        ],
+    })),
+
+    listeners(({ asyncActions }) => ({
+        createNotebookFromDashboard: async ({ dashboard }) => {
+            // TODO(widgets): Dashboard widget tiles are intentionally skipped: notebook query nodes only support
+            // insight-backed HogQL queries today, not run_widgets widget types/config.
+            const queries = dashboard.tiles.reduce(
+                (acc, tile) => {
+                    if (!tile.insight) {
+                        return acc
+                    }
+                    acc.push({
+                        title: tile.insight.name,
+                        query: tile.insight.query,
+                    })
+                    return acc
+                },
+                [] as { title: string; query: InsightVizNode | Node | null }[]
+            )
+
+            const resources = queries.map((x) => ({
+                type: NotebookNodeType.Query,
+                attrs: {
+                    title: x.title,
+                    query: x.query,
+                },
+            }))
+
+            await asyncActions.createNotebook(NotebookTarget.Scene, dashboard.name + ' (copied)', resources)
+        },
+    })),
+])

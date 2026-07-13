@@ -1,0 +1,223 @@
+import { PluginKey } from '@tiptap/pm/state'
+import { Editor, Extension, ReactRenderer } from '@tiptap/react'
+import Suggestion from '@tiptap/suggestion'
+import { useValues } from 'kea'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useState } from 'react'
+
+import { LemonButton, ProfilePicture } from '@posthog/lemon-ui'
+
+import { Popover } from 'lib/lemon-ui/Popover'
+import { createFuse } from 'lib/utils/fuseSearch'
+import { isKeyOf } from 'lib/utils/guards'
+import { membersLogic } from 'scenes/organization/membersLogic'
+
+import { OrganizationMemberType } from '~/types'
+
+import { EditorRange, RichContentNodeType } from './types'
+
+type MentionsProps = {
+    range: EditorRange
+    query?: string
+    decorationNode?: any
+    onClose?: () => void
+    editor: Editor
+}
+
+type MentionsPopoverProps = MentionsProps & {
+    visible: boolean
+    children?: JSX.Element
+}
+
+type MentionsRef = {
+    onKeyDown: (event: KeyboardEvent) => boolean
+}
+
+export const Mentions = forwardRef<MentionsRef, MentionsProps>(function SlashCommands(
+    { range, onClose, query, editor }: MentionsProps,
+    ref
+): JSX.Element | null {
+    const { meFirstMembers } = useValues(membersLogic)
+
+    // We start with 1 because the first item is the text controls
+    const [selectedIndex, setSelectedIndex] = useState(0)
+    const [selectedHorizontalIndex, setSelectedHorizontalIndex] = useState(0)
+
+    const fuse = useMemo(() => {
+        return createFuse(meFirstMembers, {
+            keys: ['id', 'user.email', 'user.first_name', 'user.last_name'],
+        })
+    }, [meFirstMembers])
+
+    const filteredMembers = useMemo(() => {
+        if (!query) {
+            return meFirstMembers
+        }
+        return fuse.search(query).map((result) => result.item)
+    }, [query, fuse, meFirstMembers])
+
+    useEffect(() => {
+        setSelectedIndex(0)
+        setSelectedHorizontalIndex(0)
+    }, [query])
+
+    const execute = async (member: OrganizationMemberType | undefined): Promise<void> => {
+        if (editor && member) {
+            editor
+                .chain()
+                .focus()
+                .deleteRange(range)
+                .insertContentAt(range.from, [
+                    {
+                        type: RichContentNodeType.Mention,
+                        attrs: {
+                            id: member.user.id,
+                        },
+                    },
+                ])
+                .run()
+
+            onClose?.()
+        }
+    }
+
+    const onPressEnter = (): boolean => {
+        const member = filteredMembers[selectedIndex]
+        // No match (e.g. members still loading or no results) — let the editor
+        // handle Enter normally instead of swallowing it.
+        if (!member) {
+            return false
+        }
+        void execute(member)
+        return true
+    }
+    const onPressUp = (): boolean => {
+        const count = filteredMembers.length
+        if (count === 0) {
+            return true
+        }
+        setSelectedIndex((selectedIndex - 1 + count) % count)
+        return true
+    }
+    const onPressDown = (): boolean => {
+        const count = filteredMembers.length
+        if (count === 0) {
+            return true
+        }
+        setSelectedIndex((selectedIndex + 1) % count)
+        return true
+    }
+
+    const onKeyDown = useCallback(
+        (event: KeyboardEvent): boolean => {
+            const keyMappings = {
+                ArrowUp: onPressUp,
+                ArrowDown: onPressDown,
+                Enter: onPressEnter,
+            }
+
+            if (isKeyOf(event.key, keyMappings)) {
+                return keyMappings[event.key]()
+            }
+
+            return false
+        },
+        // oxlint-disable-next-line exhaustive-deps
+        [selectedIndex, selectedHorizontalIndex, filteredMembers]
+    )
+
+    // Expose the keydown handler to the tiptap extension
+    useImperativeHandle(ref, () => ({ onKeyDown }), [onKeyDown])
+
+    if (!editor) {
+        return null
+    }
+
+    return (
+        <div className="deprecated-space-y-px">
+            {filteredMembers.map((member, index) => (
+                <LemonButton
+                    key={member.id}
+                    fullWidth
+                    icon={<ProfilePicture user={member.user} size="sm" />}
+                    active={index === selectedIndex}
+                    onClick={() => void execute(member)}
+                >
+                    <span className="ph-no-capture">{`${member.user.first_name} <${member.user.email}>`}</span>
+                </LemonButton>
+            ))}
+
+            {filteredMembers.length === 0 && (
+                <div className="text-secondary p-1">
+                    No member matching <code>@{query}</code>
+                </div>
+            )}
+        </div>
+    )
+})
+
+const MentionsPopover = forwardRef<MentionsRef, MentionsPopoverProps>(function MentionsPopover(
+    { visible = true, decorationNode, children, onClose, ...props }: MentionsPopoverProps,
+    ref
+): JSX.Element | null {
+    return (
+        <Popover
+            placement="bottom-start"
+            fallbackPlacements={['top-start', 'right-start']}
+            overlay={<Mentions ref={ref} onClose={onClose} {...props} />}
+            referenceElement={decorationNode}
+            visible={visible}
+            onClickOutside={onClose}
+        >
+            {children}
+        </Popover>
+    )
+})
+
+const MentionsPluginKey = new PluginKey('mentions')
+
+export const MentionsExtension = Extension.create({
+    name: 'mentions',
+
+    addProseMirrorPlugins() {
+        return [
+            Suggestion({
+                pluginKey: MentionsPluginKey,
+                editor: this.editor,
+                char: '@',
+                startOfLine: false,
+                render: () => {
+                    let renderer: ReactRenderer<MentionsRef>
+
+                    return {
+                        onStart: (props) => {
+                            renderer = new ReactRenderer(MentionsPopover, {
+                                props: props,
+                                editor: props.editor,
+                            })
+                        },
+
+                        onUpdate(props) {
+                            renderer.updateProps(props)
+
+                            if (!props.clientRect) {
+                                return
+                            }
+                        },
+
+                        onKeyDown(props) {
+                            if (props.event.key === 'Escape') {
+                                renderer.destroy()
+                                return true
+                            }
+                            return renderer.ref?.onKeyDown(props.event) ?? false
+                        },
+
+                        onExit() {
+                            renderer.destroy()
+                        },
+                    }
+                },
+            }),
+        ]
+    },
+})

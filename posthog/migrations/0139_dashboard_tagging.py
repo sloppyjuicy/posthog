@@ -5,18 +5,24 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0138_featureflag_name_optional"),
     ]
 
     operations = [
-        migrations.AddField(model_name="dashboard", name="description", field=models.TextField(blank=True)),
+        migrations.AddField(
+            model_name="dashboard",
+            name="description",
+            field=models.TextField(blank=True),
+        ),
         migrations.AddField(
             model_name="dashboard",
             name="tags",
             field=django.contrib.postgres.fields.ArrayField(
-                base_field=models.CharField(max_length=32), blank=True, default=list, size=None,
+                base_field=models.CharField(max_length=32),
+                blank=True,
+                default=list,
+                size=None,
             ),
         ),
     ]

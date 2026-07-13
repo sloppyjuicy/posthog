@@ -1,0 +1,204 @@
+import { useActions, useValues } from 'kea'
+import posthog from 'posthog-js'
+import { useEffect } from 'react'
+
+import { IconBottomPanel, IconRabbit, IconSearch, IconTortoise } from '@posthog/icons'
+import { LemonButton, LemonDialog, Link } from '@posthog/lemon-ui'
+
+import { SettingsBar, SettingsButton, SettingsMenu, SettingsToggle } from 'lib/components/PanelSettings/PanelSettings'
+import { SESSION_RECORDINGS_TTL_WARNING_THRESHOLD_DAYS } from 'lib/constants'
+import { IconHeatmap } from 'lib/lemon-ui/icons'
+import { cn } from 'lib/utils/css-classes'
+import { humanFriendlyDuration } from 'lib/utils/durations'
+import { PlayerInspectorButton } from 'scenes/session-recordings/player/player-meta/PlayerInspectorButton'
+import {
+    ModesWithInteractions,
+    PLAYBACK_SPEEDS,
+    sessionRecordingPlayerLogic,
+} from 'scenes/session-recordings/player/sessionRecordingPlayerLogic'
+import { urls } from 'scenes/urls'
+
+function PlayerControlsLayoutToggle(): JSX.Element {
+    const { playerControlsOverlay } = useValues(sessionRecordingPlayerLogic)
+    const { setPlayerControlsOverlay } = useActions(sessionRecordingPlayerLogic)
+
+    return (
+        <SettingsToggle
+            title={
+                playerControlsOverlay
+                    ? 'Player controls float over the recording and only show on hover. Click to pin them below the recording instead.'
+                    : 'Player controls are pinned below the recording. Click to make them float over the recording on hover instead.'
+            }
+            label={playerControlsOverlay ? 'Floating controls' : 'Pinned controls'}
+            icon={<IconBottomPanel />}
+            active={!playerControlsOverlay}
+            onClick={() => setPlayerControlsOverlay(!playerControlsOverlay)}
+            data-attr="toggle-player-controls-overlay"
+        />
+    )
+}
+
+function SetPlaybackSpeed(): JSX.Element {
+    const { speed, sessionPlayerData } = useValues(sessionRecordingPlayerLogic)
+    const { setSpeed } = useActions(sessionRecordingPlayerLogic)
+    return (
+        <SettingsMenu
+            icon={
+                speed === 0.5 ? (
+                    <IconTortoise className="text-lg" style={{ stroke: 'currentColor', strokeWidth: '0.5' }} />
+                ) : (
+                    <IconRabbit className="text-lg" style={{ stroke: 'currentColor', strokeWidth: '0.5' }} />
+                )
+            }
+            data-attr="session-recording-speed-select"
+            items={PLAYBACK_SPEEDS.map((speedToggle) => ({
+                label: (
+                    <div className="flex w-full deprecated-space-x-2 justify-between">
+                        <span>{speedToggle}x</span>
+                        <span>({humanFriendlyDuration(sessionPlayerData.durationMs / speedToggle / 1000)})</span>
+                    </div>
+                ),
+                onClick: () => setSpeed(speedToggle),
+                active: speed === speedToggle && speedToggle !== 1,
+                status: speed === speedToggle ? 'danger' : 'default',
+            }))}
+            label={`Speed ${speed}x`}
+        />
+    )
+}
+
+function InspectDOM(): JSX.Element {
+    const { sessionPlayerMetaData } = useValues(sessionRecordingPlayerLogic)
+    const { openExplorer } = useActions(sessionRecordingPlayerLogic)
+
+    return (
+        <SettingsButton
+            title="Inspect the DOM as it was at this moment in the session. Analyze the structure and elements captured during the recording."
+            label="Inspect DOM"
+            data-attr="explore-dom"
+            onClick={openExplorer}
+            disabledReason={
+                sessionPlayerMetaData?.snapshot_source === 'mobile' ? 'Only available for web recordings' : undefined
+            }
+            icon={<IconSearch />}
+        />
+    )
+}
+
+function TTLWarning(): JSX.Element | null {
+    const { sessionPlayerMetaData } = useValues(sessionRecordingPlayerLogic)
+    const lowTtl =
+        sessionPlayerMetaData?.recording_ttl &&
+        sessionPlayerMetaData.recording_ttl <= SESSION_RECORDINGS_TTL_WARNING_THRESHOLD_DAYS
+
+    useEffect(() => {
+        if (lowTtl) {
+            posthog.capture('recording viewed with very low TTL', sessionPlayerMetaData)
+        }
+    }, [sessionPlayerMetaData, lowTtl])
+
+    if (!lowTtl) {
+        return null
+    }
+
+    return (
+        <div className="font-medium">
+            <LemonButton
+                status="danger"
+                size="xsmall"
+                className={cn('rounded-[0px]')}
+                data-attr="recording-ttl-dialog"
+                onClick={() => {
+                    LemonDialog.open({
+                        title: 'Recording about to expire',
+                        description: (
+                            <span>
+                                <br />
+                                This recording will expire in{' '}
+                                <strong>{sessionPlayerMetaData.recording_ttl} days</strong>.
+                                <br />
+                                <br />
+                                Go to{' '}
+                                <Link to={urls.settings('project-replay', 'replay-retention')}>
+                                    Session Replay settings
+                                </Link>{' '}
+                                to increase your retention period to keep future recordings around for longer.
+                                <br />
+                                <br />
+                                Refer to{' '}
+                                <Link
+                                    to="https://posthog.com/docs/session-replay/data-retention"
+                                    disableClientSideRouting
+                                    disableDocsPanel
+                                    target="_blank"
+                                >
+                                    this page
+                                </Link>{' '}
+                                for more information about data retention in Session Replay.
+                            </span>
+                        ),
+                    })
+                }}
+                noPadding
+            >
+                This recording will expire in {sessionPlayerMetaData.recording_ttl} days
+            </LemonButton>
+        </div>
+    )
+}
+
+export function PlayerMetaTopSettings(): JSX.Element {
+    const {
+        logicProps: { withSidebar, mode },
+        hoverModeIsEnabled,
+        showPlayerChrome,
+    } = useValues(sessionRecordingPlayerLogic)
+    const { setPause, openHeatmap } = useActions(sessionRecordingPlayerLogic)
+
+    const showControlsLayoutToggle = !!mode && ModesWithInteractions.includes(mode)
+
+    return (
+        <div
+            className={cn(
+                hoverModeIsEnabled
+                    ? 'absolute top-full left-0 right-0 z-10 transition-all duration-25 ease-in-out'
+                    : '',
+                hoverModeIsEnabled && showPlayerChrome
+                    ? 'opacity-100 pointer-events-auto'
+                    : hoverModeIsEnabled
+                      ? // invisible releases the hidden overlay's raster backing; transition-all
+                        // already covers visibility so the fade still plays (see PanelLayout scrims)
+                        'opacity-0 pointer-events-none invisible'
+                      : ''
+            )}
+        >
+            <SettingsBar border="top">
+                <div className="flex w-full justify-between items-center gap-0.5">
+                    <div className="flex flex-row gap-0.5 h-full items-center">
+                        <SetPlaybackSpeed />
+                        {showControlsLayoutToggle && <PlayerControlsLayoutToggle />}
+                    </div>
+
+                    <div>
+                        <TTLWarning />
+                    </div>
+
+                    <div className="flex flex-row gap-0.5">
+                        <SettingsButton
+                            size="xsmall"
+                            icon={<IconHeatmap />}
+                            onClick={() => {
+                                setPause()
+                                openHeatmap()
+                            }}
+                            label="View heatmap"
+                            tooltip="Use the HTML from this point in the recording as the background for your heatmap data"
+                        />
+                        {withSidebar && <InspectDOM />}
+                        {withSidebar && <PlayerInspectorButton />}
+                    </div>
+                </div>
+            </SettingsBar>
+        </div>
+    )
+}

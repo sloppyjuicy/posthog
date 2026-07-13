@@ -1,0 +1,517 @@
+import { BindLogic, actions, connect, kea, key, path, props, reducers, selectors, useActions, useValues } from 'kea'
+import { actionToUrl, router, urlToAction } from 'kea-router'
+
+import { LemonDivider } from '@posthog/lemon-ui'
+
+import { ActivityLog } from 'lib/components/ActivityLog/ActivityLog'
+import { NotFound } from 'lib/components/NotFound'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { useFileSystemLogView } from 'lib/hooks/useFileSystemLogView'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { More } from 'lib/lemon-ui/LemonButton/More'
+import { LemonSkeleton } from 'lib/lemon-ui/LemonSkeleton'
+import { LemonTab, LemonTabs } from 'lib/lemon-ui/LemonTabs'
+import { LemonTag } from 'lib/lemon-ui/LemonTag/LemonTag'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { capitalizeFirstLetter } from 'lib/utils/strings'
+import { DataPipelinesNewSceneKind } from 'scenes/data-pipelines/DataPipelinesNewScene'
+import { HogFunctionConfiguration } from 'scenes/hog-functions/configuration/HogFunctionConfiguration'
+import {
+    HogFunctionConfigurationLogicProps,
+    hogFunctionConfigurationLogic,
+} from 'scenes/hog-functions/configuration/hogFunctionConfigurationLogic'
+import { HogFunctionLogs } from 'scenes/hog-functions/logs/HogFunctionLogs'
+import { HogFunctionTesting } from 'scenes/hog-functions/testing/HogFunctionTesting'
+import { Scene, SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import {
+    ActivityScope,
+    Breadcrumb,
+    CyclotronJobFilterPropertyFilter,
+    HogFunctionType,
+    HogFunctionTypeType,
+} from '~/types'
+
+import { HogFunctionBackfills } from './backfills/HogFunctionBackfills'
+import {
+    HogFunctionConfigurationClearChangesButton,
+    HogFunctionConfigurationSaveButton,
+} from './configuration/components/HogFunctionConfigurationButtons'
+import { HogFunctionIconEditable } from './configuration/HogFunctionIcon'
+import type { hogFunctionSceneLogicType } from './HogFunctionSceneType'
+import { HogInvocations } from './invocations/HogInvocations'
+import { HogFunctionMetrics } from './metrics/HogFunctionMetrics'
+import { HogFunctionSkeleton } from './misc/HogFunctionSkeleton'
+import { HogFunctionRuns } from './runs/HogFunctionRuns'
+
+const HOG_FUNCTION_SCENE_TABS = [
+    'configuration',
+    'metrics',
+    'logs',
+    'testing',
+    'runs',
+    'invocations',
+    'backfills',
+    'history',
+] as const
+export type HogFunctionSceneTab = (typeof HOG_FUNCTION_SCENE_TABS)[number]
+
+const HogFunctionSceneMapping: Partial<Record<HogFunctionTypeType, { scene: Scene; url: () => string }>> = {
+    transformation: { scene: Scene.Transformations, url: urls.transformations },
+    destination: { scene: Scene.Destinations, url: urls.destinations },
+    site_destination: { scene: Scene.Destinations, url: urls.destinations },
+    source_webhook: { scene: Scene.Sources, url: urls.sources },
+}
+
+export const hogFunctionSceneLogic = kea<hogFunctionSceneLogicType>([
+    props({} as HogFunctionConfigurationLogicProps),
+    key(({ id, templateId }: HogFunctionConfigurationLogicProps) => id ?? templateId ?? 'new'),
+    path((key) => ['scenes', 'hog-functions', 'hogFunctionSceneLogic', key]),
+    connect((props: HogFunctionConfigurationLogicProps) => ({
+        values: [hogFunctionConfigurationLogic(props), ['configuration', 'type', 'loading', 'loaded']],
+    })),
+    actions({
+        setCurrentTab: (tab: HogFunctionSceneTab) => ({ tab }),
+    }),
+    reducers(() => ({
+        currentTab: [
+            'configuration' as HogFunctionSceneTab,
+            {
+                setCurrentTab: (_, { tab }) => tab,
+            },
+        ],
+    })),
+    selectors({
+        logicProps: [() => [(_, props) => props], (props) => props],
+        supportsBackfills: [
+            (s) => [s.type, s.configuration],
+            (type: HogFunctionTypeType, configuration: HogFunctionType | null): boolean => {
+                if (type !== 'destination') {
+                    return false
+                }
+                const source = configuration?.filters?.source ?? 'events'
+                return source === 'events'
+            },
+        ],
+        alertId: [
+            (s) => [s.configuration],
+            (configuration: HogFunctionType | null): string | undefined => {
+                if (!configuration?.filters?.properties) {
+                    return undefined
+                }
+                const alertIdProp = configuration.filters.properties.find(
+                    (p: CyclotronJobFilterPropertyFilter) => p.key === 'alert_id'
+                )
+                const value = alertIdProp?.value
+                return value ? String(value) : undefined
+            },
+        ],
+        surveyId: [
+            (s) => [s.configuration],
+            (configuration: HogFunctionType | null): string | undefined => {
+                for (const event of configuration?.filters?.events ?? []) {
+                    const surveyIdProp = event.properties?.find((p) => p.key === '$survey_id')
+                    if (surveyIdProp?.value) {
+                        return String(surveyIdProp.value)
+                    }
+                }
+                return undefined
+            },
+        ],
+        isSurveyNotification: [
+            (s) => [s.configuration],
+            (configuration: HogFunctionType | null): boolean => {
+                return (configuration?.filters?.events ?? []).some((e) => e.id === 'survey sent')
+            },
+        ],
+        returnTo: [
+            () => [router.selectors.searchParams],
+            (searchParams: Record<string, string>): string | undefined => searchParams?.returnTo,
+        ],
+        breadcrumbs: [
+            (s) => [
+                s.type,
+                s.loading,
+                s.configuration,
+                s.alertId,
+                s.surveyId,
+                s.isSurveyNotification,
+                s.returnTo,
+                (_, props) => props.id ?? null,
+            ],
+            (
+                type: HogFunctionTypeType,
+                loading: boolean,
+                configuration: HogFunctionType | null,
+                alertId: string | undefined,
+                surveyId: string | undefined,
+                isSurveyNotification: boolean,
+                returnTo: string | undefined,
+                id: string | null
+            ): Breadcrumb[] => {
+                if (loading) {
+                    return [
+                        {
+                            key: Scene.HogFunction,
+                            name: 'Loading...',
+                            iconType: 'data_pipeline',
+                        },
+                    ]
+                }
+
+                const finalCrumb: Breadcrumb = {
+                    key: Scene.HogFunction,
+                    name: configuration?.name || '(Untitled)',
+                    iconType: 'data_pipeline',
+                }
+
+                const firstEventId = configuration?.filters?.events?.[0]?.id
+                const isLogsAlert = typeof firstEventId === 'string' && firstEventId.startsWith('$logs_alert_')
+
+                if (type === 'internal_destination' && isLogsAlert && alertId) {
+                    return [
+                        {
+                            key: Scene.Logs,
+                            name: 'Logs',
+                            path: `${urls.logs()}?activeTab=alerts`,
+                            iconType: 'logs',
+                        },
+                        {
+                            key: Scene.LogsAlertDetail,
+                            name: 'Alert',
+                            path: returnTo ?? urls.logsAlertDetail(alertId, 'notifications'),
+                            iconType: 'logs',
+                        },
+                        finalCrumb,
+                    ]
+                }
+
+                if (type === 'internal_destination' && alertId) {
+                    // returnTo contains the full path back to the alert edit view
+                    // Strip the alert_id param for the insight breadcrumb
+                    const alertPath = returnTo ?? urls.alert(alertId!)
+                    const insightPath = returnTo ? returnTo.split('?')[0] : urls.alerts()
+
+                    return [
+                        {
+                            key: Scene.Insight,
+                            name: 'Insight',
+                            path: insightPath,
+                            iconType: 'data_pipeline',
+                        },
+                        {
+                            key: 'alert',
+                            name: 'Alert',
+                            path: alertPath,
+                            iconType: 'data_pipeline',
+                        },
+                        finalCrumb,
+                    ]
+                }
+
+                if (isSurveyNotification) {
+                    const crumbs: Breadcrumb[] = [
+                        {
+                            key: Scene.Surveys,
+                            name: 'surveys',
+                            path: urls.surveys(),
+                        },
+                    ]
+                    if (surveyId) {
+                        crumbs.push({
+                            key: Scene.Survey,
+                            name: 'survey',
+                            path: urls.survey(surveyId),
+                        })
+                    }
+                    crumbs.push(finalCrumb)
+                    return crumbs
+                }
+
+                if (type === 'site_app') {
+                    return [
+                        {
+                            key: Scene.WebScripts,
+                            name: 'Web scripts',
+                            path: urls.webScripts(),
+                            iconType: 'data_pipeline',
+                        },
+                        finalCrumb,
+                    ]
+                }
+
+                const sceneMapping = HogFunctionSceneMapping[type]
+
+                if (sceneMapping) {
+                    return [
+                        {
+                            key: sceneMapping.scene,
+                            name: `${capitalizeFirstLetter(type).replace('_', ' ')}s`,
+                            path: id ? sceneMapping.url() : urls.dataPipelinesNew(type as DataPipelinesNewSceneKind),
+                            iconType: 'data_pipeline',
+                        },
+                        finalCrumb,
+                    ]
+                }
+
+                if (type === 'internal_destination') {
+                    // Returns a Scene that is closest to the element based on the configuration.
+                    // This is used to help the HogFunctionScene render correct breadcrumbs and redirections
+                    if (configuration?.filters?.events?.some((e) => e.id.includes('error_tracking'))) {
+                        // Error tracking scene
+                        return [
+                            {
+                                key: Scene.ErrorTracking,
+                                name: 'Error tracking',
+                                path: urls.errorTracking(),
+                            },
+                            {
+                                key: Scene.HogFunction,
+                                name: 'Alerts',
+                                path: urls.errorTrackingConfiguration() + '#selectedSetting=error-tracking-alerting',
+                            },
+                            finalCrumb,
+                        ]
+                    }
+
+                    return [
+                        {
+                            key: Scene.HogFunction,
+                            name: 'Notifications',
+                            path: returnTo,
+                        },
+                        finalCrumb,
+                    ]
+                }
+                return [
+                    {
+                        key: Scene.HogFunction,
+                        name: 'Function',
+                    },
+                    finalCrumb,
+                ]
+            },
+        ],
+    }),
+    actionToUrl(({ values }) => ({
+        setCurrentTab: () => {
+            return [
+                router.values.location.pathname,
+                {
+                    ...router.values.searchParams,
+                    tab: values.currentTab,
+                },
+                router.values.hashParams,
+            ]
+        },
+    })),
+    urlToAction(({ actions, values }) => {
+        const reactToTabChange = (_: any, search: Record<string, string>): void => {
+            const possibleTab = (search.tab ?? 'configuration') as HogFunctionSceneTab
+
+            const tab = HOG_FUNCTION_SCENE_TABS.includes(possibleTab) ? possibleTab : 'configuration'
+            if (tab !== values.currentTab) {
+                actions.setCurrentTab(tab)
+            }
+        }
+
+        return {
+            // All possible routes for this scene need to be listed here
+            [urls.hogFunction(':id')]: reactToTabChange,
+            [urls.errorTrackingAlert(':id')]: reactToTabChange,
+        }
+    }),
+])
+
+export const scene: SceneExport<HogFunctionConfigurationLogicProps> = {
+    component: HogFunctionScene,
+    logic: hogFunctionSceneLogic,
+    paramsToProps: ({ params: { id, templateId }, hashParams }) => {
+        return {
+            id,
+            templateId,
+            subTemplateId: hashParams.configuration?.sub_template_id,
+        }
+    },
+}
+
+function HogFunctionHeader(): JSX.Element {
+    const { configuration, logicProps, loading, isLegacyPlugin } = useValues(hogFunctionConfigurationLogic)
+    const { setConfigurationValue, duplicate, deleteHogFunction } = useActions(hogFunctionConfigurationLogic)
+
+    return (
+        <>
+            <SceneTitleSection
+                name={configuration.name}
+                description={configuration.description || ''}
+                resourceType={{
+                    type: 'data_pipeline',
+                    forceIcon: (
+                        <HogFunctionIconEditable
+                            logicKey={logicProps.id ?? 'new'}
+                            src={configuration.icon_url}
+                            onChange={(val) => setConfigurationValue('icon_url', val)}
+                            size="small"
+                        />
+                    ),
+                }}
+                isLoading={loading}
+                onNameChange={(value) => setConfigurationValue('name', value)}
+                onDescriptionChange={(value) => setConfigurationValue('description', value)}
+                canEdit
+                actions={
+                    <>
+                        {!logicProps.templateId && (
+                            <>
+                                <More
+                                    size="small"
+                                    overlay={
+                                        <>
+                                            {!isLegacyPlugin && (
+                                                <LemonButton fullWidth onClick={() => duplicate()}>
+                                                    Duplicate
+                                                </LemonButton>
+                                            )}
+                                            <LemonDivider />
+                                            <LemonButton status="danger" fullWidth onClick={() => deleteHogFunction()}>
+                                                Delete
+                                            </LemonButton>
+                                        </>
+                                    }
+                                />
+                                <LemonDivider vertical />
+                            </>
+                        )}
+                        <HogFunctionConfigurationClearChangesButton />
+                        <HogFunctionConfigurationSaveButton />
+                    </>
+                }
+            />
+        </>
+    )
+}
+
+export function HogFunctionScene(): JSX.Element {
+    const { currentTab, loading, loaded, logicProps, type, supportsBackfills } = useValues(hogFunctionSceneLogic)
+    const { setCurrentTab } = useActions(hogFunctionSceneLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
+
+    const { id, templateId, subTemplateId } = logicProps
+
+    useFileSystemLogView({
+        type: `hog_function/${type ?? ''}`,
+        ref: id ?? null,
+        enabled: Boolean(id && type && loaded),
+    })
+
+    if (loading && !loaded) {
+        return (
+            <div className="flex flex-col gap-4">
+                <LemonSkeleton className="w-full h-12" />
+                <HogFunctionSkeleton />
+            </div>
+        )
+    }
+
+    if (id && !loaded) {
+        return <NotFound object="Hog function" />
+    }
+
+    if (!templateId && !id) {
+        return <NotFound object="Hog function" />
+    }
+
+    const tabs: (LemonTab<HogFunctionSceneTab> | null)[] = [
+        {
+            label: 'Configuration',
+            key: 'configuration',
+            content: <HogFunctionConfiguration id={id} />,
+        },
+
+        type === 'site_app' || type === 'site_destination'
+            ? null
+            : {
+                  label: 'Metrics',
+                  key: 'metrics',
+                  content: <HogFunctionMetrics id={id} />,
+              },
+        type === 'site_app' || type === 'site_destination'
+            ? null
+            : {
+                  label: 'Logs',
+                  key: 'logs',
+                  content: <HogFunctionLogs />,
+              },
+        // New runs view backed by hog_invocation_results. Behind a flag while
+        // the underlying ClickHouse producer ramps; subsumes the legacy
+        // logs tab once it's GA.
+        type === 'site_app' ||
+        type === 'site_destination' ||
+        !featureFlags[FEATURE_FLAGS.HOG_INVOCATION_RESULTS_RUNS_TAB]
+            ? null
+            : {
+                  label: (
+                      <div className="flex flex-row">
+                          <div>Invocations</div>
+                          <LemonTag className="ml-2 uppercase" type="warning">
+                              Beta
+                          </LemonTag>
+                      </div>
+                  ),
+                  key: 'invocations',
+                  content: <HogInvocations id={id} functionKind="hog_function" />,
+              },
+        type === 'site_app' || type === 'site_destination' || type === 'internal_destination'
+            ? null
+            : {
+                  label: 'Testing',
+                  key: 'testing',
+                  content: <HogFunctionTesting />,
+              },
+
+        supportsBackfills && featureFlags[FEATURE_FLAGS.BACKFILL_WORKFLOWS_DESTINATION]
+            ? {
+                  label: (
+                      <div className="flex flex-row">
+                          <div>Backfills</div>
+                          <LemonTag className="ml-2 uppercase" type="primary">
+                              New
+                          </LemonTag>
+                      </div>
+                  ),
+                  key: 'backfills',
+                  content: <HogFunctionBackfills id={id} />,
+              }
+            : null,
+
+        supportsBackfills && featureFlags[FEATURE_FLAGS.BACKFILL_WORKFLOWS_DESTINATION]
+            ? {
+                  label: 'Backfill Runs',
+                  key: 'runs',
+                  content: <HogFunctionRuns id={id} />,
+              }
+            : null,
+
+        {
+            label: 'History',
+            key: 'history',
+            content: <ActivityLog id={id} scope={ActivityScope.HOG_FUNCTION} />,
+        },
+    ]
+
+    return (
+        <SceneContent>
+            <BindLogic logic={hogFunctionConfigurationLogic} props={logicProps}>
+                <HogFunctionHeader />
+                {templateId ? (
+                    <HogFunctionConfiguration templateId={templateId} subTemplateId={subTemplateId} />
+                ) : (
+                    <LemonTabs activeKey={currentTab} tabs={tabs} onChange={setCurrentTab} sceneInset={true} />
+                )}
+            </BindLogic>
+        </SceneContent>
+    )
+}

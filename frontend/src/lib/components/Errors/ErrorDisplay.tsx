@@ -1,0 +1,116 @@
+import { BindLogic, useValues } from 'kea'
+import { useMemo, useState } from 'react'
+
+import { LemonBanner } from '@posthog/lemon-ui'
+
+import { TitledSnack } from 'lib/components/TitledSnack'
+import { dayjs } from 'lib/dayjs'
+import { LemonDivider } from 'lib/lemon-ui/LemonDivider'
+import { Link } from 'lib/lemon-ui/Link'
+
+import { addExceptionStepsMalformedWarning } from './errorDisplayWarnings'
+import { errorPropertiesLogic } from './errorPropertiesLogic'
+import { CollapsibleExceptionList } from './ExceptionList/CollapsibleExceptionList'
+import { ErrorEventId, ErrorEventProperties, ErrorEventType } from './types'
+import { concatValues } from './utils'
+
+export function idFrom(event: ErrorEventType): string {
+    if ('uuid' in event && event.uuid) {
+        return event.uuid
+    }
+
+    // Fallback to timestamp if uuid is not available
+    if (event.timestamp) {
+        return dayjs(event.timestamp).toISOString()
+    }
+
+    return 'error'
+}
+
+export interface ErrorDisplayProps {
+    eventProperties: ErrorEventProperties
+    eventId: ErrorEventId
+}
+
+export function ErrorDisplay({ eventProperties, eventId }: ErrorDisplayProps): JSX.Element {
+    const enrichedEventProperties = useMemo(() => addExceptionStepsMalformedWarning(eventProperties), [eventProperties])
+
+    return (
+        <BindLogic logic={errorPropertiesLogic} props={{ properties: enrichedEventProperties, id: eventId }}>
+            <ErrorDisplayContent />
+        </BindLogic>
+    )
+}
+
+export function ErrorDisplayContent(): JSX.Element {
+    const { exceptionAttributes, hasStacktrace } = useValues(errorPropertiesLogic)
+    const { sentryUrl, ingestionErrors, handled } = exceptionAttributes || {}
+    const browserInfo = concatValues(exceptionAttributes, 'browser', 'browserVersion')
+    const appInfo = concatValues(exceptionAttributes, 'appNamespace', 'appVersion')
+    const [expandedFrameRawIds, setExpandedFrameRawIds] = useState(new Set<string>())
+    const handleFrameExpandedChange = (rawId: string, expanded: boolean): void => {
+        setExpandedFrameRawIds((prev) => {
+            const has = prev.has(rawId)
+            if (expanded === has) {
+                return prev
+            }
+            const next = new Set(prev)
+            if (expanded) {
+                next.add(rawId)
+            } else {
+                next.delete(rawId)
+            }
+            return next
+        })
+    }
+    return (
+        <div className="flex flex-col deprecated-space-y-2 pb-2">
+            <div className="flex justify-between gap-2 items-center">
+                <div className="flex flex-row gap-2 flex-wrap">
+                    <TitledSnack
+                        type="success"
+                        title="captured by"
+                        value={
+                            sentryUrl ? (
+                                <Link
+                                    className="text-3000 hover:underline decoration-primary-alt cursor-pointer"
+                                    to={sentryUrl}
+                                    target="_blank"
+                                >
+                                    Sentry
+                                </Link>
+                            ) : (
+                                'PostHog'
+                            )
+                        }
+                    />
+                    <TitledSnack title="handled" value={String(handled)} />
+                    <TitledSnack
+                        title="library"
+                        value={concatValues(exceptionAttributes, 'lib', 'libVersion') ?? 'unknown'}
+                    />
+                    {browserInfo && <TitledSnack title="browser" value={browserInfo} />}
+                    {appInfo && <TitledSnack title="app" value={appInfo} />}
+                    <TitledSnack title="os" value={concatValues(exceptionAttributes, 'os', 'osVersion') ?? 'unknown'} />
+                </div>
+            </div>
+
+            {ingestionErrors || hasStacktrace ? <LemonDivider dashed={true} /> : null}
+            {ingestionErrors && (
+                <>
+                    <LemonBanner type="error">
+                        <ul>
+                            {ingestionErrors.map((e, i) => (
+                                <li key={i}>{e}</li>
+                            ))}
+                        </ul>
+                    </LemonBanner>
+                </>
+            )}
+            <CollapsibleExceptionList
+                expandedFrameRawIds={expandedFrameRawIds}
+                onFrameExpandedChange={handleFrameExpandedChange}
+            />
+        </div>
+    )
+}

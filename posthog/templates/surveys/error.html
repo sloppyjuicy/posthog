@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=2023-07-07">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32x32.png?v=2023-07-07">
+    <link rel="icon" type="image/png" sizes="16x16" href="/static/icons/favicon-16x16.png?v=2023-07-07">
+    <title>{{ error_title }}</title>
+    <style>
+        :root {
+            --ph-survey-page-background: #ffffff;
+            --ph-survey-page-text: #111111;
+            --ph-survey-page-text-subtle: #6b6b6b;
+            --ph-survey-page-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+            --ph-survey-pill-background: rgba(255, 255, 255, 0.7);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            background: var(--ph-survey-page-background);
+            color: var(--ph-survey-page-text);
+            font-family: var(--ph-survey-page-font);
+            font-size: 16px;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+            text-rendering: optimizeLegibility;
+        }
+
+        body {
+            min-height: 100vh;
+        }
+
+        .main-container {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            padding: clamp(1.5rem, 4vw, 2.5rem) clamp(1.25rem, 4vw, 2.5rem);
+        }
+
+        .error-stage {
+            width: 100%;
+            max-width: 44rem;
+            margin: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .error-title {
+            margin: 0;
+            font-size: clamp(1.5rem, 2.4vw, 1.875rem);
+            font-weight: 600;
+            line-height: 1.25;
+            letter-spacing: -0.015em;
+            color: var(--ph-survey-page-text);
+            text-wrap: balance;
+        }
+
+        .error-message {
+            margin: 0;
+            font-size: 0.975rem;
+            line-height: 1.6;
+            color: var(--ph-survey-page-text-subtle);
+            text-wrap: pretty;
+        }
+
+        .footer-branding {
+            position: fixed;
+            bottom: 1.25rem;
+            right: 1.25rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.4rem 0.7rem;
+            border-radius: 999px;
+            background: var(--ph-survey-pill-background);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            box-shadow: 0 1px 2px rgba(17, 17, 17, 0.04), 0 4px 14px rgba(17, 17, 17, 0.06);
+            color: var(--ph-survey-page-text-subtle);
+            font-size: 0.72rem;
+            font-weight: 500;
+            text-decoration: none;
+            opacity: 0.75;
+            transition: opacity 140ms ease;
+            z-index: 10;
+        }
+
+        .footer-branding:hover {
+            opacity: 1;
+        }
+
+        @media (max-width: 640px) {
+            .main-container {
+                padding: 1.25rem;
+            }
+
+            .footer-branding {
+                bottom: 0.75rem;
+                right: 0.75rem;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="main-container">
+        <div class="error-stage">
+            <h1 class="error-title">{{ error_title }}</h1>
+            <p class="error-message">{{ error_message }}</p>
+        </div>
+    </div>
+    <a class="footer-branding" href="https://posthog.com/surveys?utm_source=survey-error" target="_blank" rel="noopener">
+        Survey by PostHog
+    </a>
+
+    {% if appearance %}
+    {{ appearance|json_script:"survey-appearance" }}
+    {% include "surveys/_appearance_helpers.html" %}
+    <script nonce="{{ request.csp_nonce }}">
+        (function () {
+            var appearance = JSON.parse(document.getElementById('survey-appearance').textContent) || {}
+            var root = document.documentElement
+
+            if (appearance.backgroundColor) {
+                root.style.setProperty('--ph-survey-page-background', appearance.backgroundColor)
+            }
+
+            var explicitText = appearance.textColor || appearance.inputTextColor
+            var derivedText = getContrastingTextColor(appearance.backgroundColor)
+            if (explicitText || derivedText) {
+                root.style.setProperty('--ph-survey-page-text', explicitText || derivedText)
+            }
+
+            var bgLuminance = getLuminance(appearance.backgroundColor)
+            if (bgLuminance !== null && bgLuminance < 0.5) {
+                root.style.setProperty('--ph-survey-pill-background', 'rgba(17, 17, 17, 0.55)')
+            }
+
+            if (appearance.textSubtleColor) {
+                root.style.setProperty('--ph-survey-page-text-subtle', appearance.textSubtleColor)
+            }
+            if (appearance.fontFamily && appearance.fontFamily !== 'inherit') {
+                root.style.setProperty('--ph-survey-page-font', appearance.fontFamily)
+            }
+        })()
+    </script>
+    {% endif %}
+</body>
+
+</html>

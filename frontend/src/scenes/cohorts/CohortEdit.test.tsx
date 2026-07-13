@@ -1,0 +1,493 @@
+import '@testing-library/jest-dom'
+
+import { cleanup, render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { expectLogic, partial } from 'kea-test-utils'
+
+import { cohortEditLogic } from 'scenes/cohorts/cohortEditLogic'
+import { NEW_COHORT } from 'scenes/cohorts/CohortFilters/constants'
+
+import { toPaginatedResponse } from '~/mocks/handlers'
+import { useMocks } from '~/mocks/jest'
+import { initKeaTests } from '~/test/init'
+import { mockCohort } from '~/test/mocks'
+
+import { CohortEdit } from './CohortEdit'
+
+describe('cohortEditLogic', () => {
+    let logic: ReturnType<typeof cohortEditLogic.build>
+
+    beforeEach(() => {
+        useMocks({
+            get: {
+                '/api/projects/:team_id/cohorts/': toPaginatedResponse([mockCohort]),
+                '/api/projects/:team_id/cohorts/:id/': mockCohort,
+            },
+            post: {
+                '/api/projects/:team_id/cohorts/': mockCohort,
+                '/api/projects/:team_id/cohorts/:id/': mockCohort,
+            },
+            patch: {
+                '/api/projects/:team_id/cohorts/:id/': mockCohort,
+            },
+        })
+        initKeaTests()
+    })
+
+    describe('form validation', () => {
+        it('prevents submission when name is empty and shows error', async () => {
+            logic = cohortEditLogic({ id: 'new' })
+            logic.mount()
+
+            await expectLogic(logic, () => {
+                logic.actions.setCohort({
+                    ...NEW_COHORT,
+                    id: 'new',
+                    name: '',
+                })
+                logic.actions.submitCohort()
+            })
+                .toDispatchActions(['setCohort', 'submitCohort', 'submitCohortFailure'])
+                .toMatchValues({
+                    cohortErrors: partial({
+                        name: 'Cohort name cannot be empty',
+                        filters: {
+                            properties: {
+                                values: [
+                                    {
+                                        values: [
+                                            {
+                                                event_filters: undefined,
+                                                event_type: undefined,
+                                                explicit_datetime: undefined,
+                                                id: 'Event or action cannot be empty.',
+                                                key: 'Event or action cannot be empty.',
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                        },
+                    }),
+                })
+        })
+
+        it('allows submission when name is provided with static cohort and CSV', async () => {
+            logic = cohortEditLogic({ id: 'new' })
+            logic.mount()
+
+            // Create a mock CSV file
+            const mockCsvFile = new File(['user1\nuser2'], 'test.csv', { type: 'text/csv' })
+
+            await expectLogic(logic, () => {
+                // Create a static cohort with a CSV file
+                logic.actions.setCohort({
+                    ...NEW_COHORT,
+                    id: 'new',
+                    name: 'Valid Cohort Name',
+                    is_static: true,
+                    csv: mockCsvFile,
+                })
+                logic.actions.submitCohort()
+            })
+                .toDispatchActions(['setCohort', 'submitCohort', 'submitCohortSuccess'])
+                .toMatchValues({
+                    cohortErrors: {},
+                })
+        })
+    })
+
+    describe('scroll to error functionality', () => {
+        let scrollIntoViewSpy: jest.SpyInstance
+        let querySelectorSpy: jest.SpyInstance
+
+        beforeEach(() => {
+            scrollIntoViewSpy = jest.fn()
+            querySelectorSpy = jest.spyOn(document, 'querySelector')
+
+            const mockElement = {
+                scrollIntoView: scrollIntoViewSpy,
+            }
+            querySelectorSpy.mockReturnValue(mockElement as unknown as Element)
+        })
+
+        afterEach(() => {
+            scrollIntoViewSpy.mockRestore()
+            querySelectorSpy.mockRestore()
+        })
+
+        it('scrolls to error element when validation fails', async () => {
+            logic = cohortEditLogic({ id: 'new' })
+            logic.mount()
+
+            await expectLogic(logic, () => {
+                logic.actions.setCohort({
+                    ...mockCohort,
+                    id: 'new',
+                    name: '',
+                })
+                logic.actions.submitCohort()
+            }).toDispatchActions(['setCohort', 'submitCohort', 'submitCohortFailure'])
+
+            await new Promise((resolve) => setTimeout(resolve, 10))
+
+            expect(querySelectorSpy).toHaveBeenCalledWith('.Field--error')
+            expect(scrollIntoViewSpy).toHaveBeenCalledWith({
+                block: 'center',
+                behavior: 'smooth',
+            })
+        })
+
+        it('falls back to CohortCriteriaRow error selector', async () => {
+            logic = cohortEditLogic({ id: 'new' })
+            logic.mount()
+
+            querySelectorSpy
+                .mockReturnValueOnce(null)
+                .mockReturnValueOnce({ scrollIntoView: scrollIntoViewSpy } as unknown as Element)
+
+            await expectLogic(logic, () => {
+                logic.actions.setCohort({
+                    ...mockCohort,
+                    id: 'new',
+                    name: '',
+                })
+                logic.actions.submitCohort()
+            }).toDispatchActions(['setCohort', 'submitCohort', 'submitCohortFailure'])
+
+            await new Promise((resolve) => requestAnimationFrame(resolve))
+
+            expect(querySelectorSpy).toHaveBeenCalledWith('.Field--error')
+            expect(querySelectorSpy).toHaveBeenCalledWith('.CohortCriteriaRow__Criteria--error')
+            expect(scrollIntoViewSpy).toHaveBeenCalledWith({
+                block: 'center',
+                behavior: 'smooth',
+            })
+        })
+
+        it('does not scroll when no error element is found', async () => {
+            logic = cohortEditLogic({ id: 'new' })
+            logic.mount()
+
+            querySelectorSpy.mockReturnValue(null)
+
+            await expectLogic(logic, () => {
+                logic.actions.setCohort({
+                    ...mockCohort,
+                    id: 'new',
+                    name: '',
+                })
+                logic.actions.submitCohort()
+            }).toDispatchActions(['setCohort', 'submitCohort', 'submitCohortFailure'])
+
+            await new Promise((resolve) => setTimeout(resolve, 10))
+
+            expect(scrollIntoViewSpy).not.toHaveBeenCalled()
+        })
+    })
+
+    describe('calculation status', () => {
+        afterEach(() => {
+            cleanup()
+        })
+
+        it('shows in progress state when pending_version is set but is_calculating is false', async () => {
+            const cohortId = 1
+
+            useMocks({
+                get: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        id: cohortId,
+                        name: 'Test Cohort',
+                        is_static: false,
+                        filters: { properties: { type: 'AND', values: [] } },
+                        version: null,
+                        pending_version: 1,
+                        is_calculating: false,
+                        last_calculation: null,
+                    },
+                },
+            })
+
+            render(<CohortEdit id={cohortId} />)
+
+            const inProgressElements = await screen.findAllByText('In progress...')
+            expect(inProgressElements.length).toBeGreaterThan(0)
+            const queueingElements = screen.getAllByText(
+                "We're queuing the calculation. It should be ready in a few minutes."
+            )
+            expect(queueingElements.length).toBeGreaterThan(0)
+        })
+
+        it('shows in progress state when both pending_version and is_calculating are true', async () => {
+            const cohortId = 1
+
+            useMocks({
+                get: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        id: cohortId,
+                        name: 'Test Cohort',
+                        is_static: false,
+                        filters: { properties: { type: 'AND', values: [] } },
+                        version: null,
+                        pending_version: 1,
+                        is_calculating: true,
+                        last_calculation: null,
+                    },
+                },
+            })
+
+            render(<CohortEdit id={cohortId} />)
+
+            const inProgressElements = await screen.findAllByText('In progress...')
+            expect(inProgressElements.length).toBeGreaterThan(0)
+            const calculatingElements = screen.getAllByText(
+                "We're calculating the cohort. It should be ready in a few minutes."
+            )
+            expect(calculatingElements.length).toBeGreaterThan(0)
+        })
+
+        it('shows previous data when recalculation is pending', async () => {
+            const cohortId = 1
+
+            useMocks({
+                get: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        id: cohortId,
+                        name: 'Test Cohort',
+                        is_static: false,
+                        filters: { properties: { type: 'AND', values: [] } },
+                        version: 1,
+                        pending_version: 2,
+                        is_calculating: false,
+                        last_calculation: '2024-01-01T00:00:00Z',
+                    },
+                },
+            })
+
+            render(<CohortEdit id={cohortId} />)
+
+            await screen.findByText(
+                "We're queuing a recalculation. The table below shows results from the previous calculation."
+            )
+            const inProgressElements = screen.getAllByText('In progress...')
+            expect(inProgressElements.length).toBeGreaterThan(0)
+        })
+
+        it('hides loading state when calculation is complete', async () => {
+            const cohortId = 1
+
+            useMocks({
+                get: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        id: cohortId,
+                        name: 'Test Cohort',
+                        is_static: false,
+                        filters: { properties: { type: 'AND', values: [] } },
+                        version: 1,
+                        pending_version: 1,
+                        is_calculating: false,
+                        last_calculation: '2024-01-01T00:00:00Z',
+                    },
+                },
+            })
+
+            render(<CohortEdit id={cohortId} />)
+
+            // Wait a bit for component to render then verify no loading states
+            await new Promise((resolve) => setTimeout(resolve, 100))
+            expect(screen.queryAllByText('In progress...')).toHaveLength(0)
+        })
+
+        it('shows retry button and contact support link when calculation fails', async () => {
+            const cohortId = 2
+
+            useMocks({
+                get: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        id: cohortId,
+                        name: 'Test Cohort',
+                        is_static: false,
+                        filters: { properties: { type: 'AND', values: [] } },
+                        // A failed calculation leaves pending_version ahead of version, since version
+                        // only advances on success. The error banner must still win over "pending".
+                        version: 1,
+                        pending_version: 2,
+                        is_calculating: false,
+                        errors_calculating: 1,
+                        last_calculation: '2024-01-01T00:00:00Z',
+                        last_error_message: 'Query execution timed out',
+                    },
+                },
+                patch: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        id: cohortId,
+                        name: 'Test Cohort',
+                        is_static: false,
+                        filters: { properties: { type: 'AND', values: [] } },
+                        version: 1,
+                        pending_version: 2,
+                        is_calculating: true,
+                        errors_calculating: 0,
+                        last_calculation: '2024-01-01T00:00:00Z',
+                    },
+                },
+            })
+
+            render(<CohortEdit id={cohortId} />)
+
+            // Verify error message is shown
+            await screen.findByText(/Calculation failed:/)
+            expect(screen.getByText(/Query execution timed out/)).toBeInTheDocument()
+
+            // Verify Retry button is shown as the primary action in the error banner
+            // LemonBanner renders action buttons - find the one with "Retry" text
+            const retryButtons = screen.getAllByText('Retry')
+            expect(retryButtons.length).toBeGreaterThan(0)
+            const retryButton = retryButtons[0]
+
+            // Verify contact support link is shown as secondary option
+            expect(screen.getByText('contact support')).toBeInTheDocument()
+
+            // Get the logic instance and verify clicking retry triggers submitCohort
+            logic = cohortEditLogic({ id: cohortId })
+            logic.mount()
+
+            await expectLogic(logic, async () => {
+                await userEvent.click(retryButton)
+            }).toDispatchActions(['submitCohort'])
+        })
+
+        it('shows the error banner, not a pending state, when a stuck calculation has failed', async () => {
+            const cohortId = 3
+
+            useMocks({
+                get: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        id: cohortId,
+                        name: 'Test Cohort',
+                        is_static: false,
+                        filters: { properties: { type: 'AND', values: [] } },
+                        // pending_version stuck ahead of version because every calculation failed
+                        version: 1,
+                        pending_version: 5,
+                        is_calculating: false,
+                        errors_calculating: 3,
+                        last_calculation: '2024-01-01T00:00:00Z',
+                        last_error_message: 'Invalid regular expression',
+                    },
+                },
+            })
+
+            render(<CohortEdit id={cohortId} />)
+
+            await screen.findByText(/Calculation failed:/)
+            expect(screen.getByText(/Invalid regular expression/)).toBeInTheDocument()
+            // The pending/calculating messaging must not be shown for a failed cohort
+            expect(screen.queryAllByText('In progress...')).toHaveLength(0)
+            expect(
+                screen.queryByText(
+                    "We're queuing a recalculation. The table below shows results from the previous calculation."
+                )
+            ).not.toBeInTheDocument()
+        })
+
+        it('shows calculating, not the error banner, while a retry is in flight after a prior failure', async () => {
+            const cohortId = 4
+
+            useMocks({
+                get: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        id: cohortId,
+                        name: 'Test Cohort',
+                        is_static: false,
+                        filters: { properties: { type: 'AND', values: [] } },
+                        // A retry is in flight (is_calculating) even though prior attempts errored,
+                        // so the calculating banner must win over the failure banner.
+                        version: 1,
+                        pending_version: 2,
+                        is_calculating: true,
+                        errors_calculating: 1,
+                        last_calculation: '2024-01-01T00:00:00Z',
+                        last_error_message: 'Query execution timed out',
+                    },
+                },
+            })
+
+            render(<CohortEdit id={cohortId} />)
+
+            expect(await screen.findAllByText('In progress...')).not.toHaveLength(0)
+            expect(screen.queryByText(/Calculation failed:/)).not.toBeInTheDocument()
+        })
+
+        // Pins the selector contract the fix changed, including the errors_calculating=0 and
+        // version=null boundaries the DOM tests above don't exercise.
+        it.each([
+            // stuck behind because every attempt failed: failed, not pending
+            {
+                version: 1,
+                pending_version: 5,
+                is_calculating: false,
+                errors_calculating: 3,
+                isPending: false,
+                isCalcOrPending: false,
+            },
+            // retry in flight after a prior failure: is_calculating wins
+            {
+                version: 1,
+                pending_version: 2,
+                is_calculating: true,
+                errors_calculating: 1,
+                isPending: false,
+                isCalcOrPending: true,
+            },
+            // genuine pending, never errored
+            {
+                version: 1,
+                pending_version: 2,
+                is_calculating: false,
+                errors_calculating: 0,
+                isPending: true,
+                isCalcOrPending: true,
+            },
+            // never calculated and never errored: pending
+            {
+                version: null,
+                pending_version: 1,
+                is_calculating: false,
+                errors_calculating: 0,
+                isPending: true,
+                isCalcOrPending: true,
+            },
+            // never calculated but already failing: failed, not pending
+            {
+                version: null,
+                pending_version: 1,
+                is_calculating: false,
+                errors_calculating: 2,
+                isPending: false,
+                isCalcOrPending: false,
+            },
+        ])(
+            'isPendingCalculation=$isPending / isCalculatingOrPending=$isCalcOrPending for %o',
+            async ({ version, pending_version, is_calculating, errors_calculating, isPending, isCalcOrPending }) => {
+                logic = cohortEditLogic({ id: 1 })
+                logic.mount()
+
+                await expectLogic(logic, () => {
+                    logic.actions.setCohort({
+                        ...mockCohort,
+                        id: 1,
+                        version,
+                        pending_version,
+                        is_calculating,
+                        errors_calculating,
+                    })
+                }).toMatchValues({
+                    isPendingCalculation: isPending,
+                    isCalculatingOrPending: isCalcOrPending,
+                })
+            }
+        )
+    })
+})

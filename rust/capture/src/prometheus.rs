@@ -1,0 +1,243 @@
+// prometheus exporter setup
+
+use limiters::redis::QuotaResource;
+use metrics::counter;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+
+pub const CAPTURE_EVENTS_DROPPED_TOTAL: &str = "capture_events_dropped_total";
+
+pub fn report_dropped_events(cause: &'static str, quantity: u64) {
+    counter!(CAPTURE_EVENTS_DROPPED_TOTAL, "cause" => cause).increment(quantity);
+}
+
+pub fn report_overflow_partition(quantity: u64) {
+    counter!("capture_partition_key_capacity_exceeded_total").increment(quantity);
+}
+
+pub fn report_quota_limit_exceeded(resource: &QuotaResource, quantity: u64) {
+    counter!("capture_quota_limit_exceeded", "resource" => resource.as_str()).increment(quantity);
+}
+
+pub fn report_internal_error_metrics(err_type: &'static str, stage_tag: &'static str) {
+    let tags = [("error", err_type), ("stage", stage_tag)];
+    counter!("capture_error_by_stage_and_type", &tags).increment(1);
+}
+
+pub fn report_clock_skew(skew: chrono::Duration) {
+    let skew_seconds = skew.num_milliseconds().saturating_abs() as f64 / 1000.0;
+    metrics::histogram!("capture_client_clock_skew_seconds").record(skew_seconds);
+}
+
+pub fn setup_metrics_recorder(role: String, capture_mode: &'static str) -> PrometheusHandle {
+    // Ok I broke it at the end, but the limit on our ingress is 60 and that's a nicer way of reaching it
+    const EXPONENTIAL_SECONDS: &[f64] = &[
+        0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+    ];
+    const BATCH_SIZES: &[f64] = &[
+        1.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1000.0,
+    ];
+    const PAYLOAD_SIZES: &[f64] = &[
+        1024.0,     // 1KB
+        5120.0,     // 5KB
+        10240.0,    // 10KB
+        51200.0,    // 50KB
+        102400.0,   // 100KB
+        1048576.0,  // 1MB
+        10485760.0, // 10MB
+        20971520.0, // 20MB (cutoff for dropping analytics event payloads)
+                    // backend will include Inf+ bucket
+    ];
+    // S3 upload latency buckets (in seconds, 2x increments)
+    const S3_LATENCY_SECONDS: &[f64] = &[
+        0.01,  // 10ms
+        0.02,  // 20ms
+        0.04,  // 40ms
+        0.08,  // 80ms
+        0.16,  // 160ms
+        0.32,  // 320ms
+        0.64,  // 640ms
+        1.28,  // 1.28s
+        2.56,  // 2.56s
+        5.12,  // 5.12s
+        10.24, // 10.24s
+    ];
+    // S3 upload body size buckets (in bytes, 2x increments)
+    const S3_BODY_SIZES: &[f64] = &[
+        1024.0,     // 1KB
+        2048.0,     // 2KB
+        4096.0,     // 4KB
+        8192.0,     // 8KB
+        16384.0,    // 16KB
+        32768.0,    // 32KB
+        65536.0,    // 64KB
+        131072.0,   // 128KB
+        262144.0,   // 256KB
+        524288.0,   // 512KB
+        1048576.0,  // 1MB
+        2097152.0,  // 2MB
+        4194304.0,  // 4MB
+        8388608.0,  // 8MB
+        16777216.0, // 16MB
+        33554432.0, // 32MB
+    ];
+    // Blob count per event (2x increments)
+    const BLOB_COUNTS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+    // Redis read/write pipeline round-trip (milliseconds). Dense around the
+    // 100ms read/write timeout so p99 is readable below it.
+    const GLOBAL_RATE_LIMITER_PIPELINE_MS: &[f64] = &[
+        0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0, 150.0, 250.0, 500.0, 1000.0,
+    ];
+    // Full background tick (milliseconds). Dense around the 1s tick_interval so
+    // we can see how close ticks run to the budget (e.g. reconcile ticks).
+    const GLOBAL_RATE_LIMITER_TICK_MS: &[f64] = &[
+        5.0, 10.0, 25.0, 50.0, 100.0, 150.0, 250.0, 400.0, 600.0, 800.0, 1000.0, 1500.0, 2000.0,
+        4000.0,
+    ];
+    // Global rate limiter pipeline batch sizes (entity counts)
+    const GLOBAL_RATE_LIMITER_PIPELINE_SIZES: &[f64] =
+        &[1.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0];
+    // Global rate limiter estimate drift (ratio of threshold)
+    const GLOBAL_RATE_LIMITER_DRIFT_RATIOS: &[f64] =
+        &[0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0];
+    // Global rate limiter sync staleness (milliseconds)
+    const GLOBAL_RATE_LIMITER_STALENESS_MS: &[f64] = &[
+        100.0, 500.0, 1000.0, 5000.0, 10000.0, 15000.0, 30000.0, 60000.0,
+    ];
+
+    // Absolute client clock skew buckets (in seconds).
+    // Fine granularity near zero for finding the right skew correction threshold.
+    const CLOCK_SKEW_SECONDS: &[f64] = &[
+        0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 3600.0, 86400.0,
+    ];
+
+    // Kafka produce ack duration (milliseconds), measured app-side from
+    // `send_result()` returning to broker ack / error / cancellation.
+    // Dense at low end where healthy acks live; widens into seconds / minutes
+    // to capture the long tail (retries, broker stalls, acks=all replication).
+    // Final bucket is 5 minutes; anything slower lands in +Inf.
+    const KAFKA_PRODUCE_ACK_MS: &[f64] = &[
+        0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 25.0, 50.0, 75.0, 100.0, 150.0, 250.0, 500.0, 1000.0,
+        2500.0, 5000.0, 10000.0, 30000.0, 60000.0, 120000.0, 300000.0,
+    ];
+
+    // Same shape as KAFKA_PRODUCE_ACK_MS, but in seconds for the v1 sink's
+    // `capture_v1_kafka_ack_duration_seconds` histogram.
+    const KAFKA_PRODUCE_ACK_SECONDS: &[f64] = &[
+        0.0005, 0.001, 0.002, 0.005, 0.01, 0.015, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 1.0,
+        2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+    ];
+
+    PrometheusBuilder::new()
+        .add_global_label("role", role)
+        .add_global_label("capture_mode", capture_mode)
+        .set_buckets_for_metric(
+            Matcher::Full("http_requests_duration_seconds".to_string()),
+            EXPONENTIAL_SECONDS,
+        )
+        .unwrap()
+        .set_buckets_for_metric(Matcher::Suffix("_batch_size".to_string()), BATCH_SIZES)
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Suffix("capture_full_payload_size".to_string()),
+            PAYLOAD_SIZES,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("capture_s3_upload_duration_seconds".to_string()),
+            S3_LATENCY_SECONDS,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("capture_s3_upload_body_size_bytes".to_string()),
+            S3_BODY_SIZES,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("capture_ai_otel_body_size_bytes".to_string()),
+            PAYLOAD_SIZES,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("capture_ai_otel_spans_per_request".to_string()),
+            BATCH_SIZES,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("capture_ai_blob_count_per_event".to_string()),
+            BLOB_COUNTS,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("capture_ai_blob_size_bytes".to_string()),
+            S3_BODY_SIZES, // Reuse same buckets as S3 body sizes
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("capture_ai_blob_total_bytes_per_event".to_string()),
+            S3_BODY_SIZES, // Reuse same buckets as S3 body sizes
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("global_rate_limiter_pipeline_ms".to_string()),
+            GLOBAL_RATE_LIMITER_PIPELINE_MS,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("global_rate_limiter_tick_ms".to_string()),
+            GLOBAL_RATE_LIMITER_TICK_MS,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("global_rate_limiter_pipeline_size".to_string()),
+            GLOBAL_RATE_LIMITER_PIPELINE_SIZES,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("global_rate_limiter_estimate_drift".to_string()),
+            GLOBAL_RATE_LIMITER_DRIFT_RATIOS,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("global_rate_limiter_sync_staleness_ms".to_string()),
+            GLOBAL_RATE_LIMITER_STALENESS_MS,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("capture_client_clock_skew_seconds".to_string()),
+            CLOCK_SKEW_SECONDS,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("capture_kafka_produce_ack_duration_ms".to_string()),
+            KAFKA_PRODUCE_ACK_MS,
+        )
+        .unwrap()
+        // v1 pipeline histograms: without explicit buckets these fall back to
+        // the metrics-exporter-prometheus defaults, which are too coarse for
+        // meaningful percentile queries in Grafana.
+        .set_buckets_for_metric(
+            Matcher::Full("capture_v1_response_time_seconds".to_string()),
+            EXPONENTIAL_SECONDS,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("capture_v1_kafka_ack_duration_seconds".to_string()),
+            KAFKA_PRODUCE_ACK_SECONDS,
+        )
+        .unwrap()
+        // capture_v1_event_batch_size is covered by the Suffix("_batch_size")
+        // matcher above; only the payload-size and clock-skew histograms need
+        // explicit entries.
+        .set_buckets_for_metric(
+            Matcher::Full("capture_v1_payload_size_bytes".to_string()),
+            PAYLOAD_SIZES,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("capture_v1_clock_skew_seconds".to_string()),
+            CLOCK_SKEW_SECONDS,
+        )
+        .unwrap()
+        .install_recorder()
+        .unwrap()
+}

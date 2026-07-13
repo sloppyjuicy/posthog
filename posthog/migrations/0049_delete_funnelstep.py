@@ -4,11 +4,12 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0048_auto_20200420_1051"),
     ]
 
     operations = [
-        migrations.DeleteModel(name="FunnelStep",),
+        migrations.DeleteModel(
+            name="FunnelStep",
+        ),
     ]

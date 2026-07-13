@@ -1,0 +1,287 @@
+import { expectLogic } from 'kea-test-utils'
+
+import { DateFilterLogicProps, DateFilterView } from 'lib/components/DateFilter/types'
+import { dayjs } from 'lib/dayjs'
+import { dateMapping } from 'lib/utils/dateFilters'
+
+import { dateFilterLogic } from './dateFilterLogic'
+
+describe('dateFilterLogic', () => {
+    let props: DateFilterLogicProps
+    const onChange = jest.fn()
+    let logic: ReturnType<typeof dateFilterLogic.build>
+
+    beforeEach(async () => {
+        dayjs.tz.setDefault('America/New_York')
+
+        props = {
+            key: 'test',
+            onChange,
+            dateFrom: null,
+            dateTo: null,
+            dateOptions: dateMapping,
+            isDateFormatted: false,
+        }
+        logic = dateFilterLogic(props)
+        logic.mount()
+    })
+
+    it('should only open one type of date filter', async () => {
+        await expectLogic(logic).toMatchValues({
+            isVisible: false,
+            view: DateFilterView.QuickList,
+        })
+        logic.actions.open()
+        await expectLogic(logic).toMatchValues({
+            isVisible: true,
+            view: DateFilterView.QuickList,
+        })
+        logic.actions.openFixedRange()
+        await expectLogic(logic).toMatchValues({
+            isVisible: true,
+            view: DateFilterView.FixedRange,
+        })
+        logic.actions.openFixedRangeWithTime()
+        await expectLogic(logic).toMatchValues({
+            isVisible: true,
+            view: DateFilterView.FixedRangeWithTime,
+        })
+        logic.actions.openDateToNow()
+        await expectLogic(logic).toMatchValues({
+            isVisible: true,
+            view: DateFilterView.DateToNow,
+        })
+        logic.actions.close()
+        await expectLogic(logic).toMatchValues({
+            isVisible: false,
+            view: DateFilterView.DateToNow,
+        })
+    })
+
+    it('isFixedRangeWithTime is true when both dates have time precision', async () => {
+        props = {
+            key: 'test-time-precision',
+            onChange,
+            dateFrom: '2024-01-15T10:30:00',
+            dateTo: '2024-01-16T14:45:00',
+            dateOptions: dateMapping,
+            isDateFormatted: false,
+        }
+        const withTimePrecision = dateFilterLogic(props)
+        withTimePrecision.mount()
+
+        await expectLogic(withTimePrecision).toMatchValues({
+            isFixedRange: true,
+            isFixedRangeWithTime: true,
+            dateFromHasTimePrecision: true,
+            dateToHasTimePrecision: true,
+        })
+    })
+
+    it('isFixedRangeWithTime is false when dates have no time precision', async () => {
+        props = {
+            key: 'test-no-time-precision',
+            onChange,
+            dateFrom: '2024-01-15',
+            dateTo: '2024-01-16',
+            dateOptions: dateMapping,
+            isDateFormatted: false,
+        }
+        const withoutTimePrecision = dateFilterLogic(props)
+        withoutTimePrecision.mount()
+
+        await expectLogic(withoutTimePrecision).toMatchValues({
+            isFixedRange: true,
+            isFixedRangeWithTime: false,
+            dateFromHasTimePrecision: false,
+            dateToHasTimePrecision: false,
+        })
+    })
+
+    it('isFixedRangeWithTime is true when only dateFrom has time precision', async () => {
+        props = {
+            key: 'test-from-time-precision',
+            onChange,
+            dateFrom: '2024-01-15T10:30:00',
+            dateTo: '2024-01-16',
+            dateOptions: dateMapping,
+            isDateFormatted: false,
+        }
+        const withFromTimePrecision = dateFilterLogic(props)
+        withFromTimePrecision.mount()
+
+        await expectLogic(withFromTimePrecision).toMatchValues({
+            isFixedRange: true,
+            isFixedRangeWithTime: true,
+            dateFromHasTimePrecision: true,
+            dateToHasTimePrecision: false,
+        })
+    })
+
+    it('isFixedRangeWithTime is true when only dateTo has time precision', async () => {
+        props = {
+            key: 'test-to-time-precision',
+            onChange,
+            dateFrom: '2024-01-15',
+            dateTo: '2024-01-16T14:45:00',
+            dateOptions: dateMapping,
+            isDateFormatted: false,
+        }
+        const withToTimePrecision = dateFilterLogic(props)
+        withToTimePrecision.mount()
+
+        await expectLogic(withToTimePrecision).toMatchValues({
+            isFixedRange: true,
+            isFixedRangeWithTime: true,
+            dateFromHasTimePrecision: false,
+            dateToHasTimePrecision: true,
+        })
+    })
+
+    it('renders single custom date as just the date (no "to now") under allowSingleAndRange', async () => {
+        props = {
+            key: 'test-single-date',
+            onChange,
+            dateFrom: '2024-01-15',
+            dateTo: null,
+            dateOptions: dateMapping,
+            isDateFormatted: false,
+            allowSingleAndRange: true,
+        }
+        const withSingleDate = dateFilterLogic(props)
+        withSingleDate.mount()
+
+        await expectLogic(withSingleDate).toMatchValues({
+            label: 'January 15, 2024',
+        })
+    })
+
+    it('renders single custom datetime with time under allowSingleAndRange', async () => {
+        props = {
+            key: 'test-single-datetime',
+            onChange,
+            dateFrom: '2024-01-15 14:30:00',
+            dateTo: null,
+            dateOptions: dateMapping,
+            isDateFormatted: false,
+            allowSingleAndRange: true,
+        }
+        const withSingleDateTime = dateFilterLogic(props)
+        withSingleDateTime.mount()
+
+        await expectLogic(withSingleDateTime).toMatchValues({
+            label: 'January 15, 2024 14:30:00',
+        })
+    })
+
+    it('isDateToNow label preserves time precision even without allowTimePrecision', async () => {
+        // Regression guard: labels for callers that store a time-precise dateFrom but don't pass
+        // `allowTimePrecision` should still render the time — the new `allowSingleAndRange`
+        // gating must not silently strip seconds from unrelated call sites.
+        props = {
+            key: 'test-datetonow-time',
+            onChange,
+            dateFrom: '2024-01-15T10:30:00',
+            dateTo: null,
+            dateOptions: [],
+            isDateFormatted: false,
+        }
+        const logicWithTime = dateFilterLogic(props)
+        logicWithTime.mount()
+
+        await expectLogic(logicWithTime).toMatchValues({
+            label: 'January 15, 2024 10:30:00 to now',
+        })
+    })
+
+    it('can set the date range', async () => {
+        props = {
+            key: 'test',
+            onChange,
+            dateFrom: '-1dStart',
+            dateTo: '-1dEnd',
+            dateOptions: dateMapping,
+            isDateFormatted: false,
+        }
+        const withDateFrom = dateFilterLogic(props)
+        withDateFrom.mount()
+
+        await expectLogic(withDateFrom).toMatchValues({ dateFrom: '-1dStart', dateTo: '-1dEnd', label: 'Yesterday' })
+        expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('can clear the date range', async () => {
+        props = {
+            key: 'test',
+            onChange,
+            dateFrom: '-1d',
+            dateTo: null,
+            dateOptions: dateMapping,
+            isDateFormatted: false,
+        }
+        const withDateFrom = dateFilterLogic(props)
+        withDateFrom.mount()
+
+        await expectLogic(withDateFrom, () => {
+            withDateFrom.actions.setDate(null, null)
+        })
+        expect(onChange).toHaveBeenCalledWith(null, null, false)
+    })
+
+    it('can receive Custom as date props', async () => {
+        props = {
+            key: 'test',
+            onChange,
+            dateFrom: null,
+            dateTo: null,
+            dateOptions: dateMapping,
+            isDateFormatted: false,
+        }
+        const withoutDateFrom = dateFilterLogic(props)
+        withoutDateFrom.mount()
+
+        await expectLogic(withoutDateFrom).toMatchValues({
+            dateFrom: null,
+            dateTo: null,
+            label: 'No date range override',
+        })
+        expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        // Relative dates should never have time precision
+        ['-30d', null, false, false, 'day'],
+        ['-7d', '-1d', false, false, 'day'],
+        ['-1dStart', '-1dEnd', false, false, 'day'],
+        ['-24h', null, false, false, 'day'],
+        ['mStart', null, false, false, 'day'],
+        // Fixed dates without time should not have time precision
+        ['2024-01-15', null, false, false, 'day'],
+        ['2024-01-15', '2024-01-16', false, false, 'day'],
+        // Fixed dates with time should have time precision
+        ['2024-01-15T10:30:00', null, true, false, 'minute'],
+        ['2024-01-15', '2024-01-16T14:45:00', false, true, 'day'],
+        ['2024-01-15T10:30:00', '2024-01-16T14:45:00', true, true, 'minute'],
+        // Midnight times should not count as time precision
+        ['2024-01-15T00:00:00', null, false, false, 'day'],
+    ])(
+        'handles date %s, %s correctly (fromPrecision: %s, toPrecision: %s, granularity: %s)',
+        async (dateFrom, dateTo, expectedFromPrecision, expectedToPrecision, expectedGranularity) => {
+            const testLogic = dateFilterLogic({
+                key: `test-${dateFrom}-${dateTo}`,
+                onChange: jest.fn(),
+                dateFrom,
+                dateTo,
+                dateOptions: dateMapping,
+                isDateFormatted: false,
+            })
+            testLogic.mount()
+
+            await expectLogic(testLogic).toMatchValues({
+                dateFromHasTimePrecision: expectedFromPrecision,
+                dateToHasTimePrecision: expectedToPrecision,
+                fixedRangeGranularity: expectedGranularity,
+            })
+        }
+    )
+})

@@ -1,25 +1,74 @@
-import { kea } from 'kea'
-import { propertyFilterLogic } from 'lib/components/PropertyFilters/propertyFilterLogic'
+import { actions, connect, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+
 import { TaxonomicPropertyFilterLogicProps } from 'lib/components/PropertyFilters/types'
-import { AnyPropertyFilter, PropertyFilterValue, PropertyOperator } from '~/types'
-import { taxonomicPropertyFilterLogicType } from './taxonomicPropertyFilterLogicType'
-import { cohortsModel } from '~/models/cohortsModel'
+import { isValidPropertyFilter } from 'lib/components/PropertyFilters/utils'
+import {
+    createDefaultPropertyFilter,
+    isAnyPropertyfilter,
+    propertyFilterTypeToTaxonomicFilterType,
+    sanitizePropertyFilter,
+    taxonomicFilterTypeToPropertyFilterType,
+} from 'lib/components/PropertyFilters/utils'
+import { taxonomicFilterLogic } from 'lib/components/TaxonomicFilter/taxonomicFilterLogic'
+import {
+    TaxonomicFilterGroup,
+    TaxonomicFilterGroupType,
+    TaxonomicFilterLogicProps,
+    TaxonomicFilterValue,
+    isQuickFilterItem,
+    quickFilterToPropertyFilter,
+} from 'lib/components/TaxonomicFilter/types'
+import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
 
-export const taxonomicPropertyFilterLogic = kea<taxonomicPropertyFilterLogicType>({
-    props: {} as TaxonomicPropertyFilterLogicProps,
-    key: (props) => `${props.pageKey}-${props.filterIndex}`,
+import { propertyDefinitionsModel } from '~/models/propertyDefinitionsModel'
+import {
+    AnyPropertyFilter,
+    CohortPropertyFilter,
+    EventMetadataPropertyFilter,
+    EventPropertyFilter,
+    FlagPropertyFilter,
+    PropertyFilterType,
+    PropertyOperator,
+} from '~/types'
 
-    connect: (props: TaxonomicPropertyFilterLogicProps) => ({
-        values: [propertyFilterLogic(props), ['filters']],
-    }),
+import type { taxonomicPropertyFilterLogicType } from './taxonomicPropertyFilterLogicType'
 
-    actions: {
-        selectItem: (propertyType?: string, propertyKey?: PropertyFilterValue) => ({ propertyType, propertyKey }),
+export const taxonomicPropertyFilterLogic = kea<taxonomicPropertyFilterLogicType>([
+    props({} as TaxonomicPropertyFilterLogicProps),
+    key((props) => `${props.pageKey}-${props.filterIndex}`),
+    path((key) => ['lib', 'components', 'PropertyFilters', 'components', 'taxonomicPropertyFilterLogic', key]),
+    connect((props: TaxonomicPropertyFilterLogicProps) => ({
+        values: [
+            taxonomicFilterLogic({
+                taxonomicFilterLogicKey: props.pageKey,
+                taxonomicGroupTypes: props.taxonomicGroupTypes,
+                onChange: props.taxonomicOnChange,
+                eventNames: props.eventNames,
+                excludedProperties: props.excludedProperties,
+                propertyAllowList: props.propertyAllowList,
+                endpointFilters: props.endpointFilters,
+            } as TaxonomicFilterLogicProps),
+            ['taxonomicGroups'],
+            propertyDefinitionsModel,
+            ['describeProperty'],
+        ],
+    })),
+    actions({
+        selectItem: (
+            taxonomicGroup: TaxonomicFilterGroup,
+            propertyKey?: TaxonomicFilterValue,
+            itemPropertyFilterType?: PropertyFilterType,
+            item?: any
+        ) => ({
+            taxonomicGroup,
+            propertyKey,
+            itemPropertyFilterType,
+            item,
+        }),
         openDropdown: true,
         closeDropdown: true,
-    },
-
-    reducers: {
+    }),
+    reducers({
         dropdownOpen: [
             false,
             {
@@ -27,46 +76,118 @@ export const taxonomicPropertyFilterLogic = kea<taxonomicPropertyFilterLogicType
                 closeDropdown: () => false,
             },
         ],
-    },
-
-    selectors: {
+    }),
+    selectors({
         filter: [
-            (s) => [s.filters, (_, props) => props.filterIndex],
-            (filters, filterIndex): AnyPropertyFilter | null => filters[filterIndex] || null,
+            (_, p) => [p.filters, p.filterIndex],
+            (filters, filterIndex): AnyPropertyFilter | null =>
+                filters[filterIndex] ? sanitizePropertyFilter(filters[filterIndex]) : null,
         ],
-        selectedCohortName: [
-            (s) => [s.filter, cohortsModel.selectors.cohorts],
-            (filter, cohorts) => (filter?.type === 'cohort' ? cohorts.find((c) => c.id === filter?.value)?.name : null),
-        ],
-    },
-
-    listeners: ({ actions, values, props }) => ({
-        selectItem: ({ propertyType, propertyKey }) => {
-            if (propertyKey && propertyType) {
-                if (propertyType === 'cohort') {
-                    propertyFilterLogic(props).actions.setFilter(
-                        props.filterIndex,
-                        'id',
-                        propertyKey,
-                        null,
-                        propertyType
-                    )
-                } else {
-                    const operator =
-                        propertyKey === '$active_feature_flags'
-                            ? PropertyOperator.IContains
-                            : values.filter?.operator || PropertyOperator.Exact
-
-                    propertyFilterLogic(props).actions.setFilter(
-                        props.filterIndex,
-                        propertyKey.toString(),
-                        null, // Reset value field
-                        operator,
-                        propertyType
-                    )
+        activeTaxonomicGroup: [
+            (s) => [s.filter, s.taxonomicGroups],
+            (filter, groups): TaxonomicFilterGroup | undefined => {
+                if (isAnyPropertyfilter(filter)) {
+                    const taxonomicGroupType = propertyFilterTypeToTaxonomicFilterType(filter)
+                    return groups.find((group) => group.type === taxonomicGroupType)
                 }
+            },
+        ],
+    }),
+    listeners(({ actions, values, props }) => ({
+        openDropdown: () => {
+            const existingFilter = props.filters[props.filterIndex]
+            if (!existingFilter || !isValidPropertyFilter(existingFilter)) {
+                if (eventUsageLogic.isMounted()) {
+                    eventUsageLogic.actions.reportTaxonomicFilterAddFilterClicked(props.eventNames?.[0])
+                }
+            }
+        },
+        selectItem: ({ taxonomicGroup, propertyKey, itemPropertyFilterType, item }) => {
+            if (item?._recentContext?.propertyFilter) {
+                props.setFilter(props.filterIndex, item._recentContext.propertyFilter)
+                actions.closeDropdown()
+                return
+            }
+
+            if (isQuickFilterItem(item)) {
+                props.setFilter(props.filterIndex, quickFilterToPropertyFilter(item))
+                actions.closeDropdown()
+                return
+            }
+
+            if (
+                taxonomicGroup.type === TaxonomicFilterGroupType.PageviewEvents ||
+                taxonomicGroup.type === TaxonomicFilterGroupType.PageviewUrls
+            ) {
+                const filter: EventPropertyFilter = {
+                    key: '$current_url',
+                    value: propertyKey ? String(propertyKey) : '',
+                    operator: PropertyOperator.IContains,
+                    type: PropertyFilterType.Event,
+                }
+                props.setFilter(props.filterIndex, filter)
+                actions.closeDropdown()
+                return
+            }
+
+            if (
+                taxonomicGroup.type === TaxonomicFilterGroupType.ScreenEvents ||
+                taxonomicGroup.type === TaxonomicFilterGroupType.Screens
+            ) {
+                const filter: EventPropertyFilter = {
+                    key: '$screen_name',
+                    value: propertyKey ? String(propertyKey) : '',
+                    operator: PropertyOperator.Exact,
+                    type: PropertyFilterType.Event,
+                }
+                props.setFilter(props.filterIndex, filter)
+                actions.closeDropdown()
+                return
+            }
+
+            if (taxonomicGroup.type === TaxonomicFilterGroupType.EmailAddresses) {
+                const filter: AnyPropertyFilter = {
+                    key: 'email',
+                    value: propertyKey ? String(propertyKey) : '',
+                    operator: PropertyOperator.Exact,
+                    type: PropertyFilterType.Person,
+                }
+                props.setFilter(props.filterIndex, filter)
+                actions.closeDropdown()
+                return
+            }
+
+            const propertyType = itemPropertyFilterType ?? taxonomicFilterTypeToPropertyFilterType(taxonomicGroup.type)
+            if (propertyKey && propertyType) {
+                const filter = createDefaultPropertyFilter(
+                    values.filter,
+                    propertyKey,
+                    propertyType,
+                    taxonomicGroup,
+                    values.describeProperty,
+                    item
+                )
+
+                // Add cohort name if this is a cohort filter
+                if (propertyType === 'cohort' && item?.name) {
+                    const cohortFilter = filter as CohortPropertyFilter
+                    cohortFilter.cohort_name = item.name
+                }
+
+                // Add flag key for display if this is a feature flag filter
+                if (propertyType === PropertyFilterType.Flag && item?.key) {
+                    const featureFilter = filter as FlagPropertyFilter
+                    featureFilter.label = item.key
+                }
+
+                if (propertyType === PropertyFilterType.EventMetadata && item.id.startsWith('$group_')) {
+                    const eventMetadataFilter = filter as EventMetadataPropertyFilter
+                    eventMetadataFilter.label = item.name
+                }
+
+                props.setFilter(props.filterIndex, filter)
                 actions.closeDropdown()
             }
         },
-    }),
-})
+    })),
+])

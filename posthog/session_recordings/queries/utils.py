@@ -1,0 +1,177 @@
+import re
+from typing import NamedTuple
+
+import structlog
+import posthoganalytics
+
+from posthog.schema import (
+    ActionsNode,
+    CohortPropertyFilter,
+    EventPropertyFilter,
+    EventsNode,
+    GroupPropertyFilter,
+    HogQLPropertyFilter,
+    PersonPropertyFilter,
+    PersonsOnEventsMode,
+    PropertyOperator,
+    QueryTiming,
+)
+
+from posthog.hogql import ast
+from posthog.hogql.property import action_to_expr
+
+from posthog.models import Team
+from posthog.types import AnyPropertyFilter
+
+from products.actions.backend.models.action import Action
+
+logger = structlog.get_logger(__name__)
+
+ANONYMOUS_USER_COHORT_FIX_FLAG = "anonymous-user-session-replay-filtering-fix"
+
+
+def is_anonymous_cohort_fix_enabled(team: Team) -> bool:
+    """Gate for the PoE-mode cohort-vs-anonymous-user rewrite.
+
+    When on, cohort filters skip CohortPropertyGroupsSubQuery and are instead handled
+    by ReplayFiltersEventsSubQuery, which routes NOT IN filters through the existing
+    _negative_blocklist_query path so anonymous events (no person mapping) aren't
+    wrongly excluded.
+    """
+    try:
+        return bool(posthoganalytics.feature_enabled(ANONYMOUS_USER_COHORT_FIX_FLAG, str(team.pk)))
+    except Exception:
+        return False
+
+
+NEGATIVE_OPERATORS = [
+    PropertyOperator.IS_NOT_SET,
+    PropertyOperator.IS_NOT,
+    PropertyOperator.NOT_REGEX,
+    PropertyOperator.NOT_ICONTAINS,
+    # PropertyOperator.NOT_BETWEEN, # in the schema but not used anywhere
+    # PropertyOperator.NOT_IN,  # COHORT operator we don't need to handle it explicitly
+]
+
+INVERSE_OPERATOR_FOR = {
+    PropertyOperator.IS_NOT_SET: PropertyOperator.IS_SET,
+    PropertyOperator.IS_NOT: PropertyOperator.EXACT,
+    PropertyOperator.NOT_IN: PropertyOperator.IN_,
+    PropertyOperator.NOT_REGEX: PropertyOperator.REGEX,
+    PropertyOperator.NOT_ICONTAINS: PropertyOperator.ICONTAINS,
+    PropertyOperator.NOT_BETWEEN: PropertyOperator.BETWEEN,
+}
+
+
+def is_event_property(p: AnyPropertyFilter) -> bool:
+    p_type = getattr(p, "type", None)
+    p_key = getattr(p, "key", "")
+    return p_type == "event" or (p_type == "hogql" and bool(re.search(r"(?<!person\.)properties\.", p_key)))
+
+
+def is_person_property(p: AnyPropertyFilter) -> bool:
+    p_type = getattr(p, "type", None)
+    p_key = getattr(p, "key", "")
+    return p_type == "person" or (p_type == "hogql" and "person.properties" in p_key)
+
+
+def is_group_property(p: AnyPropertyFilter) -> bool:
+    p_type = getattr(p, "type", None)
+    return p_type == "group"
+
+
+def is_cohort_property(p: AnyPropertyFilter) -> bool:
+    p_type = getattr(p, "type", None)
+    return bool(p_type and "cohort" in p_type)
+
+
+def is_session_property(p: AnyPropertyFilter) -> bool:
+    p_type = getattr(p, "type", None)
+    p_key = getattr(p, "key", "")
+    return p_type == "session" or (p_type == "hogql" and "session.properties" in p_key)
+
+
+def is_recording_property(p: AnyPropertyFilter) -> bool:
+    p_type = getattr(p, "type", None)
+    return p_type == "recording"
+
+
+def expand_test_account_filters(team: Team) -> list[AnyPropertyFilter]:
+    prop_filters: list[AnyPropertyFilter] = []
+    for prop in team.test_account_filters:
+        match prop.get("type", None):
+            case "person":
+                prop_filters.append(PersonPropertyFilter(**prop))
+            case "event":
+                prop_filters.append(EventPropertyFilter(**prop))
+            case "group":
+                prop_filters.append(GroupPropertyFilter(**prop))
+            case "hogql":
+                prop_filters.append(HogQLPropertyFilter(**prop))
+            case "cohort":
+                prop_filters.append(CohortPropertyFilter(**prop))
+            case None:
+                logger.warn("test account filter had no type", filter=prop)
+                prop_filters.append(EventPropertyFilter(**prop))
+
+    return prop_filters
+
+
+class SessionRecordingQueryResult(NamedTuple):
+    results: list
+    has_more_recording: bool
+    timings: list[QueryTiming] | None = None
+    next_cursor: str | None = None
+
+
+class UnexpectedQueryProperties(Exception):
+    def __init__(self, remaining_properties: list[AnyPropertyFilter] | None):
+        self.remaining_properties = remaining_properties
+        # Drop the raw value from each filter so that user-supplied data (e.g. a domain or URL)
+        # doesn't end up in the exception message — otherwise every distinct value produces a
+        # brand-new error-tracking fingerprint.
+        summary = [
+            {"type": getattr(p, "type", None), "key": getattr(p, "key", None), "operator": getattr(p, "operator", None)}
+            for p in (remaining_properties or [])
+        ]
+        super().__init__(f"Unexpected properties in query: {summary}")
+
+
+def _strip_person_and_event_and_cohort_properties(
+    properties: list[AnyPropertyFilter] | None,
+) -> list[AnyPropertyFilter] | None:
+    if not properties:
+        return None
+
+    properties_to_keep = [
+        p
+        for p in properties
+        if not is_event_property(p)
+        and not is_person_property(p)
+        and not is_group_property(p)
+        and not is_cohort_property(p)
+        and not is_session_property(p)
+        and not is_recording_property(p)
+    ]
+
+    return properties_to_keep
+
+
+def poe_is_active(team: Team) -> bool:
+    return team.person_on_events_mode is not None and team.person_on_events_mode != PersonsOnEventsMode.DISABLED
+
+
+def _entity_to_expr(entity: EventsNode | ActionsNode) -> ast.Expr:
+    # KLUDGE: we should be able to use NodeKind.ActionsNode here but mypy :shrug:
+    if entity.kind == "ActionsNode":
+        action = Action.objects.get(pk=entity.id)
+        return action_to_expr(action)
+    else:
+        if entity.event is None:
+            return ast.Constant(value=True)
+
+        return ast.CompareOperation(
+            op=ast.CompareOperationOp.Eq,
+            left=ast.Field(chain=["events", "event"]),
+            right=ast.Constant(value=entity.name),
+        )

@@ -1,0 +1,350 @@
+import { Handle, NodeProps } from '@xyflow/react'
+import { z } from 'zod'
+
+import { Optional } from 'lib/utils/types'
+import { LogEntry } from 'scenes/hog-functions/logs/logsViewerLogic'
+
+import { HogFlowAction } from '../types'
+
+export type HogFlowStepNodeProps = NodeProps & {
+    data: HogFlowAction
+    type: HogFlowAction['type']
+}
+
+export type StepViewNodeHandle = Omit<Optional<Handle, 'width' | 'height'>, 'nodeId'> & { label?: string }
+
+const ActionFiltersSchema = z.object({
+    events: z.array(z.any()).optional(),
+    properties: z.array(z.any()).optional(),
+    actions: z.array(z.any()).optional(),
+})
+
+const DURATION_STRING = z.string().superRefine((v, ctx) => {
+    if (!/\d/.test(v)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Please enter a duration' })
+        return
+    }
+    if (!/^\d+[dhm]$/.test(v)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Duration must be a whole number followed by d, h, or m' })
+        return
+    }
+    if (parseInt(v, 10) < 1) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Duration must be at least 1' })
+    }
+})
+
+const _commonActionFields = {
+    id: z.string(),
+    name: z.string(),
+    description: z.string(),
+    on_error: z.enum(['continue', 'abort']).optional().nullable(),
+    created_at: z.number().optional(),
+    updated_at: z.number().optional(),
+    filters: ActionFiltersSchema.optional().nullable(),
+    output_variable: z // The Hogflow-level variable to store the output of this action into
+        .union([
+            z.object({
+                key: z.string(),
+                result_path: z.string().optional().nullable(), // The path within the action result to store, e.g. 'body.user.id'
+                spread: z.boolean().optional().nullable(), // When true, spread object result into multiple variables as {key}_{property}
+                label: z.string().optional().nullable(), // Display label for the auto-created workflow variable
+            }),
+            z.array(
+                z.object({
+                    key: z.string(),
+                    result_path: z.string().optional().nullable(),
+                    spread: z.boolean().optional().nullable(),
+                    label: z.string().optional().nullable(),
+                })
+            ),
+        ])
+        .optional()
+        .nullable(),
+}
+
+const CyclotronInputSchema = z.object({
+    value: z.any(),
+    templating: z.enum(['hog', 'liquid']).optional(),
+    secret: z.boolean().optional(),
+    bytecode: z.any().optional(),
+    order: z.number().optional(),
+})
+
+export type CyclotronInputType = z.infer<typeof CyclotronInputSchema>
+
+export const CyclotronJobInputSchemaTypeSchema = z.object({
+    type: z.enum([
+        'string',
+        'number',
+        'boolean',
+        'dictionary',
+        'choice',
+        'json',
+        'integration',
+        'integration_field',
+        'email',
+        'native_email',
+        'posthog_assignee',
+        'posthog_ticket_tags',
+        'posthog_business_hours',
+        'non_failure_status_codes',
+        'customer_analytics_account_properties',
+        'customer_analytics_account_relationships',
+    ]),
+    key: z.string(),
+    label: z.string(),
+    choices: z
+        .array(
+            z.object({
+                value: z.string(),
+                label: z.string(),
+            })
+        )
+        .optional(),
+    required: z.boolean().optional(),
+    default: z.any().optional(),
+    secret: z.boolean().optional(),
+    hidden: z.boolean().optional(),
+    templating: z.boolean().optional(),
+    description: z.string().optional(),
+    integration: z.string().optional(),
+    integration_key: z.string().optional(),
+    integration_field: z.string().optional(),
+    requires_field: z.string().optional(),
+    requiredScopes: z.string().optional(),
+})
+
+export type CyclotronJobInputSchemaType = z.infer<typeof CyclotronJobInputSchemaTypeSchema>
+
+export const CyclotronInputMappingSchema = z.object({
+    name: z.string(),
+    disabled: z.boolean().optional(),
+    inputs_schema: z.array(CyclotronJobInputSchemaTypeSchema).optional(),
+    inputs: z.record(z.string(), CyclotronInputSchema).optional().nullable(),
+    filters: z.any().optional().nullable(),
+})
+
+export type CyclotronInputMappingType = z.infer<typeof CyclotronInputMappingSchema>
+
+const EventTriggerFiltersSchema = ActionFiltersSchema.extend({
+    filter_test_accounts: z.boolean().optional(),
+})
+
+export const HogFlowTriggerSchema = z.discriminatedUnion('type', [
+    z.object({
+        type: z.literal('event'),
+        filters: EventTriggerFiltersSchema,
+    }),
+    z.object({
+        type: z.literal('webhook'),
+        template_uuid: z.string().optional(), // May be used later to specify a specific template version
+        template_id: z.string(),
+        inputs: z.record(z.string(), CyclotronInputSchema),
+    }),
+    z.object({
+        type: z.literal('manual'),
+        template_uuid: z.string().optional(), // May be used later to specify a specific template version
+        template_id: z.string(),
+        inputs: z.record(z.string(), CyclotronInputSchema),
+    }),
+    z.object({
+        type: z.literal('tracking_pixel'),
+        template_uuid: z.string().optional(), // May be used later to specify a specific template version
+        template_id: z.string(),
+        inputs: z.record(z.string(), CyclotronInputSchema),
+    }),
+    z.object({
+        type: z.literal('schedule'),
+    }),
+    z.object({
+        type: z.literal('batch'),
+        filters: z.object({
+            properties: z.array(z.any()),
+        }),
+    }),
+    z.object({
+        type: z.literal('data-warehouse-table'),
+        // Dot-notated table name matching the Python CDPProducer naming
+        table_name: z.string(),
+        filters: z.object({
+            properties: z.array(z.any()).optional(),
+        }),
+        key_property: z.string().optional(),
+    }),
+])
+
+/** Trigger types that use HogFlowSchedule for recurring execution */
+export const SCHEDULED_TRIGGER_TYPES: readonly string[] = ['batch', 'schedule'] as const
+
+export const HogFlowActionSchema = z.discriminatedUnion('type', [
+    // Trigger
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('trigger'),
+        config: HogFlowTriggerSchema,
+    }),
+    // Branching
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('conditional_branch'),
+        config: z.object({
+            conditions: z.array(
+                z.object({
+                    filters: ActionFiltersSchema,
+                    name: z.string().optional(), // Custom name for the condition
+                })
+            ),
+            delay_duration: z.string().optional(),
+        }),
+    }),
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('random_cohort_branch'),
+        config: z.object({
+            cohorts: z.array(
+                z.object({
+                    percentage: z.number(),
+                    name: z.string().optional(), // Custom name for the cohort
+                })
+            ),
+        }),
+    }),
+
+    // Time based
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('delay'),
+        config: z.object({
+            delay_duration: DURATION_STRING,
+        }),
+    }),
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('wait_until_condition'),
+        config: z.object({
+            condition: z.object({
+                filters: ActionFiltersSchema.optional().nullable(),
+                name: z.string().optional(), // Custom name for the condition
+            }),
+            events: z
+                .array(
+                    z.object({
+                        filters: ActionFiltersSchema.optional().nullable(),
+                        name: z.string().optional(),
+                    })
+                )
+                .optional(),
+            max_wait_duration: DURATION_STRING,
+        }),
+    }),
+
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('wait_until_time_window'),
+        config: z.object({
+            timezone: z.string().nullable(),
+            // When true, use the person's $geoip_time_zone property for timezone
+            use_person_timezone: z.boolean().optional(),
+            // Fallback timezone when use_person_timezone is true but person has no timezone set
+            fallback_timezone: z.string().nullable().optional(),
+            // Day can be special values "weekday", "weekend" or a list of days of the week e.g. 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'
+            day: z.union([
+                z.literal('any'),
+                z.literal('weekday'),
+                z.literal('weekend'),
+                z.array(z.enum(['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'])),
+            ]),
+            // time can be "any", or a time range [start, end]
+            time: z.union([
+                z.literal('any'),
+                z.tuple([z.string(), z.string()]), // e.g. ['10:00', '11:00']
+            ]),
+        }),
+    }),
+
+    // CDP functions
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('function'),
+        config: z.object({
+            template_uuid: z.string().optional(), // May be used later to specify a specific template version
+            template_id: z.string(),
+            inputs: z.record(z.string(), CyclotronInputSchema),
+            mappings: z.array(CyclotronInputMappingSchema).optional(),
+        }),
+    }),
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('function_email'),
+        config: z.object({
+            message_category_id: z.string().optional(),
+            message_category_type: z.enum(['marketing', 'transactional']).optional(),
+            template_uuid: z.string().optional(), // May be used later to specify a specific template version
+            template_id: z.literal('template-email'),
+            inputs: z.record(z.string(), CyclotronInputSchema),
+        }),
+    }),
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('function_sms'),
+        config: z.object({
+            message_category_id: z.string().optional(),
+            message_category_type: z.enum(['marketing', 'transactional']).optional(),
+            template_uuid: z.string().optional(),
+            template_id: z.literal('template-twilio'),
+            inputs: z.record(z.string(), CyclotronInputSchema),
+        }),
+    }),
+
+    // Exit
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('exit'),
+        config: z.object({
+            reason: z.string().optional(),
+        }),
+    }),
+])
+
+export const isOptOutEligibleAction = (
+    action: HogFlowAction
+): action is Extract<HogFlowAction, { type: 'function_email' | 'function_sms' }> => {
+    return ['function_email', 'function_sms'].includes(action.type)
+}
+
+export const isEmailAction = (action: HogFlowAction): action is Extract<HogFlowAction, { type: 'function_email' }> => {
+    return ['function_email'].includes(action.type)
+}
+
+export const isFunctionAction = (
+    action: HogFlowAction
+): action is Extract<HogFlowAction, { type: 'function' | 'function_sms' | 'function_email' }> => {
+    return ['function', 'function_sms', 'function_email'].includes(action.type)
+}
+
+export const isTriggerFunction = (
+    action: HogFlowAction
+): action is Extract<HogFlowAction, { type: 'trigger'; config: { type: 'webhook' | 'tracking_pixel' | 'manual' } }> => {
+    if (action.type !== 'trigger') {
+        return false
+    }
+    const trigger = action as Extract<HogFlowAction, { type: 'trigger' }>
+    return ['webhook', 'tracking_pixel', 'manual'].includes(trigger.config.type)
+}
+
+export const isScheduleTrigger = (action: HogFlowAction): boolean => {
+    if (action.type !== 'trigger') {
+        return false
+    }
+    const trigger = action as Extract<HogFlowAction, { type: 'trigger' }>
+    return trigger.config.type === 'schedule'
+}
+
+export interface HogflowTestResult {
+    status: 'success' | 'error' | 'skipped'
+    logs?: LogEntry[]
+    nextActionId: string | null
+    errors?: string[]
+    variables?: Record<string, any>
+    execResult?: unknown
+}

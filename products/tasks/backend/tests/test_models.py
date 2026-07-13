@@ -1,0 +1,1640 @@
+import json
+import uuid
+import secrets
+from typing import ClassVar
+
+from unittest.mock import AsyncMock, patch
+
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db import IntegrityError
+from django.test import TestCase
+
+from parameterized import parameterized
+
+from posthog.models import Integration, Organization, Team
+from posthog.models.organization import OrganizationMembership
+from posthog.models.user import User
+from posthog.models.user_integration import UserIntegration
+from posthog.storage import object_storage
+
+from products.tasks.backend.models import CodeInvite, SandboxEnvironment, SandboxSnapshot, Task, TaskRun
+
+
+class TestTask(TestCase):
+    organization: ClassVar[Organization]
+    team: ClassVar[Team]
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.organization = Organization.objects.create(name="Test Org")
+        cls.team = Team.objects.create(organization=cls.organization, name="Test Team")
+
+    @parameterized.expand(
+        [
+            (Task.OriginProduct.ERROR_TRACKING,),
+            (Task.OriginProduct.EVAL_CLUSTERS,),
+            (Task.OriginProduct.USER_CREATED,),
+            (Task.OriginProduct.SUPPORT_QUEUE,),
+            (Task.OriginProduct.SESSION_SUMMARIES,),
+        ]
+    )
+    def test_task_creation_with_origin_products(self, origin_product):
+        task = Task.objects.create(
+            team=self.team,
+            title="Test Task",
+            description="Test Description",
+            origin_product=origin_product,
+        )
+        self.assertEqual(task.team, self.team)
+        self.assertEqual(task.title, "Test Task")
+        self.assertEqual(task.description, "Test Description")
+        self.assertEqual(task.origin_product, origin_product)
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_minimal(self, mock_execute_workflow):
+        user = User.objects.create(email="test@test.com")
+        Integration.objects.create(team=self.team, kind="github", config={})
+
+        with self.captureOnCommitCallbacks(execute=True):
+            task = Task.create_and_run(
+                team=self.team,
+                title="Test Create and Run",
+                description="Test Description",
+                origin_product=Task.OriginProduct.USER_CREATED,
+                user_id=user.id,
+                repository="posthog/posthog",
+            )
+
+        self.assertIsNotNone(task.id)
+        self.assertEqual(task.title, "Test Create and Run")
+        self.assertEqual(task.description, "Test Description")
+        self.assertEqual(task.origin_product, Task.OriginProduct.USER_CREATED)
+        self.assertEqual(task.team, self.team)
+        self.assertEqual(task.created_by, user)
+        self.assertEqual(task.repository, "posthog/posthog")
+
+        mock_execute_workflow.assert_called_once()
+        call_args = mock_execute_workflow.call_args
+        self.assertEqual(call_args.kwargs["task_id"], str(task.id))
+        self.assertEqual(call_args.kwargs["team_id"], self.team.id)
+        self.assertEqual(call_args.kwargs["user_id"], user.id)
+        self.assertIsNotNone(call_args.kwargs["run_id"])
+        task_run = TaskRun.objects.get(id=call_args.kwargs["run_id"])
+        self.assertEqual(task_run.task, task)
+        self.assertEqual(task_run.status, TaskRun.Status.QUEUED)
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_threads_initial_permission_mode_into_state(self, mock_execute_workflow):
+        user = User.objects.create(email="test@test.com")
+        Integration.objects.create(team=self.team, kind="github", config={})
+
+        with self.captureOnCommitCallbacks(execute=True):
+            task = Task.create_and_run(
+                team=self.team,
+                title="Slack Task",
+                description="Slack Description",
+                origin_product=Task.OriginProduct.SLACK,
+                user_id=user.id,
+                repository="posthog/posthog",
+                initial_permission_mode="bypassPermissions",
+            )
+
+        run_id = mock_execute_workflow.call_args.kwargs["run_id"]
+        task_run = TaskRun.objects.get(id=run_id)
+        self.assertEqual(task_run.state["initial_permission_mode"], "bypassPermissions")
+        self.assertEqual(task.origin_product, Task.OriginProduct.SLACK)
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_threads_ai_stage_into_state(self, mock_execute_workflow):
+        user = User.objects.create(email="test@test.com")
+        Integration.objects.create(team=self.team, kind="github", config={})
+
+        with self.captureOnCommitCallbacks(execute=True):
+            Task.create_and_run(
+                team=self.team,
+                title="Signal Task",
+                description="Signal Description",
+                origin_product=Task.OriginProduct.SIGNAL_REPORT,
+                user_id=user.id,
+                repository="posthog/posthog",
+                ai_stage="research",
+            )
+
+        run_id = mock_execute_workflow.call_args.kwargs["run_id"]
+        task_run = TaskRun.objects.get(id=run_id)
+        self.assertEqual(task_run.state["ai_stage"], "research")
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_omits_ai_stage_when_not_provided(self, mock_execute_workflow):
+        user = User.objects.create(email="test@test.com")
+        Integration.objects.create(team=self.team, kind="github", config={})
+
+        with self.captureOnCommitCallbacks(execute=True):
+            Task.create_and_run(
+                team=self.team,
+                title="Plain Task",
+                description="Plain Description",
+                origin_product=Task.OriginProduct.USER_CREATED,
+                user_id=user.id,
+                repository="posthog/posthog",
+            )
+
+        run_id = mock_execute_workflow.call_args.kwargs["run_id"]
+        task_run = TaskRun.objects.get(id=run_id)
+        self.assertNotIn("ai_stage", task_run.state)
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_omits_permission_mode_when_not_provided(self, mock_execute_workflow):
+        user = User.objects.create(email="test@test.com")
+        Integration.objects.create(team=self.team, kind="github", config={})
+
+        with self.captureOnCommitCallbacks(execute=True):
+            Task.create_and_run(
+                team=self.team,
+                title="Plain Task",
+                description="Plain Description",
+                origin_product=Task.OriginProduct.USER_CREATED,
+                user_id=user.id,
+                repository="posthog/posthog",
+            )
+
+        run_id = mock_execute_workflow.call_args.kwargs["run_id"]
+        task_run = TaskRun.objects.get(id=run_id)
+        self.assertNotIn("initial_permission_mode", task_run.state)
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_with_repository(self, mock_execute_workflow):
+        user = User.objects.create(email="test@test.com")
+        Integration.objects.create(team=self.team, kind="github", config={})
+
+        with self.captureOnCommitCallbacks(execute=True):
+            task = Task.create_and_run(
+                team=self.team,
+                title="Test Task",
+                description="Test Description",
+                origin_product=Task.OriginProduct.USER_CREATED,
+                user_id=user.id,
+                repository="posthog/posthog-js",
+            )
+
+        self.assertEqual(task.repository, "posthog/posthog-js")
+
+        mock_execute_workflow.assert_called_once()
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_invalid_repository_format(self, mock_execute_workflow):
+        user = User.objects.create(email="test@test.com")
+        Integration.objects.create(team=self.team, kind="github", config={})
+
+        with self.assertRaises(ValidationError) as cm:
+            Task.create_and_run(
+                team=self.team,
+                title="Test Task",
+                description="Test Description",
+                origin_product=Task.OriginProduct.USER_CREATED,
+                user_id=user.id,
+                repository="invalid-format",
+            )
+
+        self.assertIn("Format for repository is organization/repo", str(cm.exception))
+        mock_execute_workflow.assert_not_called()
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_public_repo_without_integration(self, mock_execute_workflow):
+        user = User.objects.create(email="test@test.com")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            task = Task.create_and_run(
+                team=self.team,
+                title="Test Task",
+                description="Test Description",
+                origin_product=Task.OriginProduct.USER_CREATED,
+                user_id=user.id,
+                repository="posthog/hedgebox",
+            )
+
+        self.assertEqual(task.repository, "posthog/hedgebox")
+        self.assertIsNone(task.github_integration)
+        mock_execute_workflow.assert_called_once()
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_non_public_repo_without_integration_raises(self, mock_execute_workflow):
+        user = User.objects.create(email="test@test.com")
+
+        with self.assertRaises(ValueError) as cm:
+            Task.create_and_run(
+                team=self.team,
+                title="Test Task",
+                description="Test Description",
+                origin_product=Task.OriginProduct.USER_CREATED,
+                user_id=user.id,
+                repository="posthog/posthog",
+            )
+
+        self.assertIn("does not have a GitHub integration", str(cm.exception))
+        mock_execute_workflow.assert_not_called()
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_with_github_integration(self, mock_execute_workflow):
+        user = User.objects.create(email="test@test.com")
+        integration = Integration.objects.create(team=self.team, kind="github", config={})
+
+        with self.captureOnCommitCallbacks(execute=True):
+            task = Task.create_and_run(
+                team=self.team,
+                title="Test Task",
+                description="Test Description",
+                origin_product=Task.OriginProduct.USER_CREATED,
+                user_id=user.id,
+                repository="posthog/posthog",
+            )
+
+        self.assertEqual(task.github_integration, integration)
+        mock_execute_workflow.assert_called_once()
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_signal_report_falls_back_to_user_integration(self, mock_execute_workflow):
+        # Signal reports are BOT-authored. When the team has no Integration row but the task
+        # creator has a UserIntegration that grants access to the repo, we should accept it
+        # instead of raising "Team does not have a GitHub integration".
+        user = User.objects.create(email="signal-report@test.com")
+        OrganizationMembership.objects.create(user=user, organization=self.organization)
+        user_integration = UserIntegration.objects.create(
+            user=user,
+            kind=UserIntegration.IntegrationKind.GITHUB,
+            integration_id="install-1",
+            config={"installation_id": "install-1"},
+            sensitive_config={"access_token": "ghs_user_install"},
+            repository_cache=[{"full_name": "posthog/posthog", "id": 1}],
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            task = Task.create_and_run(
+                team=self.team,
+                title="Signal Report",
+                description="Research",
+                origin_product=Task.OriginProduct.SIGNAL_REPORT,
+                user_id=user.id,
+                repository="posthog/posthog",
+            )
+
+        self.assertIsNone(task.github_integration)
+        self.assertEqual(task.github_user_integration, user_integration)
+        mock_execute_workflow.assert_called_once()
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_signal_report_raises_when_no_integration_anywhere(self, mock_execute_workflow):
+        user = User.objects.create(email="signal-no-int@test.com")
+        OrganizationMembership.objects.create(user=user, organization=self.organization)
+
+        with self.assertRaises(ValueError) as cm:
+            Task.create_and_run(
+                team=self.team,
+                title="Signal Report",
+                description="Research",
+                origin_product=Task.OriginProduct.SIGNAL_REPORT,
+                user_id=user.id,
+                repository="posthog/posthog",
+            )
+
+        self.assertIn("does not have a GitHub integration", str(cm.exception))
+        mock_execute_workflow.assert_not_called()
+
+    @parameterized.expand(
+        [
+            ("posthog-repo",),
+            ("noslashhere",),
+        ]
+    )
+    def test_repository_validation_fails_without_slash(self, repository):
+        with self.assertRaises(ValidationError) as cm:
+            Task.objects.create(
+                team=self.team,
+                title="Test Task",
+                description="Description",
+                origin_product=Task.OriginProduct.USER_CREATED,
+                repository=repository,
+            )
+
+        self.assertIn("Format for repository is organization/repo", str(cm.exception))
+
+    @parameterized.expand(
+        [
+            ("PostHog/posthog", "posthog/posthog"),
+            ("posthog/PostHog-JS", "posthog/posthog-js"),
+            ("PostHog/PostHog", "posthog/posthog"),
+            ("POSTHOG/POSTHOG-JS", "posthog/posthog-js"),
+            ("posthog/posthog-js", "posthog/posthog-js"),
+        ]
+    )
+    def test_repository_converts_to_lowercase(self, input_repo, expected_repo):
+        task = Task.objects.create(
+            team=self.team,
+            title="Test Task",
+            description="Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+            repository=input_repo,
+        )
+
+        self.assertEqual(task.repository, expected_repo)
+
+    def test_soft_delete(self):
+        task = Task.objects.create(
+            team=self.team,
+            title="Test Task",
+            description="Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+        )
+
+        self.assertFalse(task.deleted)
+        self.assertIsNone(task.deleted_at)
+
+        task.soft_delete()
+
+        task.refresh_from_db()
+        self.assertTrue(task.deleted)
+        self.assertIsNotNone(task.deleted_at)
+
+    def test_hard_delete_blocked(self):
+        task = Task.objects.create(
+            team=self.team,
+            title="Test Task",
+            description="Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+        )
+
+        with self.assertRaises(Exception) as cm:
+            task.delete()
+
+        self.assertIn("Cannot hard delete Task", str(cm.exception))
+        self.assertIn("Use soft_delete() instead", str(cm.exception))
+
+        task.refresh_from_db()
+        self.assertIsNotNone(task.id)
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_internal_defaults_to_false(self, mock_execute_workflow):
+        user = User.objects.create(email="internal_default@test.com")
+        Integration.objects.create(team=self.team, kind="github", config={})
+
+        task = Task.create_and_run(
+            team=self.team,
+            title="Non-internal Task",
+            description="Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+            user_id=user.id,
+            repository="posthog/posthog",
+        )
+
+        self.assertFalse(task.internal)
+
+    @patch("products.tasks.backend.temporal.client.execute_task_processing_workflow")
+    def test_create_and_run_with_internal_true(self, mock_execute_workflow):
+        user = User.objects.create(email="internal_true@test.com")
+        Integration.objects.create(team=self.team, kind="github", config={})
+
+        task = Task.create_and_run(
+            team=self.team,
+            title="Internal Task",
+            description="Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+            user_id=user.id,
+            repository="posthog/posthog",
+            internal=True,
+        )
+
+        task.refresh_from_db()
+        self.assertTrue(task.internal)
+
+
+class TestTaskSlackPrNotification(TestCase):
+    organization: ClassVar[Organization]
+    team: ClassVar[Team]
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.organization = Organization.objects.create(name="Test Org")
+        cls.team = Team.objects.create(organization=cls.organization, name="Test Team")
+
+    def _task(self) -> Task:
+        return Task.objects.create(
+            team=self.team,
+            title="Test Task",
+            description="Test Description",
+            origin_product=Task.OriginProduct.SLACK,
+        )
+
+    def test_mark_slack_pr_notified_records_overrides_and_persists(self):
+        # Records the announced PR, overrides on a new one, and survives a reload.
+        task = self._task()
+        self.assertIsNone(task.slack_notified_pr_url)
+
+        pr_1 = "https://github.com/org/repo/pull/1"
+        pr_2 = "https://github.com/org/repo/pull/2"
+        task.mark_slack_pr_notified(pr_1)
+        self.assertEqual(task.slack_notified_pr_url, pr_1)
+
+        task.mark_slack_pr_notified(pr_2)
+        self.assertEqual(task.slack_notified_pr_url, pr_2)
+
+        task.refresh_from_db()
+        self.assertEqual(task.slack_notified_pr_url, pr_2)
+
+    def test_mark_slack_pr_notified_preserves_other_state_keys(self):
+        # It's a merge into the shared state bag, not a wholesale write.
+        task = self._task()
+        task.state = {"unrelated": "keep-me"}
+        task.save(update_fields=["state"])
+
+        task.mark_slack_pr_notified("https://github.com/org/repo/pull/1")
+
+        task.refresh_from_db()
+        self.assertEqual(task.state["unrelated"], "keep-me")
+        self.assertEqual(task.slack_notified_pr_url, "https://github.com/org/repo/pull/1")
+
+
+class TestTaskSlug(TestCase):
+    organization: ClassVar[Organization]
+    team: ClassVar[Team]
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.organization = Organization.objects.create(name="Test Org")
+        cls.team = Team.objects.create(organization=cls.organization, name="Test Team")
+
+    @parameterized.expand(
+        [
+            ("JonathanLab", "JON"),
+            ("Test Team", "TES"),
+            ("ABC", "ABC"),
+            ("PostHog", "POS"),
+            ("my team", "MYT"),
+            ("123test", "123"),
+            ("test", "TES"),
+            ("t", "T"),
+            ("", "TSK"),
+        ]
+    )
+    def test_generate_team_prefix(self, team_name, expected_prefix):
+        result = Task.generate_team_prefix(team_name)
+        self.assertEqual(result, expected_prefix)
+
+    def test_task_number_auto_generation(self):
+        task = Task.objects.create(
+            team=self.team,
+            title="First Task",
+            description="Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+        )
+        self.assertIsNotNone(task.task_number)
+        self.assertEqual(task.task_number, 0)
+
+    def test_task_number_sequential(self):
+        task1 = Task.objects.create(
+            team=self.team,
+            title="First Task",
+            description="Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+        )
+        task2 = Task.objects.create(
+            team=self.team,
+            title="Second Task",
+            description="Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+        )
+        task3 = Task.objects.create(
+            team=self.team,
+            title="Third Task",
+            description="Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+        )
+
+        self.assertEqual(task1.task_number, 0)
+        self.assertEqual(task2.task_number, 1)
+        self.assertEqual(task3.task_number, 2)
+
+    def test_slug_generation(self):
+        task = Task.objects.create(
+            team=self.team,
+            title="Test Task",
+            description="Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+        )
+        self.assertEqual(task.slug, "TES-0")
+
+    def test_slug_with_different_teams(self):
+        other_team = Team.objects.create(organization=self.organization, name="JonathanLab")
+
+        task1 = Task.objects.create(
+            team=self.team,
+            title="Task 1",
+            description="Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+        )
+        task2 = Task.objects.create(
+            team=other_team,
+            title="Task 2",
+            description="Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+        )
+
+        self.assertEqual(task1.slug, "TES-0")
+        self.assertEqual(task2.slug, "JON-0")
+
+
+class TestTaskRun(TestCase):
+    organization: ClassVar[Organization]
+    team: ClassVar[Team]
+    task: ClassVar[Task]
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.organization = Organization.objects.create(name="Test Org")
+        cls.team = Team.objects.create(organization=cls.organization, name="Test Team")
+        cls.task = Task.objects.create(
+            team=cls.team,
+            title="Test Task",
+            description="Test Description",
+            origin_product=Task.OriginProduct.USER_CREATED,
+        )
+
+    @parameterized.expand(
+        [
+            (TaskRun.Status.QUEUED,),
+            (TaskRun.Status.IN_PROGRESS,),
+            (TaskRun.Status.COMPLETED,),
+            (TaskRun.Status.FAILED,),
+        ]
+    )
+    def test_run_creation_with_statuses(self, status):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+            status=status,
+        )
+        self.assertEqual(run.task, self.task)
+        self.assertEqual(run.team, self.team)
+        self.assertEqual(run.status, status)
+
+    def test_str_representation(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+            status=TaskRun.Status.IN_PROGRESS,
+        )
+        self.assertEqual(str(run), "Run for Test Task - In Progress")
+
+    @patch("products.tasks.backend.models.publish_task_run_stream_event")
+    def test_create_run_seeds_stream_state_event(self, mock_publish_stream_event):
+        run = self.task.create_run(branch="main")
+
+        mock_publish_stream_event.assert_called_once()
+        call_args = mock_publish_stream_event.call_args
+        self.assertEqual(call_args.args[0], str(run.id))
+        self.assertEqual(call_args.args[1]["type"], "task_run_state")
+        self.assertEqual(call_args.args[1]["status"], TaskRun.Status.QUEUED)
+        self.assertEqual(call_args.args[1]["branch"], "main")
+
+    def test_create_run_does_not_inject_permission_mode_by_default(self):
+        run = self.task.create_run(mode="interactive")
+
+        self.assertNotIn("initial_permission_mode", run.state)
+
+    def test_s3_prefixes_keep_existing_logs_and_artifact_paths(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        self.assertEqual(
+            run.log_url,
+            f"tasks/logs/team_{self.team.id}/task_{self.task.id}/run_{run.id}.jsonl",
+        )
+        self.assertEqual(
+            run.get_artifact_s3_prefix(),
+            f"tasks/artifacts/team_{self.team.id}/task_{self.task.id}/run_{run.id}",
+        )
+
+    def test_update_state_atomic_merges_against_latest_state(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+            state={
+                "mode": "interactive",
+                "pending_user_message": "read the attachment",
+                "pending_user_artifact_ids": ["artifact-123"],
+            },
+        )
+
+        TaskRun.update_state_atomic(
+            run.id,
+            remove_keys=["pending_user_message", "pending_user_artifact_ids"],
+        )
+        TaskRun.update_state_atomic(
+            run.id,
+            updates={
+                "sandbox_id": "sandbox-123",
+                "sandbox_url": "https://sandbox.example.com",
+            },
+        )
+
+        run.refresh_from_db()
+        self.assertEqual(run.state["mode"], "interactive")
+        self.assertEqual(run.state["sandbox_id"], "sandbox-123")
+        self.assertEqual(run.state["sandbox_url"], "https://sandbox.example.com")
+        self.assertNotIn("pending_user_message", run.state)
+        self.assertNotIn("pending_user_artifact_ids", run.state)
+
+    def test_mutate_state_atomic_can_derive_values_under_lock(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+            state={"slack_sent_relay_ids": ["relay-1"]},
+        )
+
+        def append_relay(state: dict[str, list[str]]) -> None:
+            sent_relay_ids = state.get("slack_sent_relay_ids") or []
+            sent_relay_ids.append("relay-2")
+            state["slack_sent_relay_ids"] = sent_relay_ids
+
+        TaskRun.mutate_state_atomic(run.id, append_relay)
+
+        run.refresh_from_db()
+        self.assertEqual(run.state["slack_sent_relay_ids"], ["relay-1", "relay-2"])
+
+    def test_append_log_to_empty(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        entries = [{"type": "info", "message": "First log entry"}]
+        run.append_log(entries)
+        run.refresh_from_db()
+
+        assert run.log_url is not None
+        log_content = object_storage.read(run.log_url)
+        assert log_content is not None
+
+        log_entries = [json.loads(line) for line in log_content.strip().split("\n")]
+        self.assertEqual(len(log_entries), 1)
+        self.assertEqual(log_entries[0]["type"], "info")
+        self.assertEqual(log_entries[0]["message"], "First log entry")
+
+    def test_append_log_multiple_entries(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        entries = [
+            {"type": "info", "message": "First entry"},
+            {"type": "warning", "message": "Second entry"},
+            {"type": "error", "message": "Third entry"},
+        ]
+        run.append_log(entries)
+        run.refresh_from_db()
+
+        assert run.log_url is not None
+        log_content = object_storage.read(run.log_url)
+        assert log_content is not None
+
+        log_entries = [json.loads(line) for line in log_content.strip().split("\n")]
+        self.assertEqual(len(log_entries), 3)
+        self.assertEqual(log_entries[0]["type"], "info")
+        self.assertEqual(log_entries[1]["type"], "warning")
+        self.assertEqual(log_entries[2]["type"], "error")
+
+    def test_append_log_to_existing(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        first_entries = [{"type": "info", "message": "First entry"}]
+        run.append_log(first_entries)
+
+        new_entries = [
+            {"type": "success", "message": "New entry 1"},
+            {"type": "debug", "message": "New entry 2"},
+        ]
+        run.append_log(new_entries)
+        run.refresh_from_db()
+
+        assert run.log_url is not None
+        log_content = object_storage.read(run.log_url)
+        assert log_content is not None
+
+        log_entries = [json.loads(line) for line in log_content.strip().split("\n")]
+        self.assertEqual(len(log_entries), 3)
+        self.assertEqual(log_entries[0]["message"], "First entry")
+        self.assertEqual(log_entries[1]["message"], "New entry 1")
+        self.assertEqual(log_entries[2]["message"], "New entry 2")
+
+    def test_log_file_tagged_with_ttl(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        entries = [{"type": "info", "message": "Test entry"}]
+        run.append_log(entries)
+        run.refresh_from_db()
+
+        self.assertIsNotNone(run.log_url)
+
+        # Verify S3 object has TTL tags
+        from botocore.exceptions import ClientError
+
+        from posthog.storage.object_storage import ObjectStorage, object_storage_client
+
+        try:
+            client = object_storage_client()
+            if isinstance(client, ObjectStorage):
+                response = client.aws_client.get_object_tagging(Bucket=settings.OBJECT_STORAGE_BUCKET, Key=run.log_url)
+                tags = {tag["Key"]: tag["Value"] for tag in response.get("TagSet", [])}
+                self.assertEqual(tags.get("ttl_days"), "30")
+                self.assertEqual(tags.get("team_id"), str(self.team.id))
+        except (ClientError, AttributeError):
+            # Tagging might not be available in test environment
+            pass
+
+    def test_mark_completed(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+            status=TaskRun.Status.IN_PROGRESS,
+        )
+
+        self.assertIsNone(run.completed_at)
+        run.mark_completed()
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, TaskRun.Status.COMPLETED)
+        self.assertIsNotNone(run.completed_at)
+
+    def test_mark_failed(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+            status=TaskRun.Status.IN_PROGRESS,
+        )
+
+        error_msg = "x" * 1400 + "Error: the root cause sits at the tail"
+        with patch("products.tasks.backend.models.posthoganalytics.capture") as mock_capture:
+            run.mark_failed(error_msg, error_type="stale_queued_cleanup")
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, TaskRun.Status.FAILED)
+        self.assertEqual(run.error_message, error_msg)
+        self.assertIsNotNone(run.completed_at)
+        captured = [c for c in mock_capture.call_args_list if c.kwargs.get("event") == "task_run_failed"]
+        self.assertEqual(len(captured), 1)
+        props = captured[0].kwargs["properties"]
+        self.assertEqual(props["error_type"], "stale_queued_cleanup")
+        self.assertEqual(len(props["error_message"]), 500)
+        self.assertTrue(props["error_message"].endswith("Error: the root cause sits at the tail"))
+
+    def test_output_jsonfield(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+            output={"pr_url": "https://github.com/org/repo/pull/123", "commit_sha": "abc123"},
+        )
+
+        run.refresh_from_db()
+        assert run.output is not None
+        self.assertEqual(run.output["pr_url"], "https://github.com/org/repo/pull/123")
+        self.assertEqual(run.output["commit_sha"], "abc123")
+
+        run.output["status"] = "success"
+        run.save()
+        run.refresh_from_db()
+        assert run.output is not None
+        self.assertEqual(run.output["status"], "success")
+
+    def test_state_jsonfield(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+            state={"last_checkpoint": "step_3", "variables": {"x": 1, "y": 2}},
+        )
+
+        run.refresh_from_db()
+        self.assertEqual(run.state["last_checkpoint"], "step_3")
+        self.assertEqual(run.state["variables"]["x"], 1)
+
+        run.state["completed_checkpoints"] = ["step_1", "step_2", "step_3"]
+        run.save()
+        run.refresh_from_db()
+        self.assertEqual(len(run.state["completed_checkpoints"]), 3)
+
+    def test_delete_blocked(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        with self.assertRaises(Exception) as cm:
+            run.delete()
+
+        self.assertIn("Cannot delete TaskRun", str(cm.exception))
+        self.assertIn("immutable", str(cm.exception))
+
+        run.refresh_from_db()
+        self.assertIsNotNone(run.id)
+
+    def test_emit_console_event_acp_format(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        run.emit_console_event("info", "Test message")
+
+        log_content = object_storage.read(run.log_url)
+        assert log_content is not None
+        entry = json.loads(log_content.strip())
+
+        self.assertEqual(entry["type"], "notification")
+        self.assertIn("timestamp", entry)
+        self.assertEqual(entry["notification"]["jsonrpc"], "2.0")
+        self.assertEqual(entry["notification"]["method"], "_posthog/console")
+        self.assertEqual(entry["notification"]["params"]["sessionId"], str(run.id))
+        self.assertEqual(entry["notification"]["params"]["level"], "info")
+        self.assertEqual(entry["notification"]["params"]["message"], "Test message")
+
+    @patch("products.tasks.backend.models.publish_task_run_stream_event")
+    def test_emit_console_event_publishes_to_stream(self, mock_publish_stream_event):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        run.emit_console_event("info", "Test message")
+
+        mock_publish_stream_event.assert_called_once()
+        call_args = mock_publish_stream_event.call_args
+        self.assertEqual(call_args.args[0], str(run.id))
+        self.assertEqual(call_args.args[1]["notification"]["method"], "_posthog/console")
+
+    def test_emit_progress_event_acp_format(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        run.emit_progress_event(
+            "container",
+            "in_progress",
+            "Setting up cloud container",
+            group="setup",
+            detail="provisioning",
+        )
+
+        log_content = object_storage.read(run.log_url)
+        assert log_content is not None
+        entry = json.loads(log_content.strip())
+
+        self.assertEqual(entry["type"], "notification")
+        self.assertIn("timestamp", entry)
+        self.assertEqual(entry["notification"]["jsonrpc"], "2.0")
+        self.assertEqual(entry["notification"]["method"], "_posthog/progress")
+        params = entry["notification"]["params"]
+        self.assertEqual(params["sessionId"], str(run.id))
+        self.assertEqual(params["step"], "container")
+        self.assertEqual(params["status"], "in_progress")
+        self.assertEqual(params["label"], "Setting up cloud container")
+        self.assertEqual(params["group"], "setup")
+        self.assertEqual(params["detail"], "provisioning")
+
+    def test_emit_progress_event_omits_detail_when_not_provided(self):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        run.emit_progress_event("agent", "completed", "Started agent", group="setup")
+
+        log_content = object_storage.read(run.log_url)
+        assert log_content is not None
+        entry = json.loads(log_content.strip())
+
+        params = entry["notification"]["params"]
+        self.assertNotIn("detail", params)
+        self.assertEqual(params["group"], "setup")
+
+    @patch("products.tasks.backend.models.publish_task_run_stream_event")
+    def test_emit_progress_event_publishes_to_stream(self, mock_publish_stream_event):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        run.emit_progress_event("clone", "completed", "Cloned repository", group="setup")
+
+        mock_publish_stream_event.assert_called_once()
+        call_args = mock_publish_stream_event.call_args
+        self.assertEqual(call_args.args[0], str(run.id))
+        self.assertEqual(call_args.args[1]["notification"]["method"], "_posthog/progress")
+        self.assertEqual(call_args.args[1]["notification"]["params"]["step"], "clone")
+        self.assertEqual(call_args.args[1]["notification"]["params"]["group"], "setup")
+
+    @parameterized.expand(
+        [
+            (0, "stdout output", "stderr output"),
+            (1, "failed stdout", "error message"),
+            (137, "", "killed by signal"),
+        ]
+    )
+    def test_emit_sandbox_output_acp_format(self, exit_code, stdout, stderr):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        run.emit_sandbox_output(stdout, stderr, exit_code)
+
+        log_content = object_storage.read(run.log_url)
+        assert log_content is not None
+        entry = json.loads(log_content.strip())
+
+        self.assertEqual(entry["type"], "notification")
+        self.assertIn("timestamp", entry)
+        self.assertEqual(entry["notification"]["jsonrpc"], "2.0")
+        self.assertEqual(entry["notification"]["method"], "_posthog/sandbox_output")
+        self.assertEqual(entry["notification"]["params"]["sessionId"], str(run.id))
+        self.assertEqual(entry["notification"]["params"]["stdout"], stdout)
+        self.assertEqual(entry["notification"]["params"]["stderr"], stderr)
+        self.assertEqual(entry["notification"]["params"]["exitCode"], exit_code)
+
+    @patch("products.tasks.backend.models.publish_task_run_stream_event")
+    def test_emit_sandbox_output_publishes_to_stream(self, mock_publish_stream_event):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+        )
+
+        run.emit_sandbox_output("stdout output", "stderr output", 0)
+
+        mock_publish_stream_event.assert_called_once()
+        call_args = mock_publish_stream_event.call_args
+        self.assertEqual(call_args.args[0], str(run.id))
+        self.assertEqual(call_args.args[1]["notification"]["method"], "_posthog/sandbox_output")
+
+    @parameterized.expand(
+        [
+            ("background_mode", {"mode": "background"}, True),
+            ("default_mode_is_background", {}, True),
+            ("interactive_mode", {"mode": "interactive"}, True),
+        ]
+    )
+    @patch("posthog.temporal.common.client.sync_connect")
+    def test_heartbeat_workflow_mode_filtering(self, _name, state, expect_signal, mock_connect):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+            status=TaskRun.Status.IN_PROGRESS,
+            state=state,
+        )
+
+        from django.core.cache import cache
+
+        cache.delete(f"tasks:task_run:heartbeat:{run.id}:active")
+
+        run.heartbeat_workflow(agent_active=True)
+
+        if expect_signal:
+            mock_connect.assert_called_once()
+        else:
+            mock_connect.assert_not_called()
+
+        cache.delete(f"tasks:task_run:heartbeat:{run.id}:active")
+
+    @patch("posthog.temporal.common.client.sync_connect")
+    def test_heartbeat_workflow_rate_limited_by_cache(self, mock_connect):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+            status=TaskRun.Status.IN_PROGRESS,
+            state={"mode": "background"},
+        )
+
+        from django.core.cache import cache
+
+        cache_key = f"tasks:task_run:heartbeat:{run.id}:active"
+        cache.delete(cache_key)
+        handle = mock_connect.return_value.get_workflow_handle.return_value
+        handle.signal = AsyncMock()
+
+        run.heartbeat_workflow(agent_active=True)
+        mock_connect.assert_called_once()
+        handle.signal.assert_called_once()
+        self.assertEqual(handle.signal.call_args.kwargs, {"arg": True})
+
+        mock_connect.reset_mock()
+        run.heartbeat_workflow(agent_active=True)
+        mock_connect.assert_not_called()
+
+        cache.delete(cache_key)
+
+    @patch("posthog.temporal.common.client.sync_connect")
+    def test_heartbeat_workflow_ignores_idle_heartbeats(self, mock_connect):
+        run = TaskRun.objects.create(
+            task=self.task,
+            team=self.team,
+            status=TaskRun.Status.IN_PROGRESS,
+            state={"mode": "background"},
+        )
+
+        from django.core.cache import cache
+
+        cache.delete(f"tasks:task_run:heartbeat:{run.id}:active")
+
+        handle = mock_connect.return_value.get_workflow_handle.return_value
+        handle.signal = AsyncMock()
+
+        run.heartbeat_workflow(agent_active=False)
+        mock_connect.assert_not_called()
+
+        run.heartbeat_workflow(agent_active=True)
+
+        mock_connect.assert_called_once()
+        handle.signal.assert_called_once()
+        self.assertEqual(handle.signal.call_args.kwargs, {"arg": True})
+
+        cache.delete(f"tasks:task_run:heartbeat:{run.id}:active")
+
+
+class TestSandboxSnapshot(TestCase):
+    organization: ClassVar[Organization]
+    team: ClassVar[Team]
+    integration: ClassVar[Integration]
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.organization = Organization.objects.create(name="Test Org")
+        cls.team = Team.objects.create(organization=cls.organization, name="Test Team")
+        cls.integration = Integration.objects.create(team=cls.team, kind="github", config={})
+
+    @parameterized.expand(
+        [
+            (SandboxSnapshot.Status.IN_PROGRESS,),
+            (SandboxSnapshot.Status.COMPLETE,),
+            (SandboxSnapshot.Status.ERROR,),
+        ]
+    )
+    def test_snapshot_creation_with_statuses(self, status):
+        external_id = f"snapshot-{uuid.uuid4()}"
+        snapshot = SandboxSnapshot.objects.create(
+            integration=self.integration,
+            external_id=external_id,
+            repos=["PostHog/posthog", "PostHog/posthog-js"],
+            status=status,
+        )
+        self.assertEqual(snapshot.integration, self.integration)
+        self.assertEqual(snapshot.external_id, external_id)
+        self.assertEqual(snapshot.repos, ["PostHog/posthog", "PostHog/posthog-js"])
+        self.assertEqual(snapshot.status, status)
+
+    def test_snapshot_default_values(self):
+        snapshot = SandboxSnapshot.objects.create(integration=self.integration)
+        self.assertEqual(snapshot.repos, [])
+        self.assertEqual(snapshot.metadata, {})
+        self.assertEqual(snapshot.status, SandboxSnapshot.Status.IN_PROGRESS)
+
+    def test_str_representation(self):
+        snapshot = SandboxSnapshot.objects.create(
+            integration=self.integration,
+            external_id=f"snapshot-{uuid.uuid4()}",
+            repos=["PostHog/posthog", "PostHog/posthog-js"],
+            status=SandboxSnapshot.Status.COMPLETE,
+        )
+        self.assertEqual(str(snapshot), f"Snapshot {snapshot.external_id} (Complete, 2 repos)")
+
+    def test_is_complete(self):
+        snapshot = SandboxSnapshot.objects.create(
+            integration=self.integration,
+            status=SandboxSnapshot.Status.IN_PROGRESS,
+            external_id=f"snapshot-{uuid.uuid4()}",
+        )
+        self.assertFalse(snapshot.is_complete())
+
+        snapshot.status = SandboxSnapshot.Status.COMPLETE
+        snapshot.save()
+        self.assertTrue(snapshot.is_complete())
+
+    @parameterized.expand(
+        [
+            (["PostHog/posthog", "PostHog/posthog-js"], "PostHog/posthog", True),
+            (["PostHog/posthog", "PostHog/posthog-js"], "PostHog/other", False),
+            ([], "PostHog/posthog", False),
+        ]
+    )
+    def test_has_repo(self, repos, check_repo, expected):
+        snapshot = SandboxSnapshot.objects.create(
+            integration=self.integration, repos=repos, external_id=f"snapshot-{uuid.uuid4()}"
+        )
+        self.assertEqual(snapshot.has_repo(check_repo), expected)
+
+    @parameterized.expand(
+        [
+            (["PostHog/posthog", "PostHog/posthog-js"], ["PostHog/posthog"], True),
+            (["PostHog/posthog", "PostHog/posthog-js"], ["PostHog/posthog", "PostHog/posthog-js"], True),
+            (["PostHog/posthog"], ["PostHog/posthog", "PostHog/posthog-js"], False),
+            ([], ["PostHog/posthog"], False),
+        ]
+    )
+    def test_has_repos(self, snapshot_repos, required_repos, expected):
+        snapshot = SandboxSnapshot.objects.create(
+            integration=self.integration, repos=snapshot_repos, external_id=f"snapshot-{uuid.uuid4()}"
+        )
+        self.assertEqual(snapshot.has_repos(required_repos), expected)
+
+    def test_update_status_to_complete(self):
+        snapshot = SandboxSnapshot.objects.create(integration=self.integration, external_id=f"snapshot-{uuid.uuid4()}")
+        self.assertEqual(snapshot.status, SandboxSnapshot.Status.IN_PROGRESS)
+
+        snapshot.update_status(SandboxSnapshot.Status.COMPLETE)
+        snapshot.refresh_from_db()
+        self.assertEqual(snapshot.status, SandboxSnapshot.Status.COMPLETE)
+
+    def test_update_status_to_error(self):
+        snapshot = SandboxSnapshot.objects.create(integration=self.integration, external_id=f"snapshot-{uuid.uuid4()}")
+
+        snapshot.update_status(SandboxSnapshot.Status.ERROR)
+        snapshot.refresh_from_db()
+        self.assertEqual(snapshot.status, SandboxSnapshot.Status.ERROR)
+
+    @parameterized.expand(
+        [
+            (["PostHog/posthog"], "posthog/posthog", True),
+            (["PostHog/posthog"], "POSTHOG/POSTHOG", True),
+            (["posthog/posthog-js"], "PostHog/PostHog-JS", True),
+        ]
+    )
+    def test_has_repo_case_insensitive(self, repos, check_repo, expected):
+        snapshot = SandboxSnapshot.objects.create(
+            integration=self.integration, repos=repos, external_id=f"snapshot-{uuid.uuid4()}"
+        )
+        self.assertEqual(snapshot.has_repo(check_repo), expected)
+
+    @parameterized.expand(
+        [
+            (["PostHog/posthog", "PostHog/posthog-js"], ["posthog/posthog"], True),
+            (["PostHog/posthog", "PostHog/posthog-js"], ["POSTHOG/POSTHOG", "posthog/posthog-js"], True),
+        ]
+    )
+    def test_has_repos_case_insensitive(self, snapshot_repos, required_repos, expected):
+        snapshot = SandboxSnapshot.objects.create(
+            integration=self.integration, repos=snapshot_repos, external_id=f"snapshot-{uuid.uuid4()}"
+        )
+        self.assertEqual(snapshot.has_repos(required_repos), expected)
+
+    def test_get_latest_snapshot_for_integration(self):
+        SandboxSnapshot.objects.create(
+            integration=self.integration, status=SandboxSnapshot.Status.COMPLETE, external_id=f"snapshot-{uuid.uuid4()}"
+        )
+        snapshot2 = SandboxSnapshot.objects.create(
+            integration=self.integration, status=SandboxSnapshot.Status.COMPLETE, external_id=f"snapshot-{uuid.uuid4()}"
+        )
+
+        latest = SandboxSnapshot.get_latest_snapshot_for_integration(self.integration.id)
+        self.assertEqual(latest, snapshot2)
+
+    def test_get_latest_snapshot_for_integration_ignores_in_progress(self):
+        SandboxSnapshot.objects.create(
+            integration=self.integration, status=SandboxSnapshot.Status.COMPLETE, external_id=f"snapshot-{uuid.uuid4()}"
+        )
+        SandboxSnapshot.objects.create(
+            integration=self.integration,
+            status=SandboxSnapshot.Status.IN_PROGRESS,
+            external_id=f"snapshot-{uuid.uuid4()}",
+        )
+
+        latest = SandboxSnapshot.get_latest_snapshot_for_integration(self.integration.id)
+        assert latest is not None
+        self.assertEqual(latest.status, SandboxSnapshot.Status.COMPLETE)
+
+    def test_get_latest_snapshot_for_integration_ignores_error(self):
+        SandboxSnapshot.objects.create(
+            integration=self.integration,
+            status=SandboxSnapshot.Status.COMPLETE,
+            external_id=f"snapshot-{uuid.uuid4()}",
+        )
+        SandboxSnapshot.objects.create(
+            integration=self.integration,
+            status=SandboxSnapshot.Status.ERROR,
+            external_id=f"snapshot-{uuid.uuid4()}",
+        )
+
+        latest = SandboxSnapshot.get_latest_snapshot_for_integration(self.integration.id)
+        assert latest is not None
+        self.assertEqual(latest.status, SandboxSnapshot.Status.COMPLETE)
+
+    def test_get_latest_snapshot_for_integration_none(self):
+        latest = SandboxSnapshot.get_latest_snapshot_for_integration(self.integration.id)
+        self.assertIsNone(latest)
+
+    def test_get_latest_snapshot_with_repos(self):
+        SandboxSnapshot.objects.create(
+            integration=self.integration,
+            repos=["PostHog/posthog"],
+            status=SandboxSnapshot.Status.COMPLETE,
+            external_id=f"snapshot-{uuid.uuid4()}",
+        )
+        snapshot2 = SandboxSnapshot.objects.create(
+            integration=self.integration,
+            repos=["PostHog/posthog", "PostHog/posthog-js"],
+            status=SandboxSnapshot.Status.COMPLETE,
+            external_id=f"snapshot-{uuid.uuid4()}",
+        )
+
+        result = SandboxSnapshot.get_latest_snapshot_with_repos(self.integration.id, ["PostHog/posthog"])
+        self.assertEqual(result, snapshot2)
+
+        result = SandboxSnapshot.get_latest_snapshot_with_repos(
+            self.integration.id, ["PostHog/posthog", "PostHog/posthog-js"]
+        )
+        self.assertEqual(result, snapshot2)
+
+    def test_get_latest_snapshot_with_repos_not_found(self):
+        SandboxSnapshot.objects.create(
+            integration=self.integration,
+            repos=["PostHog/posthog"],
+            status=SandboxSnapshot.Status.COMPLETE,
+            external_id=f"snapshot-{uuid.uuid4()}",
+        )
+
+        result = SandboxSnapshot.get_latest_snapshot_with_repos(
+            self.integration.id, ["PostHog/posthog", "PostHog/other"]
+        )
+        self.assertIsNone(result)
+
+    def test_get_latest_snapshot_with_repos_ignores_in_progress(self):
+        SandboxSnapshot.objects.create(
+            integration=self.integration,
+            repos=["PostHog/posthog"],
+            status=SandboxSnapshot.Status.COMPLETE,
+            external_id=f"snapshot-{uuid.uuid4()}",
+        )
+        SandboxSnapshot.objects.create(
+            integration=self.integration,
+            repos=["PostHog/posthog", "PostHog/posthog-js"],
+            status=SandboxSnapshot.Status.IN_PROGRESS,
+            external_id=f"snapshot-{uuid.uuid4()}",
+        )
+
+        result = SandboxSnapshot.get_latest_snapshot_with_repos(
+            self.integration.id, ["PostHog/posthog", "PostHog/posthog-js"]
+        )
+        self.assertIsNone(result)
+
+    def test_multiple_snapshots_per_integration(self):
+        snapshot1 = SandboxSnapshot.objects.create(integration=self.integration, external_id=f"snapshot-{uuid.uuid4()}")
+        snapshot2 = SandboxSnapshot.objects.create(integration=self.integration, external_id=f"snapshot-{uuid.uuid4()}")
+        snapshot3 = SandboxSnapshot.objects.create(integration=self.integration, external_id=f"snapshot-{uuid.uuid4()}")
+
+        snapshots = SandboxSnapshot.objects.filter(integration=self.integration)
+        self.assertEqual(snapshots.count(), 3)
+        self.assertIn(snapshot1, snapshots)
+        self.assertIn(snapshot2, snapshots)
+        self.assertIn(snapshot3, snapshots)
+
+    def test_set_null_on_integration_delete(self):
+        SandboxSnapshot.objects.create(integration=self.integration, external_id=f"snapshot-{uuid.uuid4()}")
+        SandboxSnapshot.objects.create(integration=self.integration, external_id=f"snapshot-{uuid.uuid4()}")
+
+        self.assertEqual(SandboxSnapshot.objects.filter(integration=self.integration).count(), 2)
+
+        self.integration.delete()
+
+        self.assertEqual(SandboxSnapshot.objects.filter(integration__isnull=True).count(), 2)
+
+    def test_delete_without_external_id_succeeds(self):
+        snapshot = SandboxSnapshot.objects.create(integration=self.integration)
+
+        snapshot.delete()
+
+        self.assertEqual(SandboxSnapshot.objects.filter(id=snapshot.id).count(), 0)
+
+
+class TestSandboxEnvironment(TestCase):
+    organization: ClassVar[Organization]
+    team: ClassVar[Team]
+    user: ClassVar[User]
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.organization = Organization.objects.create(name="Test Org")
+        cls.team = Team.objects.create(organization=cls.organization, name="Test Team")
+        cls.user = User.objects.create(email="test@posthog.com")
+
+    def test_default_values(self):
+        env = SandboxEnvironment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Test Environment",
+        )
+        self.assertEqual(env.network_access_level, SandboxEnvironment.NetworkAccessLevel.FULL)
+        self.assertEqual(env.allowed_domains, [])
+        self.assertFalse(env.include_default_domains)
+        self.assertEqual(env.repositories, [])
+        self.assertTrue(env.private)
+        self.assertEqual(env.environment_variables, {})
+
+    def test_environment_variables_encrypted_roundtrip(self):
+        env = SandboxEnvironment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Test Environment",
+            environment_variables={
+                "API_KEY": "sk-live-123456",
+                "SECRET_TOKEN": "super-secret-token",
+            },
+        )
+
+        env.refresh_from_db()
+        self.assertEqual(env.environment_variables["API_KEY"], "sk-live-123456")
+        self.assertEqual(env.environment_variables["SECRET_TOKEN"], "super-secret-token")
+
+    def test_environment_variables_stored_encrypted(self):
+        secret_value = "my-super-secret-api-key-12345"
+        env = SandboxEnvironment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Test Environment",
+            environment_variables={"SECRET": secret_value},
+        )
+
+        from django.db import connection
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT environment_variables FROM posthog_sandbox_environment WHERE id = %s",
+                [str(env.id)],
+            )
+            raw_value = cursor.fetchone()[0]
+
+        self.assertNotIn(secret_value, raw_value)
+
+    def test_created_by_set_null_on_user_delete(self):
+        env = SandboxEnvironment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Test Environment",
+        )
+
+        self.user.delete()
+        env.refresh_from_db()
+        self.assertIsNone(env.created_by)
+
+    def test_cascade_delete_on_team_delete(self):
+        env = SandboxEnvironment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Test Environment",
+        )
+        env_id = env.id
+
+        self.team.delete()
+        self.assertEqual(SandboxEnvironment.objects.filter(id=env_id).count(), 0)
+
+    @parameterized.expand(
+        [
+            ("API_KEY", True),
+            ("_PRIVATE_VAR", True),
+            ("lowercase_var", True),
+            ("123_INVALID", False),
+            ("INVALID-VAR", False),
+            ("", False),
+        ]
+    )
+    def test_is_valid_env_var_key(self, key, expected_valid):
+        self.assertEqual(SandboxEnvironment.is_valid_env_var_key(key), expected_valid)
+
+    @parameterized.expand(
+        [
+            ("NODE_OPTIONS", True),
+            ("NODE_REPL_EXTERNAL_MODULE", True),
+            ("LD_PRELOAD", True),
+            ("LD_LIBRARY_PATH", True),
+            ("DYLD_INSERT_LIBRARIES", True),
+            ("BASH_ENV", True),
+            ("GIT_SSH_COMMAND", True),
+            ("GIT_CONFIG_KEY_0", True),
+            ("GIT_CONFIG_VALUE_0", True),
+            ("NODE_ENV", False),
+            ("node_options", False),
+            ("MY_API_KEY", False),
+            ("LDAP_URL", False),
+            ("GITHUB_ACTOR", False),
+        ]
+    )
+    def test_is_blocked_sandbox_env_key(self, key, expected_blocked):
+        from products.tasks.backend.constants import is_blocked_sandbox_env_key
+
+        self.assertEqual(is_blocked_sandbox_env_key(key), expected_blocked)
+
+    def test_filter_user_sandbox_env_vars_drops_reserved_and_blocked(self):
+        from products.tasks.backend.constants import filter_user_sandbox_env_vars
+
+        safe, skipped = filter_user_sandbox_env_vars(
+            {
+                "SAFE_VAR": "ok",
+                "NODE_OPTIONS": "--import=evil",
+                "LD_PRELOAD": "/tmp/evil.so",
+                "GITHUB_TOKEN": "stolen",
+            }
+        )
+        self.assertEqual(safe, {"SAFE_VAR": "ok"})
+        self.assertEqual(sorted(skipped), ["GITHUB_TOKEN", "LD_PRELOAD", "NODE_OPTIONS"])
+
+    @parameterized.expand(
+        [
+            (SandboxEnvironment.NetworkAccessLevel.FULL, [], False, []),
+            (SandboxEnvironment.NetworkAccessLevel.TRUSTED, [], False, ["github.com", "api.github.com"]),
+            (SandboxEnvironment.NetworkAccessLevel.CUSTOM, ["custom.com"], False, ["custom.com"]),
+            (SandboxEnvironment.NetworkAccessLevel.CUSTOM, ["custom.com"], True, ["custom.com", "github.com"]),
+        ]
+    )
+    def test_get_effective_domains(self, access_level, allowed_domains, include_defaults, expected_contains):
+        env = SandboxEnvironment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Test Environment",
+            network_access_level=access_level,
+            allowed_domains=allowed_domains,
+            include_default_domains=include_defaults,
+        )
+        domains = env.get_effective_domains()
+        for expected in expected_contains:
+            self.assertIn(expected, domains)
+
+    def test_full_access_returns_empty_list(self):
+        env = SandboxEnvironment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Full Access",
+            network_access_level=SandboxEnvironment.NetworkAccessLevel.FULL,
+        )
+        self.assertEqual(env.get_effective_domains(), [])
+
+    def test_custom_with_defaults_does_not_duplicate(self):
+        env = SandboxEnvironment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Custom + Defaults",
+            network_access_level=SandboxEnvironment.NetworkAccessLevel.CUSTOM,
+            allowed_domains=["github.com", "custom.io"],
+            include_default_domains=True,
+        )
+        domains = env.get_effective_domains()
+        self.assertEqual(domains.count("github.com"), 1)
+        self.assertIn("custom.io", domains)
+
+    def test_custom_without_defaults_returns_only_custom(self):
+        env = SandboxEnvironment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Custom Only",
+            network_access_level=SandboxEnvironment.NetworkAccessLevel.CUSTOM,
+            allowed_domains=["only-this.com"],
+            include_default_domains=False,
+        )
+        self.assertEqual(env.get_effective_domains(), ["only-this.com"])
+
+    def test_trusted_includes_all_default_domains(self):
+        from products.tasks.backend.constants import DEFAULT_TRUSTED_DOMAINS
+
+        env = SandboxEnvironment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Trusted",
+            network_access_level=SandboxEnvironment.NetworkAccessLevel.TRUSTED,
+        )
+        self.assertEqual(env.get_effective_domains(), DEFAULT_TRUSTED_DOMAINS)
+
+
+class TestTaskRunGetSandboxEnvironment(TestCase):
+    organization: ClassVar[Organization]
+    team: ClassVar[Team]
+    other_team: ClassVar[Team]
+    user: ClassVar[User]
+    other_user: ClassVar[User]
+    integration: ClassVar[Integration]
+    task: ClassVar[Task]
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.organization = Organization.objects.create(name="Test Org")
+        cls.team = Team.objects.create(organization=cls.organization, name="Test Team")
+        cls.other_team = Team.objects.create(organization=cls.organization, name="Other Team")
+        cls.user = User.objects.create(email="creator@posthog.com")
+        cls.other_user = User.objects.create(email="other@posthog.com")
+        cls.integration = Integration.objects.create(team=cls.team, kind="github")
+        cls.task = Task.objects.create(
+            team=cls.team,
+            created_by=cls.user,
+            title="Test Task",
+            github_integration=cls.integration,
+            repository="org/repo",
+        )
+
+    def _create_run(self, sandbox_environment_id=None):
+        state = {}
+        if sandbox_environment_id:
+            state["sandbox_environment_id"] = str(sandbox_environment_id)
+        return TaskRun.objects.create(task=self.task, team=self.team, state=state)
+
+    def test_returns_none_when_no_environment_id(self):
+        run = self._create_run()
+        self.assertIsNone(run.get_sandbox_environment())
+
+    def test_returns_public_environment_on_same_team(self):
+        env = SandboxEnvironment.objects.create(
+            team=self.team, name="Public", private=False, created_by=self.other_user
+        )
+        run = self._create_run(env.id)
+        self.assertEqual(run.get_sandbox_environment(), env)
+
+    def test_returns_none_for_environment_on_different_team(self):
+        env = SandboxEnvironment.objects.create(
+            team=self.other_team, name="Other Team Env", private=False, created_by=self.other_user
+        )
+        run = self._create_run(env.id)
+        self.assertIsNone(run.get_sandbox_environment())
+
+    def test_returns_private_environment_when_creator_matches(self):
+        env = SandboxEnvironment.objects.create(team=self.team, name="My Private", private=True, created_by=self.user)
+        run = self._create_run(env.id)
+        self.assertEqual(run.get_sandbox_environment(), env)
+
+    def test_returns_none_for_private_environment_when_creator_differs(self):
+        env = SandboxEnvironment.objects.create(
+            team=self.team, name="Others Private", private=True, created_by=self.other_user
+        )
+        run = self._create_run(env.id)
+        self.assertIsNone(run.get_sandbox_environment())
+
+    def test_returns_none_for_private_environment_when_task_creator_is_null(self):
+        self.task.created_by = None
+        self.task.save()
+        env = SandboxEnvironment.objects.create(team=self.team, name="Private", private=True, created_by=self.user)
+        run = self._create_run(env.id)
+        self.assertIsNone(run.get_sandbox_environment())
+
+    def test_returns_none_for_private_environment_when_env_creator_is_null(self):
+        env = SandboxEnvironment.objects.create(
+            team=self.team, name="Private No Creator", private=True, created_by=None
+        )
+        run = self._create_run(env.id)
+        self.assertIsNone(run.get_sandbox_environment())
+
+    def test_returns_none_for_nonexistent_environment_id(self):
+        run = self._create_run(uuid.uuid4())
+        self.assertIsNone(run.get_sandbox_environment())
+
+    def test_returns_none_for_malformed_environment_id(self):
+        run = self._create_run("not-a-uuid")
+        self.assertIsNone(run.get_sandbox_environment())
+
+
+class TestCodeInvite(TestCase):
+    def test_auto_generates_code_on_save(self):
+        invite = CodeInvite.objects.create()
+        self.assertEqual(len(invite.code), 8)
+        self.assertTrue(all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" for c in invite.code))
+
+    def test_preserves_explicit_code(self):
+        invite = CodeInvite.objects.create(code="MYCODE42")
+        self.assertEqual(invite.code, "MYCODE42")
+
+    def test_retries_on_code_collision(self):
+        existing = CodeInvite.objects.create(code="AAAAAAAA")
+        self.assertEqual(existing.code, "AAAAAAAA")
+
+        call_count = 0
+        original_choice = secrets.choice
+
+        def mock_choice(alphabet):
+            nonlocal call_count
+            call_count += 1
+            # First 8 calls (first attempt) return "A" to collide, rest are random
+            if call_count <= 8:
+                return "A"
+            return original_choice(alphabet)
+
+        with patch("products.tasks.backend.models.secrets.choice", side_effect=mock_choice):
+            invite = CodeInvite.objects.create()
+
+        self.assertNotEqual(invite.code, "AAAAAAAA")
+        self.assertEqual(len(invite.code), 8)
+
+    def test_raises_after_max_retries(self):
+        CodeInvite.objects.create(code="BBBBBBBB")
+
+        with patch("products.tasks.backend.models.secrets.choice", return_value="B"):
+            with self.assertRaises(IntegrityError):
+                CodeInvite.objects.create()

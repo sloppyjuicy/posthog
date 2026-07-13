@@ -1,0 +1,221 @@
+import { IconLlmAnalytics } from '@posthog/icons'
+
+import { ErrorDisplay, idFrom } from 'lib/components/Errors/ErrorDisplay'
+import { ErrorEventType } from 'lib/components/Errors/types'
+import { ErrorPropertyTabEvent, EventPropertyTabs } from 'lib/components/EventPropertyTabs/EventPropertyTabs'
+import { JSONViewer } from 'lib/components/JSONViewer'
+import { PropertiesTable } from 'lib/components/PropertiesTable'
+import { SurveyResponseDisplay } from 'lib/components/SurveyResponseDisplay/SurveyResponseDisplay'
+import ViewRecordingButton, { RecordingPlayerType } from 'lib/components/ViewRecordingButton/ViewRecordingButton'
+import { LemonBanner } from 'lib/lemon-ui/LemonBanner'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { LemonTableProps } from 'lib/lemon-ui/LemonTable'
+import { Link } from 'lib/lemon-ui/Link'
+import { ReplayCaptureDiagnosticsModalButton } from 'scenes/session-recordings/components/ReplayCaptureDiagnosticsModalButton'
+import { hasReplayDiagnosticSignals } from 'scenes/session-recordings/utils/replayCaptureDiagnostics'
+import { urls } from 'scenes/urls'
+
+import { KNOWN_PROMOTED_PROPERTY_PARENTS } from '~/taxonomy/taxonomy'
+import { PropertyDefinitionType } from '~/types'
+
+import { ConversationDisplay } from 'products/ai_observability/frontend/ConversationDisplay/ConversationDisplay'
+import { EvaluationDisplay } from 'products/ai_observability/frontend/ConversationDisplay/EvaluationDisplay'
+import { TagDisplay } from 'products/ai_observability/frontend/ConversationDisplay/TagDisplay'
+
+import { MCPEventView } from './MCPEventView'
+
+interface EventDetailsProps {
+    event: ErrorPropertyTabEvent
+    tableProps?: Partial<LemonTableProps<Record<string, any>>>
+}
+
+export function EventDetails({ event, tableProps }: EventDetailsProps): JSX.Element {
+    const getEventId = (event: ErrorPropertyTabEvent): string => {
+        if ('uuid' in event && event.uuid) {
+            return event.uuid
+        }
+        if ('id' in event && event.id) {
+            return event.id
+        }
+        return ''
+    }
+
+    return (
+        <EventPropertyTabs
+            barClassName="px-2"
+            data-attr="event-details"
+            size="medium"
+            event={event}
+            tabContentComponentFn={({ event, properties, tabKey }) => {
+                switch (tabKey) {
+                    case 'conversation':
+                        return (
+                            <div className="mx-3 -mt-2 mb-2 gap-y-2">
+                                {properties.$ai_trace_id || properties.$session_id ? (
+                                    <div className="flex flex-row items-center gap-2">
+                                        {properties.$ai_trace_id ? (
+                                            <LemonButton
+                                                to={urls.aiObservabilityTrace(
+                                                    properties.$ai_trace_id,
+                                                    event.event !== '$ai_trace' ? { event: getEventId(event) } : {}
+                                                )}
+                                                size="small"
+                                                type="secondary"
+                                                sideIcon={<IconLlmAnalytics />}
+                                                data-attr="conversation-view-trace-button"
+                                            >
+                                                View LLM trace
+                                            </LemonButton>
+                                        ) : null}
+                                        {properties.$session_id ? (
+                                            <ViewRecordingButton
+                                                sessionId={properties.$session_id}
+                                                recordingStatus={properties.$recording_status}
+                                                timestamp={event.timestamp}
+                                                hasRecording={properties.$has_recording as boolean | undefined}
+                                                size="small"
+                                                type="secondary"
+                                                openPlayerIn={RecordingPlayerType.NewTab}
+                                                data-attr="conversation-view-session-recording-button"
+                                            />
+                                        ) : null}
+                                    </div>
+                                ) : null}
+                                <ConversationDisplay
+                                    eventProperties={properties}
+                                    eventId={getEventId(event)}
+                                    eventTimestamp={event.timestamp}
+                                />
+                            </div>
+                        )
+                    case 'evaluation':
+                        return (
+                            <div className="mx-3 -mt-2 mb-2">
+                                <EvaluationDisplay eventProperties={properties} />
+                            </div>
+                        )
+                    case 'tag':
+                        return (
+                            <div className="mx-3 -mt-2 mb-2">
+                                <TagDisplay eventProperties={properties} />
+                            </div>
+                        )
+                    case 'error_display':
+                        return (
+                            <div className="mx-3">
+                                <ErrorDisplay eventProperties={properties} eventId={idFrom(event as ErrorEventType)} />
+                            </div>
+                        )
+                    case 'survey_response':
+                        return (
+                            <div className="mx-3">
+                                <SurveyResponseDisplay
+                                    eventProperties={properties}
+                                    eventUuid={'uuid' in event && event.uuid ? event.uuid : undefined}
+                                    distinctId={'distinct_id' in event ? event.distinct_id : undefined}
+                                    timestamp={'timestamp' in event ? event.timestamp : undefined}
+                                    personProperties={'person' in event ? event.person?.properties : undefined}
+                                />
+                            </div>
+                        )
+                    case 'mcp':
+                        return <MCPEventView properties={properties} />
+                    case 'exception_properties':
+                        return (
+                            <div className="mx-3 -mt-4">
+                                <LemonBanner type="info" dismissKey="event-details-exception-properties-why-banner">
+                                    These are the internal properties that PostHog uses to display information about
+                                    exceptions.
+                                </LemonBanner>
+                                <PropertiesTable
+                                    type={PropertyDefinitionType.Event}
+                                    properties={properties}
+                                    sortProperties
+                                    tableProps={tableProps}
+                                    collapsible
+                                />
+                            </div>
+                        )
+                    case '$set_properties':
+                        return (
+                            <div className="mx-3 -mt-4">
+                                <p>
+                                    Person properties sent with this event. Will replace any property value that may
+                                    have been set on this person profile before now.{' '}
+                                    <Link to="https://posthog.com/docs/getting-started/person-properties">
+                                        Learn more
+                                    </Link>
+                                </p>
+                                <PropertiesTable
+                                    type={PropertyDefinitionType.Event}
+                                    properties={properties}
+                                    useDetectedPropertyType={true}
+                                    tableProps={tableProps}
+                                    searchable
+                                    collapsible
+                                />
+                            </div>
+                        )
+                    case '$set_once_properties':
+                        return (
+                            <div className="mx-3 -mt-4">
+                                <p>
+                                    "Set once" person properties sent with this event. Will replace any property value
+                                    that has never been set on this person profile before now.{' '}
+                                    <Link to="https://posthog.com/docs/getting-started/person-properties">
+                                        Learn more
+                                    </Link>
+                                </p>
+                                <PropertiesTable
+                                    type={PropertyDefinitionType.Event}
+                                    properties={properties}
+                                    useDetectedPropertyType={true}
+                                    tableProps={tableProps}
+                                    searchable
+                                    collapsible
+                                />
+                            </div>
+                        )
+                    case 'raw':
+                        return (
+                            <div className="mx-3 -mt-3 py-2">
+                                <JSONViewer
+                                    src={event}
+                                    name="event"
+                                    collapsed={1}
+                                    collapseStringsAfterLength={80}
+                                    sortKeys
+                                />
+                            </div>
+                        )
+                    default:
+                        return (
+                            <div className="mx-3">
+                                {tabKey === 'debug_properties' && hasReplayDiagnosticSignals(properties) && (
+                                    <div className="mb-2">
+                                        <ReplayCaptureDiagnosticsModalButton eventProperties={properties} />
+                                    </div>
+                                )}
+                                <PropertiesTable
+                                    type={PropertyDefinitionType.Event}
+                                    properties={properties}
+                                    useDetectedPropertyType={['flags', 'properties'].includes(tabKey)}
+                                    tableProps={tableProps}
+                                    filterable={tabKey === 'properties'}
+                                    sortProperties
+                                    // metadata is so short, that serachable is wasted space
+                                    searchable={tabKey !== 'metadata'}
+                                    parent={
+                                        tabKey === 'properties'
+                                            ? (event.event as KNOWN_PROMOTED_PROPERTY_PARENTS)
+                                            : undefined
+                                    }
+                                    collapsible
+                                />
+                            </div>
+                        )
+                }
+            }}
+        />
+    )
+}

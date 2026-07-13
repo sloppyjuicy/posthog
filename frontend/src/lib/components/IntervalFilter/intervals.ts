@@ -1,26 +1,47 @@
-export const intervals = {
+import type { IntervalType } from '~/types'
+
+// Derived from IntervalType so the compiler forces a picker decision when the schema gains an interval.
+// 'second' is intentionally not selectable in the UI.
+export type IntervalKeyType = Exclude<IntervalType, 'second'>
+
+export type Intervals = {
+    [key in IntervalKeyType]: {
+        label: string
+        newDateFrom?: string
+        disabledReason?: string
+        hidden?: boolean
+    }
+}
+
+export const intervals: Intervals = {
     minute: {
-        label: 'Minute',
-        newDateFrom: 'dStart',
+        label: 'minute',
+        newDateFrom: 'hStart',
     },
     hour: {
-        label: 'Hourly',
+        label: 'hour',
         newDateFrom: 'dStart',
     },
     day: {
-        label: 'Daily',
+        label: 'day',
         newDateFrom: undefined,
     },
     week: {
-        label: 'Weekly',
+        label: 'week',
         newDateFrom: '-30d',
     },
     month: {
-        label: 'Monthly',
+        label: 'month',
         newDateFrom: '-90d',
     },
+    quarter: {
+        label: 'quarter',
+        newDateFrom: '-3y',
+        hidden: true,
+    },
+    year: {
+        label: 'year',
+        newDateFrom: '-5y',
+        hidden: true,
+    },
 }
-
-export const defaultInterval = intervals.day
-
-export type IntervalKeyType = keyof typeof intervals

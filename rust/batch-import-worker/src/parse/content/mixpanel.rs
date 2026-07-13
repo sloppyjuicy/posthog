@@ -1,0 +1,526 @@
+use std::collections::HashMap;
+
+use anyhow::Error;
+use celes::Country;
+use chrono::{DateTime, Duration, Utc};
+use common_types::{CapturedEvent, InternallyCapturedEvent, RawEvent};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
+
+/// UUID namespace for generating deterministic UUIDs from Mixpanel $insert_id values.
+/// This allows deduplication of events that may be imported multiple times.
+/// Generated using `uuidgen` - this is a random UUID that serves as our namespace.
+const MIXPANEL_INSERT_ID_NAMESPACE: Uuid = Uuid::from_bytes(*b"posthog_mixpanel");
+
+use super::TransformContext;
+use crate::parse::format::{extract_between, extract_field_name, UserFacingParseError};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MixpanelContentConfig {
+    #[serde(default)] // Defaults to false
+    pub skip_no_distinct_id: bool,
+    // We had a customer report that mixpanel used to have a timestamp offsets bug, and they wanted to
+    // update all event timestamps as they were being ingested.
+    pub timestamp_offset_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MixpanelEvent {
+    event: String,
+    properties: MixpanelProperties,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MixpanelProperties {
+    #[serde(rename = "time")]
+    timestamp: i64,
+    distinct_id: Option<String>,
+    #[serde(flatten)]
+    other: HashMap<String, Value>,
+}
+
+/// Implement schema-specific error messages for MixpanelEvent
+/// That we can surface to the user to let them know what's wrong with the
+/// data set they are trying to import
+impl UserFacingParseError for MixpanelEvent {
+    fn user_facing_schema_error(err: &serde_json::Error) -> String {
+        let err_str = err.to_string();
+
+        if err_str.contains("missing field") {
+            if let Some(field_name) = extract_field_name(&err_str, "missing field `", "`") {
+                return match field_name.as_str() {
+                    "event" => "Missing required field 'event'. Each Mixpanel event must have an 'event' field with the event name (e.g., \"event\": \"page_view\").".to_string(),
+                    "properties" => "Missing required field 'properties'. Each Mixpanel event must have a 'properties' object containing at least the 'time' field.".to_string(),
+                    "time" => "Missing required field 'time' in 'properties'. Each Mixpanel event must have a timestamp (e.g., \"properties\": {\"time\": 1697379000}).".to_string(),
+                    _ => format!("Missing required field '{field_name}'. Please check that your Mixpanel export includes this field."),
+                };
+            }
+        }
+
+        if err_str.contains("invalid type:") {
+            let got = extract_between(&err_str, "invalid type: ", ", expected");
+            let expected = extract_between(&err_str, "expected ", " at line");
+
+            if let (Some(got), Some(expected)) = (got, expected) {
+                if err_str.contains("`event`") || (expected == "a string" && err.column() < 15) {
+                    return format!(
+                        "The 'event' field must be a string (e.g., \"event\": \"page_view\"), but got {got}."
+                    );
+                }
+                if err_str.contains("`time`") || expected.contains("i64") {
+                    return format!(
+                        "The 'time' field must be a Unix timestamp (integer), but got {got}. Use seconds since epoch (e.g., 1697379000)."
+                    );
+                }
+                if expected.contains("map") || expected.contains("struct") {
+                    return format!(
+                        "Expected an object/map but got {got}. The 'properties' field must be a JSON object like {{\"time\": 1697379000}}."
+                    );
+                }
+            }
+        }
+
+        // Fallback to generic message
+        "The JSON structure doesn't match the expected Mixpanel event format. Required fields: 'event' (string), 'properties' (object with 'time' as integer timestamp).".to_string()
+    }
+}
+
+// Based off sample data provided by customer.
+impl MixpanelEvent {
+    pub fn parse_fn(
+        context: TransformContext,
+        skip_no_distinct_id: bool,
+        timestamp_offset: Duration,
+        event_transform: impl Fn(RawEvent) -> Result<Option<RawEvent>, Error>,
+    ) -> impl Fn(Self) -> Result<Option<InternallyCapturedEvent>, Error> {
+        move |mx| {
+            let token = context.token.clone();
+            let team_id = context.team_id;
+
+            let distinct_id = match (get_distinct_id(&mx.properties), skip_no_distinct_id) {
+                (Some(distinct_id), _) => distinct_id,
+                (None, true) => return Ok(None),
+                (None, false) => Uuid::now_v7().to_string(),
+            };
+
+            // Generate a deterministic UUID from $insert_id if present, otherwise use random UUIDv7.
+            // This allows deduplication of events that may be imported multiple times.
+            let event_uuid = mx
+                .properties
+                .other
+                .get("$insert_id")
+                .and_then(|v| v.as_str())
+                .map(|insert_id| Uuid::new_v5(&MIXPANEL_INSERT_ID_NAMESPACE, insert_id.as_bytes()))
+                .unwrap_or_else(Uuid::now_v7);
+
+            // Was seeing timestamp values come in that were in seconds, not milliseconds
+            // Do a quick heuristic check on the size of the timestamp to determine if it's in seconds or milliseconds
+            let timestamp_value = mx.properties.timestamp;
+            let timestamp_seconds = if timestamp_value > 10_000_000_000 {
+                timestamp_value / 1000
+            } else {
+                timestamp_value
+            };
+
+            // We don't support subsecond precision for historical imports
+            let timestamp = DateTime::<Utc>::from_timestamp(timestamp_seconds, 0)
+                .ok_or(Error::msg("Invalid timestamp"))?;
+
+            let timestamp = timestamp + timestamp_offset;
+
+            let properties = mx.properties.other;
+            let properties = map_geoip_props(properties);
+            let properties = remove_mp_props(properties);
+            let properties = add_source_data(properties, context.job_id);
+
+            let raw_event = RawEvent {
+                token: Some(token.clone()),
+                distinct_id: Some(Value::String(distinct_id.clone())),
+                uuid: Some(event_uuid),
+                event: map_event_names(mx.event),
+                properties,
+                // We send timestamps in iso 8601 format
+                timestamp: Some(timestamp.to_rfc3339()),
+                set: None,
+                set_once: None,
+                offset: None,
+            };
+
+            let Some(raw_event) = event_transform(raw_event)? else {
+                return Ok(None);
+            };
+
+            // Only return the event if import_events is enabled
+            if context.import_events {
+                let inner = CapturedEvent {
+                    uuid: event_uuid,
+                    distinct_id,
+                    session_id: None,
+                    ip: "127.0.0.1".to_string(),
+                    data: serde_json::to_string(&raw_event)?,
+                    now: Utc::now().to_rfc3339(),
+                    sent_at: None,
+                    token,
+                    event: raw_event.event.clone(),
+                    timestamp,
+                    is_cookieless_mode: false,
+                    historical_migration: true,
+                };
+
+                Ok(Some(InternallyCapturedEvent { team_id, inner }))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+// Maps mixpanel event names to posthog event names
+pub fn map_event_names(event: String) -> String {
+    // TODO - add more as you find them
+    match event.as_str() {
+        "$mp_web_page_view" => "$pageview".to_string(),
+        _ => event,
+    }
+}
+
+fn get_distinct_id(props: &MixpanelProperties) -> Option<String> {
+    let distinct_id = props.distinct_id.clone();
+    let Some(before_identity) = props.other.get("$distinct_id_before_identity") else {
+        return distinct_id;
+    };
+
+    // If it's not a string, return the set distinct ID
+    let Some(before_identity) = before_identity.as_str() else {
+        return distinct_id;
+    };
+
+    // If we don't have a distinct ID, return the before identity
+    let Some(distinct_id) = distinct_id else {
+        return Some(before_identity.to_string());
+    };
+
+    // If the distinct_id starts with "$device:", it's an anonymous ID
+    if distinct_id.starts_with("$device:") {
+        return Some(before_identity.to_string());
+    }
+
+    // If the distinct_id contains only uppercase letters and dashes, it's an anonymous ID
+    if distinct_id
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c == '-' || c.is_ascii_digit())
+    {
+        return Some(before_identity.to_string());
+    }
+
+    // We default to using the distinct ID
+    Some(distinct_id)
+}
+
+const GEOIP_PROP_MAPPINGS: &[(&str, &str)] = &[
+    ("$city", "$geoip_city_name"),
+    ("$region", "$geoip_subdivision_1_name"),
+    ("mp_country_code", "$geoip_country_code"),
+];
+
+fn map_geoip_props(mut props: HashMap<String, Value>) -> HashMap<String, Value> {
+    for (from, to) in GEOIP_PROP_MAPPINGS {
+        if let Some(value) = props.remove(*from) {
+            props.insert(to.to_string(), value);
+        }
+    }
+
+    if let Some(code) = props.get("$geoip_country_code").and_then(|c| c.as_str()) {
+        if let Some(country_name) = map_country_code(code) {
+            props.insert(
+                "$geoip_country_name".to_string(),
+                Value::String(country_name),
+            );
+        }
+    }
+
+    props
+}
+
+// We have to do some mapping because maxmind doesn't precisely follow ISO3166
+// Names taken from: http://www.geonames.org/countries/
+const LONG_NAME_MAP: &[(&str, &str)] = &[
+    ("The United States of America", "United States"),
+    (
+        "The United Kingdom Of Great Britain And Northern Ireland",
+        "United Kingdom",
+    ),
+    ("The United Arab Emirates", "United Arab Emirates"),
+];
+
+fn map_country_code(code: &str) -> Option<String> {
+    let country = Country::from_alpha2(code).ok()?;
+
+    for (long_name, short_name) in LONG_NAME_MAP {
+        if country.long_name == *long_name {
+            return Some(short_name.to_string());
+        }
+    }
+
+    Some(country.long_name.to_string())
+}
+
+const MP_PROPS_TO_REMOVE: &[&str] = &[
+    "$mp_api_endpoint",
+    "mp_processing_time_ms",
+    "$insert_id",
+    "$geo_source",
+    "$mp_api_timestamp_ms",
+];
+
+fn remove_mp_props(mut props: HashMap<String, Value>) -> HashMap<String, Value> {
+    for prop in MP_PROPS_TO_REMOVE {
+        props.remove(*prop);
+    }
+
+    props
+}
+
+fn add_source_data(
+    mut props: HashMap<String, Value>,
+    job_id: uuid::Uuid,
+) -> HashMap<String, Value> {
+    props.insert("historical_migration".to_string(), Value::Bool(true));
+    props.insert(
+        "analytics_source".to_string(),
+        Value::String("mixpanel".to_string()),
+    );
+    props.insert(
+        "$import_job_id".to_string(),
+        Value::String(job_id.to_string()),
+    );
+    props
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn identity_transform(event: RawEvent) -> Result<Option<RawEvent>, Error> {
+        Ok(Some(event))
+    }
+
+    #[test]
+    fn test_job_id_in_mixpanel_event() {
+        let test_job_id = Uuid::now_v7();
+
+        let mx_event = MixpanelEvent {
+            event: "test_event".to_string(),
+            properties: MixpanelProperties {
+                timestamp: 1697379000,
+                distinct_id: Some("user123".to_string()),
+                other: HashMap::new(),
+            },
+        };
+
+        let context = TransformContext {
+            team_id: 123,
+            token: "test_token".to_string(),
+            job_id: test_job_id,
+            identify_cache: std::sync::Arc::new(crate::cache::MockIdentifyCache::new()),
+            group_cache: std::sync::Arc::new(crate::cache::MockGroupCache::new()),
+            import_events: true,
+            generate_identify_events: false,
+            generate_group_identify_events: false,
+        };
+
+        let parser =
+            MixpanelEvent::parse_fn(context, false, Duration::seconds(0), identity_transform);
+        let result = parser(mx_event).unwrap().unwrap();
+
+        let data: RawEvent = serde_json::from_str(&result.inner.data).unwrap();
+        assert_eq!(
+            data.properties.get("$import_job_id"),
+            Some(&json!(test_job_id.to_string()))
+        );
+        assert_eq!(
+            data.properties.get("historical_migration"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            data.properties.get("analytics_source"),
+            Some(&json!("mixpanel"))
+        );
+    }
+
+    #[test]
+    fn test_mixpanel_event_has_historical_migration_and_now_fields() {
+        let test_job_id = Uuid::now_v7();
+        let before_test = Utc::now();
+
+        let mx_event = MixpanelEvent {
+            event: "test_event".to_string(),
+            properties: MixpanelProperties {
+                timestamp: 1697379000,
+                distinct_id: Some("user123".to_string()),
+                other: HashMap::new(),
+            },
+        };
+
+        let context = TransformContext {
+            team_id: 123,
+            token: "test_token".to_string(),
+            job_id: test_job_id,
+            identify_cache: std::sync::Arc::new(crate::cache::MockIdentifyCache::new()),
+            group_cache: std::sync::Arc::new(crate::cache::MockGroupCache::new()),
+            import_events: true,
+            generate_identify_events: false,
+            generate_group_identify_events: false,
+        };
+
+        let parser =
+            MixpanelEvent::parse_fn(context, false, Duration::seconds(0), identity_transform);
+        let result = parser(mx_event).unwrap().unwrap();
+
+        let after_test = Utc::now();
+
+        assert!(
+            result.inner.historical_migration,
+            "historical_migration field must be true for batch import events"
+        );
+
+        assert!(
+            !result.inner.now.is_empty(),
+            "now field must be set for events"
+        );
+
+        let now_timestamp = chrono::DateTime::parse_from_rfc3339(&result.inner.now)
+            .expect("now should be valid RFC3339 timestamp")
+            .with_timezone(&Utc);
+        assert!(
+            now_timestamp >= before_test && now_timestamp <= after_test,
+            "now timestamp should be current (between test start and end)"
+        );
+
+        let serialized = serde_json::to_value(&result.inner).unwrap();
+        assert_eq!(
+            serialized["historical_migration"],
+            json!(true),
+            "historical_migration must be in serialized output"
+        );
+        assert!(
+            serialized["now"].is_string(),
+            "now must be a string in serialized output"
+        );
+    }
+
+    #[test]
+    fn test_deterministic_uuid_from_insert_id() {
+        let test_job_id = Uuid::now_v7();
+
+        let context = TransformContext {
+            team_id: 123,
+            token: "test_token".to_string(),
+            job_id: test_job_id,
+            identify_cache: std::sync::Arc::new(crate::cache::MockIdentifyCache::new()),
+            group_cache: std::sync::Arc::new(crate::cache::MockGroupCache::new()),
+            import_events: true,
+            generate_identify_events: false,
+            generate_group_identify_events: false,
+        };
+
+        // Parse the same event twice with the same $insert_id
+        let parser1 = MixpanelEvent::parse_fn(
+            context.clone(),
+            false,
+            Duration::seconds(0),
+            identity_transform,
+        );
+        let parser2 =
+            MixpanelEvent::parse_fn(context, false, Duration::seconds(0), identity_transform);
+
+        let mut other1 = HashMap::new();
+        other1.insert("$insert_id".to_string(), json!("unique_insert_id_123"));
+        let mx_event1 = MixpanelEvent {
+            event: "test_event".to_string(),
+            properties: MixpanelProperties {
+                timestamp: 1697379000,
+                distinct_id: Some("user123".to_string()),
+                other: other1,
+            },
+        };
+
+        let mut other2 = HashMap::new();
+        other2.insert("$insert_id".to_string(), json!("unique_insert_id_123"));
+        let mx_event2 = MixpanelEvent {
+            event: "test_event".to_string(),
+            properties: MixpanelProperties {
+                timestamp: 1697379000,
+                distinct_id: Some("user123".to_string()),
+                other: other2,
+            },
+        };
+
+        let result1 = parser1(mx_event1).unwrap().unwrap();
+        let result2 = parser2(mx_event2).unwrap().unwrap();
+
+        // Both events should have the same UUID because they have the same $insert_id
+        assert_eq!(
+            result1.inner.uuid, result2.inner.uuid,
+            "Events with the same $insert_id should have the same deterministic UUID"
+        );
+
+        // The UUID should be deterministic (UUID v5), not random
+        let expected_uuid = Uuid::new_v5(&MIXPANEL_INSERT_ID_NAMESPACE, b"unique_insert_id_123");
+        assert_eq!(
+            result1.inner.uuid, expected_uuid,
+            "UUID should be generated using UUID v5 from $insert_id"
+        );
+    }
+
+    #[test]
+    fn test_random_uuid_without_insert_id() {
+        let test_job_id = Uuid::now_v7();
+
+        let mx_event1 = MixpanelEvent {
+            event: "test_event".to_string(),
+            properties: MixpanelProperties {
+                timestamp: 1697379000,
+                distinct_id: Some("user123".to_string()),
+                other: HashMap::new(), // No $insert_id
+            },
+        };
+
+        let mx_event2 = MixpanelEvent {
+            event: "test_event".to_string(),
+            properties: MixpanelProperties {
+                timestamp: 1697379000,
+                distinct_id: Some("user123".to_string()),
+                other: HashMap::new(), // No $insert_id
+            },
+        };
+
+        let context = TransformContext {
+            team_id: 123,
+            token: "test_token".to_string(),
+            job_id: test_job_id,
+            identify_cache: std::sync::Arc::new(crate::cache::MockIdentifyCache::new()),
+            group_cache: std::sync::Arc::new(crate::cache::MockGroupCache::new()),
+            import_events: true,
+            generate_identify_events: false,
+            generate_group_identify_events: false,
+        };
+
+        let parser =
+            MixpanelEvent::parse_fn(context, false, Duration::seconds(0), identity_transform);
+
+        let result1 = parser(mx_event1).unwrap().unwrap();
+        let result2 = parser(mx_event2).unwrap().unwrap();
+
+        // Without $insert_id, UUIDs should be random (different)
+        assert_ne!(
+            result1.inner.uuid, result2.inner.uuid,
+            "Events without $insert_id should have different random UUIDs"
+        );
+    }
+}

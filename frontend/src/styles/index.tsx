@@ -1,3 +1,6 @@
-import './global.scss' /* Contains PostHog's main styling configurations */
-import './antd.less' /* Imports Ant Design's components */
-import './style.scss' /* DEPRECATED */
+import '@posthog/tailwind/tailwind.css'
+
+// global.scss must load AFTER tailwind so our base styles win the cascade
+import './global.scss'
+
+/* Contains PostHog's main styling configurations */

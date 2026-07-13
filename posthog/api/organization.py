@@ -1,28 +1,59 @@
-from typing import Any, Dict, List, Optional, Union, cast
+from collections.abc import Callable
+from functools import cached_property
+from typing import Any, Literal, Union, cast
 
-from django.conf import settings
 from django.db.models import Model, QuerySet
 from django.shortcuts import get_object_or_404
-from rest_framework import exceptions, permissions, response, serializers, viewsets
-from rest_framework.request import Request
 
-from posthog.api.routing import StructuredViewSetMixin
-from posthog.api.shared import TeamBasicSerializer
-from posthog.constants import AvailableFeature
-from posthog.event_usage import report_onboarding_completed
-from posthog.exceptions import EnterpriseFeatureException
-from posthog.mixins import AnalyticsDestroyModelMixin
+import posthoganalytics
+from drf_spectacular.utils import extend_schema, extend_schema_field
+from opentelemetry import trace
+from rest_framework import exceptions, permissions, serializers, viewsets
+from rest_framework.decorators import action
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from posthog import settings
+from posthog.api.routing import TeamAndOrgViewSetMixin
+from posthog.api.scoped_related_fields import OrgScopedPrimaryKeyRelatedField
+from posthog.api.shared import ProjectBasicSerializer, TeamBasicSerializer
+from posthog.auth import OAuthAccessTokenAuthentication, PersonalAPIKeyAuthentication
+from posthog.caching.organization_serializer_cache import (
+    ORG_SERIALIZER_CACHE_TTL_SECONDS,
+    _org_serializer_cache_version,
+)
+from posthog.cloud_utils import get_cached_instance_license, is_cloud
+from posthog.constants import INTERNAL_BOT_EMAIL_SUFFIX, AvailableFeature
+from posthog.event_usage import (
+    groups,
+    report_organization_action,
+    report_organization_deleted,
+    report_organization_deletion_initiated,
+)
+from posthog.exceptions_capture import capture_exception
+from posthog.helpers.email_utils import validate_display_name
 from posthog.models import Organization, User
+from posthog.models.activity_logging.model_activity import ImpersonatedContext
 from posthog.models.organization import OrganizationMembership
+from posthog.models.uploaded_media import UploadedMedia
 from posthog.permissions import (
-    CREATE_METHODS,
+    CREATE_ACTIONS,
+    APIScopePermission,
     OrganizationAdminWritePermissions,
     OrganizationMemberPermissions,
+    TimeSensitiveActionPermission,
     extract_organization,
 )
+from posthog.rate_limit import PostHogAIAccessRequestIPThrottle, PostHogAIAccessRequestUserThrottle
+from posthog.rbac.migrations.rbac_feature_flag_migration import rbac_feature_flag_role_access_migration
+from posthog.rbac.migrations.rbac_team_migration import rbac_team_access_control_migration
+from posthog.rbac.user_access_control import UserAccessControlSerializerMixin
+from posthog.tasks.email import send_posthog_ai_access_request
+from posthog.user_permissions import UserPermissions, UserPermissionsSerializerMixin
+from posthog.utils import get_safe_cache, safe_cache_set
 
 
-class PremiumMultiorganizationPermissions(permissions.BasePermission):
+class PremiumMultiorganizationPermission(permissions.BasePermission):
     """Require user to have all necessary premium features on their plan for create access to the endpoint."""
 
     message = "You must upgrade your PostHog plan to be able to create and manage multiple organizations."
@@ -30,14 +61,12 @@ class PremiumMultiorganizationPermissions(permissions.BasePermission):
     def has_permission(self, request: Request, view) -> bool:
         user = cast(User, request.user)
         if (
-            # make multiple orgs only premium on self-hosted, since enforcement of this is not possible on Cloud
-            not getattr(settings, "MULTI_TENANCY", False)
-            and request.method in CREATE_METHODS
+            view.action in CREATE_ACTIONS
             and (
                 user.organization is None
                 or not user.organization.is_feature_available(AvailableFeature.ORGANIZATIONS_PROJECTS)
             )
-            and user.organizations.count() >= 1
+            and user.organizations.exists()
         ):
             return False
         return True
@@ -48,7 +77,7 @@ class OrganizationPermissionsWithDelete(OrganizationAdminWritePermissions):
         if request.method in permissions.SAFE_METHODS:
             return True
         # TODO: Optimize so that this computation is only done once, on `OrganizationMemberPermissions`
-        organization = extract_organization(object)
+        organization = extract_organization(object, view)
         min_level = (
             OrganizationMembership.Level.OWNER if request.method == "DELETE" else OrganizationMembership.Level.ADMIN
         )
@@ -58,12 +87,76 @@ class OrganizationPermissionsWithDelete(OrganizationAdminWritePermissions):
         )
 
 
-class OrganizationSerializer(serializers.ModelSerializer):
+tracer = trace.get_tracer(__name__)
+
+
+CacheField = Literal["teams", "projects"]
+OrgCacheField = Literal["member_count"]
+
+
+def _cached_org_serializer_field(cache_key: str, fetcher: Callable[[], Any]) -> Any:
+    cached = get_safe_cache(cache_key)
+    if cached is not None:
+        return cached
+    result = fetcher()
+    safe_cache_set(cache_key, result, timeout=ORG_SERIALIZER_CACHE_TTL_SECONDS)
+    return result
+
+
+def _cached_per_user_org(field: CacheField, user_id: int, organization_id: str, fetcher: Callable[[], Any]) -> Any:
+    version = _org_serializer_cache_version(organization_id)
+    cache_key = f"org_serializer:{field}:{organization_id}:v{version}:{user_id}"
+    return _cached_org_serializer_field(cache_key, fetcher)
+
+
+def _fetch_member_count(organization: Organization) -> int:
+    # The cache version is bumped on OrganizationMembership signals (see _INVALIDATION_SOURCES
+    # below), so add/remove of members invalidates immediately. User.is_active flips and email
+    # changes to/from INTERNAL_BOT_EMAIL_SUFFIX do NOT invalidate via signals — they rely on
+    # ORG_SERIALIZER_CACHE_TTL_SECONDS (1h) as the staleness bound.
+    return (
+        OrganizationMembership.objects.exclude(user__email__endswith=INTERNAL_BOT_EMAIL_SUFFIX)
+        .filter(user__is_active=True, organization=organization)
+        .count()
+    )
+
+
+def _cached_per_org(field: OrgCacheField, organization_id: str, fetcher: Callable[[], Any]) -> Any:
+    version = _org_serializer_cache_version(organization_id)
+    cache_key = f"org_serializer:{field}:{organization_id}:v{version}"
+    return _cached_org_serializer_field(cache_key, fetcher)
+
+
+def _resolve_cached_user_id(serializer_context: dict[str, Any]) -> int | None:
+    request = serializer_context.get("request")
+    if request is None:
+        return None
+    user = getattr(request, "user", None)
+    if user is None or not user.is_authenticated:
+        return None
+    return user.id
+
+
+class OrganizationSerializer(
+    serializers.ModelSerializer, UserPermissionsSerializerMixin, UserAccessControlSerializerMixin
+):
     membership_level = serializers.SerializerMethodField()
-    setup = (
-        serializers.SerializerMethodField()
-    )  # Information related to the current state of the onboarding/setup process
-    teams = TeamBasicSerializer(many=True, read_only=True)
+    teams = serializers.SerializerMethodField()
+    projects = serializers.SerializerMethodField()
+    metadata = serializers.SerializerMethodField()
+    member_count = serializers.SerializerMethodField()
+    logo_media_id = OrgScopedPrimaryKeyRelatedField(
+        queryset=UploadedMedia.objects.all(), required=False, allow_null=True
+    )
+    default_role_id = serializers.CharField(
+        required=False,
+        allow_null=True,
+        help_text="ID of the role to automatically assign to new members joining the organization",
+    )
+    is_member_join_email_enabled = serializers.BooleanField(
+        read_only=True,
+        help_text="Legacy field; member-join emails are controlled per user in account notification settings.",
+    )
 
     class Meta:
         model = Organization
@@ -71,123 +164,434 @@ class OrganizationSerializer(serializers.ModelSerializer):
             "id",
             "name",
             "slug",
+            "logo_media_id",
             "created_at",
             "updated_at",
             "membership_level",
-            "personalization",
-            "setup",
-            "setup_section_2_completed",
             "plugins_access_level",
             "teams",
-            "available_features",
-            "domain_whitelist",
+            "projects",
+            "available_product_features",
             "is_member_join_email_enabled",
+            "metadata",
+            "customer_id",
+            "enforce_2fa",
+            "members_can_invite",
+            "members_can_create_projects",
+            "members_can_use_personal_api_keys",
+            "allow_publicly_shared_resources",
+            "member_count",
+            "is_ai_data_processing_approved",
+            "is_ai_training_opted_in",
+            "is_ai_training_locked",
+            "is_ai_training_cta_shown",
+            "is_hipaa",
+            "default_experiment_stats_method",
+            "default_anonymize_ips",
+            "default_role_id",
+            "is_active",
+            "is_not_active_reason",
+            "is_pending_deletion",
         ]
         read_only_fields = [
             "id",
             "slug",
             "created_at",
             "updated_at",
+            "membership_level",
+            "plugins_access_level",
+            "teams",
+            "projects",
+            "available_product_features",
+            "metadata",
+            "customer_id",
+            "member_count",
+            "default_role_id",
+            "is_active",
+            "is_not_active_reason",
+            "is_pending_deletion",
+            "is_ai_training_locked",
+            "is_ai_training_cta_shown",
+            "is_hipaa",
         ]
         extra_kwargs = {
-            "setup_section_2_completed": {"write_only": True},  # for reading this attribute, `setup` is used
             "slug": {
-                "required": False
+                "required": False,
             },  # slug is not required here as it's generated automatically for new organizations
         }
 
-    def create(self, validated_data: Dict, *args: Any, **kwargs: Any) -> Organization:
+    def validate_name(self, value: str) -> str:
+        return validate_display_name(value)
+
+    def validate_logo_media_id(self, value: UploadedMedia | None) -> UploadedMedia | None:
+        if value is None:
+            return value
+        if self.instance:
+            if value.team.organization_id != self.instance.id:
+                raise serializers.ValidationError("This media does not belong to this organization.")
+        else:
+            raise serializers.ValidationError("Cannot set logo media when creating an organization.")
+        return value
+
+    def create(self, validated_data: dict, *args: Any, **kwargs: Any) -> Organization:
         serializers.raise_errors_on_nested_writes("create", self, validated_data)
-        organization, _, _ = Organization.objects.bootstrap(self.context["request"].user, **validated_data)
+        user = self.context["request"].user
+        organization, _, _ = Organization.objects.bootstrap(user, **validated_data)
         return organization
 
-    def get_membership_level(self, organization: Organization) -> Optional[OrganizationMembership.Level]:
-        membership = OrganizationMembership.objects.filter(
-            organization=organization, user=self.context["request"].user,
-        ).first()
-        return membership.level if membership is not None else None
+    @tracer.start_as_current_span("organization_serializer.membership_level")
+    def get_membership_level(self, organization: Organization) -> OrganizationMembership.Level | None:
+        membership = self.user_permissions.organization_memberships.get(organization.pk)
+        return OrganizationMembership.Level(membership.level) if membership is not None else None
 
-    def get_setup(self, instance: Organization) -> Dict[str, Union[bool, int, str, None]]:
-        if not instance.is_onboarding_active:
-            # As Section 2 is the last one of the setup process (as of today),
-            # if it's completed it means the setup process is done
-            return {"is_active": False, "current_section": None}
+    @tracer.start_as_current_span("organization_serializer.teams")
+    def get_teams(self, instance: Organization) -> list[dict[str, Any]]:
+        user_id = _resolve_cached_user_id(self.context)
+        if user_id is None:
+            return self._fetch_visible_teams(instance)
+        return _cached_per_user_org("teams", user_id, str(instance.id), lambda: self._fetch_visible_teams(instance))
 
-        non_demo_team_id = next((team.pk for team in instance.teams.filter(is_demo=False)), None)
-        any_project_ingested_events = instance.teams.filter(is_demo=False, ingested_event=True).exists()
-        any_project_completed_snippet_onboarding = instance.teams.filter(
-            is_demo=False, completed_snippet_onboarding=True,
-        ).exists()
+    def _fetch_visible_teams(self, instance: Organization) -> list[dict[str, Any]]:
+        # Support new access control system
+        visible_teams = (
+            self.user_access_control.filter_queryset_by_access_level(instance.teams.all(), include_all_if_admin=True)
+            if self.user_access_control
+            else instance.teams.none()
+        )
+        # Support old access control system
+        visible_teams = visible_teams.filter(id__in=self.user_permissions.team_ids_visible_for_user).select_related(
+            "project"
+        )
+        return list(TeamBasicSerializer(visible_teams, context=self.context, many=True).data)
 
-        current_section = 1
-        if non_demo_team_id and any_project_ingested_events and any_project_completed_snippet_onboarding:
-            # All steps from section 1 completed, move on to section 2
-            current_section = 2
+    @tracer.start_as_current_span("organization_serializer.projects")
+    def get_projects(self, instance: Organization) -> list[dict[str, Any]]:
+        user_id = _resolve_cached_user_id(self.context)
+        if user_id is None:
+            return self._fetch_visible_projects(instance)
+        return _cached_per_user_org(
+            "projects", user_id, str(instance.id), lambda: self._fetch_visible_projects(instance)
+        )
 
+    def _fetch_visible_projects(self, instance: Organization) -> list[dict[str, Any]]:
+        visible_projects = instance.projects.filter(id__in=self.user_permissions.project_ids_visible_for_user)
+        return list(ProjectBasicSerializer(visible_projects, context=self.context, many=True).data)
+
+    @extend_schema_field(serializers.DictField(child=serializers.CharField()))
+    def get_metadata(self, instance: Organization) -> dict[str, Union[str, int, object]]:
         return {
-            "is_active": True,
-            "current_section": current_section,
-            "any_project_ingested_events": any_project_ingested_events,
-            "any_project_completed_snippet_onboarding": any_project_completed_snippet_onboarding,
-            "non_demo_team_id": non_demo_team_id,
-            "has_invited_team_members": instance.invites.exists() or instance.members.count() > 1,
+            "instance_tag": settings.INSTANCE_TAG,
         }
 
+    def validate_members_can_invite(self, value: bool) -> bool:
+        if self.instance and self.instance.members_can_invite != value:
+            if not self.instance.is_feature_available(AvailableFeature.ORGANIZATION_INVITE_SETTINGS):
+                raise serializers.ValidationError(
+                    "You must upgrade your plan to configure who can send invites.",
+                    code="payment_required",
+                )
+        return value
 
-class OrganizationViewSet(AnalyticsDestroyModelMixin, viewsets.ModelViewSet):
+    def validate_members_can_create_projects(self, value: bool) -> bool:
+        # Gated behind the organization invite settings entitlement for now (will move to a dedicated feature later).
+        if self.instance and self.instance.members_can_create_projects != value:
+            if not self.instance.is_feature_available(AvailableFeature.ORGANIZATION_INVITE_SETTINGS):
+                raise serializers.ValidationError(
+                    "You must upgrade your plan to configure who can create projects.",
+                    code="payment_required",
+                )
+        return value
+
+    def validate_enforce_2fa(self, value: bool | None) -> bool | None:
+        if self.instance and self.instance.enforce_2fa != value:
+            if not self.instance.is_feature_available(AvailableFeature.TWO_FACTOR_ENFORCEMENT):
+                raise serializers.ValidationError(
+                    "You must upgrade your plan to enforce 2FA.",
+                    code="payment_required",
+                )
+        return value
+
+    def validate_allow_publicly_shared_resources(self, value: bool) -> bool:
+        if self.instance and self.instance.allow_publicly_shared_resources != value:
+            if not self.instance.is_feature_available(AvailableFeature.ORGANIZATION_SECURITY_SETTINGS):
+                raise serializers.ValidationError(
+                    "You must upgrade your plan to configure public sharing settings.",
+                    code="payment_required",
+                )
+        return value
+
+    def validate_is_ai_training_opted_in(self, value: bool | None) -> bool | None:
+        if self.instance and self.instance.is_ai_training_opted_in != value:
+            if self.instance.is_hipaa:
+                raise serializers.ValidationError(
+                    "HIPAA organizations are always opted out of AI training and this setting cannot be changed.",
+                    code="locked",
+                )
+            if self.instance.is_ai_training_locked:
+                raise serializers.ValidationError(
+                    "AI training opt-in is locked for this organization and cannot be changed. Contact PostHog support if you need to update this setting.",
+                    code="locked",
+                )
+        return value
+
+    def validate_members_can_use_personal_api_keys(self, value: bool) -> bool:
+        if self.instance and self.instance.members_can_use_personal_api_keys != value:
+            if not self.instance.is_feature_available(AvailableFeature.ORGANIZATION_SECURITY_SETTINGS):
+                raise serializers.ValidationError(
+                    "You must upgrade your plan to configure personal API key permissions.",
+                    code="payment_required",
+                )
+        return value
+
+    @extend_schema_field(serializers.IntegerField())
+    @tracer.start_as_current_span("organization_serializer.member_count")
+    def get_member_count(self, organization: Organization) -> int:
+        return _cached_per_org("member_count", str(organization.id), lambda: _fetch_member_count(organization))
+
+    @tracer.start_as_current_span("organization_serializer.to_representation")
+    def to_representation(self, instance):
+        return super().to_representation(instance)
+
+
+class OrganizationAIAccessRequestResponseSerializer(serializers.Serializer):
+    success = serializers.BooleanField(
+        help_text="Whether the access request was accepted and the organization admins were notified."
+    )
+
+
+@extend_schema(extensions={"x-product": "platform_features"})
+class OrganizationViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet):
+    scope_object = "organization"
     serializer_class = OrganizationSerializer
-    permission_classes = [
-        permissions.IsAuthenticated,
-        OrganizationMemberPermissions,
-        OrganizationPermissionsWithDelete,
-    ]
+    permission_classes = [OrganizationPermissionsWithDelete, TimeSensitiveActionPermission]
     queryset = Organization.objects.none()
     lookup_field = "id"
     ordering = "-created_by"
 
-    def get_permissions(self):
-        if self.request.method == "POST":
+    def dangerously_get_permissions(self):
+        if self.action == "list":
+            return [permission() for permission in [permissions.IsAuthenticated, APIScopePermission]]
+
+        if self.action == "create":
             # Cannot use `OrganizationMemberPermissions` or `OrganizationAdminWritePermissions`
-            # because they require an existing org, unneded anyways because permissions are organization-based
-            return [permission() for permission in [permissions.IsAuthenticated, PremiumMultiorganizationPermissions]]
-        return super().get_permissions()
+            # because they require an existing org, unneeded anyways because permissions are organization-based
+            create_permissions = [
+                permission()
+                for permission in [permissions.IsAuthenticated, TimeSensitiveActionPermission, APIScopePermission]
+            ]
+            if not is_cloud():
+                create_permissions.append(PremiumMultiorganizationPermission())
 
-    def get_queryset(self) -> QuerySet:
-        return cast(User, self.request.user).organizations.all()
+            return create_permissions
 
-    def get_object(self):
+        if self.action in ["update", "partial_update"]:
+            update_permissions = [
+                permission()
+                for permission in [
+                    permissions.IsAuthenticated,
+                    TimeSensitiveActionPermission,
+                    APIScopePermission,
+                    OrganizationAdminWritePermissions,
+                ]
+            ]
+
+            if not is_cloud():
+                update_permissions.append(PremiumMultiorganizationPermission())
+
+            return update_permissions
+
+        # Any org member may ask an admin to enable PostHog AI — enabling still requires admin.
+        if self.action == "request_ai_access":
+            return [
+                permission()
+                for permission in [permissions.IsAuthenticated, APIScopePermission, OrganizationMemberPermissions]
+            ]
+
+        # We don't override for other actions
+        raise NotImplementedError()
+
+    def safely_get_queryset(self, queryset) -> QuerySet:
+        user = cast(User, self.request.user)
+        queryset = user.organizations.all()
+        if isinstance(self.request.successful_authenticator, PersonalAPIKeyAuthentication):
+            if scoped_organizations := self.request.successful_authenticator.personal_api_key.scoped_organizations:
+                queryset = queryset.filter(id__in=scoped_organizations)
+        if isinstance(self.request.successful_authenticator, OAuthAccessTokenAuthentication):
+            if scoped_organizations := self.request.successful_authenticator.access_token.scoped_organizations:
+                queryset = queryset.filter(id__in=scoped_organizations)
+
+        return queryset
+
+    def safely_get_object(self, queryset):
+        return self.organization
+
+    # Override base view as the "parent_query_dict" for an organization is the same as the organization itself
+    @cached_property
+    def organization(self) -> Organization:
+        if not self.detail:
+            raise AttributeError("Not valid for non-detail routes.")
         queryset = self.filter_queryset(self.get_queryset())
         lookup_value = self.kwargs[self.lookup_field]
         if lookup_value == "@current":
             organization = cast(User, self.request.user).organization
             if organization is None:
                 raise exceptions.NotFound("Current organization not found.")
-        else:
-            filter_kwargs = {self.lookup_field: lookup_value}
-            organization = get_object_or_404(queryset, **filter_kwargs)
-        self.check_object_permissions(self.request, organization)
-        return organization
+            return organization
 
+        filter_kwargs = {self.lookup_field: lookup_value}
+        return get_object_or_404(queryset, **filter_kwargs)
 
-class OrganizationOnboardingViewset(StructuredViewSetMixin, viewsets.GenericViewSet):
+    def perform_destroy(self, organization: Organization):
+        from ee.billing.billing_manager import BillingManager
 
-    serializer_class = OrganizationSerializer
-    permission_classes = [
-        permissions.IsAuthenticated,
-        OrganizationMemberPermissions,
-    ]
+        # Check if bulk deletion operations are disabled via environment variable
+        # Organizations contain teams, so we need to block organization deletion too
+        if settings.DISABLE_BULK_DELETES:
+            raise exceptions.ValidationError(
+                "Organization deletion is temporarily disabled during database migration. Please try again later."
+            )
 
-    def create(self, request, *args, **kwargs):
-        # Complete onboarding
-        instance: Organization = self.organization
-        self.check_object_permissions(request, instance)
+        # Check if organization has an active billing subscription
+        if is_cloud():
+            license = get_cached_instance_license()
+            if license:
+                billing_manager = BillingManager(license)
+                billing = billing_manager.get_billing(organization)
+                if billing.get("has_active_subscription"):
+                    raise exceptions.ValidationError(
+                        "Cannot delete organization with an active subscription. "
+                        "Please cancel your subscription first in the billing page."
+                    )
 
-        if not instance.is_onboarding_active:
-            raise exceptions.ValidationError("Onboarding already completed.")
+        if organization.is_pending_deletion:
+            raise exceptions.ValidationError("This organization is already being deleted.")
 
-        instance.complete_onboarding()
+        user = cast(User, self.request.user)
+        report_organization_deleted(user, organization)
+        report_organization_deletion_initiated(user, organization)
+        teams = list(organization.teams.only("id", "name").all())
+        team_ids = [team.pk for team in teams]
+        project_names = [team.name for team in teams]
+        organization_id = organization.pk
+        organization_name = organization.name
 
-        report_onboarding_completed(organization=instance, current_user=request.user)
+        # Mark as pending deletion
+        organization.is_pending_deletion = True
+        organization.save(update_fields=["is_pending_deletion"])
 
-        serializer = self.get_serializer(instance=instance)
-        return response.Response(serializer.data)
+        # Hand off all deletion work (bulky postgres, batch exports, org/team records,
+        # ClickHouse, email) to the durable Temporal workflow.
+        from posthog.temporal.delete_teams.dispatch import start_delete_organization_workflow
+
+        start_delete_organization_workflow(
+            team_ids=team_ids,
+            organization_id=str(organization_id),
+            user_id=user.id,
+            organization_name=organization_name,
+            project_names=project_names,
+        )
+
+    def get_serializer_context(self) -> dict[str, Any]:
+        return {
+            **super().get_serializer_context(),
+            "user_permissions": UserPermissions(cast(User, self.request.user)),
+        }
+
+    def _capture_organization_setting_events(self, request: Request) -> None:
+        setting_events = [
+            ("enforce_2fa", "organization 2fa enforcement toggled"),
+            ("is_ai_data_processing_approved", "organization ai data processing consent toggled"),
+            ("is_ai_training_opted_in", "organization ai training opt-in toggled"),
+        ]
+
+        fields_to_capture = [field for field, _ in setting_events if field in request.data]
+        if not fields_to_capture:
+            return
+
+        organization = self.get_object()
+        user = cast(User, request.user)
+        user_role = user.organization_memberships.get(organization=organization).level
+
+        for field, event_name in setting_events:
+            if field in request.data:
+                posthoganalytics.capture(
+                    event_name,
+                    distinct_id=str(user.distinct_id),
+                    properties={
+                        "enabled": request.data[field],
+                        "organization_id": str(organization.id),
+                        "organization_name": organization.name,
+                        "user_role": user_role,
+                    },
+                    groups=groups(organization),
+                )
+
+    def update(self, request: Request, *args: Any, **kwargs: Any) -> Response:
+        self._capture_organization_setting_events(request)
+
+        # Set user context for activity logging
+        with ImpersonatedContext(request):
+            return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request: Request, *args: Any, **kwargs: Any) -> Response:
+        self._capture_organization_setting_events(request)
+
+        # Set user context for activity logging
+        with ImpersonatedContext(request):
+            return super().partial_update(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        # Set user context for activity logging
+        with ImpersonatedContext(self.request):
+            super().perform_create(serializer)
+
+    @extend_schema(exclude=True)
+    @action(detail=True, methods=["post"])
+    def migrate_access_control(self, request: Request, **kwargs) -> Response:
+        organization = Organization.objects.get(id=kwargs["id"])
+        self.check_object_permissions(request, organization)
+
+        try:
+            user = cast(User, request.user)
+            report_organization_action(organization, "rbac_team_migration_started", {"user": user.distinct_id})
+
+            rbac_team_access_control_migration(organization.id)
+            rbac_feature_flag_role_access_migration(organization.id)
+
+            report_organization_action(organization, "rbac_team_migration_completed", {"user": user.distinct_id})
+
+        except Exception as e:
+            report_organization_action(
+                organization, "rbac_team_migration_failed", {"user": user.distinct_id, "error": str(e)}
+            )
+            capture_exception(e)
+            return Response({"status": False, "error": "An internal error has occurred."}, status=500)
+
+        return Response({"status": True})
+
+    @extend_schema(request=None, responses={200: OrganizationAIAccessRequestResponseSerializer})
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="request_ai_access",
+        throttle_classes=[PostHogAIAccessRequestUserThrottle, PostHogAIAccessRequestIPThrottle],
+    )
+    def request_ai_access(self, request: Request, **kwargs) -> Response:
+        """Notify organization admins that a member is requesting PostHog AI be enabled."""
+        organization = self.organization
+        user = cast(User, request.user)
+
+        # Nothing to request if PostHog AI is already enabled for the org.
+        if organization.is_ai_data_processing_approved:
+            raise exceptions.ValidationError("PostHog AI is already enabled for this organization.")
+
+        # Members only — admins can enable PostHog AI themselves, so there's nobody to ask.
+        membership = OrganizationMembership.objects.filter(user=user, organization=organization).first()
+        if membership is None or membership.level >= OrganizationMembership.Level.ADMIN:
+            raise exceptions.PermissionDenied("Only members can request access; admins can enable PostHog AI directly.")
+
+        send_posthog_ai_access_request.delay(
+            organization_id=str(organization.id),
+            requesting_user_id=user.id,
+        )
+        return Response({"success": True})

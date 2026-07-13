@@ -1,0 +1,737 @@
+import sys
+import math
+import uuid
+import socket
+import typing
+import asyncio
+import datetime as dt
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+
+from django.conf import settings
+
+import aioboto3
+from aiobotocore.config import AioConfig
+from aiobotocore.httpsession import AIOHTTPSession as BaseAIOHTTPSession
+from opentelemetry import trace
+from temporalio import activity
+
+from posthog.clickhouse import query_tagging
+from posthog.clickhouse.query_tagging import Product
+
+from products.batch_exports.backend.temporal.utils import make_retryable_with_exponential_backoff
+
+if typing.TYPE_CHECKING:
+    from types_aiobotocore_s3.type_defs import ObjectIdentifierTypeDef
+
+from structlog.contextvars import bind_contextvars
+
+from posthog.sync import database_sync_to_async
+from posthog.temporal.common.clickhouse import (
+    ClickHouseCheckQueryStatusError,
+    ClickHouseClient,
+    ClickHouseClientTimeoutError,
+    ClickHouseError,
+    ClickHouseQueryNotFound,
+    ClickHouseQueryStatus,
+    get_client,
+)
+from posthog.temporal.common.heartbeat import Heartbeater
+from posthog.temporal.common.logger import get_write_only_logger
+
+from products.batch_exports.backend.service import (
+    BackfillDetails,
+    BatchExportField,
+    BatchExportModel,
+    BatchExportSchema,
+    afetch_last_run_records_completed,
+)
+from products.batch_exports.backend.temporal.batch_exports import default_fields
+from products.batch_exports.backend.temporal.metrics import log_query_duration
+from products.batch_exports.backend.temporal.record_batch_model import resolve_batch_exports_model
+from products.batch_exports.backend.temporal.spmc import (
+    RecordBatchModel,
+    compose_filters_clause,
+    generate_query_ranges,
+    is_5_min_batch_export,
+    use_distributed_events_recent_table,
+    wait_for_delta_past_data_interval_end,
+)
+from products.batch_exports.backend.temporal.sql import (
+    EXPORT_TO_S3_FROM_DISTRIBUTED_EVENTS_RECENT,
+    EXPORT_TO_S3_FROM_EVENTS,
+    EXPORT_TO_S3_FROM_EVENTS_BACKFILL,
+    EXPORT_TO_S3_FROM_EVENTS_RECENT,
+    EXPORT_TO_S3_FROM_EVENTS_UNBOUNDED,
+    EXPORT_TO_S3_FROM_EVENTS_WORKFLOWS,
+    EXPORT_TO_S3_FROM_PERSONS,
+    EXPORT_TO_S3_FROM_PERSONS_BACKFILL,
+    get_s3_function_call,
+)
+from products.batch_exports.backend.temporal.utils import set_status_to_running_task
+
+LOGGER = get_write_only_logger()
+TRACER = trace.get_tracer(__name__)
+
+
+class DataIntervalEndInFutureError(Exception):
+    """Raised when a batch export's 'data_interval_end' is after now."""
+
+    def __init__(self, data_interval_end: dt.datetime) -> None:
+        super().__init__(f"The provided 'data_interval_end' ({data_interval_end.isoformat()}) is in the future")
+
+
+def _is_local_dev_or_test() -> bool:
+    return settings.DEBUG or settings.TEST
+
+
+def _uses_object_storage_endpoint() -> bool:
+    return _is_local_dev_or_test() or not settings.CLOUD_DEPLOYMENT
+
+
+def _get_s3_endpoint_url() -> str:
+    """Get the S3 endpoint URL for the Temporal worker.
+
+    When running the stack locally, MinIO runs in Docker but the Temporal workers run outside, so we need to pass in
+    localhost URL rather than the hostname of the container.
+    """
+    if _is_local_dev_or_test():
+        return "http://localhost:19000"
+    return settings.BATCH_EXPORT_OBJECT_STORAGE_ENDPOINT
+
+
+def _get_s3_credentials() -> tuple[str | None, str | None]:
+    """Get the S3 credentials for S3 internal staging bucket.
+
+    If keyless S3 auth is enabled, we use no credentials as the IAM role will be used to authenticate.
+    Otherwise, we use the credentials from the object storage settings.
+    """
+    use_keyless_s3_auth = not _uses_object_storage_endpoint()
+    if use_keyless_s3_auth:
+        aws_access_key_id = None
+        aws_secret_access_key = None
+    else:
+        aws_access_key_id = settings.OBJECT_STORAGE_ACCESS_KEY_ID
+        aws_secret_access_key = settings.OBJECT_STORAGE_SECRET_ACCESS_KEY
+    return aws_access_key_id, aws_secret_access_key
+
+
+def socket_factory(addr_info):
+    """Socket factory for ``aiohttp.TCPConnector``."""
+    family, type_, proto, _, _ = addr_info
+    sock = socket.socket(family=family, type=type_, proto=proto)
+    # Enable keepalive in the socket
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, True)
+
+    if sys.platform == "linux":
+        # Start sending keepalive probes after 30s
+        # Ensure that any idle timeouts allow at least 30s
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+        # Send keepalive probes every 10s
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        # Give up after 5 failed probes
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+
+    return sock
+
+
+class AIOHTTPSession(BaseAIOHTTPSession):
+    """Session class used to include ``socket_factory``.
+
+    This is required because aiobotocore will not allow passing ``socket_factory`` as
+    a ``connector_args``.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # This exists, but mypy is unable to check it.
+        self._connector_args["socket_factory"] = socket_factory  # type: ignore[attr-defined]
+
+
+@asynccontextmanager
+async def get_s3_client():
+    """Async context manager for creating and managing an S3 client."""
+    aws_access_key_id, aws_secret_access_key = _get_s3_credentials()
+    session = aioboto3.Session()
+    async with session.client(
+        "s3",
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        endpoint_url=_get_s3_endpoint_url(),
+        region_name=settings.BATCH_EXPORT_OBJECT_STORAGE_REGION,
+        # aiobotocore defaults keepalive_timeout to 12 seconds, which can be low for
+        # slower batch exports.
+        config=AioConfig(
+            connect_timeout=60,
+            read_timeout=300,
+            connector_args={"keepalive_timeout": 30},
+            http_session_cls=AIOHTTPSession,
+        ),
+    ) as s3_client:
+        yield s3_client
+
+
+async def _delete_all_from_bucket_with_prefix(bucket_name: str, key_prefix: str):
+    """Delete all objects in bucket_name under key_prefix."""
+    async with get_s3_client() as s3_client:
+        response = await s3_client.list_objects_v2(Bucket=bucket_name, Prefix=key_prefix)
+        if "Contents" in response:
+            objects_to_delete: list[ObjectIdentifierTypeDef] = [
+                {"Key": obj["Key"]} for obj in response["Contents"] if "Key" in obj
+            ]
+            if objects_to_delete:
+                await s3_client.delete_objects(Bucket=bucket_name, Delete={"Objects": objects_to_delete})
+
+
+@dataclass
+class S3StagingFolder:
+    folder: str
+    url: str
+
+
+@dataclass
+class InternalStageResult:
+    """Result of staging a batch export run's data in the internal S3 area."""
+
+    stage_folder: str
+    # Total rows written to the stage (from ClickHouse's query summary), or None if unknown.
+    records_total: int | None = None
+
+
+@dataclass
+class BatchExportInsertIntoInternalStageInputs:
+    """Base dataclass for batch export insert inputs containing common fields."""
+
+    team_id: int
+    batch_export_id: str
+    data_interval_start: str | None
+    data_interval_end: str
+    exclude_events: list[str] | None = None
+    include_events: list[str] | None = None
+    run_id: str | None = None
+    backfill_details: BackfillDetails | None = None
+    batch_export_model: BatchExportModel | None = None
+    is_workflows: bool = False
+    # TODO: Remove after updating existing batch exports
+    batch_export_schema: BatchExportSchema | None = None
+    destination_default_fields: list[BatchExportField] | None = None
+
+    @property
+    def properties_to_log(self) -> dict[str, typing.Any]:
+        """Return a dictionary of properties that we want to log if an error is raised."""
+        return {
+            "team_id": self.team_id,
+            "batch_export_id": self.batch_export_id,
+            "data_interval_start": self.data_interval_start,
+            "data_interval_end": self.data_interval_end,
+            "exclude_events": self.exclude_events,
+            "include_events": self.include_events,
+            "run_id": self.run_id,
+            "backfill_details": self.backfill_details,
+            "batch_export_model": self.batch_export_model,
+            "batch_export_schema": self.batch_export_schema,
+            "destination_default_fields": self.destination_default_fields,
+        }
+
+
+@activity.defn
+async def insert_into_internal_stage_activity(
+    inputs: BatchExportInsertIntoInternalStageInputs,
+) -> InternalStageResult:
+    """Write record batches to our own internal S3 staging area.
+
+    Returns:
+        The S3 staging folder where the data was written to, and the total number of rows staged.
+    """
+    bind_contextvars(
+        team_id=inputs.team_id,
+        data_interval_start=inputs.data_interval_start,
+        data_interval_end=inputs.data_interval_end,
+    )
+    logger = LOGGER.bind()
+
+    logger.info("Staging data for batch export")
+
+    async with (
+        Heartbeater(),
+        set_status_to_running_task(run_id=inputs.run_id),
+    ):
+        _, record_batch_model, model_name, fields, filters, extra_query_parameters = resolve_batch_exports_model(
+            inputs.team_id, inputs.batch_export_model, inputs.batch_export_schema, inputs.batch_export_id
+        )
+        data_interval_start = (
+            dt.datetime.fromisoformat(inputs.data_interval_start) if inputs.data_interval_start else None
+        )
+        data_interval_end = dt.datetime.fromisoformat(inputs.data_interval_end)
+        full_range = (data_interval_start, data_interval_end)
+
+        attempt_number = activity.info().attempt
+        s3_staging_folder = get_s3_staging_folder(
+            batch_export_id=inputs.batch_export_id,
+            data_interval_start=inputs.data_interval_start,
+            data_interval_end=inputs.data_interval_end,
+            attempt_number=attempt_number,
+        )
+
+        num_partitions = await compute_num_partitions(
+            batch_export_id=inputs.batch_export_id,
+            data_interval_start=data_interval_start,
+            data_interval_end=data_interval_end,
+        )
+        logger.info("Computed staging partitions", num_partitions=num_partitions)
+
+        if record_batch_model is not None:
+            query_or_model = record_batch_model
+            query_parameters = {}
+        else:
+            query, query_parameters = await _get_query(
+                model_name=model_name,
+                backfill_details=inputs.backfill_details,
+                team_id=inputs.team_id,
+                batch_export_id=inputs.batch_export_id,
+                s3_staging_folder_url=s3_staging_folder.url,
+                full_range=full_range,
+                data_interval_start=inputs.data_interval_start,
+                data_interval_end=inputs.data_interval_end,
+                fields=fields,
+                filters=filters,
+                destination_default_fields=inputs.destination_default_fields,
+                exclude_events=inputs.exclude_events,
+                include_events=inputs.include_events,
+                extra_query_parameters=extra_query_parameters,
+                num_partitions=num_partitions,
+                is_workflows=inputs.is_workflows,
+            )
+            query_or_model = query
+
+        records_total = await _write_batch_export_record_batches_to_internal_stage(
+            query_or_model=query_or_model,
+            full_range=full_range,
+            query_parameters=query_parameters,
+            team_id=inputs.team_id,
+            batch_export_id=inputs.batch_export_id,
+            data_interval_start=inputs.data_interval_start,
+            data_interval_end=inputs.data_interval_end,
+            s3_staging_folder_url=s3_staging_folder.url,
+            num_partitions=num_partitions,
+        )
+    logger.info("Staging data completed successfully", records_total=records_total)
+    return InternalStageResult(stage_folder=s3_staging_folder.folder, records_total=records_total)
+
+
+async def compute_num_partitions(
+    batch_export_id: str, data_interval_start: dt.datetime | None, data_interval_end: dt.datetime
+) -> int:
+    """Choose how many staging files (partitions) to write for this run.
+
+    We estimate the export size from the most recent completed run at or before the interval being
+    processed, then pick a partition count targeting a roughly-constant number of rows per staging
+    Arrow file, clamped to [MIN, MAX].
+
+    Sizing relative to the current interval keeps backfills of old intervals from being sized off
+    today's (potentially much larger) live runs. We size off the most recent run only if its interval
+    length matches this one's, so a change in export frequency doesn't size off a differently-sized
+    interval (we fall back and let the next run, which has a same-frequency predecessor, re-adjust).
+
+    We fall back to the static default when there is no usable estimate (first run, frequency
+    change, or a run with no recorded count), if the fetch fails, or if dynamic partitioning is
+    disabled entirely via BATCH_EXPORT_DYNAMIC_PARTITIONING_ENABLED.
+    """
+    logger = LOGGER.bind()
+    static_default = settings.BATCH_EXPORT_CLICKHOUSE_S3_PARTITIONS
+
+    if not settings.BATCH_EXPORT_DYNAMIC_PARTITIONING_ENABLED:
+        return static_default
+
+    # Without the current interval's bounds we can't match the previous run's frequency, so don't risk
+    # sizing off a differently-sized interval (e.g. an unbounded backfill) -> fall back to the default.
+    if data_interval_start is None:
+        return static_default
+    interval_duration = data_interval_end - data_interval_start
+
+    estimate_rows: int | None = None
+    try:
+        estimate_rows = await afetch_last_run_records_completed(
+            uuid.UUID(batch_export_id),
+            before_or_at_interval_end=data_interval_end,
+            # ignore stale runs from a long-paused export
+            not_older_than=data_interval_end - dt.timedelta(days=365),
+            matching_interval_duration=interval_duration,
+        )
+    except Exception:
+        logger.warning("Failed to fetch last run records completed; falling back to static default", exc_info=True)
+    if not estimate_rows or estimate_rows <= 0:
+        return static_default
+
+    min_partitions = settings.BATCH_EXPORT_CLICKHOUSE_S3_MIN_PARTITIONS
+    # guard against misconfiguration where max is set below min
+    max_partitions = max(settings.BATCH_EXPORT_CLICKHOUSE_S3_MAX_PARTITIONS, min_partitions)
+    # guard against misconfiguration where the target is set to 0
+    target_rows = max(settings.BATCH_EXPORT_CLICKHOUSE_S3_TARGET_ROWS_PER_PARTITION, 1)
+    n = math.ceil(estimate_rows / target_rows)
+    return max(min_partitions, min(n, max_partitions))
+
+
+async def _get_query(
+    model_name: str,
+    backfill_details: BackfillDetails | None,
+    team_id: int,
+    batch_export_id: str,
+    s3_staging_folder_url: str,
+    full_range: tuple[dt.datetime | None, dt.datetime],
+    data_interval_start: str | None,
+    data_interval_end: str,
+    fields: list[BatchExportField] | None = None,
+    destination_default_fields: list[BatchExportField] | None = None,
+    filters: list[dict[str, str | list[str] | None]] | None = None,
+    num_partitions: int | None = None,
+    is_workflows: bool = False,
+    **parameters,
+):
+    logger = LOGGER.bind(model_name=model_name)
+
+    if fields is None:
+        if destination_default_fields is None:
+            fields = default_fields()
+        else:
+            fields = destination_default_fields
+
+    extra_query_parameters = parameters.pop("extra_query_parameters", {}) or {}
+
+    if filters is not None and len(filters) > 0:
+        filters_str, extra_query_parameters = await database_sync_to_async(compose_filters_clause)(
+            filters, team_id=team_id, values=extra_query_parameters
+        )
+    else:
+        filters_str, extra_query_parameters = "", extra_query_parameters
+
+    is_backfill = backfill_details is not None
+    # The number of partitions controls how many files ClickHouse writes to concurrently.
+    num_partitions = num_partitions or settings.BATCH_EXPORT_CLICKHOUSE_S3_PARTITIONS
+    assert num_partitions is not None  # to satisfy mypy
+
+    aws_access_key_id, aws_secret_access_key = _get_s3_credentials()
+    s3_function = get_s3_function_call(
+        s3_folder=s3_staging_folder_url,
+        s3_key=aws_access_key_id,
+        s3_secret=aws_secret_access_key,
+        num_partitions=num_partitions,
+    )
+
+    if model_name == "persons":
+        if is_backfill and full_range[0] is None:
+            query_template = EXPORT_TO_S3_FROM_PERSONS_BACKFILL
+            query = query_template.safe_substitute(s3_function=s3_function)
+        else:
+            query_template = EXPORT_TO_S3_FROM_PERSONS
+            if str(team_id) in settings.BATCH_EXPORTS_PERSONS_LIMITED_EXPORT_TEAM_IDS:
+                filter_distinct_ids = """
+                HAVING
+                    (
+                        _timestamp >= {interval_start}::DateTime64
+                    )
+                    AND (
+                        _timestamp < {interval_end}::DateTime64
+                    )
+                """
+            else:
+                filter_distinct_ids = ""
+            query = query_template.safe_substitute(
+                s3_function=s3_function,
+                filter_distinct_ids=filter_distinct_ids,
+            )
+    else:
+        if parameters.get("exclude_events", None):
+            parameters["exclude_events"] = list(parameters["exclude_events"])
+        else:
+            parameters["exclude_events"] = []
+
+        if parameters.get("include_events", None):
+            parameters["include_events"] = list(parameters["include_events"])
+        else:
+            parameters["include_events"] = []
+
+        # for 5 min batch exports we query the events_recent table, which is known to have zero replication lag, but
+        # may not be able to handle the load from all batch exports
+        if is_5_min_batch_export(full_range=full_range) and not is_backfill and not is_workflows:
+            logger.info("Using events_recent table for 5 min batch export")
+            query_template = EXPORT_TO_S3_FROM_EVENTS_RECENT
+        # for other batch exports that should use `events_recent` we use the `distributed_events_recent` table
+        # which is a distributed table that sits in front of the `events_recent` table
+        elif (
+            use_distributed_events_recent_table(
+                is_backfill=is_backfill, backfill_details=backfill_details, data_interval_start=full_range[0]
+            )
+            and not is_workflows
+        ):
+            logger.info("Using distributed_events_recent table for batch export")
+            query_template = EXPORT_TO_S3_FROM_DISTRIBUTED_EVENTS_RECENT
+        elif str(team_id) in settings.UNCONSTRAINED_TIMESTAMP_TEAM_IDS:
+            logger.info("Using unbounded events query for batch export")
+            query_template = EXPORT_TO_S3_FROM_EVENTS_UNBOUNDED
+        elif is_workflows:
+            logger.info("Using workflows events query for batch export")
+            query_template = EXPORT_TO_S3_FROM_EVENTS_WORKFLOWS
+        elif is_backfill:
+            logger.info("Using events_batch_export_backfill query for batch export")
+            query_template = EXPORT_TO_S3_FROM_EVENTS_BACKFILL
+        else:
+            logger.info("Using events table for batch export")
+            query_template = EXPORT_TO_S3_FROM_EVENTS
+            lookback_days = settings.OVERRIDE_TIMESTAMP_TEAM_IDS.get(team_id, settings.DEFAULT_TIMESTAMP_LOOKBACK_DAYS)
+            parameters["lookback_days"] = lookback_days
+
+        if "_inserted_at" not in [field["alias"] for field in fields]:
+            control_fields = [BatchExportField(expression="_inserted_at", alias="_inserted_at")]
+        else:
+            control_fields = []
+
+        query_fields = ",".join(f"{field['expression']} AS {field['alias']}" for field in fields + control_fields)
+
+        if filters_str:
+            filters_str = f"AND {filters_str}"
+
+        query = query_template.safe_substitute(
+            fields=query_fields,
+            filters=filters_str,
+            s3_function=s3_function,
+        )
+
+    parameters["team_id"] = team_id
+
+    tags = query_tagging.get_query_tags()
+    tags.team_id = team_id
+    with suppress(Exception):
+        tags.batch_export_id = uuid.UUID(batch_export_id)
+    tags.product = Product.BATCH_EXPORT
+    tags.query_type = "batch_export"
+    parameters["log_comment"] = tags.to_json()
+
+    parameters = {**parameters, **extra_query_parameters}
+    return query, parameters
+
+
+def get_base_s3_staging_folder(batch_export_id: str, data_interval_start: str | None, data_interval_end: str) -> str:
+    """Get the base S3 staging folder for a given batch export."""
+    subfolder = "batch-exports"
+    return f"{subfolder}/{batch_export_id}/{data_interval_start}-{data_interval_end}"
+
+
+def get_s3_staging_folder(
+    batch_export_id: str, data_interval_start: str | None, data_interval_end: str, attempt_number: int
+) -> S3StagingFolder:
+    """Get the S3 staging folder for a given batch export and attempt number."""
+    base_s3_staging_folder = get_base_s3_staging_folder(batch_export_id, data_interval_start, data_interval_end)
+    folder = f"{base_s3_staging_folder}/attempt_{attempt_number}"
+    url = _get_clickhouse_s3_staging_folder_url(folder)
+    return S3StagingFolder(folder=folder, url=url)
+
+
+def _get_clickhouse_s3_staging_folder_url(folder: str) -> str:
+    """Get the URL for the S3 staging folder of a given batch export and attempt number.
+
+    This is passed to the ClickHouse query as the `s3_folder` parameter.
+    When running the stack locally, ClickHouse and MinIO are both running in Docker so we use the hostname of the
+    container.
+    """
+    bucket = settings.BATCH_EXPORT_INTERNAL_STAGING_BUCKET
+    region = settings.BATCH_EXPORT_OBJECT_STORAGE_REGION
+    # in these environments this will be a URL for MinIO
+    if _uses_object_storage_endpoint():
+        base_url = f"{settings.BATCH_EXPORT_OBJECT_STORAGE_ENDPOINT}/{bucket}/"
+    else:
+        base_url = f"https://{bucket}.s3.{region}.amazonaws.com/"
+
+    return f"{base_url}{folder}"
+
+
+async def _write_batch_export_record_batches_to_internal_stage(
+    query_or_model: str | RecordBatchModel,
+    full_range: tuple[dt.datetime | None, dt.datetime],
+    query_parameters: dict[str, typing.Any],
+    team_id: int,
+    batch_export_id: str,
+    data_interval_start: str | None,
+    data_interval_end: str,
+    s3_staging_folder_url: str,
+    num_partitions: int | None = None,
+) -> int | None:
+    """Write record batches to our own internal S3 staging area.
+
+    Returns the total number of rows written to the stage, or None if the count couldn't be
+    determined.
+    """
+    logger = LOGGER.bind()
+
+    clickhouse_url = None
+    # 5 min batch exports should query a single node, which is known to have zero replication lag
+    if is_5_min_batch_export(full_range=full_range):
+        clickhouse_url = settings.CLICKHOUSE_OFFLINE_5MIN_CLUSTER_HOST
+
+    # Data can sometimes take a while to settle, so for 5 min batch exports we wait several seconds just to be safe.
+    # For all other batch exports we wait for 1 minute since we're querying the events_recent table using a
+    # distributed table and setting `max_replica_delay_for_distributed_queries` to 1 minute
+    if is_5_min_batch_export(full_range):
+        delta = dt.timedelta(seconds=30)
+    else:
+        delta = dt.timedelta(minutes=1)
+    end_at = full_range[1]
+
+    if _is_local_dev_or_test() is False and end_at > dt.datetime.now(dt.UTC):
+        # Some tests create data in the future, so we do not check this.
+        raise DataIntervalEndInFutureError(end_at)
+
+    with TRACER.start_as_current_span("batch_export.stage.wait_for_delta"):
+        await wait_for_delta_past_data_interval_end(end_at, delta)
+
+    done_ranges: list[tuple[dt.datetime, dt.datetime]] = []
+    async with get_client(
+        team_id=team_id,
+        clickhouse_url=clickhouse_url,
+        # TODO: Strict limits are available in ClickHouse 26.4
+        # We should uncomment all of these here to let max_insert_block_size_bytes dictate the size
+        # once clickhouse is upgraded.
+        # use_strict_insert_block_limits=1,
+        # max_insert_block_size_rows=0,
+        # max_insert_block_size_bytes=settings.BATCH_EXPORTS_CLICKHOUSE_MAX_INSERT_BLOCK_SIZE_BYTES,
+        min_insert_block_size_bytes=settings.BATCH_EXPORTS_CLICKHOUSE_MAX_INSERT_BLOCK_SIZE_BYTES,
+        # Disable all of these so only the bytes limits counts.
+        min_insert_block_size_rows=0,
+    ) as client:
+        if not await client.is_alive():
+            raise ConnectionError("Cannot establish connection to ClickHouse")
+
+        total_written_rows: int | None = 0
+        # TODO - in future we might want to catch any ClickHouse memory usage errors and break down the interval into
+        # sub-intervals to reduce memory usage
+        for interval_start, interval_end in generate_query_ranges(full_range, done_ranges):
+            if interval_start is not None:
+                query_parameters["interval_start"] = interval_start.strftime("%Y-%m-%d %H:%M:%S.%f")
+            query_parameters["interval_end"] = interval_end.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+            if isinstance(query_or_model, RecordBatchModel):
+                aws_access_key_id, aws_secret_access_key = _get_s3_credentials()
+                query, query_parameters = await query_or_model.as_insert_into_s3_query_with_parameters(
+                    data_interval_start=interval_start,
+                    data_interval_end=interval_end,
+                    s3_folder=s3_staging_folder_url,
+                    s3_key=aws_access_key_id,
+                    s3_secret=aws_secret_access_key,
+                    num_partitions=num_partitions or settings.BATCH_EXPORT_CLICKHOUSE_S3_PARTITIONS,
+                )
+            else:
+                query = query_or_model
+
+            base_s3_staging_folder = get_base_s3_staging_folder(
+                batch_export_id=batch_export_id,
+                data_interval_start=data_interval_start,
+                data_interval_end=data_interval_end,
+            )
+            # First delete any existing files in the staging folder.
+            # We technically don't need to do this, since the Temporal activity attempt number is used in the S3 key,
+            # however, since we only make use of the most recent attempt, we can save on storage space by deleting the
+            # files here.
+            try:
+                with TRACER.start_as_current_span("batch_export.stage.delete_existing_objects"):
+                    await _delete_all_from_bucket_with_prefix(
+                        bucket_name=settings.BATCH_EXPORT_INTERNAL_STAGING_BUCKET, key_prefix=base_s3_staging_folder
+                    )
+            except Exception:
+                logger.exception(
+                    "Unexpected error occurred while deleting existing objects from internal S3 staging bucket",
+                )
+                raise
+
+            try:
+                with TRACER.start_as_current_span("batch_export.stage.clickhouse_query") as query_span:
+                    written_rows = await _execute_query(client, query, query_parameters)
+                    if written_rows is not None:
+                        query_span.set_attribute("batch_export.stage.written_rows", written_rows)
+            except ClickHouseError:
+                logger.exception(
+                    "ClickHouse error occurred while writing record batches to internal S3 staging bucket",
+                )
+                raise
+
+            # if any query fails to return written rows then set total to None so that we don't
+            # return a partial result
+            if written_rows is None:
+                total_written_rows = None
+            elif total_written_rows is not None:
+                total_written_rows += written_rows
+
+    return total_written_rows
+
+
+def _written_rows_from_summary(summary: dict[str, typing.Any] | None) -> int | None:
+    """Extract `written_rows` from a ClickHouse query summary (its values are strings)."""
+    if not summary or "written_rows" not in summary:
+        return None
+    try:
+        return int(summary["written_rows"])
+    except (TypeError, ValueError):
+        return None
+
+
+async def _execute_query(client: ClickHouseClient, query: str, query_parameters: dict[str, typing.Any]) -> int | None:
+    """Execute the batch exports query and wait for it to complete.
+
+    If the query takes longer than 300 seconds, we time out and wait for the query to complete by checking the query log
+    and process list.
+    If the query fails, we will raise an error.
+
+    Returns the number of rows the query wrote to the stage, or None if it couldn't be
+    determined. On the happy path this comes from ClickHouse's response summary; on the
+    timeout path (where the summary is lost) we recover it from the query log.
+    """
+    query_id = str(uuid.uuid4())
+    logger = LOGGER.bind(query_id=query_id)
+    with log_query_duration(logger=logger, query_id=query_id, query_type="insert_into_internal_stage"):
+        try:
+            summary = await client.execute_query_with_summary(
+                query, query_parameters=query_parameters, query_id=query_id, timeout=300
+            )
+        except ClickHouseClientTimeoutError:
+            logger.warning(
+                "Timed-out waiting for insert into S3. Will attempt to check query status and wait for completion",
+                timeout=300,
+            )
+            await _wait_for_query_completion(client, query_id)
+            # The summary is gone with the timed-out response, but the query has finished, so
+            # recover the written-row count from its query log entry.
+            return await client.aget_written_rows_from_query_log(query_id)
+    return _written_rows_from_summary(summary)
+
+
+async def _wait_for_query_completion(client: ClickHouseClient, query_id: str) -> None:
+    """Wait for the query to complete by checking the query log and process list.
+
+    If checking for the query status fails for some reason, we attempt to cancel the original query and raise an error.
+
+    Raises:
+        ClickHouseQueryNotFound: If the query is not found in the query log or process list after a number of retries.
+        ClickHouseCheckQueryStatusError: If an error occurs while checking the query status after a number of retries.
+        ClickHouseError: If the query were are trying to check has failed.
+    """
+    logger = LOGGER.bind(query_id=query_id)
+    num_attempts = 5
+    # Sometimes this check can fail, especially when ClickHouse is under heavy load, so we retry a few times
+    check_query = make_retryable_with_exponential_backoff(
+        client.acheck_query,
+        max_attempts=num_attempts,
+        max_retry_delay=1,
+        retryable_exceptions=(ClickHouseQueryNotFound, ClickHouseCheckQueryStatusError),
+    )
+
+    try:
+        status = await check_query(query_id, raise_on_error=True)
+        while status == ClickHouseQueryStatus.RUNNING:
+            await asyncio.sleep(10)
+            status = await check_query(query_id, raise_on_error=True)
+    except (ClickHouseQueryNotFound, ClickHouseCheckQueryStatusError):
+        logger.exception("Wait for query failed", num_attempts=num_attempts)
+        try:
+            await client.acancel_query(query_id)
+        except Exception:
+            logger.warning("Failed to cancel query", exc_info=True)
+        raise

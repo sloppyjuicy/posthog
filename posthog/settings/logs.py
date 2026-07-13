@@ -1,0 +1,167 @@
+import os
+import logging
+import warnings
+import threading
+from typing import Any
+
+import structlog
+
+from posthog.settings.base_variables import DEBUG, IS_INTERACTIVE_SHELL, TEST
+
+# Setup logging
+LOGGING_FORMATTER_NAME = os.getenv("LOGGING_FORMATTER_NAME", "default")
+
+# The level the interactive shell command restores once the REPL is ready — see
+# posthog/management/commands/shell.py. Startup is forced to ERROR below so app-ready
+# logs don't clutter the prompt; this is what logging looks like inside the session.
+SHELL_LOG_LEVEL = os.getenv("DJANGO_LOG_LEVEL", "INFO")
+
+DEFAULT_LOG_LEVEL = "ERROR" if IS_INTERACTIVE_SHELL else os.getenv("DJANGO_LOG_LEVEL", "ERROR" if TEST else "INFO")
+
+# Third-party warnings that fire during `django.setup()`, before any command's handle()
+# runs. They are pure noise in a REPL, so drop them only for interactive shells.
+if IS_INTERACTIVE_SHELL:
+    warnings.filterwarnings("ignore", message=r"pkg_resources is deprecated.*", category=UserWarning)
+    warnings.filterwarnings(
+        "ignore", message=r"Accessing the database during app initialization.*", category=RuntimeWarning
+    )
+
+
+class FilterStatsd(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.name.startswith("statsd.client")
+
+
+class MaxLevelFilter(logging.Filter):
+    def __init__(self, level: int) -> None:
+        super().__init__()
+        self.level = level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno <= self.level
+
+
+def add_pid_and_tid(
+    logger: logging.Logger, method_name: str, event_dict: structlog.types.EventDict
+) -> structlog.types.EventDict:
+    event_dict["pid"] = os.getpid()
+    event_dict["tid"] = threading.get_ident()
+    return event_dict
+
+
+# To enable standard library logs to be formatted via structlog, we add this
+# `foreign_pre_chain` to both formatters.
+foreign_pre_chain: list[structlog.types.Processor] = [
+    structlog.contextvars.merge_contextvars,
+    structlog.processors.TimeStamper(fmt="iso"),
+    structlog.stdlib.add_logger_name,
+    structlog.stdlib.add_log_level,
+    add_pid_and_tid,
+    structlog.stdlib.PositionalArgumentsFormatter(),
+    structlog.processors.StackInfoRenderer(),
+    structlog.processors.format_exc_info,
+    structlog.processors.UnicodeDecoder(),
+]
+
+structlog.configure(
+    processors=[
+        structlog.stdlib.filter_by_level,
+        *foreign_pre_chain,
+        structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+    ],
+    context_class=structlog.threadlocal.wrap_dict(dict),
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
+)
+
+# Configure all logs to be handled by structlog `ProcessorFormatter` and
+# rendered either as pretty colored console lines or as single JSON lines.
+LOGGING: dict[str, Any] = {
+    "version": 1,
+    "disable_existing_loggers": True,
+    "formatters": {
+        "default": {
+            "()": structlog.stdlib.ProcessorFormatter,
+            "processor": structlog.dev.ConsoleRenderer(colors=DEBUG),
+            "foreign_pre_chain": foreign_pre_chain,
+        },
+        "json": {
+            "()": structlog.stdlib.ProcessorFormatter,
+            "processor": structlog.processors.JSONRenderer(),
+            "foreign_pre_chain": foreign_pre_chain,
+        },
+    },
+    "filters": {
+        "filter_statsd": {
+            "()": "posthog.settings.logs.FilterStatsd",
+        },
+        "max_level_info": {
+            "()": "posthog.settings.logs.MaxLevelFilter",
+            "level": logging.INFO,
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": LOGGING_FORMATTER_NAME,
+            "filters": ["filter_statsd"],
+        },
+        "console_stdout_info": {
+            "class": "logging.StreamHandler",
+            "formatter": LOGGING_FORMATTER_NAME,
+            "filters": ["filter_statsd", "max_level_info"],
+            "stream": "ext://sys.stdout",
+        },
+        "console_stderr_warning": {
+            "class": "logging.StreamHandler",
+            "formatter": LOGGING_FORMATTER_NAME,
+            "filters": ["filter_statsd"],
+            "level": "WARNING",
+        },
+        "null": {
+            "class": "logging.NullHandler",
+        },
+    },
+    "root": {"handlers": ["console"], "level": DEFAULT_LOG_LEVEL},
+    "loggers": {
+        "django": {"handlers": ["console"], "level": DEFAULT_LOG_LEVEL},
+        "django.server": {"handlers": ["null"]},  # blackhole Django server logs (this is only needed in DEV)
+        "django.utils.autoreload": {
+            "handlers": ["null"],
+        },  # blackhole Django autoreload logs (this is only needed in DEV)
+        "kafka.conn": {"level": "WARN"},  # kafka-python logs are noisy
+        "posthog.caching.warming": {"level": "INFO", "handlers": ["console"], "propagate": False},
+        "posthog.tasks.alerts": {"level": "INFO", "handlers": ["console"], "propagate": False},
+        "posthog.tasks.split_person": {"level": "INFO", "handlers": ["console"], "propagate": False},
+        "posthog.tasks.email": {"level": "INFO", "handlers": ["console"], "propagate": False},
+        "products.exports.backend.tasks": {"level": "INFO", "handlers": ["console"], "propagate": False},
+        "posthog.tasks.ai_observability_usage_report": {"level": "INFO", "handlers": ["console"], "propagate": False},
+        # Hypercache verify-and-fix can emit expected high-volume INFO bursts.
+        # Keep those off stderr so stream-based collectors don't relabel them as errors.
+        "posthog.tasks.hypercache_verification": {
+            "level": "INFO",
+            "handlers": ["console_stdout_info", "console_stderr_warning"],
+            "propagate": False,
+        },
+        "posthog.storage.hypercache_verifier": {
+            "level": "INFO",
+            "handlers": ["console_stdout_info", "console_stderr_warning"],
+            "propagate": False,
+        },
+        "posthog.auth.mfa": {"level": "INFO", "handlers": ["console"], "propagate": False},
+        "posthog.security.command_exec_audit": {"level": "INFO", "handlers": ["console"], "propagate": False},
+        "products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline_v3.load": {
+            "level": "DEBUG",
+            "handlers": ["console"],
+            "propagate": False,
+        },
+        "posthog.models.resource_transfer.inter_project_transferer": {
+            "level": "INFO",
+            "handlers": ["console"],
+            "propagate": False,
+        },
+        "boto3": {"level": "WARN"},  # boto3 logs are noisy
+        "botocore": {"level": "WARN"},  # botocore logs are noisy
+    },
+}

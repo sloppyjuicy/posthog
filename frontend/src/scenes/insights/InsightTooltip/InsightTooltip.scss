@@ -1,81 +1,205 @@
-@import '~/vars';
-
-.ph-graph-tooltip,
-.ant-popover {
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-    font-size: 14px;
-    overflow-x: hidden;
-    z-index: $z_graph_tooltip;
-    transition: all 0.4s;
+.InsightTooltipWrapper {
+    position: absolute;
+    z-index: var(--z-graph-tooltip);
+    max-width: calc(100vw - 2rem);
+    pointer-events: none;
+    transition:
+        left 0.05s linear,
+        top 0.05s linear,
+        opacity 0.2s;
 }
 
-.ph-graph-tooltip {
-    max-width: 480px;
-    padding: 8px 12px;
-    border: 1px solid $border;
-    border-radius: $radius;
-    background: #fafafa;
-}
+.InsightTooltip {
+    max-width: 30rem;
+    overflow: hidden;
+    font-size: 0.8125rem;
+    background: var(--color-bg-surface-primary);
+    border: 1px solid var(--color-border-primary);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-elevation-3000);
 
-.inner-tooltip {
-    &.multiple {
-        header {
-            padding-bottom: 8px;
-            border-bottom: 1px solid $border;
-        }
-
-        footer {
-            margin-top: 0 !important;
-            padding-top: 6px;
-            border-top: 1px solid $border;
-        }
+    &--embedded {
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
     }
 
-    header {
-        font-weight: bold;
-        margin-bottom: $default_spacing / 2;
-    }
+    // Close button: hidden by default, visible when pinned
+    .InsightTooltip__close {
+        opacity: 0;
 
-    footer {
-        margin-top: 0.5rem;
-        font-weight: bold;
-        font-size: 85%;
-        color: $text_muted;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        svg {
-            font-size: 1.4em;
-            margin-right: 4px;
+        .InsightTooltipWrapper--pinned &,
+        .hog-charts-tooltip--pinned & {
+            opacity: 1;
         }
     }
 
-    .series-container {
-        position: relative;
+    .LemonRow {
+        font-size: 0.8125rem;
     }
 
-    .inspect-persons-label {
-        display: flex;
-        align-items: center;
-        margin-top: 2px;
-        font-style: italic;
-        svg {
-            margin-left: 2px;
-            margin-right: 6px;
+    .LemonTable {
+        font-size: 0.75rem;
+        border: none;
+        border-bottom: 1px solid var(--color-border-primary);
+        border-radius: 0;
+
+        // Disable all scroll shadows inside tooltip
+        .ScrollableShadows {
+            --shadow-x-start: 0 0 0 0 transparent !important;
+            --shadow-x-end: 0 0 0 0 transparent !important;
+            --shadow-y-start: 0 0 0 0 transparent !important;
+            --shadow-y-end: 0 0 0 0 transparent !important;
+        }
+
+        .LemonTable__cell--sticky::before,
+        .LemonTable__header--sticky::before {
+            box-shadow: none !important;
+        }
+
+        // Close column in table header
+        th.InsightTooltip__close-column {
+            position: sticky;
+            right: 0;
+            padding: 0.4rem;
+            vertical-align: top;
+            background: transparent;
+
+            .InsightTooltipWrapper--pinned &,
+            .hog-charts-tooltip--pinned & {
+                background: linear-gradient(to right, transparent, var(--color-bg-surface-primary) 30%);
+            }
+        }
+
+        td.InsightTooltip__close-column {
+            padding: 0;
+            background: transparent;
+        }
+
+        .insights-label {
+            margin: 0;
+        }
+
+        .datum-column {
+            padding-left: 0.5rem;
+            overflow-wrap: anywhere;
+        }
+
+        // Clip long breakdown values and series/event names so a few-column
+        // tooltip never grows wide enough to require horizontal scrolling.
+        // max-width lives on the inner content (not the cell) because cells in
+        // an auto-layout table grow to fit content and ignore their own max-width.
+        .datum-title {
+            max-width: 9rem;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .datum-column .insights-label {
+            max-width: 12rem;
+        }
+
+        .datum-counts-column .insights-label {
+            max-width: 6rem;
+        }
+
+        .insights-label,
+        .insights-label * {
+            min-width: 0;
+        }
+
+        .insights-label__math {
+            flex-shrink: 0;
+            overflow: hidden;
+
+            .LemonTag {
+                flex-shrink: 0;
+            }
+
+            .PropertyKeyInfo__text {
+                max-width: 6rem;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+        }
+
+        // InsightLabel nests its text in fit-content flex wrappers that ignore
+        // the label's max-width, so long names overflow and hard-clip at the
+        // tooltip edge. Cap the wrappers at the label width so the label's
+        // built-in text-ellipsis truncation can engage.
+        .datum-column .insights-label,
+        .datum-counts-column .insights-label {
+            overflow: hidden;
+
+            div {
+                max-width: 100%;
+            }
+        }
+
+        .LemonTable__content > table > thead {
+            letter-spacing: 0;
+
+            .datum-column {
+                .LemonTable__header-content {
+                    white-space: nowrap;
+                }
+            }
+        }
+
+        .LemonTable__content > table {
+            .datum-label-column {
+                display: flex;
+                align-items: center;
+                min-width: 0;
+                font-weight: 600;
+                overflow-wrap: anywhere;
+            }
+
+            .series-data-cell {
+                font-weight: 600;
+            }
+
+            .tag-pill {
+                margin-right: 0;
+                overflow: hidden;
+                color: var(--primary-alt);
+                vertical-align: middle;
+                background-color: var(--color-border-primary);
+                border: 0;
+            }
         }
     }
 
-    ul {
-        list-style-type: none;
-        padding: 0;
-        margin-bottom: 0;
-        max-height: 32vh;
-        overflow-y: hidden; // As the element has pointer-events: none to allow proper function, scrolling is not supported anyways
+    // Scrollable tooltip body with sticky header
+    &__scrollable .LemonTable {
+        .ScrollableShadows__inner {
+            max-height: 16rem;
+            overflow-y: auto !important;
+        }
 
-        li {
+        .LemonTable__content > table > thead {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            background: var(--color-bg-surface-primary);
+        }
+    }
+
+    .table-subtext {
+        padding: 0.5rem 1rem;
+        font-size: 0.75rem;
+        color: var(--color-text-secondary);
+        text-align: center;
+        background-color: var(--color-bg-surface-primary);
+
+        .table-subtext-click-to-inspect {
             display: flex;
             align-items: center;
-            padding-bottom: 2px;
+            justify-content: center;
+            color: var(--color-text-primary);
+            white-space: nowrap;
         }
     }
 }

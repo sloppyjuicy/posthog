@@ -4,13 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0011_auto_20200127_2105"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name="team", name="app_url", field=models.CharField(blank=True, max_length=200, null=True),
+            model_name="team",
+            name="app_url",
+            field=models.CharField(blank=True, max_length=200, null=True),
         ),
     ]

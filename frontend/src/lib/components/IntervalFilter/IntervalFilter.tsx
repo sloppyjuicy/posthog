@@ -1,54 +1,93 @@
-import React from 'react'
-import { Select } from 'antd'
-import { intervalFilterLogic } from './intervalFilterLogic'
-import { useValues, useActions } from 'kea'
-import { disableHourFor, disableMinuteFor } from 'lib/utils'
-import { CalendarOutlined } from '@ant-design/icons'
-import { defaultInterval, IntervalKeyType, intervals } from 'lib/components/IntervalFilter/intervals'
-import { ViewType } from '~/types'
+import { useActions, useValues } from 'kea'
 
-interface InvertalFilterProps {
-    view: ViewType
+import { IconPin } from '@posthog/icons'
+import { LemonButton, LemonSelect, LemonSelectOption } from '@posthog/lemon-ui'
+
+import { insightLogic } from 'scenes/insights/insightLogic'
+import { insightVizDataLogic } from 'scenes/insights/insightVizDataLogic'
+
+import { InsightQueryNode } from '~/queries/schema/schema-general'
+import { IntervalType } from '~/types'
+
+interface IntervalFilterProps {
     disabled?: boolean
 }
 
-export function IntervalFilter({ view, disabled }: InvertalFilterProps): JSX.Element {
-    const { interval } = useValues(intervalFilterLogic)
-    const { setIntervalFilter, setDateFrom } = useActions(intervalFilterLogic)
-    const options = Object.entries(intervals).map(([key, { label }]) => ({
-        key,
-        value: key,
-        label:
-            key === interval ? (
-                <>
-                    <CalendarOutlined /> {label}
-                </>
-            ) : (
-                label
-            ),
-        disabled: (key === 'minute' || key === 'hour') && view === ViewType.SESSIONS,
-    }))
+export function IntervalFilter({ disabled }: IntervalFilterProps): JSX.Element {
+    const { insightProps, editingDisabledReason } = useValues(insightLogic)
+    const { interval, enabledIntervals, isIntervalManuallySet } = useValues(insightVizDataLogic(insightProps))
+    const { updateQuerySource, setIsIntervalManuallySet } = useActions(insightVizDataLogic(insightProps))
+
     return (
-        <Select
-            bordered={false}
+        <span className="flex items-center gap-2">
+            <span className="@max-[780px]:hidden">
+                <span className="hidden md:inline">grouped </span>by
+            </span>
+            {isIntervalManuallySet ? (
+                <LemonButton
+                    type="secondary"
+                    onClick={() => {
+                        setIsIntervalManuallySet(false)
+                    }}
+                    tooltip="Unpin interval"
+                    className="flex-1"
+                    center
+                    size="small"
+                    icon={<IconPin color="var(--content-warning)" />}
+                    disabledReason={editingDisabledReason}
+                >
+                    {interval || 'day'}
+                </LemonButton>
+            ) : (
+                <IntervalFilterStandalone
+                    disabled={disabled}
+                    disabledReason={editingDisabledReason}
+                    interval={interval || 'day'}
+                    onIntervalChange={(value) => {
+                        updateQuerySource({ interval: value } as Partial<InsightQueryNode>)
+                    }}
+                    options={Object.entries(enabledIntervals).map(([value, { label, disabledReason, hidden }]) => ({
+                        value: value as IntervalType,
+                        label,
+                        hidden,
+                        disabledReason,
+                    }))}
+                />
+            )}
+        </span>
+    )
+}
+
+interface IntervalFilterStandaloneProps {
+    disabled?: boolean
+    disabledReason?: string | null
+    interval: IntervalType | undefined
+    onIntervalChange: (interval: IntervalType) => void
+    options?: LemonSelectOption<IntervalType>[]
+}
+
+const DEFAULT_OPTIONS: LemonSelectOption<IntervalType>[] = [
+    { value: 'hour', label: 'Hour' },
+    { value: 'day', label: 'Day' },
+    { value: 'week', label: 'Week' },
+    { value: 'month', label: 'Month' },
+]
+
+export function IntervalFilterStandalone({
+    disabled,
+    disabledReason,
+    interval,
+    onIntervalChange,
+    options = DEFAULT_OPTIONS,
+}: IntervalFilterStandaloneProps): JSX.Element {
+    return (
+        <LemonSelect
+            size="small"
             disabled={disabled}
-            defaultValue={interval || 'day'}
-            value={interval || undefined}
+            disabledReason={disabledReason}
+            value={interval || 'day'}
             dropdownMatchSelectWidth={false}
-            onChange={(key) => {
-                const { newDateFrom } = intervals[key as IntervalKeyType] || defaultInterval
-                const minuteDisabled = key === 'minute' && newDateFrom && disableMinuteFor[newDateFrom]
-                const hourDisabled = key === 'hour' && newDateFrom && disableHourFor[newDateFrom]
-                if (minuteDisabled || hourDisabled) {
-                    return false
-                }
-
-                if (newDateFrom) {
-                    setDateFrom(newDateFrom)
-                }
-
-                setIntervalFilter(key)
-            }}
+            onChange={onIntervalChange}
             data-attr="interval-filter"
             options={options}
         />

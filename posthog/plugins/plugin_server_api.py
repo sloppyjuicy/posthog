@@ -1,0 +1,191 @@
+import json
+from typing import Union
+
+import requests
+import structlog
+
+from posthog.models.utils import UUIDT
+from posthog.redis import get_client
+from posthog.security.outbound_proxy import internal_requests
+from posthog.settings import CDP_API_URL, INTERNAL_API_SECRET, PLUGINS_RELOAD_REDIS_URL
+
+logger = structlog.get_logger(__name__)
+
+# NOTE: Any message publishing to the workers should be done here so that it is easy to find and update if needed
+
+
+def get_internal_api_headers() -> dict[str, str]:
+    return {"x-internal-api-secret": INTERNAL_API_SECRET} if INTERNAL_API_SECRET else {}
+
+
+def publish_message(channel: str, payload: Union[dict, str]):
+    message = json.dumps(payload) if not isinstance(payload, str) else payload
+    get_client(PLUGINS_RELOAD_REDIS_URL).publish(channel, message)
+
+
+def reload_plugins_on_workers():
+    logger.info("Reloading plugins on workers")
+    publish_message("reload-plugins", "")
+
+
+def reload_action_on_workers(team_id: int, action_id: int):
+    logger.info(f"Reloading action {action_id} on workers")
+    publish_message("reload-action", {"teamId": team_id, "actionId": action_id})
+
+
+def drop_action_on_workers(team_id: int, action_id: int):
+    logger.info(f"Dropping action {action_id} on workers")
+    publish_message("drop-action", {"teamId": team_id, "actionId": action_id})
+
+
+def reload_hog_functions_on_workers(team_id: int, hog_function_ids: list[str]):
+    logger.info(f"Reloading hog functions {hog_function_ids} on workers")
+    publish_message("reload-hog-functions", {"teamId": team_id, "hogFunctionIds": hog_function_ids})
+
+
+def reload_hog_flows_on_workers(team_id: int, hog_flow_ids: list[str]):
+    logger.info(f"Reloading hog flows {hog_flow_ids} on workers")
+    publish_message("reload-hog-flows", {"teamId": team_id, "hogFlowIds": hog_flow_ids})
+
+
+def reload_evaluations_on_workers(team_id: int, evaluation_ids: list[str]):
+    logger.info(f"Reloading evaluations {evaluation_ids} on workers")
+    publish_message("reload-evaluations", {"teamId": team_id, "evaluationIds": evaluation_ids})
+
+
+def reload_taggers_on_workers(team_id: int, tagger_ids: list[str]):
+    logger.info(f"Reloading taggers {tagger_ids} on workers")
+    publish_message("reload-taggers", {"teamId": team_id, "taggerIds": tagger_ids})
+
+
+def reload_provider_keys_on_workers(team_id: int, provider_key_ids: list[str]):
+    logger.info(f"Reloading provider keys {provider_key_ids} on workers")
+    publish_message("reload-provider-keys", {"teamId": team_id, "providerKeyIds": provider_key_ids})
+
+
+def reload_all_hog_functions_on_workers():
+    logger.info(f"Reloading all hog functions on workers")
+    publish_message("reload-all-hog-functions", {})
+
+
+def reload_integrations_on_workers(team_id: int, integration_ids: list[int]):
+    logger.info(f"Reloading integrations {integration_ids} on workers")
+    publish_message("reload-integrations", {"teamId": team_id, "integrationIds": integration_ids})
+
+
+def populate_plugin_capabilities_on_workers(plugin_id: str):
+    logger.info(f"Populating plugin capabilities for plugin {plugin_id} on workers")
+    publish_message("populate-plugin-capabilities", {"pluginId": plugin_id})
+
+
+def create_hog_invocation_test(team_id: int, hog_function_id: str, payload: dict) -> requests.Response:
+    logger.info(f"Creating hog invocation test for hog function {hog_function_id} on workers")
+    return internal_requests.post(
+        CDP_API_URL + f"/api/projects/{team_id}/hog_functions/{hog_function_id}/invocations",
+        json=payload,
+        headers=get_internal_api_headers(),
+    )
+
+
+def create_hog_flow_invocation_test(team_id: int, hog_flow_id: str, payload: dict) -> requests.Response:
+    logger.info(f"Creating hog flow invocation test for hog flow {hog_flow_id} on workers")
+    return internal_requests.post(
+        CDP_API_URL + f"/api/projects/{team_id}/hog_flows/{hog_flow_id}/invocations",
+        json=payload,
+        headers=get_internal_api_headers(),
+    )
+
+
+def create_hog_flow_scheduled_invocation(
+    team_id: int, hog_flow_id: str, variables: dict[str, object]
+) -> requests.Response:
+    logger.info(f"Creating scheduled hog flow invocation for hog flow {hog_flow_id} on workers")
+    return internal_requests.post(
+        CDP_API_URL + f"/api/projects/{team_id}/hog_flows/{hog_flow_id}/scheduled_invocations",
+        json={"variables": variables},
+        headers=get_internal_api_headers(),
+    )
+
+
+def get_hog_function_status(team_id: int, hog_function_id: UUIDT) -> requests.Response:
+    return internal_requests.get(
+        CDP_API_URL + f"/api/projects/{team_id}/hog_functions/{hog_function_id}/status",
+        headers=get_internal_api_headers(),
+    )
+
+
+def patch_hog_function_status(team_id: int, hog_function_id: UUIDT, state: int) -> requests.Response:
+    return internal_requests.patch(
+        CDP_API_URL + f"/api/projects/{team_id}/hog_functions/{hog_function_id}/status",
+        json={"state": state},
+        headers=get_internal_api_headers(),
+    )
+
+
+def generate_messaging_preferences_token(team_id: int, identifier: str) -> str:
+    payload = {"team_id": team_id, "identifier": identifier}
+    response = internal_requests.post(
+        CDP_API_URL + "/api/messaging/generate_preferences_token",
+        json=payload,
+        headers=get_internal_api_headers(),
+    )
+    if response.status_code == 200:
+        return response.json().get("token")
+    return ""
+
+
+def validate_messaging_preferences_token(token: str) -> requests.Response:
+    return internal_requests.get(
+        CDP_API_URL + f"/api/messaging/validate_preferences_token/{token}",
+        headers=get_internal_api_headers(),
+    )
+
+
+def get_hog_function_templates() -> requests.Response:
+    return internal_requests.get(
+        CDP_API_URL + "/api/hog_function_templates",
+        headers=get_internal_api_headers(),
+    )
+
+
+def create_batch_hog_flow_job_invocation(
+    team_id: int, hog_flow_id: UUIDT, batch_job_id: UUIDT, max_audience_size: int | None = None
+) -> requests.Response:
+    return internal_requests.post(
+        CDP_API_URL + f"/api/projects/{team_id}/hog_flows/{hog_flow_id}/batch_invocations/{batch_job_id}",
+        json={"max_audience_size": max_audience_size},
+        headers=get_internal_api_headers(),
+    )
+
+
+def rerun_hog_invocations(
+    team_id: int,
+    function_kind: str,
+    function_id: str,
+    payload: dict,
+) -> requests.Response:
+    """
+    Trigger a rerun of past hog function / hog flow invocations.
+
+    `payload` is one of:
+      - {"invocation_ids": ["uuid", ...]}                   -> rerun these specific runs
+      - {"filter": {"window_start": "...", "window_end": "...", "status": [...], ...}}
+
+    The Node side (`nodejs/src/cdp/rerun`) reads the matching rows from
+    `hog_invocation_results`, rehydrates the invocation from the stored
+    `invocation_globals`, and re-enqueues onto cyclotron with `is_retry=1`.
+    """
+    logger.info(
+        "Triggering rerun of hog invocations",
+        function_kind=function_kind,
+        function_id=function_id,
+    )
+    return internal_requests.post(
+        CDP_API_URL + f"/api/projects/{team_id}/{function_kind}s/{function_id}/rerun",
+        json=payload,
+        headers=get_internal_api_headers(),
+    )
+
+
+def get_plugin_server_status() -> requests.Response:
+    return internal_requests.get(CDP_API_URL + f"/_health")

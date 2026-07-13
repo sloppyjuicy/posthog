@@ -1,0 +1,439 @@
+import { useActions, useValues } from 'kea'
+import { router } from 'kea-router'
+import { useMemo } from 'react'
+
+import { IconBadge, IconEye, IconHide, IconInfo } from '@posthog/icons'
+import { LemonTag, LemonTagType, Spinner, Tooltip } from '@posthog/lemon-ui'
+
+import { FlaggedFeature } from 'lib/components/FlaggedFeature'
+import { ImageCarousel } from 'lib/components/ImageCarousel/ImageCarousel'
+import { NotFound } from 'lib/components/NotFound'
+import { ObjectTags } from 'lib/components/ObjectTags/ObjectTags'
+import { PropertyKeyInfo } from 'lib/components/PropertyKeyInfo'
+import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { TZLabel } from 'lib/components/TZLabel'
+import { UserActivityIndicator } from 'lib/components/UserActivityIndicator/UserActivityIndicator'
+import ViewRecordingsPlaylistButton from 'lib/components/ViewRecordingButton/ViewRecordingsPlaylistButton'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
+import { SpinnerOverlay } from 'lib/lemon-ui/Spinner/Spinner'
+import { getPrimaryPropertyForEvent } from 'lib/utils/events'
+import { DefinitionLogicProps, definitionLogic } from 'scenes/data-management/definition/definitionLogic'
+import { EventDefinitionExperiments } from 'scenes/data-management/events/EventDefinitionExperiments'
+import { EventDefinitionInsights } from 'scenes/data-management/events/EventDefinitionInsights'
+import { EventDefinitionProperties } from 'scenes/data-management/events/EventDefinitionProperties'
+import { EventDefinitionSchema } from 'scenes/data-management/events/EventDefinitionSchema'
+import { LinkedHogFunctions } from 'scenes/hog-functions/list/LinkedHogFunctions'
+import { SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneDivider } from '~/layout/scenes/components/SceneDivider'
+import { SceneSection } from '~/layout/scenes/components/SceneSection'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import { defaultDataTableColumns } from '~/queries/nodes/DataTable/utils'
+import { Query } from '~/queries/Query/Query'
+import { NodeKind } from '~/queries/schema/schema-general'
+import { getFilterLabel } from '~/taxonomy/helpers'
+import {
+    EventDefinition,
+    FilterLogicalOperator,
+    PropertyDefinition,
+    PropertyDefinitionVerificationStatus,
+} from '~/types'
+
+import { getEventDefinitionIcon, getPropertyDefinitionIcon } from '../events/DefinitionHeader'
+
+export const scene: SceneExport<DefinitionLogicProps> = {
+    component: DefinitionView,
+    logic: definitionLogic,
+    paramsToProps: ({ params: { id } }) => ({ id }),
+}
+
+type StatusProps = {
+    tagType: LemonTagType
+    label: string
+    icon: React.ReactNode
+    tooltip: string
+}
+
+const getStatusProps = (isProperty: boolean): Record<PropertyDefinitionVerificationStatus, StatusProps> => ({
+    verified: {
+        tagType: 'success',
+        label: 'Verified',
+        icon: <IconBadge />,
+        tooltip: `This ${
+            isProperty ? 'property' : 'event'
+        } is verified and can be used in filters and other selection components.`,
+    },
+    hidden: {
+        tagType: 'danger',
+        label: 'Hidden',
+        icon: <IconHide />,
+        tooltip: `This ${
+            isProperty ? 'property' : 'event'
+        } is hidden and will not appear in filters and other selection components.`,
+    },
+    visible: {
+        tagType: 'default',
+        label: 'Visible',
+        icon: <IconEye />,
+        tooltip: `This ${
+            isProperty ? 'property' : 'event'
+        } is visible and can be used in filters and other selection components.`,
+    },
+})
+
+function PrimaryPropertyDetail({ definition }: { definition: EventDefinition }): JSX.Element {
+    const taxonomyPrimary = getPrimaryPropertyForEvent(definition.name)
+    const teamOverride = definition.primary_property
+    const effective = taxonomyPrimary ?? teamOverride
+    const isBuiltIn = !!taxonomyPrimary
+
+    return (
+        <div className="flex flex-col flex-1 basis-48 min-w-48">
+            <h5>Primary property</h5>
+            <b>
+                {effective ? (
+                    <span className="flex items-center gap-1">
+                        <PropertyKeyInfo
+                            value={effective}
+                            type={TaxonomicFilterGroupType.EventProperties}
+                            disableIcon
+                        />
+                        {isBuiltIn && (
+                            <Tooltip title="This is a built-in default for this event. Team overrides are not applied to events with a built-in primary property.">
+                                <LemonTag type="muted" size="small">
+                                    Built-in
+                                </LemonTag>
+                            </Tooltip>
+                        )}
+                    </span>
+                ) : (
+                    '-'
+                )}
+            </b>
+            <p className="italic text-secondary text-xs mt-1 mb-0">
+                If set, this property's value is shown alongside the event name in surfaces like the session replay
+                inspector.
+            </p>
+        </div>
+    )
+}
+
+export function DefinitionView(props: DefinitionLogicProps): JSX.Element {
+    const logic = definitionLogic(props)
+    const { definition, definitionLoading, definitionMissing, singular, isEvent, isProperty, metrics, metricsLoading } =
+        useValues(logic)
+    const { deleteDefinition } = useActions(logic)
+
+    const memoizedQuery = useMemo(() => {
+        const columnsToUse =
+            'default_columns' in definition && !!definition.default_columns?.length
+                ? definition.default_columns
+                : defaultDataTableColumns(NodeKind.EventsQuery)
+
+        return {
+            kind: NodeKind.DataTableNode,
+            source: {
+                kind: NodeKind.EventsQuery,
+                select: columnsToUse,
+                event: definition.name,
+            },
+            full: true,
+            showEventFilter: false,
+            showPersistentColumnConfigurator: true,
+            context: {
+                type: 'event_definition',
+                eventDefinitionId: definition.id,
+            },
+        }
+    }, [definition])
+
+    if (definitionLoading) {
+        return <SpinnerOverlay sceneLevel />
+    }
+
+    if (definitionMissing) {
+        return <NotFound object="event" />
+    }
+
+    const definitionStatus = definition.verified ? 'verified' : definition.hidden ? 'hidden' : 'visible'
+
+    const statusProps = getStatusProps(isProperty)
+
+    const formattedName = getFilterLabel(
+        definition.name,
+        isEvent ? TaxonomicFilterGroupType.Events : TaxonomicFilterGroupType.EventProperties
+    )
+
+    return (
+        <SceneContent>
+            <SceneTitleSection
+                name={formattedName}
+                resourceType={
+                    isEvent
+                        ? {
+                              type: 'event definition',
+                              forceIcon: getEventDefinitionIcon(definition),
+                          }
+                        : {
+                              type: 'property definition',
+                              forceIcon: getPropertyDefinitionIcon(definition),
+                          }
+                }
+                actions={
+                    <>
+                        {isEvent && (
+                            <ViewRecordingsPlaylistButton
+                                filters={{
+                                    filter_group: {
+                                        type: FilterLogicalOperator.And,
+                                        values: [
+                                            {
+                                                type: FilterLogicalOperator.And,
+                                                values: [
+                                                    {
+                                                        id: definition.name,
+                                                        type: 'events',
+                                                        order: 0,
+                                                        name: definition.name,
+                                                    },
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                }}
+                                type="secondary"
+                                size="small"
+                                data-attr="event-definition-view-recordings"
+                            />
+                        )}
+                        <LemonButton
+                            data-attr="delete-definition"
+                            type="secondary"
+                            status="danger"
+                            size="small"
+                            onClick={() =>
+                                LemonDialog.open({
+                                    title: `Delete this ${singular} definition?`,
+                                    description: (
+                                        <>
+                                            <p>
+                                                <strong>
+                                                    {getFilterLabel(
+                                                        definition.name,
+                                                        isEvent
+                                                            ? TaxonomicFilterGroupType.Events
+                                                            : TaxonomicFilterGroupType.EventProperties
+                                                    )}
+                                                </strong>{' '}
+                                                will no longer appear in selectors. Associated data will remain in the
+                                                database.
+                                            </p>
+                                            <p>
+                                                This definition will be recreated if the ${singular} is ever seen again
+                                                in the event stream.
+                                            </p>
+                                        </>
+                                    ),
+                                    primaryButton: {
+                                        status: 'danger',
+                                        children: 'Delete definition',
+                                        onClick: () => deleteDefinition(),
+                                    },
+                                    secondaryButton: {
+                                        children: 'Cancel',
+                                    },
+                                    width: 448,
+                                })
+                            }
+                            tooltip="Delete this definition. Associated data will remain."
+                        >
+                            Delete
+                        </LemonButton>
+                        <LemonButton
+                            data-attr="edit-definition"
+                            type="secondary"
+                            size="small"
+                            onClick={() => {
+                                if (isProperty) {
+                                    router.actions.push(urls.propertyDefinitionEdit(definition.id))
+                                } else {
+                                    router.actions.push(urls.eventDefinitionEdit(definition.id))
+                                }
+                            }}
+                        >
+                            Edit
+                        </LemonButton>
+                    </>
+                }
+                forceBackTo={
+                    isEvent
+                        ? {
+                              path: urls.eventDefinitions(),
+                              name: 'Event definitions',
+                              key: 'events',
+                          }
+                        : {
+                              path: urls.propertyDefinitions(),
+                              name: 'Property definitions',
+                              key: 'properties',
+                          }
+                }
+            />
+
+            <div className="deprecated-space-y-2">
+                {formattedName !== definition.name && (
+                    <div className="flex flex-wrap items-center gap-2 text-secondary">
+                        <div>{isProperty ? 'Property' : 'Event'} name:</div>
+                        <LemonTag className="font-mono">{definition.name}</LemonTag>
+                    </div>
+                )}
+                <h5>Description</h5>
+                <div className="definition-description my-2" data-attr="definition-description-view">
+                    {definition.description || (
+                        <span className="text-muted italic">Add a description for this {singular}</span>
+                    )}
+                </div>
+                {definition.tags && definition.tags.length > 0 && (
+                    <ObjectTags
+                        tags={definition.tags}
+                        data-attr="definition-tags-view"
+                        className="definition-tags"
+                        saving={definitionLoading}
+                    />
+                )}
+
+                {!!(definition as EventDefinition).media_preview_urls?.length && (
+                    <div className="mt-4">
+                        <h5 className="mb-2">
+                            Preview{' '}
+                            <Tooltip title="Previews show where a client side event is triggered. Upload a screenshot or design.">
+                                <IconInfo className="text-sm" />
+                            </Tooltip>
+                        </h5>
+                        <ImageCarousel imageUrls={(definition as EventDefinition).media_preview_urls!} />
+                    </div>
+                )}
+                <UserActivityIndicator at={definition.updated_at} by={definition.updated_by} />
+            </div>
+
+            <SceneDivider />
+
+            <div className="flex flex-wrap gap-4">
+                {isEvent && (
+                    <div className="flex flex-col flex-1 basis-48 min-w-48">
+                        <h5>
+                            First seen{' '}
+                            <Tooltip title="This is the first time this event was ingested. Event timestamps can be historical, so it may not match the timestamp of the earliest event.">
+                                <IconInfo className="text-sm" />
+                            </Tooltip>
+                        </h5>
+                        <b>{definition.created_at ? <TZLabel time={definition.created_at} /> : '-'}</b>
+                    </div>
+                )}
+                {isEvent && (
+                    <div className="flex flex-col flex-1 basis-48 min-w-48">
+                        <h5>
+                            Last seen{' '}
+                            <Tooltip title="This is the last time this event was ingested. Event timestamps can be historical, so it may not match the timestamp of the latest event.">
+                                <IconInfo className="text-sm" />
+                            </Tooltip>
+                        </h5>
+                        <b>{definition.last_seen_at ? <TZLabel time={definition.last_seen_at} /> : '-'}</b>
+                    </div>
+                )}
+                {isEvent && (
+                    <div className="flex flex-col flex-1 basis-48 min-w-48">
+                        <h5>
+                            30 day queries{' '}
+                            <Tooltip title="Number of times this event has been queried in the last 30 days">
+                                <IconInfo className="text-sm" />
+                            </Tooltip>
+                        </h5>
+                        <b>
+                            {metricsLoading ? (
+                                <Spinner textColored />
+                            ) : (
+                                <>{metrics?.query_usage_30_day ? metrics.query_usage_30_day.toLocaleString() : '-'}</>
+                            )}
+                        </b>
+                    </div>
+                )}
+
+                {definitionStatus && (
+                    <div className="flex flex-col flex-1 basis-48 min-w-48">
+                        <h5>Verification status</h5>
+                        <div>
+                            <LemonTag type={statusProps[definitionStatus].tagType}>
+                                {statusProps[definitionStatus].icon}
+                                {statusProps[definitionStatus].label}
+                            </LemonTag>
+                        </div>
+                        <p className="italic text-secondary text-xs mt-1 mb-0">
+                            {statusProps[definitionStatus].tooltip}
+                        </p>
+                    </div>
+                )}
+
+                {isProperty && (
+                    <div className="flex flex-col flex-1 basis-48 min-w-48">
+                        <h5>Property type</h5>
+                        <b>{(definition as PropertyDefinition).property_type ?? '-'}</b>
+                    </div>
+                )}
+
+                {isEvent && (
+                    <FlaggedFeature flag={FEATURE_FLAGS.PROMOTED_EVENT_PROPERTIES_EDIT}>
+                        <PrimaryPropertyDetail definition={definition as EventDefinition} />
+                    </FlaggedFeature>
+                )}
+            </div>
+
+            <SceneDivider />
+
+            {isEvent && definition.id !== 'new' && (
+                <>
+                    <FlaggedFeature flag={FEATURE_FLAGS.SCHEMA_MANAGEMENT}>
+                        <EventDefinitionSchema definition={definition} />
+                        <SceneDivider />
+                    </FlaggedFeature>
+                    <EventDefinitionProperties definition={definition} />
+                    <SceneDivider />
+                    <EventDefinitionInsights definition={definition} />
+                    <SceneDivider />
+                    <EventDefinitionExperiments definition={definition} />
+                    <SceneDivider />
+                    <SceneSection
+                        title="Connected destinations"
+                        description="Get notified via Slack, webhooks or more whenever this event is captured."
+                    >
+                        <LinkedHogFunctions
+                            type="destination"
+                            forceFilterGroups={[
+                                {
+                                    events: [
+                                        {
+                                            id: `${definition.name}`,
+                                            type: 'events',
+                                        },
+                                    ],
+                                },
+                            ]}
+                        />
+                    </SceneSection>
+
+                    <SceneDivider />
+                    <SceneSection
+                        title="Matching events"
+                        description="This is the list of recent events that match this definition."
+                    >
+                        <Query query={memoizedQuery} />
+                    </SceneSection>
+                </>
+            )}
+        </SceneContent>
+    )
+}

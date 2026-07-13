@@ -1,59 +1,195 @@
-from .action import Action
-from .action_step import ActionStep
-from .annotation import Annotation
-from .cohort import Cohort, CohortPeople
-from .dashboard import Dashboard
-from .dashboard_item import DashboardItem
+# Need to skip autoimporting because this file is severely prone to circular imports errors
+# You should try and make them alphabetically sorted manually if possible
+# isort: skip_file
+from ..session_recordings.models.session_recording import SessionRecording
+from ..session_recordings.models.session_recording_external_reference import SessionRecordingExternalReference
+from ..session_recordings.models.session_recording_playlist import SessionRecordingPlaylist
+from ..session_recordings.models.session_recording_playlist_item import SessionRecordingPlaylistItem
+from ._deprecated_prompts import Prompt, PromptSequence, UserPromptState
+from .activity_logging.activity_log import ActivityLog
+from .activity_logging.notification_viewed import NotificationViewed
+from .async_deletion import AsyncDeletion, DeletionType
+from .async_migration import AsyncMigration, AsyncMigrationError, MigrationStatus
+from .column_configuration import ColumnConfiguration
+from .comment import Comment
+from .core_event import CoreEvent
+from .data_deletion_request import DataDeletionRequest
+from .data_color_theme import DataColorTheme
+from ..ducklake.models import DuckgresServer, DuckgresServerTeam, DuckgresSinkSchemaState
 from .element import Element
 from .element_group import ElementGroup
 from .entity import Entity
-from .event import Event
-from .event_definition import EventDefinition
-from .feature_flag import FeatureFlag
+from .event.event import Event
+from .event_buffer import EventBuffer
+
+# TODO: remove noqa once the event filters API imports from posthog.models
+from .event_filter_config import EventFilterConfig  # noqa: F401
+from products.event_definitions.backend.models import EventDefinition
+from products.event_definitions.backend.models import EventProperty
+from .role_external_reference import RoleExternalReference
+from .file_system.file_system import FileSystem
+from .file_system.folder_context_generation import FileSystemFolderContextGeneration
+from .file_system.folder_instructions import FileSystemFolderInstructions
+from .file_system.file_system_view_log import FileSystemViewLog
+from .file_system.persisted_folder import PersistedFolder
 from .filters import Filter, RetentionFilter
+from .group import Group
+from .group_usage_metric import GroupUsageMetric
+from .group_type_mapping import GroupTypeMapping
+from .host_definition import HostDefinition
+from .health_issue import HealthIssue
+from .identity_provider_config import IdentityProviderConfig
+from .instance_setting import InstanceSetting
+from .integration import Integration
+from .integration_repository_cache import IntegrationRepositoryCacheEntry
+from .materialized_column_slots import MaterializedColumnSlot, MaterializedColumnSlotState
 from .messaging import MessagingRecord
-from .organization import Organization, OrganizationInvite, OrganizationMembership
-from .person import Person, PersonDistinctId
+from .object_media_preview import ObjectMediaPreview
+from .organization import Organization, OrganizationMembership
+from .organization_domain import OrganizationDomain
+from .organization_integration import OrganizationIntegration
+from .organization_invite import OrganizationInvite, InviteExpiredException
+from .person import Person, PersonDistinctId, PersonOverride, PersonOverrideMapping
 from .personal_api_key import PersonalAPIKey
-from .plugin import Plugin, PluginAttachment, PluginConfig, PluginLogEntry
+from .project_secret_api_key import ProjectSecretAPIKey
+from .product_intent import ProductIntent
+from .project import Project
 from .property import Property
-from .property_definition import PropertyDefinition
-from .session_recording_event import SessionRecordingEvent
-from .sessions_filter import SessionsFilter
-from .team import Team
+from products.event_definitions.backend.models import PropertyDefinition
+from .proxy_record import ProxyRecord
+from .quick_filter import QuickFilter
+from .remote_config import RemoteConfig
+from .resource_transfer.resource_transfer import ResourceTransfer
+from products.event_definitions.backend.models import EventSchema, SchemaPropertyGroup, SchemaPropertyGroupProperty
+from .share_password import SharePassword
+from .sharing_configuration import SharingConfiguration
+from .tag import Tag
+from .tagged_item import TaggedItem
+from .team import Team, TeamRevenueAnalyticsConfig, TeamMarketingAnalyticsConfig
+from .event_ingestion_restriction_config import EventIngestionRestrictionConfig
+from .uploaded_media import UploadedMedia
 from .user import User, UserManager
+from .user_group import UserGroup, UserGroupMembership
+from .user_integration import UserIntegration
+from .user_push_token import UserPushToken
+from .repo_routing_rule import RepoRoutingRule
+from .user_repo_preference import UserRepoPreference
+from .user_scene_personalisation import UserScenePersonalisation
+from .user_home_settings import UserHomeSettings
+from .oauth import (
+    CIMDVerificationToken,
+    OAuthAccessToken,
+    OAuthApplication,
+    OAuthGrant,
+    OAuthIDToken,
+    OAuthRefreshToken,
+)
 
 __all__ = [
-    "Action",
-    "ActionStep",
-    "Annotation",
-    "Cohort",
-    "CohortPeople",
+    "ActivityLog",
+    "AsyncDeletion",
+    "AsyncMigration",
+    "AsyncMigrationError",
+    "CIMDVerificationToken",
+    "ColumnConfiguration",
+    "CoreEvent",
     "Dashboard",
-    "DashboardItem",
+    "DataDeletionRequest",
+    "DashboardTile",
+    "DashboardTemplate",
+    "DataColorTheme",
+    "DeletionType",
+    "DuckgresServer",
+    "DuckgresServerTeam",
+    "DuckgresSinkSchemaState",
     "Element",
     "ElementGroup",
     "Entity",
     "Event",
+    "EventBuffer",
     "EventDefinition",
-    "FeatureFlag",
+    "EventProperty",
+    "RoleExternalReference",
+    "FileSystem",
+    "FileSystemFolderContextGeneration",
+    "FileSystemFolderInstructions",
+    "FileSystemViewLog",
+    "PersistedFolder",
     "Filter",
-    "RetentionFilter",
+    "Group",
+    "GroupUsageMetric",
+    "GroupTypeMapping",
+    "HealthIssue",
+    "HostDefinition",
+    "IdentityProviderConfig",
+    "InstanceSetting",
+    "Integration",
+    "IntegrationRepositoryCacheEntry",
+    "InviteExpiredException",
+    "MaterializedColumnSlot",
+    "MaterializedColumnSlotState",
     "MessagingRecord",
+    "Notebook",
+    "MigrationStatus",
+    "NotificationViewed",
+    "ObjectMediaPreview",
     "Organization",
+    "OrganizationDomain",
+    "OrganizationIntegration",
     "OrganizationInvite",
     "OrganizationMembership",
+    "OAuthAccessToken",
+    "OAuthApplication",
+    "OAuthGrant",
+    "OAuthIDToken",
+    "OAuthRefreshToken",
     "Person",
     "PersonDistinctId",
     "PersonalAPIKey",
-    "Plugin",
-    "PluginAttachment",
-    "PluginConfig",
+    "ProjectSecretAPIKey",
+    "PersonOverride",
+    "PersonOverrideMapping",
+    "ProductIntent",
+    "Project",
     "Property",
     "PropertyDefinition",
-    "SessionRecordingEvent",
-    "SessionsFilter",
+    "ProxyRecord",
+    "QuickFilter",
+    "RetentionFilter",
+    "RemoteConfig",
+    "ResourceTransfer",
+    "EventSchema",
+    "SchemaPropertyGroup",
+    "SchemaPropertyGroupProperty",
+    "SessionRecording",
+    "SessionRecordingPlaylist",
+    "SessionRecordingExternalReference",
+    "SessionRecordingPlaylistItem",
+    "SharePassword",
+    "SharingConfiguration",
+    "Tag",
+    "TaggedItem",
     "Team",
+    "TeamRevenueAnalyticsConfig",
+    "TeamMarketingAnalyticsConfig",
+    "EventIngestionRestrictionConfig",
+    "UploadedMedia",
     "User",
+    "RepoRoutingRule",
+    "UserRepoPreference",
+    "UserScenePersonalisation",
+    "UserHomeSettings",
     "UserManager",
+    "UserGroup",
+    "UserGroupMembership",
+    "UserIntegration",
+    "UserPushToken",
+    "DataWarehouseTable",
+    "WebAnalyticsFilterPreset",
+    "ScheduledChange",
+    "Comment",
+    # Deprecated models here for backwards compatibility
+    "Prompt",
+    "PromptSequence",
+    "UserPromptState",
 ]

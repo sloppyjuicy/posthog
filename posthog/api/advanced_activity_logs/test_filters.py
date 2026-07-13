@@ -1,0 +1,428 @@
+from posthog.test.base import BaseTest
+
+from django.http import QueryDict
+from django.test import SimpleTestCase
+
+from parameterized import parameterized
+
+from posthog.models.activity_logging.activity_log import ActivityLog
+
+from .filters import AdvancedActivityLogFilterManager
+from .viewset import AdvancedActivityLogFiltersSerializer
+
+
+class TestAdvancedActivityLogFilterManager(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.filter_manager = AdvancedActivityLogFilterManager()
+
+    def test_get_type_variants_string_to_numeric(self):
+        variants = self.filter_manager._get_type_variants("42")
+        self.assertIn("42", variants)
+        self.assertIn(42, variants)
+
+        variants = self.filter_manager._get_type_variants("3.14")
+        self.assertIn("3.14", variants)
+        self.assertIn(3.14, variants)
+
+        variants = self.filter_manager._get_type_variants("42.0")
+        self.assertIn("42.0", variants)
+        self.assertIn(42.0, variants)
+
+    def test_get_type_variants_numeric_to_string(self):
+        variants = self.filter_manager._get_type_variants(42)
+        self.assertIn(42, variants)
+        self.assertIn("42", variants)
+
+        variants = self.filter_manager._get_type_variants(3.14)
+        self.assertIn(3.14, variants)
+        self.assertIn("3.14", variants)
+
+    def test_get_type_variants_boolean_conversion(self):
+        variants = self.filter_manager._get_type_variants("true")
+        self.assertIn("true", variants)
+        self.assertIn(True, variants)
+
+        variants = self.filter_manager._get_type_variants("false")
+        self.assertIn("false", variants)
+        self.assertIn(False, variants)
+
+        variants = self.filter_manager._get_type_variants("1")
+        self.assertIn("1", variants)
+        self.assertIn(1, variants)
+        self.assertIn(True, variants)
+
+        variants = self.filter_manager._get_type_variants("0")
+        self.assertIn("0", variants)
+        self.assertIn(0, variants)
+        self.assertIn(False, variants)
+
+        variants = self.filter_manager._get_type_variants(True)
+        self.assertIn(True, variants)
+        self.assertIn("true", variants)
+        self.assertIn("True", variants)
+        self.assertIn("1", variants)
+
+        variants = self.filter_manager._get_type_variants(False)
+        self.assertIn(False, variants)
+        self.assertIn("false", variants)
+        self.assertIn("False", variants)
+        self.assertIn("0", variants)
+
+    def test_get_type_variants_edge_cases(self):
+        variants = self.filter_manager._get_type_variants("hello")
+        self.assertEqual(variants, ["hello"])
+
+        variants = self.filter_manager._get_type_variants("")
+        self.assertEqual(variants, [""])
+
+        variants = self.filter_manager._get_type_variants("   ")
+        self.assertEqual(variants, ["   "])
+
+        variants = self.filter_manager._get_type_variants("abc123")
+        self.assertEqual(variants, ["abc123"])
+
+    def test_get_type_variants_no_duplicates(self):
+        variants = self.filter_manager._get_type_variants("1")
+        strings = [v for v in variants if isinstance(v, str)]
+        integers = [v for v in variants if isinstance(v, int) and not isinstance(v, bool)]
+        booleans = [v for v in variants if isinstance(v, bool)]
+
+        self.assertEqual(len([v for v in strings if v == "1"]), 1)
+        self.assertEqual(len([v for v in integers if v == 1]), 1)
+        self.assertEqual(len([v for v in booleans if v is True]), 1)
+
+    def _create_activity_log(self, detail: dict) -> ActivityLog:
+        return ActivityLog.objects.create(
+            organization_id=self.organization.id,
+            team_id=self.team.id,
+            user=self.user,
+            scope="TestScope",
+            activity="updated",
+            item_id="test-item",
+            detail=detail,
+        )
+
+    def test_apply_detail_filters_exact_type_insensitive(self):
+        log1 = self._create_activity_log({"count": 42})
+        log2 = self._create_activity_log({"count": "42"})
+        log3 = self._create_activity_log({"count": 42.0})
+        log4 = self._create_activity_log({"count": "other"})
+
+        queryset = ActivityLog.objects.filter(id__in=[log1.id, log2.id, log3.id, log4.id])
+
+        filtered = self.filter_manager._apply_detail_filters(queryset, {"count": {"operation": "exact", "value": "42"}})
+        result_ids = set(filtered.values_list("id", flat=True))
+        expected_ids = {log1.id, log2.id, log3.id}
+        self.assertEqual(result_ids, expected_ids)
+
+        filtered = self.filter_manager._apply_detail_filters(queryset, {"count": {"operation": "exact", "value": 42}})
+        result_ids = set(filtered.values_list("id", flat=True))
+        expected_ids = {log1.id, log2.id, log3.id}
+        self.assertEqual(result_ids, expected_ids)
+
+    def test_apply_detail_filters_in_type_insensitive(self):
+        log1 = self._create_activity_log({"count": "42"})
+        log2 = self._create_activity_log({"count": 42})
+        log3 = self._create_activity_log({"count": "other"})
+
+        queryset = ActivityLog.objects.filter(id__in=[log1.id, log2.id, log3.id])
+
+        filtered = self.filter_manager._apply_detail_filters(queryset, {"count": {"operation": "in", "value": ["42"]}})
+        result_ids = set(filtered.values_list("id", flat=True))
+        expected_ids = {log1.id, log2.id}
+
+        self.assertEqual(result_ids, expected_ids)
+
+    def test_apply_detail_filters_contains_unchanged(self):
+        log1 = self._create_activity_log({"message": "Error code 404"})
+        log2 = self._create_activity_log({"message": "Success"})
+
+        queryset = ActivityLog.objects.filter(id__in=[log1.id, log2.id])
+
+        filtered = self.filter_manager._apply_detail_filters(
+            queryset, {"message": {"operation": "contains", "value": "Error"}}
+        )
+        result_ids = set(filtered.values_list("id", flat=True))
+        self.assertEqual(result_ids, {log1.id})
+
+    def test_nested_object_type_conversion(self):
+        log1 = self._create_activity_log({"config": {"timeout": 30}})
+        log2 = self._create_activity_log({"config": {"timeout": "30"}})
+        log3 = self._create_activity_log({"config": {"timeout": 60}})
+
+        queryset = ActivityLog.objects.filter(id__in=[log1.id, log2.id, log3.id])
+
+        filtered = self.filter_manager._apply_detail_filters(
+            queryset, {"config.timeout": {"operation": "exact", "value": "30"}}
+        )
+        result_ids = set(filtered.values_list("id", flat=True))
+        expected_ids = {log1.id, log2.id}
+        self.assertEqual(result_ids, expected_ids)
+
+    def test_array_field_type_conversion(self):
+        log1 = self._create_activity_log({"items": [{"id": 1}, {"id": 2}]})
+        log2 = self._create_activity_log({"items": [{"id": "1"}, {"id": "3"}]})
+        log3 = self._create_activity_log({"items": [{"id": "other"}]})
+
+        queryset = ActivityLog.objects.filter(id__in=[log1.id, log2.id, log3.id])
+
+        filtered = self.filter_manager._apply_array_field_filter(queryset, "items[].id", "exact", "1")
+        result_ids = set(filtered.values_list("id", flat=True))
+        expected_ids = {log1.id, log2.id}
+        self.assertEqual(result_ids, expected_ids)
+
+    def test_array_field_in_operation_type_conversion(self):
+        log1 = self._create_activity_log({"tags": [{"priority": 1}, {"priority": 3}]})
+        log2 = self._create_activity_log({"tags": [{"priority": "2"}, {"priority": "1"}]})
+        log3 = self._create_activity_log({"tags": [{"priority": "high"}]})
+
+        queryset = ActivityLog.objects.filter(id__in=[log1.id, log2.id, log3.id])
+
+        filtered = self.filter_manager._apply_array_field_filter(queryset, "tags[].priority", "in", ["1", "2"])
+        result_ids = set(filtered.values_list("id", flat=True))
+        expected_ids = {log1.id, log2.id}
+        self.assertEqual(result_ids, expected_ids)
+
+    def test_deeply_nested_array_fields(self):
+        log1 = self._create_activity_log(
+            {
+                "changes": [
+                    {"after": [{"field": {"subarray": [{"value": 42}]}}]},
+                    {"after": [{"field": {"subarray": [{"value": "other"}]}}]},
+                ]
+            }
+        )
+        log2 = self._create_activity_log({"changes": [{"after": [{"field": {"subarray": [{"value": "42"}]}}]}]})
+        log3 = self._create_activity_log({"changes": [{"after": [{"field": {"subarray": [{"value": "different"}]}}]}]})
+
+        queryset = ActivityLog.objects.filter(id__in=[log1.id, log2.id, log3.id])
+
+        filtered = self.filter_manager._apply_array_field_filter(
+            queryset, "changes[].after[].field.subarray[].value", "exact", "42"
+        )
+        result_ids = set(filtered.values_list("id", flat=True))
+        expected_ids = {log1.id, log2.id}
+        self.assertEqual(result_ids, expected_ids)
+
+    def test_rejects_dunder_field_paths(self):
+        log = self._create_activity_log({"name": "test"})
+        queryset = ActivityLog.objects.filter(id=log.id)
+
+        filtered = self.filter_manager._apply_detail_filters(
+            queryset, {"user__email": {"operation": "exact", "value": "admin@example.com"}}
+        )
+        self.assertEqual(filtered.count(), 1)
+
+        filtered = self.filter_manager._apply_detail_filters(
+            queryset, {"user__password": {"operation": "contains", "value": "pbkdf2"}}
+        )
+        self.assertEqual(filtered.count(), 1)
+
+    def test_rejects_invalid_operations(self):
+        log = self._create_activity_log({"name": "test"})
+        queryset = ActivityLog.objects.filter(id=log.id)
+
+        filtered = self.filter_manager._apply_detail_filters(queryset, {"name": {"operation": "regex", "value": ".*"}})
+        self.assertEqual(filtered.count(), 1)
+
+        filtered = self.filter_manager._apply_detail_filters(queryset, {"name": {"operation": "gt", "value": "a"}})
+        self.assertEqual(filtered.count(), 1)
+
+
+class TestIpAddressFilter(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.filter_manager = AdvancedActivityLogFilterManager()
+
+    def _create_log(self, ip_address: str | None) -> ActivityLog:
+        return ActivityLog.objects.create(
+            organization_id=self.organization.id,
+            team_id=self.team.id,
+            user=self.user,
+            scope="TestScope",
+            activity="updated",
+            item_id="test-item",
+            detail={},
+            ip_address=ip_address,
+        )
+
+    def test_filters_by_single_ip(self):
+        match = self._create_log("203.0.113.42")
+        self._create_log("198.51.100.7")
+        self._create_log(None)
+
+        queryset = ActivityLog.objects.filter(team_id=self.team.id)
+        filtered = self.filter_manager.apply_filters(queryset, {"ip_addresses": ["203.0.113.42"]})
+        self.assertEqual(set(filtered.values_list("id", flat=True)), {match.id})
+
+    def test_filters_by_multiple_ips(self):
+        match1 = self._create_log("203.0.113.42")
+        match2 = self._create_log("198.51.100.7")
+        self._create_log("192.0.2.99")
+
+        queryset = ActivityLog.objects.filter(team_id=self.team.id)
+        filtered = self.filter_manager.apply_filters(queryset, {"ip_addresses": ["203.0.113.42", "198.51.100.7"]})
+        self.assertEqual(set(filtered.values_list("id", flat=True)), {match1.id, match2.id})
+
+    def test_no_ip_filter_returns_all(self):
+        log1 = self._create_log("203.0.113.42")
+        log2 = self._create_log(None)
+
+        queryset = ActivityLog.objects.filter(team_id=self.team.id)
+        filtered = self.filter_manager.apply_filters(queryset, {"ip_addresses": []})
+        self.assertEqual(set(filtered.values_list("id", flat=True)), {log1.id, log2.id})
+
+    def test_filters_by_wildcard_prefix(self):
+        match1 = self._create_log("203.0.113.42")
+        match2 = self._create_log("203.0.113.99")
+        self._create_log("198.51.100.7")
+        self._create_log(None)
+
+        queryset = ActivityLog.objects.filter(team_id=self.team.id)
+        filtered = self.filter_manager.apply_filters(queryset, {"ip_addresses": ["203.0.113.*"]})
+        self.assertEqual(set(filtered.values_list("id", flat=True)), {match1.id, match2.id})
+
+    def test_combines_exact_and_wildcard(self):
+        exact_match = self._create_log("198.51.100.7")
+        wildcard_match = self._create_log("203.0.113.42")
+        self._create_log("10.0.0.1")
+
+        queryset = ActivityLog.objects.filter(team_id=self.team.id)
+        filtered = self.filter_manager.apply_filters(queryset, {"ip_addresses": ["198.51.100.7", "203.0.*"]})
+        self.assertEqual(set(filtered.values_list("id", flat=True)), {exact_match.id, wildcard_match.id})
+
+
+class TestAdvancedActivityLogFiltersSerializerValidation(SimpleTestCase):
+    # Pure field-level validation (the serializer has no validate() and no context),
+    # so no DB is needed. The viewset wiring is guarded by an endpoint test in
+    # TestOrganizationAdvancedActivityLogsViewSet (test_activity_log.py).
+    @parameterized.expand(
+        [
+            ("ipv4", "203.0.113.42", True),
+            ("ipv6", "2001:db8::1", True),
+            ("wildcard", "203.0.113.*", True),
+            ("text", "not-an-ip", False),
+            ("regex_metachar", "192.168.1.(0|1)", False),
+            ("empty", "", False),
+        ]
+    )
+    def test_serializer_validates_ip_filter_shape(self, _name: str, value: str, expected: bool) -> None:
+        query = QueryDict(mutable=True)
+        query.appendlist("ip_addresses", value)
+        serializer = AdvancedActivityLogFiltersSerializer(data=query)
+        self.assertEqual(serializer.is_valid(), expected, serializer.errors)
+
+
+class TestTypeConversionIntegration(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.filter_manager = AdvancedActivityLogFilterManager()
+
+    def test_full_filter_pipeline_with_type_conversion(self):
+        log1 = ActivityLog.objects.create(
+            organization_id=self.organization.id,
+            team_id=self.team.id,
+            user=self.user,
+            scope="Dashboard",
+            activity="updated",
+            item_id="123",
+            detail={"version": 2, "active": True, "name": "Test Dashboard"},
+        )
+
+        log2 = ActivityLog.objects.create(
+            organization_id=self.organization.id,
+            team_id=self.team.id,
+            user=self.user,
+            scope="Dashboard",
+            activity="created",
+            item_id="456",
+            detail={"version": "2", "active": "true", "name": "Another Dashboard"},
+        )
+
+        filters = {
+            "scopes": ["Dashboard"],
+            "detail_filters": {
+                "version": {"operation": "exact", "value": "2"},
+                "active": {"operation": "exact", "value": "true"},
+            },
+        }
+
+        queryset = ActivityLog.objects.filter(id__in=[log1.id, log2.id])
+        filtered = self.filter_manager.apply_filters(queryset, filters)
+
+        result_ids = set(filtered.values_list("id", flat=True))
+        expected_ids = {log1.id, log2.id}
+        self.assertEqual(result_ids, expected_ids)
+
+
+class TestOptionalBooleanFilters(BaseTest):
+    """
+    Tests for was_impersonated and is_system optional boolean filters.
+
+    These tests prevent regression of a bug where selecting "All" in the UI
+    behaved the same as selecting "No" because:
+    1. DRF's BooleanField has default_empty_html=False, causing missing params to become False
+    2. The filter logic applied filtering even when the value was None
+
+    The fix involved:
+    1. OptionalBooleanField with default_empty_html=None
+    2. Filter logic that skips filtering when value is None
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.filter_manager = AdvancedActivityLogFilterManager()
+
+    def test_missing_boolean_params_serialize_to_none_not_false(self):
+        """
+        When was_impersonated/is_system params are omitted from query string,
+        the serializer should return None (not False).
+
+        This catches the DRF default_empty_html=False bug.
+        """
+        from django.http import QueryDict
+
+        from posthog.api.advanced_activity_logs.viewset import AdvancedActivityLogFiltersSerializer
+
+        query_params = QueryDict("start_date=2024-01-01")
+        serializer = AdvancedActivityLogFiltersSerializer(data=query_params)
+        serializer.is_valid(raise_exception=True)
+
+        self.assertIsNone(serializer.validated_data.get("was_impersonated"))
+        self.assertIsNone(serializer.validated_data.get("is_system"))
+
+    def test_none_filter_values_return_all_records(self):
+        """
+        When filter dict contains None values (from missing query params),
+        no filtering should be applied - all records should be returned.
+
+        This is the "All" option in the UI dropdown.
+        """
+        log_impersonated = ActivityLog.objects.create(
+            organization_id=self.organization.id,
+            team_id=self.team.id,
+            user=self.user,
+            scope="TestScope",
+            activity="updated",
+            item_id="test",
+            detail={},
+            was_impersonated=True,
+            is_system=True,
+        )
+        log_normal = ActivityLog.objects.create(
+            organization_id=self.organization.id,
+            team_id=self.team.id,
+            user=self.user,
+            scope="TestScope",
+            activity="updated",
+            item_id="test",
+            detail={},
+            was_impersonated=False,
+            is_system=False,
+        )
+
+        queryset = ActivityLog.objects.filter(id__in=[log_impersonated.id, log_normal.id])
+
+        filtered = self.filter_manager.apply_filters(queryset, {"was_impersonated": None, "is_system": None})
+        self.assertEqual(filtered.count(), 2)

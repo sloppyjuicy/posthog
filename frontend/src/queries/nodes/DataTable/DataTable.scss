@@ -1,0 +1,81 @@
+.DataTable {
+    td {
+        max-width: 20rem;
+    }
+
+    // This style makes the sticky css fail, so we need to remove it when there are pinned columns
+    .DataTable__row:not(.DataTable__has_pinned_columns) {
+        position: relative;
+        z-index: 0;
+    }
+
+    // This style makes the sticky css fail, so we need to remove it when there are pinned columns
+    .DataTable__row td:first-child:not(.LemonTable__cell--pinned, .LemonTable__header--pinned) {
+        &::after {
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: -1;
+            width: var(--data-table-fraction-fill, 0%);
+            height: 100%;
+            pointer-events: none;
+            content: '';
+            background-color: var(--color-bg-fill-info-secondary);
+            opacity: 0.5;
+        }
+    }
+
+    .DataTable__row--highlight_once {
+        animation: DataTable__highlight 2000ms ease-out;
+    }
+
+    .DataTable__row--category_row {
+        height: 2rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: var(--color-text-secondary);
+        text-align: center;
+        background-color: var(--color-bg-primary);
+    }
+
+    @keyframes DataTable__highlight {
+        0% {
+            background-color: var(--mark);
+        }
+
+        100% {
+            background-color: initial;
+        }
+    }
+}
+
+.DataVisualizationTable {
+    border: 0;
+    border-radius: 0;
+
+    th {
+        max-width: 15rem;
+        overflow: visible;
+        text-overflow: clip;
+        white-space: normal;
+
+        .LemonTable__header-content div {
+            overflow-wrap: break-word;
+            white-space: normal;
+
+            // line clamp to 3 lines of text and then ellipsis
+            > span:first-child {
+                display: -webkit-box;
+                -webkit-line-clamp: 3;
+                -webkit-box-orient: vertical;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+        }
+    }
+
+    td {
+        max-width: 15rem;
+        white-space: nowrap;
+    }
+}

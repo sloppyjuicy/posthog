@@ -1,0 +1,226 @@
+.PlayerSeekbar {
+    --bar-height: 6px;
+    --slider-height: 20px;
+    --thumb-size: 15px;
+
+    position: relative;
+    display: flex;
+    width: 100%;
+    height: var(--slider-height);
+
+    &:hover,
+    &--scrubbing {
+        --bar-height: 10px;
+
+        .PlayerSeekBarPreview {
+            opacity: 1;
+        }
+    }
+
+    .PlayerSeekbar__slider {
+        position: absolute;
+        top: calc((var(--slider-height) - var(--bar-height)) / 2);
+        right: 0;
+        left: 0;
+        z-index: 2;
+        height: var(--bar-height);
+        cursor: pointer;
+        background-color: var(--color-border-primary);
+        border-radius: var(--bar-height);
+        transition:
+            height 150ms ease-in-out,
+            top 150ms ease-in-out;
+
+        .PlayerSeekbar__thumb {
+            position: absolute;
+            top: calc(var(--bar-height) / 2);
+            z-index: 5;
+            width: var(--thumb-size);
+            height: var(--thumb-size);
+            margin-top: calc(var(--thumb-size) / 2 * -1);
+            background-color: var(--color-accent);
+            border: 2px solid var(--color-bg-surface-primary);
+            border-radius: 50%;
+            transition: top 150ms ease-in-out;
+            backface-visibility: hidden;
+        }
+
+        .PlayerSeekbar__sources {
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 2;
+            display: flex;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            border-radius: var(--bar-height);
+
+            .PlayerSeekbar__sources__item {
+                height: 100%;
+                background-color: var(--color-neutral-100);
+                transition: background-color 150ms ease;
+
+                &--loaded {
+                    background-color: var(--color-neutral-450);
+                }
+            }
+        }
+
+        .PlayerSeekbar__segments {
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 4;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            pointer-events: none;
+            border-radius: var(--bar-height);
+
+            .PlayerSeekbar__segment {
+                position: absolute;
+                height: 100%;
+                pointer-events: auto;
+                cursor: pointer;
+                border-radius: 2px;
+                opacity: 0.75;
+                transition: opacity 150ms ease;
+
+                &:hover {
+                    opacity: 0.9;
+                }
+
+                &--success {
+                    background-color: var(--success);
+                }
+
+                &--failure {
+                    background-color: var(--danger);
+                }
+
+                &--unknown {
+                    background-color: var(--color-neutral-500);
+                }
+            }
+        }
+
+        .PlayerSeekbar__unplayable {
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 4;
+            height: 100%;
+            cursor: help;
+            background: repeating-linear-gradient(
+                45deg,
+                var(--danger) 0,
+                var(--danger) 2px,
+                transparent 2px,
+                transparent 6px
+            );
+            border-radius: var(--bar-height) 0 0 var(--bar-height);
+            opacity: 0.6;
+        }
+
+        .PlayerSeekbar__played {
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 3;
+            height: 100%;
+            background-color: hsl(25deg 85% 50% / 70%);
+            border-radius: var(--bar-height) 0 0 var(--bar-height);
+        }
+    }
+
+    .PlayerSeekBarPreview {
+        position: absolute;
+        bottom: 100%;
+        z-index: 6;
+        width: 100%;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 150ms ease-in-out;
+
+        .PlayerSeekBarPreview__tooltip {
+            width: 100%;
+
+            .PlayerSeekBarPreview__tooltip__content {
+                display: inline-block;
+                padding: 0.1rem;
+                margin-bottom: 0.5rem;
+                font-size: 0.75rem;
+                font-weight: 600;
+                color: #fff;
+                background-color: var(--tooltip-bg);
+                border-radius: var(--radius);
+                transform: translateX(-50%);
+
+                &--with-preview {
+                    margin-bottom: 3.5rem;
+                }
+            }
+        }
+    }
+}
+
+.PlayerSeekbarTicks {
+    position: relative;
+    z-index: 1;
+    width: 100%;
+    height: 0.75rem;
+
+    .PlayerSeekbarTick {
+        --tick-color: var(--color-text-secondary);
+        --tick-width: 3px;
+        --emoji-width: 16px;
+        --comment-width: 12px;
+
+        position: absolute;
+        top: 0;
+        height: 100%;
+        cursor: pointer;
+        transition: transform 150ms ease-in-out;
+
+        &--warning {
+            --tick-color: var(--warning);
+        }
+
+        &--danger {
+            --tick-color: var(--danger);
+        }
+
+        &--primary {
+            --tick-color: var(--color-accent);
+        }
+
+        .PlayerSeekbarTick__line {
+            position: absolute;
+            width: var(--tick-width);
+            height: 100%;
+            margin-left: calc(var(--tick-width) / 2 * -1);
+            background-color: var(--tick-color);
+            border-radius: 2px;
+            opacity: 0.5;
+        }
+
+        .PlayerSeekbarTick__emoji {
+            position: absolute;
+            bottom: 5px;
+            width: var(--emoji-width);
+            height: 100%;
+            margin-left: calc(var(--emoji-width) / 2 * -1);
+            opacity: 0.75;
+        }
+
+        .PlayerSeekbarTick__comment {
+            position: absolute;
+            bottom: 5px;
+            width: var(--comment-width);
+            height: 100%;
+            margin-left: calc(var(--comment-width) / 2 * -1);
+            opacity: 0.65;
+        }
+    }
+}

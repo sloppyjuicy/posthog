@@ -4,14 +4,15 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0153_plugin_capabilities"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name="organization", name="for_internal_metrics", field=models.BooleanField(default=False),
+            model_name="organization",
+            name="for_internal_metrics",
+            field=models.BooleanField(default=False),
         ),
         migrations.AddConstraint(
             model_name="organization",

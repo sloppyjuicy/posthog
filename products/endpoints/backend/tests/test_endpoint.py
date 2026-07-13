@@ -1,0 +1,1888 @@
+from datetime import datetime
+from typing import Any
+
+from freezegun import freeze_time
+from posthog.test.base import APIBaseTest, ClickhouseTestMixin
+from unittest import TestCase, mock
+
+from parameterized import parameterized
+from rest_framework import status
+
+from posthog.schema import EndpointLastExecutionTimesRequest
+
+from posthog.models.activity_logging.activity_log import ActivityLog
+from posthog.models.personal_api_key import PersonalAPIKey
+from posthog.models.team import Team
+from posthog.models.user import User
+from posthog.models.utils import generate_random_token_personal, hash_key_value
+
+from products.endpoints.backend.models import Endpoint, EndpointVersion
+from products.endpoints.backend.tests.conftest import create_endpoint_with_version
+from products.product_analytics.backend.models.insight_variable import InsightVariable
+
+
+class TestEndpoint(ClickhouseTestMixin, APIBaseTest):
+    ENDPOINT = "endpoints"
+
+    def setUp(self):
+        super().setUp()
+        self.api_key = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            user=self.user,
+            label="Test API Key",
+            secure_value=hash_key_value(self.api_key),
+            scopes=["*"],
+        )
+        self.sample_hogql_query = {
+            "connectionId": None,
+            "explain": None,
+            "filters": None,
+            "kind": "HogQLQuery",
+            "modifiers": None,
+            "name": None,
+            "query": "SELECT count(1) FROM query_log",
+            "response": None,
+            "sendRawQuery": None,
+            "tags": None,
+            "values": None,
+            "variables": None,
+            "version": None,
+        }
+        self.sample_insight_query = {
+            "kind": "TrendsQuery",
+            "series": [{"kind": "EventsNode"}],
+        }
+
+    def test_create_hogql_endpoint(self):
+        """Test creating a endpoint successfully."""
+        data = {
+            "name": "test_query",
+            "description": "Test query description",
+            "query": self.sample_hogql_query,
+        }
+
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        response_data = response.json()
+
+        self.assertEqual("test_query", response_data["name"])
+        self.assertEqual(self.sample_hogql_query, response_data["query"])
+        self.assertEqual("Test query description", response_data["description"])
+        self.assertTrue(response_data["is_active"])
+        self.assertIn("id", response_data)
+        self.assertIn("endpoint_path", response_data)
+        self.assertIn("created_at", response_data)
+        self.assertIn("updated_at", response_data)
+
+        self.assertIsNone(response_data["derived_from_insight"])
+
+        # Verify it was saved to database
+        endpoint = Endpoint.objects.get(name="test_query", team=self.team)
+        # Query is stored on the version, not the endpoint
+        version = endpoint.get_version()
+        assert version is not None
+        self.assertEqual(version.query, self.sample_hogql_query)
+        self.assertEqual(endpoint.created_by, self.user)
+        self.assertIsNone(endpoint.derived_from_insight)
+
+        # Activity log created
+        logs = ActivityLog.objects.filter(team_id=self.team.id, scope="Endpoint", activity="created")
+        self.assertEqual(logs.count(), 1, list(logs.values("activity", "scope", "item_id")))
+        log = logs.latest("created_at")
+        self.assertEqual(log.item_id, str(endpoint.id))
+        assert log.detail is not None
+        self.assertEqual(log.detail.get("name"), "test_query")
+
+    def test_cannot_create_endpoint_with_invalid_sql(self):
+        """Test creating an endpoint with invalid HogQL fails."""
+        data = {
+            "name": "test_query",
+            "description": "Test query description",
+            "query": {"kind": "HogQLQuery", "query": "selet 100"},  # intentionally wrong spelling
+        }
+
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        response_data = response.json()
+        self.assertEqual(response_data["type"], "validation_error")
+
+    def test_cannot_create_endpoint_with_undefined_variable_placeholders(self):
+        data = {
+            "name": "test_query",
+            "query": {
+                "kind": "HogQLQuery",
+                "query": "SELECT count() FROM events WHERE event = {variables.event_name}",
+            },
+        }
+
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        self.assertIn("event_name", response.json()["detail"])
+
+    def test_create_endpoint_with_defined_variable_placeholders(self):
+        variable = InsightVariable.objects.create(
+            team=self.team, name="Event Name", code_name="event_name", type="String"
+        )
+        variable_id = str(variable.id)
+        data = {
+            "name": "test_query",
+            "query": {
+                "kind": "HogQLQuery",
+                "query": "SELECT count() FROM events WHERE event = {variables.event_name}",
+                "variables": {
+                    variable_id: {
+                        "variableId": variable_id,
+                        "code_name": "event_name",
+                        "value": "$pageview",
+                    }
+                },
+            },
+        }
+
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+
+    def test_cannot_create_endpoint_with_partially_defined_variables(self):
+        variable = InsightVariable.objects.create(
+            team=self.team, name="Event Name", code_name="event_name", type="String"
+        )
+        variable_id = str(variable.id)
+        data = {
+            "name": "test_query",
+            "query": {
+                "kind": "HogQLQuery",
+                "query": "SELECT count() FROM events WHERE event = {variables.event_name} AND properties.os = {variables.os}",
+                "variables": {
+                    variable_id: {
+                        "variableId": variable_id,
+                        "code_name": "event_name",
+                        "value": "$pageview",
+                    }
+                },
+            },
+        }
+
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        self.assertIn("os", response.json()["detail"])
+        self.assertNotIn("event_name", response.json()["detail"])
+
+    def test_cannot_update_endpoint_with_undefined_variable_placeholders(self):
+        create_data = {
+            "name": "test_query",
+            "query": {"kind": "HogQLQuery", "query": "SELECT count() FROM events"},
+        }
+        self.client.post(f"/api/environments/{self.team.id}/endpoints/", create_data, format="json")
+
+        update_data = {
+            "query": {
+                "kind": "HogQLQuery",
+                "query": "SELECT count() FROM events WHERE event = {variables.event_name}",
+            },
+        }
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/test_query/", update_data, format="json"
+        )
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        self.assertIn("event_name", response.json()["detail"])
+
+    def test_update_endpoint_syncs_query_variables_from_placeholders(self):
+        event_name_variable = InsightVariable.objects.create(
+            team=self.team, name="Event Name", code_name="event_name", type="String", default_value="$pageview"
+        )
+        browser_variable = InsightVariable.objects.create(
+            team=self.team, name="Browser", code_name="browser", type="String", default_value="Chrome"
+        )
+        city_variable = InsightVariable.objects.create(
+            team=self.team, name="City", code_name="city", type="String", default_value="Paris"
+        )
+
+        create_data = {
+            "name": "test_query",
+            "query": {
+                "kind": "HogQLQuery",
+                "query": "SELECT count() FROM events WHERE event = {variables.event_name} AND properties.$browser = {variables.browser}",
+                "variables": {
+                    str(event_name_variable.id): {
+                        "variableId": str(event_name_variable.id),
+                        "code_name": "event_name",
+                        "value": "$identify",
+                    },
+                    str(browser_variable.id): {
+                        "variableId": str(browser_variable.id),
+                        "code_name": "browser",
+                        "value": "Safari",
+                    },
+                },
+            },
+        }
+        create_response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", create_data, format="json")
+        self.assertEqual(status.HTTP_201_CREATED, create_response.status_code, create_response.json())
+
+        update_data = {
+            "query": {
+                "kind": "HogQLQuery",
+                "query": "SELECT count() FROM events WHERE event = {variables.event_name} AND properties.$geoip_city_name = {variables.city}",
+                "variables": {
+                    str(event_name_variable.id): {
+                        "variableId": str(event_name_variable.id),
+                        "code_name": "event_name",
+                        "value": "$pageleave",
+                    },
+                    str(browser_variable.id): {
+                        "variableId": str(browser_variable.id),
+                        "code_name": "browser",
+                        "value": "Firefox",
+                    },
+                },
+            }
+        }
+        update_response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/test_query/", update_data, format="json"
+        )
+
+        self.assertEqual(status.HTTP_200_OK, update_response.status_code, update_response.json())
+
+        variables = update_response.json()["query"]["variables"]
+        self.assertEqual({v["code_name"] for v in variables.values()}, {"event_name", "city"})
+        self.assertEqual(variables[str(event_name_variable.id)]["value"], "$pageleave")
+        self.assertEqual(variables[str(city_variable.id)]["value"], "Paris")
+
+    def test_cannot_create_endpoint_with_non_uuid_variable_id(self):
+        create_data = {
+            "name": "non-existent-variable",
+            "query": {
+                "kind": "HogQLQuery",
+                "query": "SELECT count() FROM events WHERE event = {variables.event_name}",
+                "variables": {
+                    "var-1": {
+                        "variableId": "var-1",
+                        "code_name": "event_name",
+                        "value": "$pageview",
+                    }
+                },
+            },
+        }
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", create_data, format="json")
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        self.assertIn("not valid UUIDs", response.json()["detail"])
+
+    def test_cannot_create_endpoint_with_nonexistent_variable_id(self):
+        fake_uuid = "00000000-0000-0000-0000-000000000001"
+        create_data = {
+            "name": "non-existent-variable",
+            "query": {
+                "kind": "HogQLQuery",
+                "query": "SELECT count() FROM events WHERE event = {variables.event_name}",
+                "variables": {
+                    fake_uuid: {
+                        "variableId": fake_uuid,
+                        "code_name": "event_name",
+                        "value": "$pageview",
+                    }
+                },
+            },
+        }
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", create_data, format="json")
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        self.assertIn("Variable ID(s) not found", response.json()["detail"])
+
+    def test_create_insight_endpoint(self):
+        data = {
+            "name": "test_insight_query",
+            "description": "Test query description",
+            "query": self.sample_insight_query,
+        }
+
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+
+    def test_update_endpoint(self):
+        """Test updating an existing endpoint."""
+        endpoint = create_endpoint_with_version(
+            name="update_test",
+            team=self.team,
+            query=self.sample_hogql_query,
+            description="Original description",
+            created_by=self.user,
+        )
+
+        updated_data = {
+            "description": "Updated description",
+            "is_active": False,
+            "query": {"kind": "HogQLQuery", "query": "SELECT 1"},
+        }
+
+        response = self.client.put(
+            f"/api/environments/{self.team.id}/endpoints/{endpoint.name}/", updated_data, format="json"
+        )
+
+        response_data = response.json()
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response_data)
+
+        self.assertEqual("update_test", response_data["name"])
+        self.assertEqual("Updated description", response_data["description"])
+        self.assertFalse(response_data["is_active"])
+        want_query = {
+            "connectionId": None,
+            "explain": None,
+            "filters": None,
+            "kind": "HogQLQuery",
+            "modifiers": None,
+            "name": None,
+            "query": "SELECT 1",
+            "response": None,
+            "sendRawQuery": None,
+            "tags": None,
+            "values": None,
+            "variables": None,
+            "version": None,
+        }
+        self.assertEqual(want_query, response_data["query"])
+
+        # Verify database was updated
+        endpoint.refresh_from_db()
+        version = endpoint.get_version()
+        self.assertIsNotNone(version)
+        self.assertEqual(version.description, "Updated description")
+        self.assertFalse(endpoint.is_active)
+
+        # Activity log updated with changes
+        logs = ActivityLog.objects.filter(
+            team_id=self.team.id,
+            scope="Endpoint",
+            activity="updated",
+            item_id=str(endpoint.id),
+        )
+        self.assertEqual(logs.count(), 1, list(logs.values("activity", "detail")))
+        log = logs.latest("created_at")
+        assert log.detail is not None
+
+        self.assertEqual("updated", log.activity)
+        changes = log.detail.get("changes", [])
+        changed_fields = {c.get("field") for c in changes}
+        # description is now stored on EndpointVersion, not tracked in Endpoint activity log
+        self.assertIn("is_active", changed_fields)
+        self.assertNotIn("description", changed_fields)
+
+    def test_delete_endpoint(self):
+        endpoint = create_endpoint_with_version(
+            name="delete_test",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+        )
+
+        response = self.client.delete(f"/api/environments/{self.team.id}/endpoints/delete_test/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        # Endpoint still exists in database but is soft-deleted
+        endpoint.refresh_from_db()
+        self.assertTrue(endpoint.deleted)
+        self.assertIsNotNone(endpoint.deleted_at)
+
+        # Not visible in list
+        list_response = self.client.get(f"/api/environments/{self.team.id}/endpoints/")
+        self.assertEqual(list_response.status_code, status.HTTP_200_OK)
+        names = [e["name"] for e in list_response.json()["results"]]
+        self.assertNotIn("delete_test", names)
+
+        # Not accessible via retrieve
+        retrieve_response = self.client.get(f"/api/environments/{self.team.id}/endpoints/delete_test/")
+        self.assertEqual(retrieve_response.status_code, status.HTTP_404_NOT_FOUND)
+
+        # Activity log still created
+        logs = ActivityLog.objects.filter(team_id=self.team.id, scope="Endpoint", activity="deleted")
+        self.assertEqual(logs.count(), 1, list(logs.values("activity", "scope", "item_id")))
+        log = logs.latest("created_at")
+        self.assertEqual(log.item_id, str(endpoint.id))
+        assert log.detail is not None
+        self.assertEqual(log.detail.get("name"), "delete_test")
+
+    def test_delete_endpoint_prevents_hard_delete(self):
+        endpoint = create_endpoint_with_version(
+            name="hard_delete_test",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+        )
+        with self.assertRaises(Exception, msg="Cannot hard delete Endpoint"):
+            endpoint.delete()
+
+    def test_create_endpoint_after_soft_delete_reuses_name(self):
+        endpoint = create_endpoint_with_version(
+            name="reusable_name",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+        )
+
+        delete_response = self.client.delete(f"/api/environments/{self.team.id}/endpoints/reusable_name/")
+        self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+
+        endpoint.refresh_from_db()
+        self.assertTrue(endpoint.deleted)
+
+        # Create a new endpoint with the same name
+        data = {"name": "reusable_name", "query": self.sample_hogql_query}
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        self.assertEqual(response.json()["name"], "reusable_name")
+
+    def test_create_rolls_back_endpoint_when_version_creation_fails(self):
+        payload = {"name": "rollback-endpoint", "query": {"kind": "HogQLQuery", "query": "SELECT 1"}}
+
+        with mock.patch.object(EndpointVersion.objects, "create", side_effect=RuntimeError("boom")):
+            response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Endpoint.objects.filter(team=self.team, name="rollback-endpoint", deleted=False).count(), 0)
+
+        # The name must be reusable after the failed create
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+
+    def test_soft_deleted_endpoint_not_runnable(self):
+        create_endpoint_with_version(
+            name="run_deleted",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+        )
+        self.client.delete(f"/api/environments/{self.team.id}/endpoints/run_deleted/")
+
+        response = self.client.get(f"/api/environments/{self.team.id}/endpoints/run_deleted/run/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_invalid_query_name_validation(self):
+        """Test validation of invalid query names."""
+        data = {
+            "name": "invalid@name!",
+            "query": self.sample_hogql_query,
+        }
+
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+
+    def test_missing_required_fields(self):
+        """Test validation when required fields are missing."""
+        data: dict[str, Any] = {"query": self.sample_hogql_query}
+
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        data = {"name": "test_query"}
+
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_duplicate_name_in_team(self):
+        """Test that duplicate names within the same team are not allowed."""
+        create_endpoint_with_version(
+            name="duplicate_test",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+        )
+
+        data = {
+            "name": "duplicate_test",
+            "query": {"kind": "HogQLQuery", "query": "SELECT 2"},
+        }
+
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_team_isolation(self):
+        """Test that queries are properly isolated between teams."""
+        other_team = Team.objects.create(organization=self.organization, name="Other Team")
+        other_user = User.objects.create_and_join(self.organization, "other@test.com", None)
+
+        create_endpoint_with_version(
+            name="other_team_query",
+            team=other_team,
+            query=self.sample_hogql_query,
+            created_by=other_user,
+        )
+
+        response = self.client.get(f"/api/environments/{self.team.id}/endpoints/other_team_query/run/")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_list_filter_by_is_active(self):
+        """Test filtering endpoints by is_active status."""
+        create_endpoint_with_version(
+            name="active_query",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+            is_active=True,
+        )
+        create_endpoint_with_version(
+            name="inactive_query",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+            is_active=False,
+        )
+
+        response = self.client.get(f"/api/environments/{self.team.id}/endpoints/?is_active=true")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(len(response_data["results"]), 1)
+        self.assertEqual(response_data["results"][0]["name"], "active_query")
+        self.assertTrue(response_data["results"][0]["is_active"])
+
+        response = self.client.get(f"/api/environments/{self.team.id}/endpoints/?is_active=false")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(len(response_data["results"]), 1)
+        self.assertEqual(response_data["results"][0]["name"], "inactive_query")
+        self.assertFalse(response_data["results"][0]["is_active"])
+
+    def test_list_filter_by_created_by(self):
+        """Test filtering endpoints by created_by user."""
+        other_user = User.objects.create_and_join(self.organization, "other@test.com", None)
+
+        create_endpoint_with_version(
+            name="query_by_user1",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+        )
+        create_endpoint_with_version(
+            name="query_by_user2",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=other_user,
+        )
+
+        # Test filtering by first user
+        response = self.client.get(f"/api/environments/{self.team.id}/endpoints/?created_by={self.user.id}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(len(response_data["results"]), 1)
+        self.assertEqual(response_data["results"][0]["name"], "query_by_user1")
+
+        # Test filtering by second user
+        response = self.client.get(f"/api/environments/{self.team.id}/endpoints/?created_by={other_user.id}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(len(response_data["results"]), 1)
+        self.assertEqual(response_data["results"][0]["name"], "query_by_user2")
+
+    def test_list_filter_combined(self):
+        """Test filtering endpoints by both is_active and created_by."""
+        other_user = User.objects.create_and_join(self.organization, "other@test.com", None)
+
+        create_endpoint_with_version(
+            name="active_query_user1",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+            is_active=True,
+        )
+        create_endpoint_with_version(
+            name="inactive_query_user1",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+            is_active=False,
+        )
+        create_endpoint_with_version(
+            name="active_query_user2",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=other_user,
+            is_active=True,
+        )
+
+        response = self.client.get(
+            f"/api/environments/{self.team.id}/endpoints/?is_active=true&created_by={self.user.id}"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(len(response_data["results"]), 1)
+        self.assertEqual(response_data["results"][0]["name"], "active_query_user1")
+        self.assertTrue(response_data["results"][0]["is_active"])
+
+    def test_list_no_filters(self):
+        """Test listing all endpoints without filters."""
+        create_endpoint_with_version(
+            name="query1",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+            is_active=True,
+        )
+        create_endpoint_with_version(
+            name="query2",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+            is_active=False,
+        )
+
+        # Test without any filters - should return all queries
+        response = self.client.get(f"/api/environments/{self.team.id}/endpoints/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(len(response_data["results"]), 2)
+        query_names = {q["name"] for q in response_data["results"]}
+        self.assertEqual(query_names, {"query1", "query2"})
+
+    def test_create_endpoint_with_comprehensive_trends_query(self):
+        """Test creating a endpoint with a comprehensive TrendsQuery containing many fields."""
+        comprehensive_trends_query = {
+            "kind": "TrendsQuery",
+            "series": [
+                {
+                    "kind": "EventsNode",
+                    "event": "$pageview",
+                    "custom_name": "Page Views",
+                    "math": "total",
+                    "fixedProperties": [
+                        {"key": "$current_url", "operator": "icontains", "type": "event", "value": "posthog.com"}
+                    ],
+                },
+                {"kind": "EventsNode", "event": "$autocapture", "custom_name": "Autocapture Events", "math": "dau"},
+            ],
+            "dateRange": {"date_from": "2025-01-01", "date_to": "2025-01-31", "explicitDate": True},
+            "interval": "week",
+            "breakdownFilter": {
+                "breakdown": "$geoip_country_code",
+                "breakdown_type": "event",
+                "breakdown_limit": 10,
+                "breakdown_hide_other_aggregation": False,
+                "breakdown_normalize_url": True,
+            },
+            "compareFilter": {"compare": True, "compare_to": "-1m"},
+            "trendsFilter": {
+                "display": "ActionsLineGraph",
+                "showLegend": True,
+                "showValuesOnSeries": True,
+                "showLabelsOnSeries": False,
+                "showPercentStackView": False,
+                "showMultipleYAxes": True,
+                "aggregationAxisFormat": "numeric",
+                "aggregationAxisPrefix": "$",
+                "aggregationAxisPostfix": " USD",
+                "decimalPlaces": 2,
+                "minDecimalPlaces": 1,
+                "confidenceLevel": 0.95,
+                "showConfidenceIntervals": True,
+                "showMovingAverage": False,
+                "movingAverageIntervals": 7,
+                "smoothingIntervals": 3,
+                "showTrendLines": True,
+                "showAlertThresholdLines": False,
+                "yAxisScaleType": "linear",
+                "formula": "A + B",
+                "formulas": ["A", "B", "A + B"],
+                "goalLines": [{"value": 1000, "label": "Target"}],
+                "hiddenLegendIndexes": [1],
+            },
+            "properties": [
+                {"key": "$browser", "operator": "in", "type": "event", "value": ["Chrome", "Firefox", "Safari"]},
+                {"key": "email", "operator": "is_set", "type": "person", "value": None},
+            ],
+            "filterTestAccounts": True,
+            "samplingFactor": 0.1,
+            "aggregation_group_type_index": 1,
+            "dataColorTheme": 0.5,
+            "version": 2,
+        }
+
+        data = {
+            "name": "comprehensive_trends_test",
+            "description": "A comprehensive trends query with many fields populated",
+            "query": comprehensive_trends_query,
+        }
+
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        response_data = response.json()
+
+        # Verify all the key fields are preserved
+        self.assertEqual("comprehensive_trends_test", response_data["name"])
+        self.assertEqual("A comprehensive trends query with many fields populated", response_data["description"])
+        self.assertTrue(response_data["is_active"])
+
+        saved_query = response_data["query"]
+        self.assertEqual("TrendsQuery", saved_query["kind"])
+        self.assertEqual("week", saved_query["interval"])
+        self.assertEqual(2, len(saved_query["series"]))
+        self.assertEqual("$pageview", saved_query["series"][0]["event"])
+        self.assertEqual("Page Views", saved_query["series"][0]["custom_name"])
+
+        # Verify date range
+        self.assertEqual("2025-01-01", saved_query["dateRange"]["date_from"])
+        self.assertEqual("2025-01-31", saved_query["dateRange"]["date_to"])
+        self.assertTrue(saved_query["dateRange"]["explicitDate"])
+
+        self.assertEqual("$geoip_country_code", saved_query["breakdownFilter"]["breakdown"])
+        self.assertEqual("event", saved_query["breakdownFilter"]["breakdown_type"])
+        self.assertEqual(10, saved_query["breakdownFilter"]["breakdown_limit"])
+
+        self.assertTrue(saved_query["compareFilter"]["compare"])
+        self.assertEqual("-1m", saved_query["compareFilter"]["compare_to"])
+
+        trends_filter = saved_query["trendsFilter"]
+        self.assertEqual("ActionsLineGraph", trends_filter["display"])
+        self.assertTrue(trends_filter["showLegend"])
+        self.assertTrue(trends_filter["showValuesOnSeries"])
+        self.assertEqual("numeric", trends_filter["aggregationAxisFormat"])
+        self.assertEqual("$", trends_filter["aggregationAxisPrefix"])
+        self.assertEqual(" USD", trends_filter["aggregationAxisPostfix"])
+        self.assertEqual(2, trends_filter["decimalPlaces"])
+        self.assertEqual(0.95, trends_filter["confidenceLevel"])
+        self.assertEqual("A + B", trends_filter["formula"])
+        self.assertEqual(1, len(trends_filter["goalLines"]))
+        self.assertEqual(1000, trends_filter["goalLines"][0]["value"])
+
+        self.assertEqual(2, len(saved_query["properties"]))
+        self.assertEqual("$browser", saved_query["properties"][0]["key"])
+        self.assertEqual("in", saved_query["properties"][0]["operator"])
+        self.assertEqual(["Chrome", "Firefox", "Safari"], saved_query["properties"][0]["value"])
+
+        self.assertTrue(saved_query["filterTestAccounts"])
+        self.assertEqual(0.1, saved_query["samplingFactor"])
+        self.assertEqual(1, saved_query["aggregation_group_type_index"])
+
+        endpoint = Endpoint.objects.get(name="comprehensive_trends_test", team=self.team)
+        self.assertEqual(endpoint.created_by, self.user)
+        # Query is stored on the version, not the endpoint
+        version = endpoint.get_version()
+        assert version is not None
+        self.assertEqual("TrendsQuery", version.query["kind"])
+
+    def test_get_last_execution_times_empty_names(self):
+        """Test getting last execution times with empty names list."""
+        data = EndpointLastExecutionTimesRequest(names=[]).model_dump()
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/last_execution_times/", data, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+
+        self.assertIn("query_status", response_data, response_data)
+        query_status = response_data["query_status"]
+        self.assertIn("complete", query_status)
+        self.assertIn("results", query_status)
+
+        self.assertIsNone(query_status["results"], query_status)
+
+    def test_get_last_execution_times_after_endpoint_execution(self):
+        """Test getting last execution times with endpoint names after they have been executed."""
+        create_endpoint_with_version(
+            name="test_query_1",
+            team=self.team,
+            query={"kind": "HogQLQuery", "query": "SELECT 1"},
+            created_by=self.user,
+            is_active=True,
+        )
+        create_endpoint_with_version(
+            name="test_query_2",
+            team=self.team,
+            query={"kind": "HogQLQuery", "query": "SELECT 2"},
+            created_by=self.user,
+            is_active=True,
+        )
+
+        # Execute the endpoints using API key to update Postgres execution timestamps.
+        response1 = self.client.get(
+            f"/api/environments/{self.team.id}/endpoints/test_query_1/run/",
+            headers={"authorization": f"Bearer {self.api_key}"},
+        )
+        self.assertEqual(response1.status_code, status.HTTP_200_OK)
+
+        response2 = self.client.get(
+            f"/api/environments/{self.team.id}/endpoints/test_query_2/run/",
+            headers={"authorization": f"Bearer {self.api_key}"},
+        )
+        self.assertEqual(response2.status_code, status.HTTP_200_OK)
+
+        data = {"names": ["test_query_1", "test_query_2", "nonexistent_query"]}
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/last_execution_times/", data, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        response_data = response.json()
+
+        self.assertIn("query_status", response_data)
+        query_status = response_data["query_status"]
+        self.assertIn("complete", query_status)
+        self.assertIn("results", query_status)
+        self.assertIsInstance(query_status["results"], list)
+
+        results = query_status["results"]
+        self.assertEqual(len(results), 2, f"Expected 2 results, got {results}")
+
+        query_timestamps = {row[0]: row[1] for row in results if len(row) >= 2}
+
+        self.assertIn("test_query_1", query_timestamps, f"test_query_1 not found in results: {results}")
+        self.assertIn("test_query_2", query_timestamps, f"test_query_2 not found in results: {results}")
+        self.assertIsNotNone(
+            datetime.fromisoformat(query_timestamps["test_query_1"]),
+            f"Invalid timestamp format for test_query_1: {query_timestamps['test_query_1']}",
+        )
+        self.assertIsNotNone(
+            datetime.fromisoformat(query_timestamps["test_query_2"]),
+            f"Invalid timestamp format for test_query_2: {query_timestamps['test_query_2']}",
+        )
+
+        endpoint = Endpoint.objects.get(name="test_query_1", team=self.team)
+        version = EndpointVersion.objects.get(endpoint=endpoint, version=1)
+        self.assertIsNotNone(endpoint.last_executed_at)
+        self.assertIsNotNone(version.last_executed_at)
+
+    def test_last_execution_times_is_endpoint_level_only(self):
+        """last_execution_times returns endpoint-level rows only — per-version data is not exposed."""
+        endpoint = create_endpoint_with_version(
+            name="test_query_versions",
+            team=self.team,
+            query={"kind": "HogQLQuery", "query": "SELECT 1"},
+            created_by=self.user,
+            is_active=True,
+            current_version=2,
+        )
+        endpoint.last_executed_at = datetime.fromisoformat("2026-05-02T12:00:00+00:00")
+        endpoint.save(update_fields=["last_executed_at"])
+        # A per-version timestamp must not surface through this endpoint.
+        version_2 = endpoint.get_version(2)
+        assert version_2 is not None
+        version_2.last_executed_at = datetime.fromisoformat("2026-05-09T12:00:00+00:00")
+        version_2.save(update_fields=["last_executed_at"])
+
+        data = {"names": ["test_query_versions"]}
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/last_execution_times/", data, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        results = response.json()["query_status"]["results"]
+        # Endpoint-level shape [name, last_executed_at] — two elements, no version, endpoint timestamp.
+        self.assertEqual(results, [["test_query_versions", "2026-05-02T12:00:00+00:00"]])
+
+    def test_versions_endpoint_reports_per_version_last_executed_at(self):
+        """endpoint-versions reports each version's own last_executed_at, not the endpoint-level one."""
+        endpoint = create_endpoint_with_version(
+            name="v_test",
+            team=self.team,
+            query={"kind": "HogQLQuery", "query": "SELECT 1"},
+            created_by=self.user,
+            is_active=True,
+        )
+        endpoint.last_executed_at = datetime.fromisoformat("2026-05-02T12:00:00+00:00")
+        endpoint.save(update_fields=["last_executed_at"])
+        version = endpoint.get_version()
+        assert version is not None
+        version.last_executed_at = datetime.fromisoformat("2026-05-09T12:00:00+00:00")
+        version.save(update_fields=["last_executed_at"])
+
+        response = self.client.get(f"/api/environments/{self.team.id}/endpoints/v_test/versions/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        rows = response.json()["results"]
+        self.assertEqual(len(rows), 1)
+        # The version's own timestamp, not the endpoint-level one.
+        self.assertEqual(rows[0]["last_executed_at"], "2026-05-09T12:00:00+00:00")
+
+    def test_get_last_execution_times_with_nonexistent_query(self):
+        """Test getting last execution times with a nonexistent query."""
+        data = {"names": ["nonexistent_query"]}
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/last_execution_times/", data, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+
+        self.assertIn("query_status", response_data)
+        query_status = response_data["query_status"]
+        self.assertIsInstance(query_status["results"], list)
+        self.assertEqual(len(query_status["results"]), 0)
+
+    def test_get_last_execution_times_of_endpoint_not_executed(self):
+        """Test getting last execution times of a endpoint that has not been executed."""
+        create_endpoint_with_version(
+            name="test_query_1",
+            team=self.team,
+            query={"kind": "HogQLQuery", "query": "SELECT 1"},
+            created_by=self.user,
+            is_active=True,
+        )
+
+        data = {"names": ["test_query_1"]}
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/last_execution_times/", data, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+
+        self.assertIn("query_status", response_data)
+        query_status = response_data["query_status"]
+        self.assertIsInstance(query_status["results"], list)
+        self.assertEqual(len(query_status["results"]), 0, query_status)
+
+    def test_get_last_execution_times_with_personal_api_key(self):
+        """Personal API key access must be allowed — the MCP server calls this action via a personal API key."""
+        create_endpoint_with_version(
+            name="test_query_1",
+            team=self.team,
+            query={"kind": "HogQLQuery", "query": "SELECT 1"},
+            created_by=self.user,
+            is_active=True,
+        )
+
+        # Drop session auth so the request is authenticated purely by the personal API key,
+        # matching how the MCP server reaches this endpoint.
+        self.client.logout()
+
+        data = {"names": ["test_query_1"]}
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/last_execution_times/",
+            data,
+            format="json",
+            headers={"authorization": f"Bearer {self.api_key}"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+
+    @parameterized.expand(
+        [
+            ("valid_900s", 900, status.HTTP_201_CREATED, None),
+            ("valid_3600s", 3600, status.HTTP_201_CREATED, None),
+            ("valid_86400s", 86400, status.HTTP_201_CREATED, None),
+            ("valid_604800s", 604800, status.HTTP_201_CREATED, None),
+            ("invalid_off_bucket_3000s", 3000, status.HTTP_400_BAD_REQUEST, "must be one of"),
+            ("invalid_too_small_60s", 60, status.HTTP_400_BAD_REQUEST, "must be one of"),
+            ("invalid_too_large_604801s", 604801, status.HTTP_400_BAD_REQUEST, "must be one of"),
+            ("null_uses_default", None, status.HTTP_201_CREATED, None),
+        ]
+    )
+    def test_data_freshness_validation(self, name, data_freshness_seconds, expected_status, expected_error_text):
+        data = {
+            "name": f"freshness_test_{name}",
+            "query": self.sample_hogql_query,
+            "data_freshness_seconds": data_freshness_seconds,
+        }
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+        self.assertEqual(response.status_code, expected_status)
+
+        if expected_status == status.HTTP_201_CREATED:
+            expected_value = data_freshness_seconds if data_freshness_seconds is not None else 86400
+            self.assertEqual(response.json()["data_freshness_seconds"], expected_value)
+        elif expected_error_text:
+            self.assertIn(expected_error_text, str(response.json()))
+
+    @parameterized.expand(
+        [
+            (
+                "hogql_1h",
+                {"kind": "HogQLQuery", "query": "SELECT 1 as result"},
+                3600,  # 1 hour data freshness
+                50,  # Time within freshness (minutes)
+                70,  # Time past freshness (minutes)
+            ),
+            (
+                "trends_6h",
+                {
+                    "kind": "TrendsQuery",
+                    "series": [{"kind": "EventsNode", "event": "$pageview", "math": "total"}],
+                    "dateRange": {"date_from": "-7d", "date_to": None},
+                    "interval": "day",
+                },
+                21600,  # 6 hour data freshness
+                300,  # Time within freshness (minutes, 5 hours)
+                370,  # Time past freshness (minutes, ~6.2 hours)
+            ),
+        ]
+    )
+    @freeze_time("2025-01-01 12:00:00")
+    def test_custom_data_freshness_behavior(
+        self, name, query, data_freshness_seconds, time_within_freshness_min, time_past_freshness_min
+    ):
+        endpoint = create_endpoint_with_version(
+            name=f"custom_freshness_{name}",
+            team=self.team,
+            query=query,
+            created_by=self.user,
+            is_active=True,
+            data_freshness_seconds=data_freshness_seconds,
+        )
+
+        # First execution - should calculate fresh
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/{endpoint.name}/run/", {"debug": True})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+
+        self.assertIn("cache_key", response_data)
+        self.assertIn("last_refresh", response_data)
+        cache_key = response_data["cache_key"]
+
+        # Second execution immediately - should use cache
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/{endpoint.name}/run/", {"debug": True})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(response_data["cache_key"], cache_key)
+        self.assertTrue(response_data.get("is_cached", False))
+
+        # Move time forward (still within freshness window)
+        hours_within = time_within_freshness_min // 60
+        mins_within = time_within_freshness_min % 60
+        with freeze_time(f"2025-01-01 {12 + hours_within:02d}:{mins_within:02d}:00"):
+            response = self.client.get(f"/api/environments/{self.team.id}/endpoints/{endpoint.name}/run/")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            response_data = response.json()
+            self.assertTrue(
+                response_data.get("is_cached", False),
+                f"Should still use cache at {time_within_freshness_min} minutes",
+            )
+
+        # Move time forward (past freshness window) - should recalculate
+        hours_past = time_past_freshness_min // 60
+        mins_past = time_past_freshness_min % 60
+        with freeze_time(f"2025-01-01 {12 + hours_past:02d}:{mins_past:02d}:00"):
+            response = self.client.get(f"/api/environments/{self.team.id}/endpoints/{endpoint.name}/run/")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            response_data = response.json()
+            self.assertFalse(
+                response_data.get("is_cached", True),
+                f"Should recalculate after {time_past_freshness_min} minutes",
+            )
+
+    @freeze_time("2025-01-01 12:00:00")
+    def test_default_data_freshness(self):
+        endpoint = create_endpoint_with_version(
+            name="default_freshness",
+            team=self.team,
+            query={"kind": "HogQLQuery", "query": "SELECT 2 as result"},
+            created_by=self.user,
+            is_active=True,
+        )
+
+        # First execution
+        response = self.client.get(f"/api/environments/{self.team.id}/endpoints/{endpoint.name}/run/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        cache_key = response_data.get("cache_key")
+
+        # Move time forward 5 minutes - should still use cache (default is 24 hours)
+        with freeze_time("2025-01-01 12:05:00"):
+            response = self.client.get(f"/api/environments/{self.team.id}/endpoints/{endpoint.name}/run/")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            response_data = response.json()
+            self.assertTrue(response_data.get("is_cached", False), "Should use cache with default timing")
+            self.assertEqual(response_data.get("cache_key"), cache_key)
+
+    def test_update_data_freshness_seconds(self):
+        endpoint = create_endpoint_with_version(
+            name="update_freshness_test",
+            team=self.team,
+            query=self.sample_hogql_query,
+            created_by=self.user,
+            data_freshness_seconds=3600,
+        )
+
+        # Update to different data freshness
+        updated_data: dict[str, int | None] = {"data_freshness_seconds": 21600}
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/{endpoint.name}/", updated_data, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["data_freshness_seconds"], 21600)
+
+        endpoint.refresh_from_db()
+        version = endpoint.get_version()
+        self.assertIsNotNone(version)
+        self.assertEqual(version.data_freshness_seconds, 21600)
+
+    def test_create_endpoint_with_insight_reference(self):
+        """Test creating an endpoint with a reference to the insight it was created from."""
+        data = {
+            "name": "test_with_insight",
+            "description": "Endpoint created from insight",
+            "query": self.sample_hogql_query,
+            "derived_from_insight": "abc123xyz",
+        }
+
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", data, format="json")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        response_data = response.json()
+
+        self.assertEqual("test_with_insight", response_data["name"])
+        self.assertEqual("abc123xyz", response_data["derived_from_insight"])
+        endpoint = Endpoint.objects.get(name="test_with_insight", team=self.team)
+        self.assertEqual(endpoint.derived_from_insight, "abc123xyz")
+
+
+class TestEndpointTags(ClickhouseTestMixin, APIBaseTest):
+    """Cover the Tag mixin wired into the Endpoints viewset."""
+
+    ENDPOINT = "endpoints"
+
+    def setUp(self):
+        super().setUp()
+        self.sample_hogql_query = {
+            "kind": "HogQLQuery",
+            "query": "SELECT 1",
+        }
+
+    def _create(self, name: str, **extra: Any) -> dict:
+        payload: dict[str, Any] = {"name": name, "query": self.sample_hogql_query}
+        payload.update(extra)
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", payload, format="json")
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        return response.json()
+
+    def test_create_with_tags(self):
+        from posthog.models import Tag
+
+        response_data = self._create("ep_create_tags", tags=["alpha", "beta"])
+
+        self.assertEqual(sorted(response_data["tags"]), ["alpha", "beta"])
+        self.assertEqual(Tag.objects.filter(team_id=self.team.id).count(), 2)
+
+    def test_create_without_tags_returns_empty_list(self):
+        response_data = self._create("ep_no_tags")
+        self.assertEqual(response_data["tags"], [])
+
+    def test_patch_replaces_tags(self):
+        self._create("ep_patch", tags=["alpha", "beta"])
+
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/ep_patch/",
+            {"tags": ["gamma"]},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["tags"], ["gamma"])
+
+    def test_patch_with_empty_list_clears_tags(self):
+        from posthog.models import Tag
+
+        self._create("ep_clear", tags=["alpha"])
+        self.assertEqual(Tag.objects.filter(team_id=self.team.id, name="alpha").count(), 1)
+
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/ep_clear/",
+            {"tags": []},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["tags"], [])
+        # Orphaned tag is cleaned up
+        self.assertEqual(Tag.objects.filter(team_id=self.team.id, name="alpha").count(), 0)
+
+    def test_patch_without_tags_field_keeps_tags(self):
+        self._create("ep_keep", tags=["alpha"])
+
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/ep_keep/",
+            {"description": "updated"},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["tags"], ["alpha"])
+
+    def test_retrieve_returns_tags(self):
+        self._create("ep_get", tags=["alpha"])
+
+        response = self.client.get(f"/api/environments/{self.team.id}/endpoints/ep_get/")
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(response.json()["tags"], ["alpha"])
+
+    def test_list_returns_tags(self):
+        self._create("ep_list_1", tags=["alpha"])
+        self._create("ep_list_2", tags=["beta", "gamma"])
+
+        response = self.client.get(f"/api/environments/{self.team.id}/endpoints/")
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        results = {r["name"]: sorted(r["tags"]) for r in response.json()["results"]}
+        self.assertEqual(results["ep_list_1"], ["alpha"])
+        self.assertEqual(results["ep_list_2"], ["beta", "gamma"])
+
+    def test_tags_not_a_list_returns_400(self):
+        # Pydantic validates the shape via EndpointRequest.tags: list[str] | None
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/",
+            {"name": "ep_bad", "query": self.sample_hogql_query, "tags": "not-a-list"},
+            format="json",
+        )
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+
+    def test_tags_are_scoped_per_team(self):
+        from posthog.models import Tag
+
+        other_team = Team.objects.create(organization=self.organization, name="other team")
+        Tag.objects.create(name="alpha", team_id=other_team.id)
+
+        self._create("ep_scope", tags=["alpha"])
+
+        team_tags = Tag.objects.filter(name="alpha")
+        self.assertEqual(team_tags.count(), 2)
+        self.assertEqual(set(team_tags.values_list("team_id", flat=True)), {self.team.id, other_team.id})
+
+
+class TestMaterializationPreview(ClickhouseTestMixin, APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.var_id_1 = "00000000-0000-0000-0000-000000000001"
+        self.var_id_2 = "00000000-0000-0000-0000-000000000002"
+        self.variable_query = {
+            "kind": "HogQLQuery",
+            "query": "SELECT count() FROM events WHERE timestamp >= {variables.start_ts} AND timestamp < {variables.end_ts}",
+            "variables": {
+                self.var_id_1: {"variableId": self.var_id_1, "code_name": "start_ts", "value": "2024-01-01"},
+                self.var_id_2: {"variableId": self.var_id_2, "code_name": "end_ts", "value": "2024-02-01"},
+            },
+        }
+
+    def _create_endpoint_with_variables(self, name="range-endpoint"):
+        from products.product_analytics.backend.models.insight_variable import InsightVariable
+
+        InsightVariable.objects.create(
+            team=self.team, id="00000000-0000-0000-0000-000000000001", code_name="start_ts", type="String"
+        )
+        InsightVariable.objects.create(
+            team=self.team, id="00000000-0000-0000-0000-000000000002", code_name="end_ts", type="String"
+        )
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/",
+            {"name": name, "query": self.variable_query},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        return response.json()
+
+    def test_preview_returns_transform(self):
+        self._create_endpoint_with_variables()
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/range-endpoint/materialization_preview/",
+            {},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+
+        assert data["can_materialize"] is True
+        assert data["reason"] is None
+        assert data["transformed_query"] is not None
+        assert "toStartOfDay" in data["transformed_query"]
+        assert len(data["range_pairs"]) == 1
+        assert data["range_pairs"][0]["column"] == "timestamp"
+        assert set(data["range_pairs"][0]["variables"]) == {"start_ts", "end_ts"}
+
+        # The endpoint isn't materialized yet, so its backing table doesn't exist in the database.
+        # The execution-query preview must still be produced (printed without type resolution)
+        # rather than failing with "Unknown table".
+        assert data["execution_query"] is not None
+        assert data["display_execution_query"] is not None
+
+    def test_preview_with_bucket_override(self):
+        self._create_endpoint_with_variables()
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/range-endpoint/materialization_preview/",
+            {"bucket_overrides": {"timestamp": "hour"}},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+
+        assert data["can_materialize"] is True
+        assert "toStartOfHour" in data["transformed_query"]
+        assert "toStartOfDay" not in data["transformed_query"]
+        assert data["range_pairs"][0]["bucket_fn"] == "toStartOfHour"
+
+    def test_preview_non_materializable_query(self):
+        create_endpoint_with_version(
+            name="simple-endpoint",
+            team=self.team,
+            query={"kind": "HogQLQuery", "query": "SELECT 1"},
+            created_by=self.user,
+        )
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/simple-endpoint/materialization_preview/",
+            {},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+
+        # No variables, but query is materializable
+        assert data["can_materialize"] is True
+        assert data["transformed_query"] is not None
+
+    def test_create_does_not_auto_materialize(self):
+        endpoint_data = self._create_endpoint_with_variables("no-auto-mat")
+
+        # Should NOT be materialized
+        assert endpoint_data["is_materialized"] is False
+        assert endpoint_data.get("materialization", {}).get("status") is None
+
+    def test_bucket_overrides_stored_on_version(self):
+        from products.product_analytics.backend.models.insight_variable import InsightVariable
+
+        InsightVariable.objects.create(
+            team=self.team, id="00000000-0000-0000-0000-000000000001", code_name="start_ts", type="String"
+        )
+        InsightVariable.objects.create(
+            team=self.team, id="00000000-0000-0000-0000-000000000002", code_name="end_ts", type="String"
+        )
+
+        self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/",
+            {"name": "bucket-test", "query": self.variable_query},
+            format="json",
+        )
+
+        # Enable materialization with bucket overrides
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/bucket-test/",
+            {"is_materialized": True, "bucket_overrides": {"timestamp": "hour"}},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        data = response.json()
+        assert data["bucket_overrides"] == {"timestamp": "hour"}
+
+        # Verify persisted
+        from products.endpoints.backend.models import EndpointVersion
+
+        version = EndpointVersion.objects.get(endpoint__name="bucket-test", endpoint__team=self.team, version=1)
+        assert version.bucket_overrides == {"timestamp": "hour"}
+
+    def test_invalid_bucket_override_returns_400(self):
+        self._create_endpoint_with_variables("invalid-bucket")
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/invalid-bucket/materialization_preview/",
+            {"bucket_overrides": {"timestamp": "invalid_fn"}},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_reenable_materialization_without_bucket_overrides_clears_old_value(self):
+        from products.endpoints.backend.models import EndpointVersion
+
+        self._create_endpoint_with_variables("clear-bucket")
+
+        # Enable materialization with bucket overrides
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/clear-bucket/",
+            {"is_materialized": True, "bucket_overrides": {"timestamp": "hour"}},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        version = EndpointVersion.objects.get(endpoint__name="clear-bucket", endpoint__team=self.team, version=1)
+        assert version.bucket_overrides == {"timestamp": "hour"}
+
+        # Disabling reverts the saved query, whose schedule teardown talks to Temporal —
+        # mock the facade call so the test doesn't require a running Temporal dev server.
+        with mock.patch("products.data_warehouse.backend.facade.api.delete_saved_query_schedule"):
+            response = self.client.patch(
+                f"/api/environments/{self.team.id}/endpoints/clear-bucket/",
+                {"is_materialized": False},
+                format="json",
+            )
+        assert response.status_code == status.HTTP_200_OK, response.json()
+
+        # Re-enable without bucket_overrides
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/clear-bucket/",
+            {"is_materialized": True},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        version.refresh_from_db()
+        assert version.bucket_overrides is None
+
+    def test_bucket_overrides_preserved_on_query_change_version_migration(self):
+        from products.endpoints.backend.models import EndpointVersion
+
+        self._create_endpoint_with_variables("migrate-bucket")
+
+        # Enable materialization with bucket overrides
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/migrate-bucket/",
+            {"is_materialized": True, "bucket_overrides": {"timestamp": "hour"}},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK
+        version_v1 = EndpointVersion.objects.get(endpoint__name="migrate-bucket", endpoint__team=self.team, version=1)
+        assert version_v1.bucket_overrides == {"timestamp": "hour"}
+
+        # PATCH with a new query (same timestamp range pattern, different SELECT)
+        new_query = {
+            **self.variable_query,
+            "query": "SELECT event, count() FROM events WHERE timestamp >= {variables.start_ts} AND timestamp < {variables.end_ts} GROUP BY event",
+        }
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/migrate-bucket/",
+            {"query": new_query},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+
+        # New version should have been created
+        assert data["current_version"] == 2
+
+        # bucket_overrides should carry forward to v2
+        version_v2 = EndpointVersion.objects.get(endpoint__name="migrate-bucket", endpoint__team=self.team, version=2)
+        assert version_v2.bucket_overrides == {"timestamp": "hour"}
+
+    def test_bucket_overrides_change_triggers_immediate_refresh(self):
+        from unittest import mock
+
+        from products.endpoints.backend.models import EndpointVersion
+
+        self._create_endpoint_with_variables("trigger-bucket")
+
+        # Enable materialization with initial bucket overrides
+        self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/trigger-bucket/",
+            {"is_materialized": True, "bucket_overrides": {"timestamp": "week"}},
+            format="json",
+        )
+        version = EndpointVersion.objects.get(endpoint__name="trigger-bucket", endpoint__team=self.team, version=1)
+        assert version.bucket_overrides == {"timestamp": "week"}
+
+        # Change bucket_overrides — should trigger an immediate refresh
+        with mock.patch("products.endpoints.backend.logic.crud.trigger_saved_query_schedule") as mock_trigger:
+            response = self.client.patch(
+                f"/api/environments/{self.team.id}/endpoints/trigger-bucket/",
+                {"bucket_overrides": {"timestamp": "hour"}},
+                format="json",
+            )
+            assert response.status_code == status.HTTP_200_OK, response.json()
+            version = EndpointVersion.objects.get(endpoint__name="trigger-bucket", endpoint__team=self.team, version=1)
+            assert version.bucket_overrides == {"timestamp": "hour"}
+            mock_trigger.assert_called_once()
+
+    def test_bucket_overrides_unchanged_does_not_trigger_refresh(self):
+        from unittest import mock
+
+        self._create_endpoint_with_variables("no-trigger-bucket")
+
+        # Enable materialization with bucket overrides
+        self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/no-trigger-bucket/",
+            {"is_materialized": True, "bucket_overrides": {"timestamp": "hour"}},
+            format="json",
+        )
+
+        # PATCH with same bucket_overrides — should NOT trigger refresh
+        with mock.patch(
+            "products.data_warehouse.backend.logic.data_load.saved_query_service.trigger_saved_query_schedule"
+        ) as mock_trigger:
+            response = self.client.patch(
+                f"/api/environments/{self.team.id}/endpoints/no-trigger-bucket/",
+                {"bucket_overrides": {"timestamp": "hour"}},
+                format="json",
+            )
+            assert response.status_code == status.HTTP_200_OK, response.json()
+            mock_trigger.assert_not_called()
+
+
+class TestExtractColumns(ClickhouseTestMixin, APIBaseTest):
+    @parameterized.expand(
+        [
+            (
+                "simple_select_with_alias",
+                {"kind": "HogQLQuery", "query": "SELECT event AS ev FROM events"},
+                [{"name": "ev", "type": "string"}],
+            ),
+            (
+                "multiple_columns",
+                {"kind": "HogQLQuery", "query": "SELECT event, distinct_id, timestamp FROM events"},
+                [
+                    {"name": "event", "type": "string"},
+                    {"name": "distinct_id", "type": "string"},
+                    {"name": "timestamp", "type": "datetime"},
+                ],
+            ),
+            (
+                "non_hogql_query",
+                {"kind": "TrendsQuery", "series": [{"kind": "EventsNode"}]},
+                [],
+            ),
+            (
+                "empty_query",
+                {"kind": "HogQLQuery", "query": ""},
+                [],
+            ),
+            (
+                "literal_expressions",
+                {"kind": "HogQLQuery", "query": "SELECT 100 AS total, 'hello' AS greeting"},
+                [
+                    {"name": "total", "type": "integer"},
+                    {"name": "greeting", "type": "string"},
+                ],
+            ),
+            (
+                "aggregate_functions",
+                {"kind": "HogQLQuery", "query": "SELECT count() AS cnt, min(timestamp) AS first_seen FROM events"},
+                [
+                    {"name": "cnt", "type": "integer"},
+                    {"name": "first_seen", "type": "datetime"},
+                ],
+            ),
+            (
+                "nullable_result",
+                {"kind": "HogQLQuery", "query": "SELECT nullIf(event, '') AS maybe_event FROM events"},
+                [{"name": "maybe_event", "type": "string"}],
+            ),
+            (
+                "query_with_variable_placeholders",
+                {
+                    "kind": "HogQLQuery",
+                    "query": "SELECT event, count() AS cnt FROM events WHERE event = {variables.event_name} GROUP BY event",
+                },
+                [
+                    {"name": "event", "type": "string"},
+                    {"name": "cnt", "type": "integer"},
+                ],
+            ),
+        ]
+    )
+    def test_extract_columns(self, _name: str, query: dict, expected: list[dict]):
+        from products.endpoints.backend.models import EndpointVersion
+
+        result = EndpointVersion.extract_columns(query, team_id=self.team.pk)
+        self.assertEqual(result, expected)
+
+
+class TestClickhouseTypeMapping(TestCase):
+    @parameterized.expand(
+        [
+            ("String", "string"),
+            ("UInt64", "integer"),
+            ("Int32", "integer"),
+            ("Float64", "float"),
+            ("DateTime64(6, 'UTC')", "datetime"),
+            ("Date", "date"),
+            ("Date32", "date"),
+            ("Bool", "boolean"),
+            ("Decimal(18, 4)", "decimal"),
+            ("UUID", "string"),
+            ("Enum8('a' = 1, 'b' = 2)", "string"),
+            ("FixedString(16)", "string"),
+            ("Array(String)", "array"),
+            ("Tuple(String, Int32)", "json"),
+            ("Map(String, String)", "json"),
+            ("Nullable(String)", "string"),
+            ("LowCardinality(String)", "string"),
+            ("LowCardinality(Nullable(String))", "string"),
+            ("Nullable(LowCardinality(String))", "string"),
+            ("SimpleAggregateFunction(max, DateTime64(6, 'UTC'))", "datetime"),
+            ("SimpleAggregateFunction(any, String)", "string"),
+            ("AggregateFunction(count, UInt64)", "integer"),
+            ("SomeFutureType", "unknown"),
+        ]
+    )
+    def test_clickhouse_type_to_serialized_type(self, ch_type: str, expected: str):
+        from products.endpoints.backend.models import _clickhouse_type_to_serialized_type
+
+        self.assertEqual(_clickhouse_type_to_serialized_type(ch_type), expected)
+
+
+class TestOptionalBreakdownProperties(ClickhouseTestMixin, APIBaseTest):
+    """PR 1: pure additive plumbing — round-trip, inheritance, validation. No runtime semantics yet."""
+
+    ENDPOINT = "endpoints"
+
+    def setUp(self):
+        super().setUp()
+        self.trends_with_breakdown = {
+            "kind": "TrendsQuery",
+            "series": [{"kind": "EventsNode"}],
+            "breakdownFilter": {
+                "breakdowns": [
+                    {"property": "$browser", "type": "event"},
+                    {"property": "$os", "type": "event"},
+                ],
+            },
+        }
+
+    def _create(self, name: str, query: dict, **extra: Any) -> dict:
+        payload: dict[str, Any] = {"name": name, "query": query, **extra}
+        response = self.client.post(f"/api/environments/{self.team.id}/endpoints/", payload, format="json")
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        return response.json()
+
+    def test_defaults_to_empty_list_on_create(self):
+        data = self._create("ep_default", self.trends_with_breakdown)
+        self.assertEqual(data["optional_breakdown_properties"], [])
+
+        endpoint = Endpoint.objects.get(name="ep_default", team=self.team)
+        self.assertEqual(endpoint.get_version().optional_breakdown_properties, [])
+
+    def test_round_trip_on_create(self):
+        data = self._create(
+            "ep_optional",
+            self.trends_with_breakdown,
+            optional_breakdown_properties=["$browser"],
+        )
+        self.assertEqual(data["optional_breakdown_properties"], ["$browser"])
+
+        endpoint = Endpoint.objects.get(name="ep_optional", team=self.team)
+        self.assertEqual(endpoint.get_version().optional_breakdown_properties, ["$browser"])
+
+    def test_accepts_names_from_legacy_list_breakdown(self):
+        legacy_list_query = {
+            "kind": "TrendsQuery",
+            "series": [{"kind": "EventsNode"}],
+            "breakdownFilter": {"breakdown": ["$browser", "$os"], "breakdown_type": "event"},
+        }
+        data = self._create(
+            "ep_legacy_list",
+            legacy_list_query,
+            optional_breakdown_properties=["$os"],
+        )
+        self.assertEqual(data["optional_breakdown_properties"], ["$os"])
+
+    def test_round_trip_on_patch(self):
+        self._create("ep_patch", self.trends_with_breakdown)
+
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/ep_patch/",
+            {"optional_breakdown_properties": ["$os"]},
+            format="json",
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["optional_breakdown_properties"], ["$os"])
+
+        endpoint = Endpoint.objects.get(name="ep_patch", team=self.team)
+        self.assertEqual(endpoint.get_version().optional_breakdown_properties, ["$os"])
+
+    def test_version_targeted_patch_validates_against_targeted_version(self):
+        browser_query = {
+            "kind": "TrendsQuery",
+            "series": [{"kind": "EventsNode"}],
+            "breakdownFilter": {"breakdowns": [{"property": "$browser", "type": "event"}]},
+        }
+        os_query = {
+            "kind": "TrendsQuery",
+            "series": [{"kind": "EventsNode"}],
+            "breakdownFilter": {"breakdowns": [{"property": "$os", "type": "event"}]},
+        }
+        self._create("ep_target_version", browser_query)
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/ep_target_version/",
+            {"query": os_query},
+            format="json",
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+
+        # $browser is valid for targeted v1 even though the current (v2) query dropped it.
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/ep_target_version/?version=1",
+            {"optional_breakdown_properties": ["$browser"]},
+            format="json",
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        endpoint = Endpoint.objects.get(name="ep_target_version", team=self.team)
+        self.assertEqual(endpoint.get_version(1).optional_breakdown_properties, ["$browser"])
+
+        # $os is valid for the current version but not for targeted v1.
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/ep_target_version/?version=1",
+            {"optional_breakdown_properties": ["$os"]},
+            format="json",
+        )
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+
+    def test_patch_can_clear(self):
+        self._create(
+            "ep_clear",
+            self.trends_with_breakdown,
+            optional_breakdown_properties=["$browser"],
+        )
+
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/ep_clear/",
+            {"optional_breakdown_properties": []},
+            format="json",
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["optional_breakdown_properties"], [])
+
+    def test_patch_without_field_keeps_value(self):
+        self._create(
+            "ep_keep",
+            self.trends_with_breakdown,
+            optional_breakdown_properties=["$browser"],
+        )
+
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/ep_keep/",
+            {"description": "updated"},
+            format="json",
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["optional_breakdown_properties"], ["$browser"])
+
+    def test_rejects_unknown_property_name(self):
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/",
+            {
+                "name": "ep_bad_prop",
+                "query": self.trends_with_breakdown,
+                "optional_breakdown_properties": ["$does_not_exist"],
+            },
+            format="json",
+        )
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        self.assertEqual(response.json().get("attr"), "optional_breakdown_properties")
+
+    def test_rejects_for_hogql_query(self):
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/",
+            {
+                "name": "ep_hogql",
+                "query": {"kind": "HogQLQuery", "query": "SELECT 1"},
+                "optional_breakdown_properties": ["$browser"],
+            },
+            format="json",
+        )
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        self.assertEqual(response.json().get("attr"), "optional_breakdown_properties")
+
+    def test_rejects_for_query_kind_without_breakdown_support(self):
+        # LifecycleQuery has no breakdown support
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/endpoints/",
+            {
+                "name": "ep_lifecycle",
+                "query": {"kind": "LifecycleQuery", "series": [{"kind": "EventsNode"}]},
+                "optional_breakdown_properties": ["$browser"],
+            },
+            format="json",
+        )
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        self.assertEqual(response.json().get("attr"), "optional_breakdown_properties")
+
+    def test_inheritance_on_query_change_prunes_to_existing_breakdowns(self):
+        self._create(
+            "ep_inherit",
+            self.trends_with_breakdown,
+            optional_breakdown_properties=["$browser", "$os"],
+        )
+
+        # New query drops $os from the breakdown list
+        new_query = {
+            "kind": "TrendsQuery",
+            "series": [{"kind": "EventsNode"}],
+            "breakdownFilter": {"breakdowns": [{"property": "$browser", "type": "event"}]},
+        }
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/ep_inherit/",
+            {"query": new_query},
+            format="json",
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+
+        endpoint = Endpoint.objects.get(name="ep_inherit", team=self.team)
+        self.assertEqual(endpoint.current_version, 2)
+        v2 = endpoint.get_version(2)
+        # $os was pruned because it isn't in the new query's breakdownFilter
+        self.assertEqual(v2.optional_breakdown_properties, ["$browser"])
+
+    def test_inheritance_drops_to_empty_when_no_breakdowns_in_new_query(self):
+        self._create(
+            "ep_inherit_drop",
+            self.trends_with_breakdown,
+            optional_breakdown_properties=["$browser"],
+        )
+
+        # New query has no breakdownFilter at all
+        new_query = {"kind": "TrendsQuery", "series": [{"kind": "EventsNode"}]}
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/ep_inherit_drop/",
+            {"query": new_query},
+            format="json",
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+
+        v2 = Endpoint.objects.get(name="ep_inherit_drop", team=self.team).get_version(2)
+        self.assertEqual(v2.optional_breakdown_properties, [])
+
+    def test_version_detail_includes_optional_breakdown_properties(self):
+        """`_serialize` is shared between the endpoint and version-detail paths — make sure the
+        field surfaces on GET /endpoints/{name}/?version=N too, not just /endpoints/{name}/."""
+        self._create(
+            "ep_version_detail",
+            self.trends_with_breakdown,
+            optional_breakdown_properties=["$browser"],
+        )
+
+        response = self.client.get(
+            f"/api/environments/{self.team.id}/endpoints/ep_version_detail/?version=1",
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        body = response.json()
+        self.assertEqual(body["version"], 1)
+        self.assertEqual(body["optional_breakdown_properties"], ["$browser"])
+
+    def test_explicit_list_overrides_pruned_inheritance_on_query_change(self):
+        """When PATCH carries both a new query AND an explicit optional_breakdown_properties,
+        the explicit value wins — it doesn't get clobbered by the inheritance pruning that
+        runs as part of create_new_version()."""
+        self._create(
+            "ep_explicit_override",
+            self.trends_with_breakdown,
+            optional_breakdown_properties=["$browser", "$os"],
+        )
+
+        # New query keeps both breakdowns but bumps breakdown_limit so has_query_changed() trips
+        # and create_new_version() actually runs (the path whose pruning we're testing against).
+        new_query = {
+            "kind": "TrendsQuery",
+            "series": [{"kind": "EventsNode"}],
+            "breakdownFilter": {
+                "breakdowns": [
+                    {"property": "$browser", "type": "event"},
+                    {"property": "$os", "type": "event"},
+                ],
+                "breakdown_limit": 10,
+            },
+        }
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/endpoints/ep_explicit_override/",
+            {"query": new_query, "optional_breakdown_properties": ["$os"]},
+            format="json",
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+
+        endpoint = Endpoint.objects.get(name="ep_explicit_override", team=self.team)
+        self.assertEqual(endpoint.current_version, 2)
+        v2 = endpoint.get_version(2)
+        # Explicit list wins — NOT the inherited ["$browser", "$os"].
+        self.assertEqual(v2.optional_breakdown_properties, ["$os"])

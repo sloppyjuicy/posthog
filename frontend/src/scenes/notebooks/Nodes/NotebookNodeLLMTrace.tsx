@@ -1,0 +1,184 @@
+import { BindLogic, useActions, useValues } from 'kea'
+
+import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { useOnMountEffect } from 'lib/hooks/useOnMountEffect'
+import { useAttachedLogic } from 'lib/logic/scenes/useAttachedLogic'
+
+import { groupsModel } from '~/models/groupsModel'
+import { dataNodeLogic } from '~/queries/nodes/DataNode/dataNodeLogic'
+import { DateRange } from '~/queries/nodes/DataNode/DateRange'
+import { Reload } from '~/queries/nodes/DataNode/Reload'
+import { DataTableExport } from '~/queries/nodes/DataTable/DataTableExport'
+import { dataTableLogic } from '~/queries/nodes/DataTable/dataTableLogic'
+import { DataTableSavedFilters } from '~/queries/nodes/DataTable/DataTableSavedFilters'
+import { DataTableSavedFiltersButton } from '~/queries/nodes/DataTable/DataTableSavedFiltersButton'
+import { EventPropertyFilters } from '~/queries/nodes/EventsNode/EventPropertyFilters'
+import { Query } from '~/queries/Query/Query'
+import { TracesQuery } from '~/queries/schema/schema-general'
+import { isTracesQuery } from '~/queries/utils'
+
+import { AIObservabilitySetupPrompt } from 'products/ai_observability/frontend/AIObservabilitySetupPrompt'
+import { aiObservabilitySharedLogic } from 'products/ai_observability/frontend/aiObservabilitySharedLogic'
+import { useTracesQueryContext } from 'products/ai_observability/frontend/AIObservabilityTracesScene'
+import { aiObservabilityTracesTabLogic } from 'products/ai_observability/frontend/tabs/aiObservabilityTracesTabLogic'
+import { CUSTOMER_ANALYTICS_DEFAULT_QUERY_TAGS } from 'products/customer_analytics/frontend/constants'
+
+import { NotebookNodeAttributeProperties, NotebookNodeProps, NotebookNodeType } from '../types'
+import { getCustomerProfileRemoveMenuItem } from './customerProfileNotebookNodeMenu'
+import { createPostHogWidgetNode } from './NodeWrapper'
+import { notebookNodeLogic } from './notebookNodeLogic'
+import { getLogicKey } from './utils'
+
+const Component = ({ attributes }: NotebookNodeProps<NotebookNodeLLMTraceAttributes>): JSX.Element | null => {
+    const { expanded, notebookLogic } = useValues(notebookNodeLogic)
+    const { setMenuItems } = useActions(notebookNodeLogic)
+    const { groupKey, groupTypeIndex, personId, tabId } = attributes
+    const group = groupKey && groupTypeIndex !== undefined ? { groupKey, groupTypeIndex } : undefined
+    const logicKey = getLogicKey({ groupKey, personId, tabId })
+
+    const sharedLogic = aiObservabilitySharedLogic({ logicKey, personId, group })
+    const tracesLogic = aiObservabilityTracesTabLogic({ personId, group })
+    const { setDates, setShouldFilterTestAccounts, setPropertyFilters } = useActions(sharedLogic)
+    const { setTracesQuery } = useActions(tracesLogic)
+    const { tracesQuery } = useValues(tracesLogic)
+    const context = useTracesQueryContext()
+    useAttachedLogic(sharedLogic, notebookLogic)
+    useAttachedLogic(tracesLogic, notebookLogic)
+
+    useOnMountEffect(() => {
+        const removeMenuItem = getCustomerProfileRemoveMenuItem(NotebookNodeType.LLMTrace)
+        if (removeMenuItem) {
+            setMenuItems([removeMenuItem])
+        }
+    })
+
+    if (!expanded) {
+        return null
+    }
+
+    return (
+        <BindLogic logic={dataNodeLogic} props={{ key: logicKey }}>
+            <AIObservabilitySetupPrompt className="border-none" thing="trace">
+                <Query
+                    uniqueKey={logicKey}
+                    attachTo={notebookLogic}
+                    query={{
+                        ...tracesQuery,
+                        source: {
+                            ...tracesQuery.source,
+                            tags: CUSTOMER_ANALYTICS_DEFAULT_QUERY_TAGS,
+                        },
+                        embedded: true,
+                        showTestAccountFilters: false,
+                        showReload: false,
+                        showExport: false,
+                        showDateRange: false,
+                        showPropertyFilter: false,
+                        showTimings: false,
+                    }}
+                    context={context}
+                    setQuery={(query) => {
+                        if (!isTracesQuery(query.source)) {
+                            throw new Error('Invalid query')
+                        }
+                        setDates(query.source.dateRange?.date_from || null, query.source.dateRange?.date_to || null)
+                        setShouldFilterTestAccounts(query.source.filterTestAccounts || false)
+                        setPropertyFilters(query.source.properties || [])
+                        setTracesQuery(query)
+                    }}
+                />
+            </AIObservabilitySetupPrompt>
+        </BindLogic>
+    )
+}
+
+const Settings = ({ attributes }: NotebookNodeAttributeProperties<NotebookNodeLLMTraceAttributes>): JSX.Element => {
+    const { personId, groupKey, groupTypeIndex, nodeId } = attributes
+    const group = groupKey && groupTypeIndex !== undefined ? { groupKey, groupTypeIndex } : undefined
+    const sharedLogic = aiObservabilitySharedLogic({ logicKey: nodeId, personId, group })
+    const tracesLogic = aiObservabilityTracesTabLogic({ personId, group })
+    const { setDates, setPropertyFilters } = useActions(sharedLogic)
+    const { setTracesQuery } = useActions(tracesLogic)
+    const { tracesQuery } = useValues(tracesLogic)
+    const { groupsTaxonomicTypes } = useValues(groupsModel)
+
+    return (
+        <div className="p-2 space-y-2 mb-2">
+            <BindLogic
+                logic={dataTableLogic}
+                props={{ vizKey: nodeId, dataKey: nodeId, query: tracesQuery, dataNodeLogicKey: nodeId }}
+            >
+                <BindLogic logic={dataNodeLogic} props={{ key: nodeId, query: tracesQuery.source }}>
+                    <div className="flex gap-2 justify-between">
+                        <DateRange
+                            key="date-range"
+                            query={tracesQuery.source as TracesQuery}
+                            setQuery={(query) => {
+                                if (!isTracesQuery(query)) {
+                                    throw new Error('Invalid query')
+                                }
+                                setDates(query.dateRange?.date_from || null, query.dateRange?.date_to || null)
+                            }}
+                        />
+                        <EventPropertyFilters
+                            key="event-property"
+                            query={tracesQuery.source as TracesQuery}
+                            setQuery={(query) => {
+                                if (!isTracesQuery(query)) {
+                                    throw new Error('Invalid query')
+                                }
+                                setPropertyFilters(query.properties || [])
+                            }}
+                            taxonomicGroupTypes={[
+                                TaxonomicFilterGroupType.EventProperties,
+                                TaxonomicFilterGroupType.PersonProperties,
+                                ...groupsTaxonomicTypes,
+                                TaxonomicFilterGroupType.Cohorts,
+                                TaxonomicFilterGroupType.HogQLExpression,
+                            ]}
+                        />
+                        <DataTableSavedFiltersButton
+                            key="saved-filters-button"
+                            uniqueKey={nodeId}
+                            query={tracesQuery}
+                            setQuery={setTracesQuery}
+                        />
+                    </div>
+                    <DataTableSavedFilters uniqueKey={nodeId} query={tracesQuery} setQuery={setTracesQuery} />
+                    <div className="flex justify-between">
+                        <Reload key="reload" />
+                        <DataTableExport
+                            key="data-table-export"
+                            query={tracesQuery}
+                            setQuery={setTracesQuery}
+                            fileNameForExport={`${personId ?? groupKey}-llm-traces-export`}
+                        />
+                    </div>
+                </BindLogic>
+            </BindLogic>
+        </div>
+    )
+}
+
+type NotebookNodeLLMTraceAttributes = {
+    personId?: string
+    groupKey?: string
+    groupTypeIndex?: number
+    tabId: string
+}
+
+export const NotebookNodeLLMTrace = createPostHogWidgetNode<NotebookNodeLLMTraceAttributes>({
+    nodeType: NotebookNodeType.LLMTrace,
+    titlePlaceholder: 'Traces',
+    Component,
+    Settings,
+    resizeable: false,
+    expandable: true,
+    startExpanded: true,
+    attributes: {
+        personId: {},
+        groupKey: {},
+        groupTypeIndex: {},
+        tabId: {},
+    },
+})

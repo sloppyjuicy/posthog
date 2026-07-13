@@ -1,0 +1,113 @@
+from functools import cache
+from typing import Optional, cast
+
+from django.conf import settings
+
+from psycopg.conninfo import conninfo_to_dict
+
+from posthog.hogql.base import Expr
+from posthog.hogql.context import HogQLContext
+from posthog.hogql.database.models import FunctionCallTable
+from posthog.hogql.escape_sql import escape_hogql_identifier
+
+from posthog.person_db_router import PERSONS_DB_MODELS
+from posthog.persons_db import persons_db_url
+from posthog.scopes import APIScopeObject
+
+
+@cache
+def _pk_column_for_pg_table(postgres_table_name: str) -> Optional[str]:
+    """Look up the primary key column from the actual DB schema. Cached per process.
+    Returns None for tables with composite primary key."""
+    from django.db import connection
+
+    with connection.cursor() as cursor:
+        return connection.introspection.get_primary_key_column(cursor, postgres_table_name)
+
+
+def build_function_call(postgres_table_name: str, context: Optional[HogQLContext] = None):
+    raw_params: dict[str, str] = {}
+
+    def add_param(value: str, is_sensitive: bool = True) -> str:
+        if context is not None:
+            if is_sensitive:
+                return context.add_sensitive_value(value)
+            return context.add_value(value)
+
+        param_name = f"value_{len(raw_params.items())}"
+        raw_params[param_name] = value
+        return f"%({param_name})s"
+
+    table = add_param(postgres_table_name)
+
+    if settings.DEBUG or settings.TEST:
+        address = add_param("db:5432")  # docker container for postgres from clickhouse
+
+        # Extract model name from postgres table name (e.g., "posthog_group" -> "group")
+        model_name = postgres_table_name.replace("posthog_", "")
+        if model_name in PERSONS_DB_MODELS:
+            # The persons DB is not a Django-managed connection. Source its credentials from the
+            # off-ORM URL (posthog/persons_db.py), which conftest points at the test-prefixed
+            # persons DB under tests — mirroring the test DB name Django would have resolved.
+            # Index directly (not .get with a default): a missing critical field should raise a
+            # clear KeyError here rather than pass blank credentials that surface as an opaque
+            # ClickHouse connection error at query time.
+            conninfo = cast(dict[str, str], conninfo_to_dict(persons_db_url(writer=True)))
+            db = add_param(conninfo["dbname"])
+            user = add_param(conninfo["user"])
+            password = add_param(conninfo["password"])
+        else:
+            from django.db import connections
+
+            database = settings.DATABASES["default"]
+            # during tests, django uses test-prefixed db name rather than the configured NAME
+            actual_db_name = connections["default"].settings_dict["NAME"]
+            db = add_param(actual_db_name)
+            user = add_param(database["USER"])
+            password = add_param(database["PASSWORD"])
+    else:
+        host_var = settings.CLICKHOUSE_HOGQL_RDSPROXY_READ_HOST
+        port_var = settings.CLICKHOUSE_HOGQL_RDSPROXY_READ_PORT
+        database_var = settings.CLICKHOUSE_HOGQL_RDSPROXY_READ_DATABASE
+        user_var = settings.CLICKHOUSE_HOGQL_RDSPROXY_READ_USER
+        password_var = settings.CLICKHOUSE_HOGQL_RDSPROXY_READ_PASSWORD
+
+        if not host_var or not port_var or not database_var or not user_var or not password_var:
+            raise ValueError("CLICKHOUSE_HOGQL_RDSPROXY env vars missing to create postgresql link from clickhouse")
+
+        address = add_param(f"{host_var}:{port_var}")
+        db = add_param(database_var)
+        user = add_param(user_var)
+        password = add_param(password_var)
+
+    return f"postgresql({address}, {db}, {table}, {user}, {password})"
+
+
+class PostgresTable(FunctionCallTable):
+    requires_args: bool = False
+    postgres_table_name: str
+    access_scope: Optional[APIScopeObject] = None
+    # Column that object-level access control filters ids against.
+    # Defaults to the primary key, which is correct when the table's rows ARE the access-controlled object
+    # (e.g. system.dashboards). Child tables that only expose a parent object's data set this
+    # to the foreign key pointing at that parent (e.g. system.dashboard_tiles -> "dashboard_id"),
+    # so denying the parent also hides its child rows.
+    access_control_id_field: Optional[str] = None
+    predicates: list[Expr] = []
+
+    def get_predicates(self) -> list[Expr]:
+        return self.predicates
+
+    @property
+    def primary_key(self) -> Optional[str]:
+        return _pk_column_for_pg_table(self.postgres_table_name)
+
+    @property
+    def access_control_id(self) -> Optional[str]:
+        return self.access_control_id_field or self.primary_key
+
+    def to_printed_hogql(self):
+        return escape_hogql_identifier(self.name)
+
+    def to_printed_clickhouse(self, context):
+        return build_function_call(self.postgres_table_name, context)

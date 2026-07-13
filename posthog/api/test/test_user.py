@@ -1,12 +1,49 @@
 import uuid
-from unittest.mock import patch
+import datetime
+from datetime import timedelta
+from typing import cast
+from urllib.parse import quote, unquote
 
+from freezegun.api import freeze_time
+from posthog.test.base import APIBaseTest, NonAtomicBaseTest
+from unittest import mock
+from unittest.mock import ANY, patch
+
+from django.contrib.auth.tokens import default_token_generator
+from django.core import mail
+from django.core.cache import cache
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 from django.utils.text import slugify
-from rest_framework import status
 
+from django_otp.plugins.otp_static.models import StaticDevice
+from django_otp.plugins.otp_totp.models import TOTPDevice
+from parameterized import parameterized
+from rest_framework import status
+from social_django.models import UserSocialAuth
+
+from posthog.api.email_verification import email_verification_token_generator
 from posthog.models import Team, User
-from posthog.models.organization import Organization
-from posthog.test.base import APIBaseTest
+from posthog.models.instance_setting import set_instance_setting
+from posthog.models.oauth import OAuthAccessToken, OAuthApplication
+from posthog.models.organization import Organization, OrganizationMembership
+from posthog.models.organization_domain import OrganizationDomain
+from posthog.models.personal_api_key import PersonalAPIKey
+from posthog.models.utils import generate_random_token_personal, hash_key_value
+from posthog.models.webauthn_credential import WebauthnCredential
+from posthog.temporal.tests.delete_teams.inline import execute_deletion_workflows_inline
+
+from products.dashboards.backend.models.dashboard import Dashboard
+
+
+def create_user(email: str, password: str, organization: Organization):
+    """
+    Helper that just creates a user. It currently uses the orm, but we
+    could use either the api, or django admin to create, to get better parity
+    with real world scenarios.
+    """
+    return User.objects.create_and_join(organization, email, password)
 
 
 class TestUserAPI(APIBaseTest):
@@ -30,10 +67,15 @@ class TestUserAPI(APIBaseTest):
         cls.user.current_team = cls.team
         cls.user.save()
 
+    def setUp(self):
+        # prevent throttling of user requests to pass on from one test
+        # to the next
+        cache.clear()
+        return super().setUp()
+
     # RETRIEVING USER
 
     def test_retrieve_current_user(self):
-
         response = self.client.get("/api/users/@me/")
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -53,6 +95,7 @@ class TestUserAPI(APIBaseTest):
         self.assertEqual(response_data["team"]["api_token"], "token123")
         self.assertNotIn("test_account_filters", response_data["team"])  # Ensure we're not returning the full `Team`
         self.assertNotIn("event_names", response_data["team"])
+        self.assertEqual(response_data["role_at_organization"], self.user.role_at_organization)
 
         self.assertEqual(response_data["organization"]["name"], self.organization.name)
         self.assertEqual(response_data["organization"]["membership_level"], 1)
@@ -70,28 +113,284 @@ class TestUserAPI(APIBaseTest):
                     "id": str(self.organization.id),
                     "name": self.organization.name,
                     "slug": slugify(self.organization.name),
+                    "logo_media_id": None,
+                    "membership_level": 1,
+                    "members_can_use_personal_api_keys": True,
+                    "is_active": True,
+                    "is_not_active_reason": None,
+                    "is_pending_deletion": False,
                 },
-                {"id": str(self.new_org.id), "name": "New Organization", "slug": "new-organization"},
+                {
+                    "id": str(self.new_org.id),
+                    "name": "New Organization",
+                    "slug": "new-organization",
+                    "logo_media_id": None,
+                    "membership_level": 1,
+                    "members_can_use_personal_api_keys": True,
+                    "is_active": True,
+                    "is_not_active_reason": None,
+                    "is_pending_deletion": False,
+                },
             ],
         )
 
-    def test_cannot_retrieve_or_list_other_users(self):
+    def test_me_membership_queries_do_not_scale_with_org_count(self):
+        def me_membership_queries(user: User) -> tuple[int, dict]:
+            self.client.force_login(user)
+            with CaptureQueriesContext(connection) as ctx:
+                response = self.client.get("/api/users/@me/")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            count = sum(
+                1
+                for q in ctx.captured_queries
+                if "posthog_organizationmembership" in q["sql"] and q["sql"].lstrip()[:6].upper() == "SELECT"
+            )
+            return count, response.json()
+
+        user_in_one_org = create_user(
+            "one-org@example.com", self.CONFIG_PASSWORD, Organization.objects.create(name="Solo Org")
+        )
+
+        owner_org = Organization.objects.create(name="Owner Org")
+        user_in_many_orgs = create_user("many-orgs@example.com", self.CONFIG_PASSWORD, owner_org)
+        OrganizationMembership.objects.filter(organization=owner_org, user=user_in_many_orgs).update(
+            level=OrganizationMembership.Level.OWNER
+        )
+        member_orgs = [Organization.objects.create(name=f"Member Org {i}") for i in range(5)]
+        for org in member_orgs:
+            OrganizationMembership.objects.create(
+                organization=org, user=user_in_many_orgs, level=OrganizationMembership.Level.MEMBER
+            )
+
+        few, _ = me_membership_queries(user_in_one_org)
+        many, many_body = me_membership_queries(user_in_many_orgs)
+
+        assert few > 0, "membership query predicate matched nothing; the table/SELECT filter is wrong"
+        assert many == few, f"membership_level is N+1: {many} membership queries for 6 orgs vs {few} for 1 org"
+
+        levels_by_org = {org["id"]: org["membership_level"] for org in many_body["organizations"]}
+        assert levels_by_org[str(owner_org.id)] == OrganizationMembership.Level.OWNER
+        assert levels_by_org[str(member_orgs[0].id)] == OrganizationMembership.Level.MEMBER
+
+    def test_current_user_includes_pending_invites(self):
+        from posthog.models import OrganizationInvite
+
+        other_org = Organization.objects.create(name="Other Org For Pending Invites Test")
+        matching_invite = OrganizationInvite.objects.create(
+            organization=other_org,
+            target_email=self.user.email,
+            created_by=self.user,
+        )
+
+        # Invite for a different email — should be ignored.
+        OrganizationInvite.objects.create(
+            organization=self.organization,
+            target_email="someone-else@example.com",
+            created_by=self.user,
+        )
+
+        # Invite to an org the user already belongs to — should be ignored.
+        OrganizationInvite.objects.create(
+            organization=self.organization,
+            target_email=self.user.email,
+            created_by=self.user,
+        )
+
+        response = self.client.get("/api/users/@me/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        pending_invites = response.json()["pending_invites"]
+        self.assertEqual(len(pending_invites), 1)
+        self.assertEqual(pending_invites[0]["id"], str(matching_invite.id))
+        self.assertEqual(pending_invites[0]["organization_id"], str(other_org.id))
+        self.assertEqual(pending_invites[0]["organization_name"], "Other Org For Pending Invites Test")
+        self.assertEqual(pending_invites[0]["target_email"], self.user.email)
+
+    def test_current_user_pending_invites_matches_email_case_insensitively(self):
+        from posthog.models import OrganizationInvite
+
+        other_org = Organization.objects.create(name="Other Org For Pending Invites Test")
+        OrganizationInvite.objects.create(
+            organization=other_org,
+            target_email=self.user.email.upper(),
+            created_by=self.user,
+        )
+
+        response = self.client.get("/api/users/@me/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()["pending_invites"]), 1)
+
+    def test_current_user_pending_invites_excludes_expired(self):
+        from posthog.constants import INVITE_DAYS_VALIDITY
+        from posthog.models import OrganizationInvite
+
+        other_org = Organization.objects.create(name="Other Org For Pending Invites Test")
+        with freeze_time(timezone.now() - timedelta(days=INVITE_DAYS_VALIDITY + 1)):
+            OrganizationInvite.objects.create(
+                organization=other_org,
+                target_email=self.user.email,
+                created_by=self.user,
+            )
+
+        response = self.client.get("/api/users/@me/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()["pending_invites"]), 0)
+
+    def test_hedgehog_config_is_unset(self):
+        self.user.hedgehog_config = None
+        self.user.save()
+
+        response = self.client.get(f"/api/users/@me/hedgehog_config/")
+        assert response.status_code == status.HTTP_200_OK
+        # the front end assumes it will _always_ get JSON
+        assert response.json() == {}
+
+    def test_hedgehog_config_is_set(self):
+        self.user.hedgehog_config = {"a bag": "of data"}
+        self.user.save()
+
+        response = self.client.get(f"/api/users/@me/hedgehog_config/")
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == {"a bag": "of data"}
+
+    def test_users_me_includes_active_realtime_notification_types(self):
+        self.client.force_login(self.user)
+        response = self.client.get("/api/users/@me/")
+        assert response.status_code == 200
+        body = response.json()
+        assert "active_realtime_notification_types" in body
+        assert "comment_mention" in body["active_realtime_notification_types"]
+
+    @parameterized.expand(
+        [
+            ("unreviewed_nothing", False, False, False, False),
+            ("unreviewed_pat_only", False, True, False, True),
+            ("unreviewed_passkey_only", False, False, True, True),
+            ("unreviewed_pat_and_passkey", False, True, True, True),
+            ("reviewed_pat_only", True, True, False, False),
+            ("reviewed_passkey_only", True, False, True, False),
+            ("reviewed_pat_and_passkey", True, True, True, False),
+            ("reviewed_nothing", True, False, False, False),
+        ]
+    )
+    def test_requires_credential_review(
+        self,
+        _name: str,
+        reviewed: bool,
+        with_key: bool,
+        with_passkey: bool,
+        expected: bool,
+    ):
+        self.user.credentials_reviewed_at = timezone.now() if reviewed else None
+        self.user.save(update_fields=["credentials_reviewed_at"])
+        if with_key:
+            PersonalAPIKey.objects.create(
+                user=self.user,
+                label="Test key",
+                secure_value=hash_key_value("phx_test_value_1234567890"),
+                scopes=["*"],
+            )
+        if with_passkey:
+            WebauthnCredential.objects.create(
+                user=self.user,
+                label="Test passkey",
+                credential_id=b"test-credential-id",
+                public_key=b"test-public-key",
+                algorithm=-7,
+                transports=["internal"],
+                verified=True,
+            )
+        response = self.client.get("/api/users/@me/")
+        assert response.status_code == 200
+        assert response.json()["requires_credential_review"] is expected
+
+    def test_requires_credential_review_unverified_passkey(self):
+        # Unverified passkeys are the realistic pre-claim attack artifact - a partner
+        # session can register a credential without ever completing verification.
+        self.user.credentials_reviewed_at = None
+        self.user.save(update_fields=["credentials_reviewed_at"])
+        WebauthnCredential.objects.create(
+            user=self.user,
+            label="Unverified passkey",
+            credential_id=b"unverified-credential-id",
+            public_key=b"test-public-key",
+            algorithm=-7,
+            transports=["internal"],
+            verified=False,
+        )
+        response = self.client.get("/api/users/@me/")
+        assert response.status_code == 200
+        assert response.json()["requires_credential_review"] is True
+
+    def test_credentials_review_complete_endpoint(self):
+        User.objects.filter(pk=self.user.pk).update(credentials_reviewed_at=None)
+        PersonalAPIKey.objects.create(
+            user=self.user,
+            label="Test key",
+            secure_value=hash_key_value("phx_test_value_1234567890"),
+            scopes=["*"],
+        )
+
+        response = self.client.get("/api/users/@me/")
+        assert response.json()["requires_credential_review"] is True
+
+        response = self.client.post("/api/users/@me/credentials_review_complete/")
+        assert response.status_code == 204
+
+        refreshed = User.objects.get(pk=self.user.pk)
+        assert refreshed.credentials_reviewed_at is not None
+
+        response = self.client.get("/api/users/@me/")
+        assert response.json()["requires_credential_review"] is False
+
+        first_ts = refreshed.credentials_reviewed_at
+        response = self.client.post("/api/users/@me/credentials_review_complete/")
+        assert response.status_code == 204
+        assert User.objects.get(pk=self.user.pk).credentials_reviewed_at == first_ts
+
+    def test_credentials_review_complete_requires_auth(self):
+        self.client.logout()
+        response = self.client.post("/api/users/@me/credentials_review_complete/")
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_credentials_review_complete_rejects_personal_api_key_auth(self):
+        # The partner-issued wildcard PAK is the thing this feature surfaces;
+        # accepting it as auth here would let the attacker silently dismiss
+        # their own review before the legit owner ever logs in.
+        api_key_value = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            user=self.user,
+            label="Partner-minted key",
+            secure_value=hash_key_value(api_key_value),
+            scopes=["*"],
+        )
+        User.objects.filter(pk=self.user.pk).update(credentials_reviewed_at=None)
+
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {api_key_value}")
+        response = self.client.post("/api/users/@me/credentials_review_complete/")
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+        assert User.objects.get(pk=self.user.pk).credentials_reviewed_at is None
+
+    def test_can_only_list_yourself(self):
         """
-        At this moment only the current user can be retrieved from this endpoint. Listing is not supported.
+        At this moment only the current user can be retrieved from this endpoint.
         """
         response = self.client.get("/api/users/")
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-        self.assertEqual(response.json(), self.not_found_response("Endpoint not found."))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["count"], 1)
+        self.assertEqual(response.json()["results"][0]["uuid"], str(self.user.uuid))
 
         user = self._create_user("newtest@posthog.com")
         response = self.client.get(f"/api/users/{user.uuid}")
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(
             response.json(),
             {
-                "type": "validation_error",
-                "code": "invalid_parameter",
-                "detail": "Currently this endpoint only supports retrieving `@me` instance.",
+                "type": "authentication_error",
+                "code": "permission_denied",
+                "detail": "As a non-staff user you're only allowed to access the `@me` user instance.",
                 "attr": None,
             },
         )
@@ -101,6 +400,44 @@ class TestUserAPI(APIBaseTest):
         response = self.client.get("/api/users/@me/")
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
         self.assertEqual(response.json(), self.unauthenticated_response())
+
+    def test_non_admin_filter_users_by_email(self):
+        org = Organization.objects.create()
+        team = Team.objects.create(organization=org, name="Another team")
+        user = User.objects.create_and_join(
+            org, "foo@bar.com", "<PASSWORD>", first_name="", level=OrganizationMembership.Level.MEMBER
+        )
+        user.current_team = team
+        user.save(update_fields=["current_team"])
+
+        response = self.client.get(f"/api/users/?email={user.email}")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["count"], 0, "Should not return users from another orgs")
+
+    def test_admin_filter_users_by_email(self):
+        admin = User.objects.create_and_join(
+            self.organization, "admin@admin.com", "pw", first_name="", level=OrganizationMembership.Level.MEMBER
+        )
+        admin.current_team = self.team
+        admin.is_staff = True
+        admin.save(update_fields=["current_team", "is_staff"])
+        self.client.force_authenticate(admin)
+        org = Organization.objects.create()
+        team = Team.objects.create(organization=org, name="Another team")
+        user = User.objects.create_and_join(
+            org, "foo@bar.com", "<PASSWORD>", first_name="", level=OrganizationMembership.Level.MEMBER
+        )
+        user.current_team = team
+        user.save(update_fields=["current_team"])
+
+        response = self.client.get(f"/api/users/?email={user.email}")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["count"], 1, "Admin users should be able to list users from other orgs")
+        response_user = response.json()["results"][0]
+        self.assertEqual(response_user["email"], user.email)
+        self.assertEqual(response_user["id"], user.id, "User id should be returned")
 
     # CREATING USERS
 
@@ -112,8 +449,8 @@ class TestUserAPI(APIBaseTest):
         count = User.objects.count()
 
         response = self.client.post("/api/users/", {"first_name": "James", "email": "test+james@posthog.com"})
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-        self.assertEqual(response.json(), self.not_found_response("Endpoint not found."))
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+        self.assertEqual(response.json(), self.method_not_allowed_response("POST"))
 
         self.assertEqual(User.objects.count(), count)
 
@@ -129,15 +466,15 @@ class TestUserAPI(APIBaseTest):
             "/api/users/@me/",
             {
                 "first_name": "Cooper",
-                "email": "updated@posthog.com",
                 "anonymize_data": True,
-                "email_opt_in": False,
                 "events_column_config": {"active": ["column_1", "column_2"]},
+                "notification_settings": {"plugin_disabled": False},
+                "has_seen_product_intro_for": {"feature_flags": True},
                 "uuid": 1,  # should be ignored
                 "id": 1,  # should be ignored
-                "is_staff": True,  # should be ignored
                 "organization": str(another_org.id),  # should be ignored
                 "team": str(another_team.id),  # should be ignored
+                "role_at_organization": "engineering",
             },
         )
 
@@ -146,32 +483,521 @@ class TestUserAPI(APIBaseTest):
 
         self.assertNotEqual(response_data["uuid"], 1)
         self.assertEqual(response_data["first_name"], "Cooper")
-        self.assertEqual(response_data["email"], "updated@posthog.com")
         self.assertEqual(response_data["anonymize_data"], True)
-        self.assertEqual(response_data["email_opt_in"], False)
         self.assertEqual(response_data["events_column_config"], {"active": ["column_1", "column_2"]})
-        self.assertEqual(response_data["is_staff"], False)
         self.assertEqual(response_data["organization"]["id"], str(self.organization.id))
         self.assertEqual(response_data["team"]["id"], self.team.id)
+        self.assertEqual(response_data["has_seen_product_intro_for"], {"feature_flags": True})
+        self.assertEqual(response_data["role_at_organization"], "engineering")
 
         user.refresh_from_db()
         self.assertNotEqual(user.pk, 1)
         self.assertNotEqual(user.uuid, 1)
         self.assertEqual(user.first_name, "Cooper")
-        self.assertEqual(user.email, "updated@posthog.com")
         self.assertEqual(user.anonymize_data, True)
+        self.assertLessEqual({"plugin_disabled": False}.items(), user.notification_settings.items())
+        self.assertEqual(user.has_seen_product_intro_for, {"feature_flags": True})
+        self.assertEqual(user.role_at_organization, "engineering")
 
-        mock_capture.assert_called_once_with(
-            user.distinct_id,
-            "user updated",
+        # UserSerializer.to_representation also fires posthoganalytics.capture
+        # for the "update user properties" identify, so use assert_any_call to
+        # find the "user updated" event we actually care about here.
+        mock_capture.assert_any_call(
+            event="user updated",
+            distinct_id=user.distinct_id,
             properties={
-                "updated_attrs": ["anonymize_data", "email", "email_opt_in", "events_column_config", "first_name"],
+                "updated_attrs": [
+                    "anonymize_data",
+                    "events_column_config",
+                    "first_name",
+                    "has_seen_product_intro_for",
+                    "partial_notification_settings",
+                    "role_at_organization",
+                ],
+                "$set": mock.ANY,
+            },
+            groups={
+                "instance": ANY,
+                "organization": str(self.team.organization_id),
+                "project": str(self.team.uuid),
             },
         )
 
     @patch("posthoganalytics.capture")
+    def test_user_can_cancel_own_email_change_request(self, _mock_capture):
+        self.user.pending_email = "another@email.com"
+        self.user.save()
+
+        response = self.client.patch("/api/users/cancel_email_change_request")
+
+        response_data = response.json()
+        assert response.status_code == status.HTTP_200_OK
+        assert response_data["pending_email"] is None
+
+    @patch("posthoganalytics.capture")
+    def test_user_cannot_cancel_email_change_request_if_it_doesnt_exist(self, _mock_capture):
+        # Fire a call to the endpoint without priming the User with a pending_email field
+
+        response = self.client.patch("/api/users/cancel_email_change_request")
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @patch("posthoganalytics.capture")
+    def test_set_scene_personalisation_for_user_dashboard_must_be_in_current_team(self, _mock_capture):
+        a_third_team = Team.objects.create(name="A Third Team", organization=self.organization)
+
+        dashboard_one = Dashboard.objects.create(team=a_third_team, name="Dashboard 1")
+
+        response = self.client.post(
+            "/api/users/@me/scene_personalisation",
+            # even if someone tries to send a different user or team they are ignored
+            {
+                "user": 12345,
+                "team": 12345,
+                "dashboard": str(dashboard_one.id),
+                "scene": "Person",
+            },
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @patch("posthoganalytics.capture")
+    def test_set_scene_personalisation_for_user_dashboard_must_exist(self, _mock_capture):
+        response = self.client.post(
+            "/api/users/@me/scene_personalisation",
+            # even if someone tries to send a different user or team they are ignored
+            {"user": 12345, "team": 12345, "dashboard": 12345, "scene": "Person"},
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @patch("posthoganalytics.capture")
+    def test_set_scene_personalisation_for_user_must_send_dashboard(self, _mock_capture):
+        response = self.client.post(
+            "/api/users/@me/scene_personalisation",
+            # even if someone tries to send a different user or team they are ignored
+            {"user": 12345, "team": 12345, "scene": "Person"},
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @patch("posthoganalytics.capture")
+    def test_set_scene_personalisation_for_user_must_send_scene(self, _mock_capture):
+        dashboard_one = Dashboard.objects.create(team=self.team, name="Dashboard 1")
+
+        response = self.client.post(
+            "/api/users/@me/scene_personalisation",
+            # even if someone tries to send a different user or team they are ignored
+            {
+                "user": 12345,
+                "team": 12345,
+                "dashboard": str(dashboard_one.id),
+            },
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @patch("posthoganalytics.capture")
+    def test_set_scene_personalisation_for_user(self, _mock_capture):
+        another_org = Organization.objects.create(name="Another Org")
+        another_team = Team.objects.create(name="Another Team", organization=another_org)
+        user = self._create_user("the-user@posthog.com", password="12345678")
+        user.current_team = another_team
+        user.save()
+        self.client.force_login(user)
+
+        dashboard_one = Dashboard.objects.create(team=another_team, name="Dashboard 1")
+        dashboard_two = Dashboard.objects.create(team=another_team, name="Dashboard 2")
+
+        self._assert_set_scene_choice(
+            "Person",
+            dashboard_one,
+            user,
+            [
+                {
+                    "dashboard": dashboard_one.pk,
+                    "scene": "Person",
+                },
+            ],
+        )
+
+        self._assert_set_scene_choice(
+            "Person",
+            dashboard_two,
+            user,
+            [
+                {
+                    "dashboard": dashboard_two.pk,
+                    "scene": "Person",
+                },
+            ],
+        )
+
+        self._assert_set_scene_choice(
+            "Group",
+            dashboard_two,
+            user,
+            [
+                {
+                    "dashboard": dashboard_two.pk,
+                    "scene": "Person",
+                },
+                {
+                    "dashboard": dashboard_two.pk,
+                    "scene": "Group",
+                },
+            ],
+        )
+
+    def _assert_set_scene_choice(
+        self, scene: str, dashboard: Dashboard, user: User, expected_choices: list[dict]
+    ) -> None:
+        response = self.client.post(
+            "/api/users/@me/scene_personalisation",
+            # even if someone tries to send a different user or team they are ignored
+            {
+                "user": 12345,
+                "team": 12345,
+                "dashboard": str(dashboard.id),
+                "scene": scene,
+            },
+        )
+        assert response.status_code == status.HTTP_200_OK
+        response_data = response.json()
+        assert response_data["uuid"] == str(user.uuid)
+        assert response_data["scene_personalisation"] == expected_choices
+
+    @patch("posthog.api.user.is_email_available", return_value=False)
+    @patch("posthog.tasks.email.send_email_change_emails.delay")
+    def test_no_notifications_when_user_email_is_changed_and_email_not_available(
+        self, mock_send_email_change_emails, mock_is_email_available
+    ):
+        self.user.email = "alpha@example.com"
+        self.user.save()
+
+        response = self.client.patch(
+            "/api/users/@me/",
+            {
+                "email": "beta@example.com",
+            },
+        )
+        response_data = response.json()
+        self.user.refresh_from_db()
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response_data["email"] == "beta@example.com"
+        assert self.user.email == "beta@example.com"
+        mock_is_email_available.assert_called_once()
+        mock_send_email_change_emails.assert_not_called()
+
+    @patch("posthog.api.user.is_email_available", return_value=True)
+    @patch("posthog.tasks.email.send_email_change_emails.delay")
+    @patch("posthog.api.email_verification.send_email_verification")
+    def test_notifications_sent_when_user_email_is_changed_and_email_available(
+        self,
+        mock_send_email_verification,
+        mock_send_email_change_emails,
+        mock_is_email_available,
+    ):
+        """Test that when a user updates their email, they receive a verification email before the switch actually happens."""
+        self.user.email = "alpha@example.com"
+        self.user.save()
+        with self.is_cloud(True):
+            with freeze_time("2020-01-01T21:37:00+00:00"):
+                response = self.client.patch(
+                    "/api/users/@me/",
+                    {
+                        "email": "beta@example.com",
+                    },
+                )
+            response_data = response.json()
+            self.user.refresh_from_db()
+
+            assert response.status_code == status.HTTP_200_OK
+            assert response_data["email"] == "alpha@example.com"
+            assert response_data["pending_email"] == "beta@example.com"
+            assert self.user.email == "alpha@example.com"
+            assert self.user.pending_email == "beta@example.com"
+
+            mock_is_email_available.assert_called_once()
+            mock_send_email_verification.assert_called_once()
+
+            token = email_verification_token_generator.make_token(self.user)
+            with freeze_time("2020-01-01T21:37:00+00:00"):
+                response = self.client.post(
+                    f"/api/users/verify_email/",
+                    {"uuid": self.user.uuid, "token": token},
+                )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+            self.user.refresh_from_db()
+            assert self.user.email == "beta@example.com"
+            self.assertIsNone(self.user.pending_email)
+            mock_is_email_available.assert_called_once()
+            mock_send_email_change_emails.assert_called_once_with(
+                "2020-01-01T21:37:00+00:00",
+                self.user.first_name,
+                "alpha@example.com",
+                "beta@example.com",
+            )
+
+    @parameterized.expand(
+        [
+            ("single_google", [("google-oauth2", "google-sub-1")]),
+            (
+                "multiple_providers",
+                [
+                    ("google-oauth2", "google-sub-1"),
+                    ("google-oauth2", "google-sub-2"),
+                    ("github", "octocat"),
+                    ("gitlab", "12345"),
+                ],
+            ),
+        ]
+    )
+    def test_verified_email_change_removes_social_auth_connections(self, _, social_auths: list[tuple[str, str]]):
+        self.user.email = "alpha@example.com"
+        self.user.save()
+
+        social_auth_ids = [
+            UserSocialAuth.objects.create(user=self.user, provider=provider, uid=uid).id
+            for provider, uid in social_auths
+        ]
+        other_user = User.objects.create_user("other@example.com", "pwd1234*", "Other")
+        other_user_social_auth_id = UserSocialAuth.objects.create(
+            user=other_user, provider="google-oauth2", uid="other-google-sub"
+        ).id
+
+        with (
+            patch("posthog.api.user.is_email_available", return_value=True) as mock_is_email_available,
+            patch("posthog.tasks.email.send_email_change_emails.delay") as mock_send_email_change_emails,
+            patch("posthog.api.email_verification.send_email_verification") as mock_send_email_verification,
+        ):
+            with self.is_cloud(True):
+                response = self.client.patch(
+                    "/api/users/@me/",
+                    {
+                        "email": "beta@example.com",
+                    },
+                )
+
+            assert response.status_code == status.HTTP_200_OK
+            mock_is_email_available.assert_called_once()
+            mock_send_email_verification.assert_called_once()
+
+            token = email_verification_token_generator.make_token(self.user)
+            response = self.client.post(
+                "/api/users/verify_email/",
+                {"uuid": self.user.uuid, "token": token},
+            )
+            assert response.status_code == status.HTTP_200_OK
+
+            self.user.refresh_from_db()
+            assert self.user.email == "beta@example.com"
+            assert self.user.pending_email is None
+            for social_auth_id in social_auth_ids:
+                assert not UserSocialAuth.objects.filter(id=social_auth_id).exists()
+            assert UserSocialAuth.objects.filter(id=other_user_social_auth_id).exists()
+            mock_send_email_change_emails.assert_called_once_with(
+                ANY,
+                self.user.first_name,
+                "alpha@example.com",
+                "beta@example.com",
+            )
+
+    @parameterized.expand(
+        [
+            ("current_email_enforced", "alpha@example.com", "sso_enforced_current_email"),
+            ("new_email_enforced", "beta@example.com", "sso_enforced_new_email"),
+        ]
+    )
+    @patch("posthog.api.user.is_email_available", return_value=True)
+    @patch("posthog.tasks.email.send_email_change_emails.delay")
+    def test_email_change_blocked_when_sso_is_enforced(
+        self,
+        _,
+        enforced_email: str,
+        expected_code: str,
+        mock_send_email_change_emails,
+        mock_is_email_available,
+    ):
+        self.user.email = "alpha@example.com"
+        self.user.save()
+
+        with patch(
+            "posthog.models.organization_domain.OrganizationDomainManager.get_sso_enforcement_for_email_address",
+            side_effect=lambda email, organization=None: "google-oauth2" if email == enforced_email else None,
+        ):
+            with self.is_cloud(True):
+                response = self.client.patch("/api/users/@me/", {"email": "beta@example.com"})
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["code"] == expected_code
+        self.user.refresh_from_db()
+        assert self.user.email == "alpha@example.com"
+        assert self.user.pending_email is None
+        mock_send_email_change_emails.assert_not_called()
+
+    @patch("posthog.api.user.is_email_available", return_value=True)
+    @patch("posthog.api.user.EmailVerifier.create_token_and_send_email_verification")
+    def test_email_change_allowed_between_two_sso_enforced_domains_of_same_org(
+        self,
+        mock_send_email_verification,
+        mock_is_email_available,
+    ):
+        self.user.email = "alice@example.com"
+        self.user.save()
+        for domain in ("example.com", "example.org"):
+            OrganizationDomain.objects.create(
+                organization=self.organization,
+                domain=domain,
+                verified_at=timezone.now(),
+                sso_enforcement="google-oauth2",
+            )
+
+        with patch(
+            "posthog.models.organization_domain.OrganizationDomainManager.get_sso_enforcement_for_email_address",
+            side_effect=lambda email, organization=None: (
+                "google-oauth2" if email.split("@")[-1] in ("example.com", "example.org") else None
+            ),
+        ):
+            with self.is_cloud(True):
+                response = self.client.patch("/api/users/@me/", {"email": "alice@example.org"})
+
+        assert response.status_code == status.HTTP_200_OK
+        self.user.refresh_from_db()
+        assert self.user.pending_email == "alice@example.org"
+        mock_send_email_verification.assert_called_once()
+
+    @patch("posthog.api.user.is_email_available", return_value=True)
+    @patch("posthog.tasks.email.send_email_change_emails.delay")
+    def test_email_change_blocked_to_sso_enforced_domain_of_another_org(
+        self,
+        mock_send_email_change_emails,
+        mock_is_email_available,
+    ):
+        self.user.email = "alice@example.com"
+        self.user.save()
+        OrganizationDomain.objects.create(
+            organization=self.organization,
+            domain="example.com",
+            verified_at=timezone.now(),
+            sso_enforcement="google-oauth2",
+        )
+        other_org = Organization.objects.create(name="Attacker Org")
+        OrganizationDomain.objects.create(
+            organization=other_org,
+            domain="example.net",
+            verified_at=timezone.now(),
+            sso_enforcement="google-oauth2",
+        )
+
+        with patch(
+            "posthog.models.organization_domain.OrganizationDomainManager.get_sso_enforcement_for_email_address",
+            side_effect=lambda email, organization=None: (
+                "google-oauth2" if email.split("@")[-1] in ("example.com", "example.net") else None
+            ),
+        ):
+            with self.is_cloud(True):
+                response = self.client.patch("/api/users/@me/", {"email": "alice@example.net"})
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["code"] == "sso_enforced_current_email"
+        self.user.refresh_from_db()
+        assert self.user.email == "alice@example.com"
+        assert self.user.pending_email is None
+
+    @patch("posthog.tasks.email.send_email_change_emails.delay")
+    def test_verify_email_without_pending_email_keeps_social_auth_connections(self, mock_send_email_change_emails):
+        social_auth = UserSocialAuth.objects.create(
+            user=self.user,
+            provider="google-oauth2",
+            uid="google-sub-1",
+        )
+
+        token = email_verification_token_generator.make_token(self.user)
+        response = self.client.post(
+            "/api/users/verify_email/",
+            {"uuid": self.user.uuid, "token": token},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        self.user.refresh_from_db()
+        assert UserSocialAuth.objects.filter(id=social_auth.id).exists()
+        mock_send_email_change_emails.assert_not_called()
+
+    @patch("posthog.api.user.login")
+    @patch("posthog.tasks.email.send_email_change_emails.delay")
+    def test_email_change_verification_skips_auto_login_for_sso_enforced_domain(self, _, mock_login):
+        self.user.pending_email = "alice@example.com"
+        self.user.save()
+
+        with patch(
+            "posthog.models.organization_domain.OrganizationDomainManager.get_sso_enforcement_for_email_address",
+            side_effect=lambda email, organization=None: "google-oauth2" if email == "alice@example.com" else None,
+        ):
+            token = email_verification_token_generator.make_token(self.user)
+            response = self.client.post("/api/users/verify_email/", {"uuid": self.user.uuid, "token": token})
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["requires_sso"] is True
+        self.user.refresh_from_db()
+        assert self.user.email == "alice@example.com"
+        # No password-backend session is handed out for an SSO-enforced account; they must log in via SSO.
+        mock_login.assert_not_called()
+
+    @patch("posthog.api.user.login")
+    @patch("posthog.tasks.email.send_email_change_emails.delay")
+    def test_initial_email_verification_skips_auto_login_for_sso_enforced_domain(self, _, mock_login):
+        self.user.email = "alice@example.com"
+        self.user.pending_email = None
+        self.user.save()
+
+        with patch(
+            "posthog.models.organization_domain.OrganizationDomainManager.get_sso_enforcement_for_email_address",
+            side_effect=lambda email, organization=None: "google-oauth2" if email == "alice@example.com" else None,
+        ):
+            token = email_verification_token_generator.make_token(self.user)
+            response = self.client.post("/api/users/verify_email/", {"uuid": self.user.uuid, "token": token})
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["requires_sso"] is True
+        mock_login.assert_not_called()
+
+    @patch("posthog.api.user.is_email_available", return_value=True)
+    @patch("posthog.tasks.email.send_email_change_emails.delay")
+    def test_no_notifications_when_user_email_is_changed_and_only_case_differs(
+        self, mock_send_email_change_emails, mock_is_email_available
+    ):
+        self.user.email = "alpha@example.com"
+        self.user.save()
+
+        response = self.client.patch(
+            "/api/users/@me/",
+            {
+                "email": "ALPHA@example.com",
+            },
+        )
+        response_data = response.json()
+        self.user.refresh_from_db()
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response_data["email"] == "ALPHA@example.com"
+        assert self.user.email == "ALPHA@example.com"
+        mock_is_email_available.assert_not_called()
+        mock_send_email_change_emails.assert_not_called()
+
+    def test_cannot_upgrade_yourself_to_staff_user(self):
+        response = self.client.patch("/api/users/@me/", {"is_staff": True})
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(
+            response.json(),
+            self.permission_denied_response("You are not a staff user, contact your instance admin."),
+        )
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.is_staff, False)
+
+    @patch("posthoganalytics.capture")
     def test_can_update_current_organization(self, mock_capture):
-        response = self.client.patch("/api/users/@me/", {"set_current_organization": str(self.new_org.id)},)
+        response = self.client.patch("/api/users/@me/", {"set_current_organization": str(self.new_org.id)})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         response_data = response.json()
         self.assertEqual(response_data["organization"]["id"], str(self.new_org.id))
@@ -185,10 +1011,15 @@ class TestUserAPI(APIBaseTest):
         self.assertEqual(self.user.current_organization, self.new_org)
         self.assertEqual(self.user.current_team, self.new_project)
 
-        mock_capture.assert_called_once_with(
-            self.user.distinct_id,
-            "user updated",
-            properties={"updated_attrs": ["current_organization", "current_team"]},
+        mock_capture.assert_any_call(
+            event="user updated",
+            distinct_id=self.user.distinct_id,
+            properties={"updated_attrs": ["current_organization", "current_team"], "$set": mock.ANY},
+            groups={
+                "instance": ANY,
+                "organization": str(self.new_org.id),
+                "project": str(self.new_project.uuid),
+            },
         )
 
     @patch("posthoganalytics.capture")
@@ -207,10 +1038,15 @@ class TestUserAPI(APIBaseTest):
         self.assertEqual(self.user.current_organization, self.new_org)
         self.assertEqual(self.user.current_team, team)
 
-        mock_capture.assert_called_once_with(
-            self.user.distinct_id,
-            "user updated",
-            properties={"updated_attrs": ["current_organization", "current_team"]},
+        mock_capture.assert_any_call(
+            event="user updated",
+            distinct_id=self.user.distinct_id,
+            properties={"updated_attrs": ["current_organization", "current_team"], "$set": mock.ANY},
+            groups={
+                "instance": ANY,
+                "organization": str(self.new_org.id),
+                "project": str(team.uuid),
+            },
         )
 
     def test_cannot_set_mismatching_org_and_team(self):
@@ -220,7 +1056,11 @@ class TestUserAPI(APIBaseTest):
         self.user.join(organization=org)
 
         response = self.client.patch(
-            "/api/users/@me/", {"set_current_team": team.id, "set_current_organization": self.organization.id}
+            "/api/users/@me/",
+            {
+                "set_current_team": team.id,
+                "set_current_organization": self.organization.id,
+            },
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(
@@ -300,13 +1140,131 @@ class TestUserAPI(APIBaseTest):
 
         self._assert_current_org_and_team_unchanged()
 
-    @patch("posthoganalytics.capture")
-    def test_user_can_update_password(self, mock_capture):
+    def test_current_team_prefer_current_organization(self):
+        """
+        If current_organization is set but current_team isn't (for example when a team is deleted), make sure we set the team in the current organization
+        """
+        org2 = Organization.objects.create(name="bla")
+        OrganizationMembership.objects.create(organization=org2, user=self.user)
+        team2 = Team.objects.create(organization=org2)
 
+        # select current organization
+        self.user.current_organization = org2
+        self.user.current_team = None
+        self.user.save()
+
+        response = self.client.get("/api/users/@me/").json()
+        self.assertEqual(response["team"]["id"], team2.pk)
+
+    def test_team_property_does_not_save_when_no_teams_found(self):
+        """
+        Test that the team property doesn't trigger a save when the teams query returns None
+        """
+        # Create a brand new user that belongs to no organizations or teams
+        new_user = User.objects.create_user(
+            email="newuser@posthog.com", password="testpass123", first_name="New", last_name="User"
+        )
+
+        # Clear the cached properties to force re-evaluation
+        if hasattr(new_user, "_cached_team"):
+            delattr(new_user, "_cached_team")
+        if hasattr(new_user, "_cached_organization"):
+            delattr(new_user, "_cached_organization")
+
+        # Now test the team property - this should not trigger a save since no teams exist
+        with mock.patch.object(new_user, "save") as mock_save:
+            team = new_user.team  # Property access, but it can actually perform a save
+
+            # Verify no save was called for the team property
+            mock_save.assert_not_called()
+
+            # Verify team is None
+            self.assertIsNone(team)
+            self.assertIsNone(new_user.current_team)
+
+    def test_team_property_saves_when_team_found(self):
+        """
+        Test that the team property does trigger a save when a team is found
+        """
+        # Set current organization but no current team
+        self.user.current_team = None
+        self.user.save()
+
+        # Clear the cached property to force re-evaluation
+        if hasattr(self.user, "_cached_team"):
+            delattr(self.user, "_cached_team")
+
+        # Mock the save method to track if it's called
+        with mock.patch.object(self.user, "save") as mock_save:
+            # Access the team property - this should trigger a save since a team exists
+            result_team = self.user.team
+
+            # Verify save was called with correct parameters
+            mock_save.assert_called_once_with(update_fields=["current_team"])
+
+            # Verify team is set correctly
+            self.assertEqual(result_team, self.team)
+            self.assertEqual(self.user.current_team, self.team)
+
+    def test_organization_property_does_not_save_when_no_organizations_found(self):
+        """
+        Test that the organization property doesn't trigger a save when no organizations exist
+        """
+        # Create a brand new user that belongs to no organizations or teams
+        new_user = User.objects.create_user(
+            email="newuser2@posthog.com", password="testpass123", first_name="New", last_name="User"
+        )
+
+        # Access the organization property - this should NOT trigger a save since no organizations exist
+        with mock.patch.object(new_user, "save") as mock_save:
+            organization = new_user.organization
+
+            # Verify no save was called for the organization property
+            mock_save.assert_not_called()
+
+            # Verify organization is None
+            self.assertIsNone(organization)
+            self.assertIsNone(new_user.current_organization)
+
+    def test_organization_property_saves_when_organization_found(self):
+        """
+        Test that the organization property does trigger a save when an organization is found
+        """
+        # Create a new organization and add the user to it
+        new_org = Organization.objects.create(name="Test Organization")
+        self.user.join(organization=new_org)
+
+        # Set current organization to None to simulate the property needing to find and set it
+        self.user.current_organization = None
+        self.user.save()
+
+        # Clear the cached property to force re-evaluation
+        if hasattr(self.user, "_cached_organization"):
+            delattr(self.user, "_cached_organization")
+
+        # Mock the save method to track if it's called
+        with mock.patch.object(self.user, "save") as mock_save:
+            # Access the organization property - this should trigger a save since an organization exists
+            result_organization = self.user.organization
+
+            # Verify save was called with correct parameters
+            mock_save.assert_called_once_with(update_fields=["current_organization"])
+
+            # Verify organization is set correctly (should be one of the user's organizations)
+            self.assertIsNotNone(result_organization)
+            self.assertIn(result_organization, [self.organization, new_org])
+            self.assertEqual(self.user.current_organization, result_organization)
+
+    @patch("posthoganalytics.capture")
+    @patch("posthog.tasks.email.send_password_changed_email.delay")
+    def test_user_can_update_password(self, mock_send_password_changed_email, mock_capture):
         user = self._create_user("bob@posthog.com", password="A12345678")
         self.client.force_login(user)
 
-        response = self.client.patch("/api/users/@me/", {"current_password": "A12345678", "password": "a_new_password"})
+        response = self.client.patch(
+            "/api/users/@me/",
+            {"current_password": "A12345678", "password": "a_new_password"},
+        )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         response_data = response.json()
         self.assertEqual(response_data["email"], "bob@posthog.com")
@@ -321,21 +1279,33 @@ class TestUserAPI(APIBaseTest):
         user.refresh_from_db()
         self.assertTrue(user.check_password("a_new_password"))
 
-        mock_capture.assert_called_once_with(
-            user.distinct_id, "user updated", properties={"updated_attrs": ["password"]},
+        mock_capture.assert_any_call(
+            event="user updated",
+            distinct_id=user.distinct_id,
+            properties={"updated_attrs": ["password"], "$set": mock.ANY},
+            groups={
+                "instance": ANY,
+                "organization": str(self.team.organization_id),
+                "project": str(self.team.uuid),
+            },
         )
 
         # User can log in with new password
         response = self.client.post("/api/login", {"email": "bob@posthog.com", "password": "a_new_password"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+        # Assert password changed email was sent
+        mock_send_password_changed_email.assert_called_once_with(user.id)
+
     @patch("posthoganalytics.capture")
-    def test_user_with_no_password_set_can_set_password(self, mock_capture):
+    @patch("posthog.tasks.email.send_password_changed_email.delay")
+    def test_user_with_no_password_set_can_set_password(self, mock_send_password_changed_email, mock_capture):
         user = self._create_user("no_password@posthog.com", password=None)
         self.client.force_login(user)
 
         response = self.client.patch(
-            "/api/users/@me/", {"password": "a_new_password"},  # note we don't send current password
+            "/api/users/@me/",
+            {"password": "a_new_password"},  # note we don't send current password
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         response_data = response.json()
@@ -351,21 +1321,35 @@ class TestUserAPI(APIBaseTest):
         user.refresh_from_db()
         self.assertTrue(user.check_password("a_new_password"))
 
-        mock_capture.assert_called_once_with(
-            user.distinct_id, "user updated", properties={"updated_attrs": ["password"]},
+        mock_capture.assert_any_call(
+            event="user updated",
+            distinct_id=user.distinct_id,
+            properties={"updated_attrs": ["password"], "$set": mock.ANY},
+            groups={
+                "instance": ANY,
+                "organization": str(self.team.organization_id),
+                "project": str(self.team.uuid),
+            },
         )
 
         # User can log in with new password
-        response = self.client.post("/api/login", {"email": "no_password@posthog.com", "password": "a_new_password"})
+        response = self.client.post(
+            "/api/login",
+            {"email": "no_password@posthog.com", "password": "a_new_password"},
+        )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-    def test_user_with_unusable_password_set_can_set_password(self):
+        # Assert password changed email was sent
+        mock_send_password_changed_email.assert_called_once_with(user.id)
+
+    @patch("posthog.tasks.email.send_password_changed_email.delay")
+    def test_user_with_unusable_password_set_can_set_password(self, mock_send_password_changed_email):
         user = self._create_user("no_password@posthog.com", password="123456789")
         user.set_unusable_password()
         user.save()
         self.client.force_login(user)
 
-        response = self.client.patch("/api/users/@me/", {"password": "a_new_password"},)
+        response = self.client.patch("/api/users/@me/", {"password": "a_new_password"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         # Assert session is still valid
@@ -377,9 +1361,11 @@ class TestUserAPI(APIBaseTest):
         self.assertTrue(user.check_password("a_new_password"))
 
     @patch("posthoganalytics.capture")
-    def test_cant_update_to_insecure_password(self, mock_capture):
-
-        response = self.client.patch("/api/users/@me/", {"current_password": self.CONFIG_PASSWORD, "password": "123"})
+    def test_cannot_update_to_insecure_password(self, mock_capture):
+        response = self.client.patch(
+            "/api/users/@me/",
+            {"current_password": self.CONFIG_PASSWORD, "password": "123"},
+        )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(
             response.json(),
@@ -398,7 +1384,11 @@ class TestUserAPI(APIBaseTest):
         # Password was not changed
         self.user.refresh_from_db()
         self.assertTrue(self.user.check_password(self.CONFIG_PASSWORD))
-        mock_capture.assert_not_called()
+        # The GET on /api/users/@me/ fires the inline identify ("update user properties")
+        # via UserSerializer.to_representation. The 4xx PATCH must NOT fire "user updated"
+        # because the update was rejected.
+        update_calls = [c for c in mock_capture.call_args_list if c.kwargs.get("event") == "user updated"]
+        assert update_calls == []
 
     def test_user_cannot_update_password_without_current_password(self):
         response = self.client.patch("/api/users/@me/", {"password": "12345678"})
@@ -434,6 +1424,26 @@ class TestUserAPI(APIBaseTest):
         self.user.refresh_from_db()
         self.assertTrue(self.user.check_password(self.CONFIG_PASSWORD))
 
+    @patch("posthog.api.user.send_password_changed_email.delay")
+    def test_user_without_password_can_set_password(self, mock_send_email):
+        # Create a user without a password (e.g., SSO user)
+        self.user.set_unusable_password()
+        self.user.save()
+
+        # Re-authenticate with force_login since password is now unusable
+        self.client.force_login(self.user)
+
+        # User should be able to set password without providing current_password
+        # Use a strong password that meets validation requirements
+        new_password = "NewSecurePassword123!"
+        response = self.client.patch("/api/users/@me/", {"password": new_password})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Password should be set
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.has_usable_password())
+        self.assertTrue(self.user.check_password(new_password))
+
     def test_unauthenticated_user_cannot_update_anything(self):
         self.client.logout()
         response = self.client.patch(
@@ -452,39 +1462,743 @@ class TestUserAPI(APIBaseTest):
         self.assertNotEqual(self.user.email, "new@posthog.com")
         self.assertFalse(self.user.check_password("hijacked"))
 
-    # DELETING USER
+    def test_user_cannot_update_password_with_incorrect_current_password_and_ratelimit_to_prevent_attacks(self):
+        for _ in range(7):
+            response = self.client.patch("/api/users/@me/", {"current_password": "wrong", "password": "12345678"})
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        self.assertLessEqual(
+            {"attr": None, "code": "throttled", "type": "throttled_error"}.items(),
+            response.json().items(),
+        )
 
-    def test_deleting_current_user_is_not_supported(self):
-        """
-        Self-serve account deletion is currently not supported.
-        """
-        response = self.client.delete("/api/users/@me/")
-        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
-        self.assertEqual(response.json(), self.method_not_allowed_response("DELETE"))
+        # Password was not changed
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(self.CONFIG_PASSWORD))
+
+    def test_no_ratelimit_for_get_requests_for_users(self):
+        for _ in range(6):
+            response = self.client.get("/api/users/@me/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        for _ in range(4):
+            # below rate limit, so shouldn't be throttled
+            response = self.client.patch("/api/users/@me/", {"current_password": "wrong", "password": "12345678"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        for _ in range(2):
+            response = self.client.get("/api/users/@me/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        for _ in range(2):
+            # finally above rate limit, so should be throttled
+            response = self.client.patch("/api/users/@me/", {"current_password": "wrong", "password": "12345678"})
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_no_ratelimit_for_updates_that_are_not_password_changes(self):
+        for _ in range(10):
+            response = self.client.patch("/api/users/@me/", {"organization_name": "new name"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_cannot_delete_user_with_organization_memberships(self):
+        user = self._create_user("activeorgmemberships@posthog.com", password="test")
+
+        self.client.force_login(user)
+
+        user.join(organization=self.new_org, level=OrganizationMembership.Level.MEMBER)
+
+        assert OrganizationMembership.objects.filter(user=user, organization=self.new_org).exists()
+
+        response = self.client.delete(f"/api/users/@me/")
+        assert response.status_code == status.HTTP_409_CONFLICT
+
+    @patch("posthoganalytics.capture")
+    def test_can_delete_user_with_no_organization_memberships(self, mock_capture):
+        user = self._create_user("noactiveorgmemberships@posthog.com", password="test")
+
+        self.client.force_login(user)
+
+        user.join(organization=self.new_org, level=OrganizationMembership.Level.MEMBER)
+
+        assert OrganizationMembership.objects.filter(user=user, organization=self.new_org).exists()
+
+        OrganizationMembership.objects.filter(user=user).delete()
+
+        assert not OrganizationMembership.objects.filter(user=user).exists()
+
+        response = self.client.delete(f"/api/users/@me/")
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        assert not User.objects.filter(uuid=user.uuid).exists()
+
+        mock_capture.assert_called_once_with(
+            distinct_id=user.distinct_id,
+            event="user account deleted",
+            properties=mock.ANY,
+        )
+
+    def test_cannot_delete_another_user_with_no_org_memberships(self):
+        user = self._create_user("deleteanotheruser@posthog.com", password="test")
+
+        user_with_no_org_memberships = self._create_user("userwithnoorgmemberships@posthog.com", password="test")
+
+        OrganizationMembership.objects.filter(user=user_with_no_org_memberships).delete()
+
+        assert not OrganizationMembership.objects.filter(user=user_with_no_org_memberships).exists()
+
+        self.client.force_login(user)
+
+        response = self.client.delete(f"/api/users/{user_with_no_org_memberships.uuid}/")
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert User.objects.filter(uuid=user_with_no_org_memberships.uuid).exists()
+
+    def test_forbidden_to_delete_another_user_with_org_memberships(self):
+        user = self._create_user("deleteanotheruser@posthog.com", password="test")
+
+        user_with_org_memberships = self._create_user("userwithorgmemberships@posthog.com", password="test")
+
+        assert OrganizationMembership.objects.filter(user=user_with_org_memberships).exists()
+
+        self.client.force_login(user)
+
+        response = self.client.delete(f"/api/users/{user_with_org_memberships.uuid}/")
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert User.objects.filter(uuid=user_with_org_memberships.uuid).exists()
+
+    def test_cannot_delete_own_user_account_with_personal_api_key(self):
+        api_key_value = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            label="Test Delete User Account Key",
+            user=self.user,
+            secure_value=hash_key_value(api_key_value),
+            scopes=["*"],
+        )
+
+        OrganizationMembership.objects.filter(user=self.user).delete()
+
+        assert not OrganizationMembership.objects.filter(user=self.user).exists()
+
+        self.client.logout()
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {api_key_value}")
+        response = self.client.delete(f"/api/users/@me/")
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_redirect_user_to_site_with_toolbar(self):
+        self.team.app_urls = ["http://127.0.0.1:8010"]
+        self.team.save()
+
+        response = self.client.get(
+            "/api/user/redirect_to_site/?userIntent=add-action&appUrl=http%3A%2F%2F127.0.0.1%3A8010"
+        )
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        locationHeader = response.headers.get("location", "not found")
+        self.assertIn("22apiURL%22%3A%20%22http%3A%2F%2Ftestserver%22", locationHeader)
+        self.maxDiff = None
+        assert (
+            unquote(locationHeader)
+            == 'http://127.0.0.1:8010#__posthog={"action": "ph_authorize", "token": "token123", "actionId": null, "experimentId": null, "productTourId": null, "userIntent": "add-action", "toolbarVersion": "toolbar", "apiURL": "http://testserver", "dataAttributes": ["data-attr"]}'
+        )
+
+    def test_generate_params_for_user_to_load_toolbar(self):
+        self.team.app_urls = ["http://127.0.0.1:8010"]
+        self.team.save()
+
+        response = self.client.get(
+            "/api/user/redirect_to_site/?userIntent=add-action&appUrl=http%3A%2F%2F127.0.0.1%3A8010&generateOnly=1"
+        )
+        assert response.status_code == status.HTTP_200_OK
+        assert (
+            unquote(response.json()["toolbarParams"])
+            == '{"action": "ph_authorize", "token": "token123", "actionId": null, "experimentId": null, "productTourId": null, "userIntent": "add-action", "toolbarVersion": "toolbar", "apiURL": "http://testserver", "dataAttributes": ["data-attr"]}'
+        )
+
+    def test_generate_only_param_can_be_falsy(self):
+        self.team.app_urls = ["http://127.0.0.1:8010"]
+        self.team.save()
+
+        response = self.client.get(
+            "/api/user/redirect_to_site/?userIntent=add-action&appUrl=http%3A%2F%2F127.0.0.1%3A8010&generateOnly=0"
+        )
+        assert response.status_code == status.HTTP_302_FOUND
+
+    def test_redirect_user_to_site_with_experiments_toolbar(self):
+        self.team.app_urls = ["http://127.0.0.1:8010"]
+        self.team.save()
+
+        response = self.client.get(
+            "/api/user/redirect_to_site/?userIntent=edit-experiment&experimentId=12&appUrl=http%3A%2F%2F127.0.0.1%3A8010"
+        )
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        locationHeader = response.headers.get("location", "not found")
+        self.assertIn("22apiURL%22%3A%20%22http%3A%2F%2Ftestserver%22", locationHeader)
+        self.maxDiff = None
+        self.assertEqual(
+            unquote(locationHeader),
+            'http://127.0.0.1:8010#__posthog={"action": "ph_authorize", "token": "token123", "actionId": null, "experimentId": "12", "productTourId": null, "userIntent": "edit-experiment", "toolbarVersion": "toolbar", "apiURL": "http://testserver", "dataAttributes": ["data-attr"]}',
+        )
+
+    def test_redirect_only_to_allowed_urls(self):
+        self.team.app_urls = [
+            "https://www.example.com",
+            "https://*.otherexample.com",
+            "https://anotherexample.com",
+        ]
+        self.team.save()
+
+        def assert_allowed_url(url):
+            response = self.client.get(f"/api/user/redirect_to_site/?appUrl={quote(url)}")
+            location = cast(str | None, response.headers.get("location")) or ""
+            self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+            self.assertTrue(f"{url}#__posthog=" in location)
+
+        def assert_forbidden_url(url):
+            response = self.client.get(f"/api/user/redirect_to_site/?appUrl={quote(url)}")
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.assertEqual(response.headers.get("location"), None)
+
+        # hostnames
+        assert_allowed_url("https://www.example.com")
+        assert_forbidden_url("https://www.notexample.com")
+        # www.anotherexample.com is equivalent to anotherexample.com
+        assert_allowed_url("https://www.anotherexample.com")
+
+        # bare domain matches www entry
+        assert_allowed_url("https://example.com")
+
+        # wildcard domains and folders
+        assert_forbidden_url("https://subdomain.example.com")
+        assert_allowed_url("https://subdomain.otherexample.com")
+        assert_allowed_url("https://sub.subdomain.otherexample.com")
+
+    @patch("posthog.api.user.secrets.token_urlsafe")
+    @patch("posthog.api.user.get_flags_from_service")
+    def test_prepare_toolbar_preloaded_flags_with_feature_flags(self, mock_get_flags, patched_token):
+        """Test that prepare_toolbar_preloaded_flags creates a cache entry with feature flags"""
+        from django.core.cache import cache
+
+        from products.feature_flags.backend.models.feature_flag import FeatureFlag
+
+        patched_token.return_value = "test-cache-key-123"
+
+        # Mock the Rust service V2 response format
+        mock_get_flags.return_value = {
+            "flags": {
+                "test-flag-1": {"enabled": True, "variant": None},
+                "test-flag-2": {"enabled": True, "variant": "test-variant"},
+            }
+        }
+
+        # Create some feature flags
+        FeatureFlag.objects.create(team=self.team, key="test-flag-1", created_by=self.user)
+        FeatureFlag.objects.create(
+            team=self.team,
+            key="test-flag-2",
+            created_by=self.user,
+            filters={"groups": [{"properties": [], "rollout_percentage": 100, "variant": "test-variant"}]},
+        )
+
+        response = self.client.post(
+            "/api/user/prepare_toolbar_preloaded_flags/", {"distinct_id": "user123"}, content_type="application/json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+
+        # Should return cache key and flag count
+        self.assertIn("key", data)
+        self.assertIn("flag_count", data)
+        self.assertEqual(data["key"], "test-cache-key-123")
+        self.assertGreater(data["flag_count"], 0)
+
+        # Verify flags are cached with security metadata
+        cached_data = cache.get(f"toolbar_flags_{data['key']}")
+        self.assertIsNotNone(cached_data)
+        self.assertIn("feature_flags", cached_data)
+        self.assertIn("team_id", cached_data)
+        self.assertEqual(cached_data["team_id"], self.team.id)
+        self.assertIn("test-flag-1", cached_data["feature_flags"])
+        self.assertIn("test-flag-2", cached_data["feature_flags"])
+
+    @patch("posthog.api.user.get_flags_from_service")
+    def test_prepare_toolbar_preloaded_flags_passes_internal_request_token(self, mock_get_flags):
+        """The toolbar prep handler is internal PostHog traffic, not customer SDK
+        traffic — it must forward INTERNAL_REQUEST_TOKEN so the Rust service skips
+        the per-team billing limiter."""
+        mock_get_flags.return_value = {"flags": {}}
+
+        with self.settings(INTERNAL_REQUEST_TOKEN="test-internal-token"):
+            response = self.client.post(
+                "/api/user/prepare_toolbar_preloaded_flags/",
+                {"distinct_id": "user123"},
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(mock_get_flags.call_args.kwargs["internal_request_token"], "test-internal-token")
+
+    def test_get_toolbar_preloaded_flags_retrieves_from_cache(self):
+        """Test that get_toolbar_preloaded_flags retrieves flags from cache"""
+        from django.core.cache import cache
+
+        # Set up cached flags with metadata
+        test_flags = {"flag1": True, "flag2": "variant-a", "flag3": False}
+        cache_data = {"feature_flags": test_flags, "team_id": self.team.id}
+        cache_key = "toolbar_flags_test-key-456"
+        cache.set(cache_key, cache_data, timeout=300)
+
+        response = self.client.get("/api/user/get_toolbar_preloaded_flags/?key=test-key-456")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertEqual(data["featureFlags"], test_flags)
+
+    def test_get_toolbar_preloaded_flags_returns_404_for_missing_key(self):
+        """Test that get_toolbar_preloaded_flags returns 404 for expired/missing cache key"""
+        response = self.client.get("/api/user/get_toolbar_preloaded_flags/?key=nonexistent-key")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertIn("error", response.json())
+
+    def test_get_toolbar_preloaded_flags_prevents_cross_team_access(self):
+        """Test that users cannot access flags from other teams"""
+        from django.core.cache import cache
+
+        # Create flags for a different team
+        other_team = Team.objects.create(name="Other Team", organization=self.organization)
+        test_flags = {"secret-flag": True}
+        cache_data = {"feature_flags": test_flags, "team_id": other_team.id}
+        cache_key = "toolbar_flags_test-key-789"
+        cache.set(cache_key, cache_data, timeout=300)
+
+        # Try to access with current user (who belongs to self.team, not other_team)
+        response = self.client.get("/api/user/get_toolbar_preloaded_flags/?key=test-key-789")
+
+        # Should be forbidden
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("error", response.json())
+
+    def test_redirect_to_site_with_toolbar_flags_key(self):
+        self.team.app_urls = ["http://127.0.0.1:8010"]
+        self.team.save()
+
+        response = self.client.get(
+            "/api/user/redirect_to_site/?userIntent=add-action&appUrl=http%3A%2F%2F127.0.0.1%3A8010&toolbarFlagsKey=test-key-789"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        location_header = response.headers.get("location", "not found")
+
+        # Verify toolbarFlagsKey is in the redirect URL params
+        self.assertIn("toolbarFlagsKey", unquote(location_header))
+        self.assertIn("test-key-789", unquote(location_header))
+
+        # Verify the full params structure
+        decoded_location = unquote(location_header)
+        self.assertIn('"toolbarFlagsKey": "test-key-789"', decoded_location)
+
+    def test_user_cannot_update_protected_fields(self):
+        self.user.is_staff = False
+        self.user.save()
+        fields = {
+            "date_joined": "2021-01-01T00:00:00Z",
+            "uuid": str(uuid.uuid4()),
+            "distinct_id": "distinct_id",
+            "pending_email": "changed@example.com",
+            "is_email_verified": True,
+        }
+
+        initial_user = self.client.get("/api/users/@me/").json()
+
+        for field, value in fields.items():
+            response = self.client.patch("/api/users/@me/", {field: value})
+            assert response.json()[field] == initial_user[field], (
+                f"Updating field '{field}' to '{value}' worked when it shouldn't! Was {initial_user[field]} and is now {response.json()[field]}"
+            )
+
+    def test_can_update_notification_settings(self):
+        response = self.client.patch(
+            "/api/users/@me/",
+            {
+                "notification_settings": {
+                    "plugin_disabled": False,
+                    "discussions_mentioned": False,
+                    "error_tracking_issue_assigned": False,
+                    "project_weekly_digest_disabled": {123: True},
+                    "all_weekly_digest_disabled": True,
+                    "data_pipeline_error_threshold": 0.1,
+                    "materialized_view_sync_failed": True,
+                }
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(
+            response_data["notification_settings"],
+            {
+                "plugin_disabled": False,
+                "discussions_mentioned": False,
+                "project_weekly_digest_disabled": {"123": True},  # Note: JSON converts int keys to strings
+                "all_weekly_digest_disabled": True,
+                "error_tracking_issue_assigned": False,
+                "error_tracking_weekly_digest": True,
+                "data_pipeline_error_threshold": 0.1,
+                "project_api_key_exposed": True,
+                "materialized_view_sync_failed": True,
+                "web_analytics_weekly_digest": True,
+                "organization_member_join_email_disabled": {},
+                "realtime_notifications_disabled": {},
+                "pipeline_notifications_disabled": {},
+            },
+        )
 
         self.user.refresh_from_db()
+        self.assertEqual(
+            self.user.partial_notification_settings,
+            {
+                "plugin_disabled": False,
+                "discussions_mentioned": False,
+                "project_weekly_digest_disabled": {"123": True},
+                "all_weekly_digest_disabled": True,
+                "error_tracking_issue_assigned": False,
+                "error_tracking_weekly_digest": True,
+                "data_pipeline_error_threshold": 0.1,
+                "project_api_key_exposed": True,
+                "materialized_view_sync_failed": True,
+                "web_analytics_weekly_digest": True,
+                "organization_member_join_email_disabled": {},
+                "realtime_notifications_disabled": {},
+                "pipeline_notifications_disabled": {},
+            },
+        )
+
+    def test_notification_settings_project_settings_are_merged_not_replaced(self):
+        # First update
+        response = self.client.patch(
+            "/api/users/@me/", {"notification_settings": {"project_weekly_digest_disabled": {123: True}}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Second update with different project
+        response = self.client.patch(
+            "/api/users/@me/", {"notification_settings": {"project_weekly_digest_disabled": {456: True}}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response_data = response.json()
+        self.assertEqual(
+            response_data["notification_settings"]["project_weekly_digest_disabled"], {"123": True, "456": True}
+        )
+
+    def test_notification_settings_organization_member_join_settings_are_merged_not_replaced(self):
+        # First update
+        response = self.client.patch(
+            "/api/users/@me/",
+            {
+                "notification_settings": {
+                    "organization_member_join_email_disabled": {"00000000-0000-0000-0000-000000000001": True}
+                }
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Second update with different organization
+        response = self.client.patch(
+            "/api/users/@me/",
+            {
+                "notification_settings": {
+                    "organization_member_join_email_disabled": {"00000000-0000-0000-0000-000000000002": True}
+                }
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response_data = response.json()
+        self.assertEqual(
+            response_data["notification_settings"]["organization_member_join_email_disabled"],
+            {
+                "00000000-0000-0000-0000-000000000001": True,
+                "00000000-0000-0000-0000-000000000002": True,
+            },
+        )
+
+    def test_notification_settings_default_includes_realtime_disabled_empty_dict(self):
+        user = self._create_user("rt-defaults@test.com")
+        assert user.notification_settings["realtime_notifications_disabled"] == {}
+
+    def test_realtime_notifications_disabled_accepts_valid_payload(self):
+        self.client.force_login(self.user)
+        response = self.client.patch(
+            "/api/users/@me/",
+            {
+                "notification_settings": {
+                    "realtime_notifications_disabled": {"comment_mention": {str(self.team.id): True}}
+                }
+            },
+            format="json",
+        )
+        assert response.status_code == 200, response.json()
+        self.user.refresh_from_db()
+        assert self.user.partial_notification_settings is not None
+        assert self.user.partial_notification_settings["realtime_notifications_disabled"] == {
+            "comment_mention": {str(self.team.id): True}
+        }
+
+    @parameterized.expand(
+        [
+            ("unknown_type", {"made_up_type": {"1": True}}, "Unknown notification type"),
+            ("non_bool_value", {"comment_mention": {"1": "yes"}}, "must be boolean"),
+            ("non_dict_top_level", "not_a_dict", "must be a dict"),
+            ("non_dict_inner", {"comment_mention": "not_a_dict"}, "must be a dict of team_id"),
+        ]
+    )
+    def test_realtime_notifications_disabled_rejects_invalid_payload(self, _name, payload, expected_message_substr):
+        self.client.force_login(self.user)
+        response = self.client.patch(
+            "/api/users/@me/",
+            {"notification_settings": {"realtime_notifications_disabled": payload}},
+            format="json",
+        )
+        assert response.status_code == 400, response.json()
+        assert expected_message_substr in response.json()["detail"], response.json()
+
+    def test_realtime_notifications_disabled_false_overwrites_true_for_same_pair(self):
+        self.user.partial_notification_settings = {"realtime_notifications_disabled": {"comment_mention": {"1": True}}}
+        self.user.save()
+        self.client.force_login(self.user)
+        response = self.client.patch(
+            "/api/users/@me/",
+            {"notification_settings": {"realtime_notifications_disabled": {"comment_mention": {"1": False}}}},
+            format="json",
+        )
+        assert response.status_code == 200, response.json()
+        self.user.refresh_from_db()
+        assert self.user.partial_notification_settings is not None
+        assert self.user.partial_notification_settings["realtime_notifications_disabled"] == {
+            "comment_mention": {"1": False}
+        }
+
+    def test_realtime_notifications_disabled_two_level_merge_preserves_other_pairs(self):
+        self.user.partial_notification_settings = {
+            "realtime_notifications_disabled": {
+                "comment_mention": {"7": True, "8": True},
+                "alert_firing": {"7": True},
+            }
+        }
+        self.user.save()
+        self.client.force_login(self.user)
+        response = self.client.patch(
+            "/api/users/@me/",
+            {"notification_settings": {"realtime_notifications_disabled": {"comment_mention": {"9": True}}}},
+            format="json",
+        )
+        assert response.status_code == 200, response.json()
+        self.user.refresh_from_db()
+        assert self.user.partial_notification_settings is not None
+        assert self.user.partial_notification_settings["realtime_notifications_disabled"] == {
+            "comment_mention": {"7": True, "8": True, "9": True},
+            "alert_firing": {"7": True},
+        }
+
+    @parameterized.expand(
+        [
+            ("bool_scalar", "all_weekly_digest_disabled", False),
+            ("plugin_disabled_bool", "plugin_disabled", True),
+            ("project_dict", "project_weekly_digest_disabled", {"99": True}),
+            ("org_dict", "organization_member_join_email_disabled", {"00000000-0000-0000-0000-000000000099": True}),
+            ("realtime_two_level_dict", "realtime_notifications_disabled", {"comment_mention": {"99": True}}),
+            ("float_threshold", "data_pipeline_error_threshold", 0.99),
+        ]
+    )
+    def test_partial_notification_settings_patch_preserves_unrelated_keys(self, _name, patched_key, patched_value):
+        # Pre-seed every key with a non-default value so any clobber is visible.
+        pre_seeded = {
+            "plugin_disabled": False,
+            "error_tracking_issue_assigned": False,
+            "discussions_mentioned": False,
+            "project_weekly_digest_disabled": {"1": True, "2": True},
+            "all_weekly_digest_disabled": True,
+            "data_pipeline_error_threshold": 0.42,
+            "project_api_key_exposed": False,
+            "materialized_view_sync_failed": True,
+            "web_analytics_weekly_digest": False,
+            "organization_member_join_email_disabled": {"00000000-0000-0000-0000-000000000001": True},
+            "realtime_notifications_disabled": {"comment_mention": {"1": True}},
+        }
+        self.user.partial_notification_settings = pre_seeded
+        self.user.save()
+        self.client.force_login(self.user)
+
+        response = self.client.patch(
+            "/api/users/@me/",
+            {"notification_settings": {patched_key: patched_value}},
+            format="json",
+        )
+
+        assert response.status_code == 200, response.json()
+        self.user.refresh_from_db()
+        assert self.user.partial_notification_settings is not None
+        for unrelated_key, original_value in pre_seeded.items():
+            if unrelated_key == patched_key:
+                continue
+            assert self.user.partial_notification_settings[unrelated_key] == original_value, (
+                f"Patching {patched_key!r} clobbered {unrelated_key!r}"
+            )
+
+    def test_pipeline_notifications_rejects_malformed_pipeline_ids(self):
+        for bad_key in [
+            "<script>alert(1)</script>",
+            "random_garbage_key",
+            "hog_function:",
+            "hog_function:not a uuid",
+            "unknown_type:abc",
+            "",
+        ]:
+            response = self.client.patch(
+                "/api/users/@me/",
+                {"notification_settings": {"pipeline_notifications_disabled": {bad_key: True}}},
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, f"key {bad_key!r} was accepted")
+            self.assertEqual(response.json()["code"], "invalid_input")
+
+    def test_pipeline_notifications_accepts_valid_pipeline_ids(self):
+        for good_key in [
+            "hog_function:019dcf05-db1d-0000-682a-935c8e1ad2c9",
+            "batch_export:019dcf05-dac4-0000-07d4-cf53026deba6",
+            "plugin_config:42",
+        ]:
+            response = self.client.patch(
+                "/api/users/@me/",
+                {"notification_settings": {"pipeline_notifications_disabled": {good_key: True}}},
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK, f"key {good_key!r} was rejected")
+
+    def test_pipeline_notifications_caps_total_entries(self):
+        from posthog.api.user import MAX_PIPELINE_NOTIFICATIONS
+
+        too_many = {f"hog_function:fake-{i}": True for i in range(MAX_PIPELINE_NOTIFICATIONS + 1)}
+        response = self.client.patch(
+            "/api/users/@me/",
+            {"notification_settings": {"pipeline_notifications_disabled": too_many}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("more than", response.json()["detail"])
+
+    def test_invalid_notification_settings_returns_error(self):
+        response = self.client.patch("/api/users/@me/", {"notification_settings": {"invalid_key": True}})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(),
+            {
+                "type": "validation_error",
+                "code": "invalid_input",
+                "detail": "Key invalid_key is not valid as a key for notification settings",
+                "attr": "notification_settings",
+            },
+        )
+
+    def test_notification_settings_wrong_type_returns_error(self):
+        response = self.client.patch(
+            "/api/users/@me/",
+            {
+                "notification_settings": {
+                    "project_weekly_digest_disabled": {"123": "not a boolean"}  # This should be True or False
+                }
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(),
+            {
+                "type": "validation_error",
+                "code": "invalid_input",
+                "detail": "Notification setting values must be boolean, got <class 'str'> instead",
+                "attr": "notification_settings",
+            },
+        )
+
+    def test_can_disable_all_notifications(self):
+        response = self.client.patch("/api/users/@me/", {"notification_settings": {"all_weekly_digest_disabled": True}})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(
+            response_data["notification_settings"],
+            {
+                "plugin_disabled": True,  # Default value
+                "discussions_mentioned": True,  # Default value
+                "project_weekly_digest_disabled": {},  # Default value
+                "all_weekly_digest_disabled": True,
+                "error_tracking_issue_assigned": True,  # Default value
+                "error_tracking_weekly_digest": True,  # Default value
+                "data_pipeline_error_threshold": 0.01,  # Default value
+                "project_api_key_exposed": True,  # Default value
+                "materialized_view_sync_failed": False,  # Default value
+                "web_analytics_weekly_digest": True,  # Default value
+                "organization_member_join_email_disabled": {},  # Default value
+                "realtime_notifications_disabled": {},  # Default value
+                "pipeline_notifications_disabled": {},  # Default value
+            },
+        )
 
 
-class TestUserSlackWebhook(APIBaseTest):
-    ENDPOINT: str = "/api/user/test_slack_webhook/"
+class TestSessionAuthEndpoints(APIBaseTest):
+    """
+    Tests that certain endpoints require session authentication and reject Personal API Keys.
 
-    def send_request(self, payload):
-        return self.client.post(self.ENDPOINT, payload)
+    These endpoints (redirect_to_site, etc.) are browser-interactive
+    features that should not be accessible via API keys.
+    """
 
-    def test_slack_webhook_no_webhook(self):
-        response = self.send_request({})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["error"], "no webhook URL")
+    def setUp(self):
+        super().setUp()
+        self.api_key_value = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            label="Test API Key",
+            user=self.user,
+            secure_value=hash_key_value(self.api_key_value),
+            scopes=["*"],
+        )
+        self.team.app_urls = ["http://127.0.0.1:8010"]
+        self.team.save()
 
-    def test_slack_webhook_bad_url(self):
-        response = self.send_request({"webhook": "blabla"})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["error"], "invalid webhook URL")
+    def test_redirect_to_site_rejects_personal_api_key(self):
+        """Personal API Keys should not be able to call redirect_to_site."""
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.api_key_value}")
 
-    def test_slack_webhook_bad_url_full(self):
-        response = self.send_request({"webhook": "http://localhost/bla"})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["error"], "invalid webhook URL")
+        response = self.client.get("/api/user/redirect_to_site/?appUrl=http%3A%2F%2F127.0.0.1%3A8010")
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response.json()["detail"], "Authentication credentials were not provided.")
+
+    def test_redirect_to_site_works_with_session_auth(self):
+        """Session authentication should still work for redirect_to_site."""
+        response = self.client.get("/api/user/redirect_to_site/?appUrl=http%3A%2F%2F127.0.0.1%3A8010")
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+
+    def test_prepare_toolbar_preloaded_flags_rejects_personal_api_key(self):
+        """Personal API Keys should not be able to call prepare_toolbar_preloaded_flags."""
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.api_key_value}")
+
+        response = self.client.post(
+            "/api/user/prepare_toolbar_preloaded_flags/",
+            {"distinct_id": "test-user"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response.json()["detail"], "Authentication credentials were not provided.")
+
+    def test_get_toolbar_preloaded_flags_rejects_personal_api_key(self):
+        """Personal API Keys should not be able to call get_toolbar_preloaded_flags."""
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.api_key_value}")
+
+        response = self.client.get("/api/user/get_toolbar_preloaded_flags/?key=test-key")
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response.json()["detail"], "Authentication credentials were not provided.")
 
 
 class TestLoginViews(APIBaseTest):
@@ -492,3 +2206,768 @@ class TestLoginViews(APIBaseTest):
         User.objects.all().delete()
         response = self.client.get("/", follow=True)
         self.assertRedirects(response, "/preflight")
+
+
+class TestStaffUserAPI(APIBaseTest):
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        cls.user.is_staff = True
+        cls.user.save()
+
+    def test_can_list_staff_users(self):
+        response = self.client.get("/api/users/?is_staff=true")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(response_data["count"], 1)
+        self.assertEqual(response_data["results"][0]["is_staff"], True)
+        self.assertEqual(response_data["results"][0]["email"], self.CONFIG_EMAIL)
+
+    def test_only_staff_can_list_other_users(self):
+        self.user.is_staff = False
+        self.user.save()
+
+        response = self.client.get("/api/users")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["count"], 1)
+        self.assertEqual(response.json()["results"][0]["uuid"], str(self.user.uuid))
+
+    def test_update_staff_user(self):
+        user = self._create_user("newuser@posthog.com", password="12345678")
+        self.assertEqual(user.is_staff, False)
+
+        # User becomes staff
+        response = self.client.patch(f"/api/users/{user.uuid}/", {"is_staff": True})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(response_data["is_staff"], True)
+        user.refresh_from_db()
+        self.assertEqual(user.is_staff, True)
+
+        # User is no longer staff
+        response = self.client.patch(f"/api/users/{user.uuid}/", {"is_staff": False})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(response_data["is_staff"], False)
+        user.refresh_from_db()
+        self.assertEqual(user.is_staff, False)
+
+    def test_only_staff_user_can_update_staff_prop(self):
+        user = self._create_user("newuser@posthog.com", password="12345678")
+
+        self.user.is_staff = False
+        self.user.save()
+
+        response = self.client.patch(f"/api/users/{user.uuid}/", {"is_staff": True})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(
+            response.json(),
+            {
+                "type": "authentication_error",
+                "code": "permission_denied",
+                "detail": "As a non-staff user you're only allowed to access the `@me` user instance.",
+                "attr": None,
+            },
+        )
+
+        user.refresh_from_db()
+        self.assertEqual(user.is_staff, False)
+
+
+class TestEmailVerificationAPI(APIBaseTest):
+    CONFIG_AUTO_LOGIN = False
+
+    def setUp(self):
+        # prevent throttling of user requests to pass on from one test
+        # to the next
+        cache.clear()
+        super().setUp()
+
+        set_instance_setting("EMAIL_HOST", "localhost")
+
+        self.other_user = self._create_user("otheruser@posthog.com", password="12345678")
+        assert not self.other_user.is_email_verified
+        assert not self.other_user.is_email_verified
+
+    # Email verification request
+
+    @patch("posthoganalytics.capture")
+    def test_user_can_request_verification_email(self, mock_capture):
+        set_instance_setting("EMAIL_HOST", "localhost")
+        with self.settings(CELERY_TASK_ALWAYS_EAGER=True, SITE_URL="https://my.posthog.net"):
+            response = self.client.post(f"/api/users/request_email_verification/", {"uuid": self.user.uuid})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.content.decode(), '{"success":true}')
+        self.assertSetEqual({",".join(outmail.to) for outmail in mail.outbox}, {self.CONFIG_EMAIL})
+
+        self.assertEqual(mail.outbox[0].subject, "Verify your email address")
+        self.assertEqual(mail.outbox[0].body, "")  # no plain-text version support yet
+
+        html_message = mail.outbox[0].alternatives[0][0]  # type: ignore
+        self.validate_basic_html(
+            html_message,
+            "https://my.posthog.net",
+            preheader="Please follow the link inside to verify your account.",
+        )
+        link_index = html_message.find("https://my.posthog.net/verify_email")
+        reset_link = html_message[link_index : html_message.find('"', link_index)]
+        token = reset_link.replace("https://my.posthog.net/verify_email/", "").replace(f"{self.user.uuid}/", "")
+
+        response = self.client.post(f"/api/users/verify_email/", {"uuid": self.user.uuid, "token": token})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # check is_email_verified is changed to True
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.is_email_verified)
+
+        # assert events were captured
+        mock_capture.assert_any_call(
+            event="user logged in",
+            distinct_id=self.user.distinct_id,
+            properties={"social_provider": ""},
+            groups={
+                "instance": ANY,
+                "organization": str(self.team.organization_id),
+                "project": str(self.team.uuid),
+            },
+        )
+        mock_capture.assert_any_call(
+            event="user verified email",
+            distinct_id=self.user.distinct_id,
+            properties={"$set": ANY},
+        )
+
+        mock_capture.assert_any_call(
+            event="verification email sent",
+            distinct_id=self.user.distinct_id,
+            groups={
+                "organization": str(self.team.organization_id),
+            },
+        )
+        self.assertEqual(mock_capture.call_count, 3)
+
+    def test_cant_verify_if_email_is_not_configured(self):
+        set_instance_setting("EMAIL_HOST", "")
+        with self.settings(CELERY_TASK_ALWAYS_EAGER=True):
+            response = self.client.post(f"/api/users/request_email_verification/", {"uuid": self.user.uuid})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(),
+            {
+                "type": "validation_error",
+                "code": "email_not_available",
+                "detail": "Cannot verify email address because email is not configured for your instance. Please contact your administrator.",
+                "attr": None,
+            },
+        )
+
+    def test_cant_verify_more_than_six_times(self):
+        set_instance_setting("EMAIL_HOST", "localhost")
+
+        for i in range(7):
+            with self.settings(CELERY_TASK_ALWAYS_EAGER=True, SITE_URL="https://my.posthog.net"):
+                response = self.client.post(
+                    f"/api/users/request_email_verification/",
+                    {"uuid": self.user.uuid},
+                )
+            if i < 6:
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+            else:
+                # Fourth request should fail
+                self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+                self.assertLessEqual(
+                    {"attr": None, "code": "throttled", "type": "throttled_error"}.items(),
+                    response.json().items(),
+                )
+
+        # Three emails should be sent, fourth should not
+        self.assertEqual(len(mail.outbox), 6)
+
+    # Token validation
+
+    def test_can_validate_email_verification_token(self):
+        token = email_verification_token_generator.make_token(self.user)
+        response = self.client.post(f"/api/users/verify_email/", {"uuid": self.user.uuid, "token": token})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_cant_validate_email_verification_token_without_a_token(self):
+        response = self.client.post(f"/api/users/verify_email/", {"uuid": self.user.uuid})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(),
+            {
+                "type": "validation_error",
+                "code": "required",
+                "detail": "This field is required.",
+                "attr": "token",
+            },
+        )
+
+    def test_invalid_verification_token_returns_error(self):
+        valid_token = default_token_generator.make_token(self.user)
+
+        with freeze_time(timezone.now() - datetime.timedelta(seconds=86_401)):
+            # tokens expire after one day
+            expired_token = default_token_generator.make_token(self.user)
+
+        for token in [
+            valid_token[:-1],
+            "not_even_trying",
+            self.user.uuid,
+            expired_token,
+        ]:
+            response = self.client.post(
+                f"/api/users/verify_email/",
+                {"uuid": self.user.uuid, "token": token},
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(
+                response.json(),
+                {
+                    "type": "validation_error",
+                    "code": "invalid_token",
+                    "detail": "This verification token is invalid or has expired.",
+                    "attr": "token",
+                },
+            )
+
+    def test_can_only_validate_email_token_one_time(self):
+        token = email_verification_token_generator.make_token(self.user)
+        response = self.client.post(f"/api/users/verify_email/", {"uuid": self.user.uuid, "token": token})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response = self.client.post(f"/api/users/verify_email/", {"uuid": self.user.uuid, "token": token})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(),
+            {
+                "type": "validation_error",
+                "code": "invalid_token",
+                "detail": "This verification token is invalid or has expired.",
+                "attr": "token",
+            },
+        )
+
+    def test_email_verification_logs_in_user(self):
+        token = email_verification_token_generator.make_token(self.user)
+
+        self.client.logout()
+        assert self.client.get("/api/users/@me/").status_code == 401
+        session_user_id = self.client.session.get("_auth_user_id")
+        assert session_user_id is None
+
+        # NOTE: Posting sets the session user id but doesn't log in the test client hence we just check the session id
+        self.client.post(f"/api/users/verify_email/", {"uuid": self.user.uuid, "token": token})
+        session_user_id = self.client.session.get("_auth_user_id")
+        assert session_user_id == str(self.user.id)
+
+    def test_email_verification_logs_in_correctuser(self):
+        other_token = email_verification_token_generator.make_token(self.other_user)
+        self.client.logout()
+        assert self.client.session.get("_auth_user_id") is None
+
+        # NOTE: The user id in path should basically be ignored
+        self.client.post(f"/api/users/verify_email/", {"uuid": self.other_user.uuid, "token": other_token})
+        session_user_id = self.client.session.get("_auth_user_id")
+        assert session_user_id == str(self.other_user.id)
+
+    def test_email_verification_does_not_apply_to_current_logged_in_user(self):
+        other_token = email_verification_token_generator.make_token(self.other_user)
+
+        res = self.client.post(f"/api/users/verify_email/", {"uuid": self.other_user.uuid, "token": other_token})
+        assert res.status_code == status.HTTP_200_OK
+        self.user.refresh_from_db()
+        self.other_user.refresh_from_db()
+        # Should now be logged in as other user
+        assert self.client.session.get("_auth_user_id") == str(self.other_user.id)
+        assert not self.user.is_email_verified
+        assert self.other_user.is_email_verified
+
+    def test_email_verification_fails_if_using_other_accounts_token(self):
+        token = email_verification_token_generator.make_token(self.user)
+        other_token = email_verification_token_generator.make_token(self.other_user)
+        self.client.logout()
+
+        assert (
+            self.client.post(f"/api/users/verify_email/", {"uuid": self.other_user.uuid, "token": token}).status_code
+            == status.HTTP_400_BAD_REQUEST
+        )
+
+        assert (
+            self.client.post(f"/api/users/verify_email/", {"uuid": self.user.uuid, "token": other_token}).status_code
+            == status.HTTP_400_BAD_REQUEST
+        )
+
+    def test_does_not_apply_pending_email_for_old_tokens(self):
+        self.client.logout()
+
+        token = email_verification_token_generator.make_token(self.user)
+        self.user.pending_email = "new@posthog.com"
+        self.user.save()
+
+        response = self.client.post(f"/api/users/verify_email/", {"uuid": self.user.uuid, "token": token})
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert self.user.email != "new@posthog.com"
+        assert self.user.pending_email == "new@posthog.com"
+
+        token = email_verification_token_generator.make_token(self.user)
+        response = self.client.post(f"/api/users/verify_email/", {"uuid": self.user.uuid, "token": token})
+        assert response.status_code == status.HTTP_200_OK
+        self.user.refresh_from_db()
+        assert self.user.email == "new@posthog.com"
+        assert self.user.pending_email is None
+
+    def test_email_verification_does_not_log_in_user_with_2fa_totp(self):
+        # If the user has a TOTP device configured, verifying their email must
+        # NOT silently establish an authenticated session — otherwise an
+        # attacker with access to the email inbox could bypass 2FA entirely.
+        TOTPDevice.objects.create(user=self.user, name="default", confirmed=True)
+
+        token = email_verification_token_generator.make_token(self.user)
+        self.client.logout()
+        assert self.client.session.get("_auth_user_id") is None
+
+        response = self.client.post(f"/api/users/verify_email/", {"uuid": self.user.uuid, "token": token})
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == {"success": True, "token": token, "requires_2fa": True}
+
+        # Email should still be marked verified, but the session must remain unauthenticated.
+        self.user.refresh_from_db()
+        assert self.user.is_email_verified
+        assert self.client.session.get("_auth_user_id") is None
+
+    def test_cant_request_verification_for_already_verified_email(self):
+        self.user.is_email_verified = True
+        self.user.save()
+
+        with self.settings(CELERY_TASK_ALWAYS_EAGER=True):
+            response = self.client.post(f"/api/users/request_email_verification/", {"uuid": self.user.uuid})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(),
+            {
+                "type": "validation_error",
+                "code": "already_verified",
+                "detail": "Email is already verified.",
+                "attr": None,
+            },
+        )
+        # No email should have been sent for an already-verified address.
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_can_request_verification_for_pending_email_change(self):
+        # An already-verified user who initiated an email change still needs to
+        # verify the new address — re-requesting the verification link must work.
+        self.user.is_email_verified = True
+        self.user.pending_email = "new-address@posthog.com"
+        self.user.save()
+
+        with self.settings(CELERY_TASK_ALWAYS_EAGER=True, SITE_URL="https://my.posthog.net"):
+            response = self.client.post(f"/api/users/request_email_verification/", {"uuid": self.user.uuid})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["new-address@posthog.com"])
+
+
+class TestUserTwoFactor(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        # prevent throttling of user requests to pass on from one test
+        # to the next
+        cache.clear()
+
+    @patch("posthog.api.user.TOTPDeviceForm")
+    def test_two_factor_start_setup(self, mock_totp_form):
+        response = self.client.get(f"/api/users/@me/two_factor_start_setup/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), {"success": True, "secret": ANY})
+
+        # Verify session contains required keys
+        self.assertIn("django_two_factor-hex", self.client.session)
+        self.assertIn("django_two_factor-qr_secret_key", self.client.session)
+        self.assertEqual(len(self.client.session["django_two_factor-hex"]), 40)  # 20 bytes hex = 40 chars
+
+    @patch("posthog.api.user.send_two_factor_auth_enabled_email")
+    @patch("posthog.api.user.TOTPDeviceForm")
+    def test_two_factor_validation_with_valid_token(self, mock_totp_form, mock_send_email):
+        # Setup form mock
+        mock_form_instance = mock_totp_form.return_value
+        mock_form_instance.is_valid.return_value = True
+
+        # Setup session state
+        session = self.client.session
+        session["django_two_factor-hex"] = "1234567890abcdef1234"
+        session.save()
+
+        response = self.client.post(f"/api/users/@me/two_factor_validate/", {"token": "123456"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), {"success": True})
+
+        # Verify form was created with correct params
+        mock_totp_form.assert_called_once_with("1234567890abcdef1234", self.user, data={"token": "123456"})
+        mock_form_instance.save.assert_called_once()
+
+        # Verify email was triggered
+        mock_send_email.delay.assert_called_once_with(self.user.id)
+
+    @patch("posthog.api.user.TOTPDeviceForm")
+    def test_two_factor_validation_with_invalid_token(self, mock_totp_form):
+        # Setup form mock to fail validation
+        mock_form_instance = mock_totp_form.return_value
+        mock_form_instance.is_valid.return_value = False
+
+        # Setup session state
+        session = self.client.session
+        session["django_two_factor-hex"] = "1234567890abcdef1234"
+        session.save()
+
+        response = self.client.post(f"/api/users/@me/two_factor_validate/", {"token": "invalid"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(),
+            {
+                "type": "validation_error",
+                "code": "token_invalid",
+                "detail": "Token is not valid",
+                "attr": None,
+            },
+        )
+
+    def test_two_factor_status_when_disabled(self):
+        response = self.client.get(f"/api/users/@me/two_factor_status/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(),
+            {
+                "is_enabled": False,
+                "backup_codes": [],
+                "method": None,
+                "has_passkeys": False,
+                "has_totp": False,
+                "passkeys_enabled_for_2fa": False,
+            },
+        )
+
+    @patch("posthog.api.user.default_device")
+    def test_two_factor_status_when_enabled(self, mock_default_device):
+        # Mock TOTP device
+        totp_device = TOTPDevice.objects.create(user=self.user, name="default")
+        mock_default_device.return_value = totp_device
+
+        # Create backup codes
+        static_device = StaticDevice.objects.create(user=self.user, name="backup")
+        static_device.token_set.create(token="123456")
+        static_device.token_set.create(token="789012")
+
+        response = self.client.get(f"/api/users/@me/two_factor_status/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(),
+            {
+                "is_enabled": True,
+                "backup_codes": ["123456", "789012"],
+                "method": "TOTP",
+                "has_passkeys": False,
+                "has_totp": True,
+                "passkeys_enabled_for_2fa": False,
+            },
+        )
+
+    def test_two_factor_status_with_passkeys_only(self):
+        """Test two_factor_status when user has passkeys but no TOTP"""
+        from posthog.models.webauthn_credential import WebauthnCredential
+
+        WebauthnCredential.objects.create(
+            user=self.user,
+            credential_id=b"test-credential-id",
+            label="Test Passkey",
+            public_key=b"test-public-key",
+            algorithm=-7,
+            counter=0,
+            transports=["internal"],
+            verified=True,
+        )
+        # Enable passkeys for 2FA
+        self.user.passkeys_enabled_for_2fa = True
+        self.user.save()
+
+        response = self.client.get(f"/api/users/@me/two_factor_status/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(),
+            {
+                "is_enabled": True,
+                "backup_codes": [],
+                "method": "passkey",
+                "has_passkeys": True,
+                "has_totp": False,
+                "passkeys_enabled_for_2fa": True,
+            },
+        )
+
+    def test_two_factor_status_with_both_totp_and_passkeys(self):
+        """Test two_factor_status when user has both TOTP and passkeys (TOTP takes precedence)"""
+        from posthog.models.webauthn_credential import WebauthnCredential
+
+        # Create TOTP device
+        totp_device = TOTPDevice.objects.create(user=self.user, name="default")
+
+        # Create passkey
+        WebauthnCredential.objects.create(
+            user=self.user,
+            credential_id=b"test-credential-id",
+            label="Test Passkey",
+            public_key=b"test-public-key",
+            algorithm=-7,
+            counter=0,
+            transports=["internal"],
+            verified=True,
+        )
+        # Enable passkeys for 2FA
+        self.user.passkeys_enabled_for_2fa = True
+        self.user.save()
+
+        # Create backup codes
+        static_device = StaticDevice.objects.create(user=self.user, name="backup")
+        static_device.token_set.create(token="123456")
+
+        with patch("posthog.api.user.default_device", return_value=totp_device):
+            response = self.client.get(f"/api/users/@me/two_factor_status/")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(
+                response.json(),
+                {
+                    "is_enabled": True,
+                    "backup_codes": ["123456"],
+                    "method": "TOTP",
+                    "has_passkeys": True,
+                    "has_totp": True,
+                    "passkeys_enabled_for_2fa": True,
+                },
+            )
+
+    def test_two_factor_status_with_unverified_passkeys(self):
+        """Test two_factor_status when user has unverified passkeys (should not count as 2FA)"""
+        from posthog.models.webauthn_credential import WebauthnCredential
+
+        WebauthnCredential.objects.create(
+            user=self.user,
+            credential_id=b"test-credential-id",
+            label="Test Passkey",
+            public_key=b"test-public-key",
+            algorithm=-7,
+            counter=0,
+            transports=["internal"],
+            verified=False,  # Unverified
+        )
+
+        response = self.client.get(f"/api/users/@me/two_factor_status/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(),
+            {
+                "is_enabled": False,
+                "backup_codes": [],
+                "method": None,
+                "has_passkeys": False,
+                "has_totp": False,
+                "passkeys_enabled_for_2fa": False,
+            },
+        )
+
+    def test_two_factor_status_with_passkeys_disabled_for_2fa(self):
+        """Test two_factor_status when user has passkeys but passkeys_enabled_for_2fa is False"""
+        from posthog.models.webauthn_credential import WebauthnCredential
+
+        WebauthnCredential.objects.create(
+            user=self.user,
+            credential_id=b"test-credential-id",
+            label="Test Passkey",
+            public_key=b"test-public-key",
+            algorithm=-7,
+            counter=0,
+            transports=["internal"],
+            verified=True,
+        )
+        # Ensure passkeys_enabled_for_2fa is False (default)
+        self.user.passkeys_enabled_for_2fa = False
+        self.user.save()
+
+        response = self.client.get(f"/api/users/@me/two_factor_status/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(),
+            {
+                "is_enabled": False,
+                "backup_codes": [],
+                "method": None,
+                "has_passkeys": True,
+                "has_totp": False,
+                "passkeys_enabled_for_2fa": False,
+            },
+        )
+
+    @parameterized.expand(
+        [
+            # name, has_totp, passkey_state, passkeys_enabled_for_2fa, expected_is_2fa_enabled
+            ("no_factor", False, None, False, False),
+            ("totp_only", True, None, False, True),
+            ("passkey_enabled_for_2fa", False, "verified", True, True),
+            ("passkey_present_but_disabled_for_2fa", False, "verified", False, False),
+            ("unverified_passkey_enabled_for_2fa", False, "unverified", True, False),
+        ]
+    )
+    def test_user_me_is_2fa_enabled(
+        self,
+        _name: str,
+        has_totp: bool,
+        passkey_state: str | None,
+        passkeys_enabled_for_2fa: bool,
+        expected_is_2fa_enabled: bool,
+    ):
+        """
+        /api/users/@me/.is_2fa_enabled must reflect passkey-2FA, not only TOTP — otherwise the
+        frontend keeps reopening the enforce-2FA setup modal even after the user has a passkey
+        configured as their second factor.
+        """
+        from posthog.models.webauthn_credential import WebauthnCredential
+
+        if has_totp:
+            TOTPDevice.objects.create(user=self.user, name="default", confirmed=True)
+        if passkey_state is not None:
+            WebauthnCredential.objects.create(
+                user=self.user,
+                credential_id=b"cred",
+                label="Test Passkey",
+                public_key=b"pk",
+                algorithm=-7,
+                counter=0,
+                transports=["internal"],
+                verified=(passkey_state == "verified"),
+            )
+        self.user.passkeys_enabled_for_2fa = passkeys_enabled_for_2fa
+        self.user.save(update_fields=["passkeys_enabled_for_2fa"])
+
+        response = self.client.get("/api/users/@me/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["is_2fa_enabled"], expected_is_2fa_enabled)
+
+    @patch("posthog.api.user.default_device")
+    def test_two_factor_backup_codes_generation(self, mock_default_device):
+        # Mock TOTP device to simulate 2FA being enabled
+        totp_device = TOTPDevice.objects.create(user=self.user, name="default")
+        mock_default_device.return_value = totp_device
+
+        response = self.client.post(f"/api/users/@me/two_factor_backup_codes/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        backup_codes = response.json()["backup_codes"]
+        self.assertEqual(len(backup_codes), 10)  # Verify 10 backup codes are generated
+
+        # Verify codes are stored in database
+        static_device = StaticDevice.objects.get(user=self.user)
+        stored_codes = [token.token for token in static_device.token_set.all()]
+        self.assertEqual(sorted(backup_codes), sorted(stored_codes))
+
+    def test_two_factor_backup_codes_requires_2fa_enabled(self):
+        response = self.client.post(f"/api/users/@me/two_factor_backup_codes/")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(),
+            {
+                "type": "validation_error",
+                "code": "2fa_not_enabled",
+                "detail": "2FA must be enabled first",
+                "attr": None,
+            },
+        )
+
+    @patch("posthog.api.user.send_two_factor_auth_disabled_email")
+    def test_two_factor_disable(self, mock_send_email):
+        # Setup 2FA devices
+        TOTPDevice.objects.create(user=self.user, name="default")
+        static_device = StaticDevice.objects.create(user=self.user, name="backup")
+        static_device.token_set.create(token="123456")
+
+        response = self.client.post(f"/api/users/@me/two_factor_disable/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), {"success": True})
+
+        # Verify all 2FA devices are removed
+        self.assertEqual(TOTPDevice.objects.filter(user=self.user).count(), 0)
+        self.assertEqual(StaticDevice.objects.filter(user=self.user).count(), 0)
+
+        # Verify email was triggered
+        mock_send_email.delay.assert_called_once_with(self.user.id)
+
+    def test_team_scoped_oauth_token_with_user_read_can_access_me_endpoint(self):
+        oauth_app = OAuthApplication.objects.create(
+            name="Test OAuth App",
+            client_id="test_client_id",
+            client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://example.com/callback",
+            algorithm="RS256",
+            user=self.user,
+        )
+
+        access_token = OAuthAccessToken.objects.create(
+            application=oauth_app,
+            user=self.user,
+            token="test_oauth_token",
+            scope="user:read project:read",
+            expires=timezone.now() + timedelta(hours=1),
+            scoped_teams=[self.team.id],
+        )
+
+        response = self.client.get("/api/users/@me/", headers={"authorization": f"Bearer {access_token.token}"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(response_data["uuid"], str(self.user.uuid))
+
+
+class TestUserDeletionAfterOrgDeletion(NonAtomicBaseTest):
+    """Deleting a user's only organization (which runs on Temporal) must let them delete their account.
+
+    The org-deletion workflow runs inline so the membership cascade actually completes; that requires a
+    non-atomic test case, since the workflow's activities run on their own database connections.
+    """
+
+    CLASS_DATA_LEVEL_SETUP = False
+
+    @patch("posthoganalytics.capture")
+    def test_can_delete_account_after_deleting_only_organization(self, mock_capture):
+        org = Organization.objects.create(name="Solo Org")
+        user = User.objects.create(email="solo@posthog.com", password="testpassword")
+        OrganizationMembership.objects.create(
+            user=user,
+            organization=org,
+            level=OrganizationMembership.Level.OWNER,
+        )
+        self.client.force_login(user)
+
+        # User belongs to exactly one organization
+        response = self.client.get("/api/users/@me/")
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.json()["organizations"]) == 1
+
+        # Cannot delete account while still a member of an organization
+        response = self.client.delete("/api/users/@me/")
+        assert response.status_code == status.HTTP_409_CONFLICT
+
+        # Delete the organization (runs the deletion workflow to completion)
+        with execute_deletion_workflows_inline():
+            response = self.client.delete(f"/api/organizations/{org.id}")
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+
+        # The membership cascade removed the user's memberships, so they now see zero organizations
+        assert not OrganizationMembership.objects.filter(user=user).exists()
+        response = self.client.get("/api/users/@me/")
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.json()["organizations"]) == 0
+
+        # Now the user can delete their account
+        response = self.client.delete("/api/users/@me/")
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        assert not User.objects.filter(pk=user.pk).exists()

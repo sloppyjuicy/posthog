@@ -1,41 +1,90 @@
-import { ActionFilter, EntityFilter, EntityTypes, FunnelStepRangeEntityFilter } from '~/types'
-import { Typography } from 'antd'
-import React from 'react'
-import { TextProps } from 'antd/es/typography/Text'
-import { getKeyMapping } from 'lib/components/PropertyKeyInfo'
-import { getDisplayNameFromEntityFilter } from 'scenes/insights/utils'
+import clsx from 'clsx'
 
-interface Props {
-    filter: EntityFilter | ActionFilter | FunnelStepRangeEntityFilter
-    showSubTitle?: boolean
+import { getEventDefinitionIcon } from 'scenes/data-management/events/DefinitionHeader'
+import { getDisplayNameFromEntityFilter, isAllEventsEntityFilter } from 'scenes/insights/utils'
+
+import { getCoreFilterDefinition } from '~/taxonomy/helpers'
+import { ActionFilter, EntityFilter, EntityTypes } from '~/types'
+
+import { TaxonomicFilterGroupType } from './TaxonomicFilter/types'
+
+interface EntityFilterInfoProps {
+    filter: EntityFilter | ActionFilter
+    allowWrap?: boolean
+    showSingleName?: boolean
+    style?: React.CSSProperties
+    layout?: 'row' | 'column'
+    filterGroupType?: TaxonomicFilterGroupType
+    isOptional?: boolean
+    showIcon?: boolean
 }
 
-function TextWrapper(props: TextProps): JSX.Element {
-    return (
-        <Typography.Text ellipsis={true} style={{ maxWidth: 400 }} {...props}>
-            {props.children}
-        </Typography.Text>
-    )
-}
-
-export function EntityFilterInfo({ filter, showSubTitle = true }: Props): JSX.Element {
-    const title = getDisplayNameFromEntityFilter(filter)
-    const subtitle = getDisplayNameFromEntityFilter(filter, false)
-
-    if (filter.type === EntityTypes.NEW_ENTITY || (!title && !subtitle)) {
-        return <TextWrapper title="Select filter">Select filter</TextWrapper>
+export function EntityFilterInfo({
+    filter,
+    allowWrap = false,
+    showSingleName = false,
+    style,
+    layout = 'row',
+    filterGroupType,
+    isOptional = false,
+    showIcon = false,
+}: EntityFilterInfoProps): JSX.Element {
+    const isColumn = layout === 'column'
+    let name: string | undefined
+    if (isAllEventsEntityFilter(filter) && !filter?.custom_name) {
+        name = 'All events'
+    } else {
+        const raw = getDisplayNameFromEntityFilter(filter, false)
+        name =
+            (filterGroupType ? getCoreFilterDefinition(raw, filterGroupType)?.label?.trim() : null) ?? raw ?? undefined
     }
 
-    const titleToDisplay = getKeyMapping(title, 'event')?.label ?? title ?? undefined
-    const subTitleToDisplay = getKeyMapping(subtitle, 'event')?.label ?? subtitle ?? undefined
+    const customName = filter?.custom_name ? (getDisplayNameFromEntityFilter(filter, true) ?? undefined) : undefined
+
+    const icon = showIcon
+        ? getEventDefinitionIcon({
+              id: String(filter.id ?? ''),
+              name: filter.name || String(filter.id ?? ''),
+              is_action: filter.type === EntityTypes.ACTIONS,
+              is_data_warehouse: filter.type === EntityTypes.DATA_WAREHOUSE,
+          })
+        : null
 
     return (
-        <span style={{ display: 'flex', flexDirection: 'row', alignItems: 'center' }}>
-            <TextWrapper title={titleToDisplay}>{titleToDisplay}</TextWrapper>
-            {showSubTitle && title !== subtitle && (
-                <TextWrapper type="secondary" style={{ fontSize: 13, marginLeft: 4 }} title={subTitleToDisplay}>
-                    ({subTitleToDisplay})
-                </TextWrapper>
+        // eslint-disable-next-line react/forbid-dom-props
+        <span
+            className={clsx(
+                isColumn
+                    ? 'flex flex-col items-start gap-0.5'
+                    : !allowWrap && 'block overflow-hidden text-ellipsis whitespace-nowrap'
+            )}
+            style={style}
+        >
+            <span className={clsx(icon && 'inline-flex items-center gap-1 max-w-full')}>
+                {icon}
+                <span
+                    className={clsx('EntityFilterInfo max-w-full', !allowWrap && 'whitespace-nowrap truncate')}
+                    title={customName ?? name}
+                >
+                    {customName ?? name}
+                </span>
+            </span>
+            {isOptional && (
+                <span className={clsx('text-xs font-normal text-secondary normal-case', !isColumn && 'ml-1')}>
+                    (optional)
+                </span>
+            )}
+            {customName && !showSingleName && (
+                <span
+                    className={clsx(
+                        'EntityFilterInfo max-w-full text-secondary text-xs',
+                        isColumn ? (icon ? 'ml-5' : '') : 'ml-1',
+                        !allowWrap && 'whitespace-nowrap truncate'
+                    )}
+                    title={name}
+                >
+                    {name}
+                </span>
             )}
         </span>
     )

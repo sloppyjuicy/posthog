@@ -1,0 +1,608 @@
+import type { MaxBillingContext } from 'scenes/max/maxBillingContextLogic'
+import type { MaxUIContext } from 'scenes/max/maxTypes'
+
+import type { Category, InsightShortId, NotebookInfo } from '~/types'
+
+// eslint-disable-next-line import/no-cycle
+import { DocumentBlock } from './schema-assistant-artifacts'
+import type {
+    AssistantFunnelsQuery,
+    AssistantHogQLQuery,
+    AssistantLifecycleQuery,
+    AssistantPathsQuery,
+    AssistantRetentionQuery,
+    AssistantStickinessQuery,
+    AssistantTrendsQuery,
+} from './schema-assistant-queries'
+import type {
+    DataVisualizationNode,
+    FunnelsQuery,
+    HogQLQuery,
+    LifecycleQuery,
+    PathsQuery,
+    QuerySchema,
+    RetentionQuery,
+    RevenueAnalyticsGrossRevenueQuery,
+    RevenueAnalyticsMRRQuery,
+    RevenueAnalyticsMetricsQuery,
+    RevenueAnalyticsTopCustomersQuery,
+    StickinessQuery,
+    TrendsQuery,
+} from './schema-general'
+
+// re-export MaxBillingContext to make it available in the schema
+export type { MaxBillingContext }
+
+// re-export QuerySchema to make it available in the schema
+export type AssistantQuerySchema = QuerySchema
+
+// Define ProsemirrorJSONContent locally to avoid exporting the TipTap type into schema.json
+// which leads to improper type naming
+// This matches the TipTap/Prosemirror JSONContent structure
+export interface ProsemirrorJSONContent {
+    type?: string
+    attrs?: Record<string, any>
+    content?: ProsemirrorJSONContent[]
+    marks?: {
+        type: string
+        attrs?: Record<string, any>
+        [key: string]: any
+    }[]
+    text?: string
+    [key: string]: any
+}
+
+export enum AssistantMessageType {
+    Human = 'human',
+    ToolCall = 'tool',
+    Context = 'context',
+    Assistant = 'ai',
+    Reasoning = 'ai/reasoning',
+    Visualization = 'ai/viz',
+    MultiVisualization = 'ai/multi_viz',
+    Artifact = 'ai/artifact',
+    Failure = 'ai/failure',
+    Notebook = 'ai/notebook',
+    Planning = 'ai/planning',
+    TaskExecution = 'ai/task_execution',
+}
+
+/** Source of artifact - determines which model to fetch from */
+export enum ArtifactSource {
+    /** Artifact created by the agent (stored in AgentArtifact) */
+    Artifact = 'artifact',
+    /** Reference to a saved insight (stored in Insight model) */
+    Insight = 'insight',
+    /** Legacy visualization message converted to artifact (content stored inline in state) */
+    State = 'state',
+}
+
+/** Type of artifact content */
+export enum ArtifactContentType {
+    /** Visualization artifact (chart, graph, etc.) */
+    Visualization = 'visualization',
+    /** Notebook */
+    Notebook = 'notebook',
+}
+
+export interface BaseAssistantMessage {
+    id?: string
+    parent_tool_call_id?: string
+}
+
+export interface HumanMessage extends BaseAssistantMessage {
+    type: AssistantMessageType.Human
+    content: string
+    ui_context?: MaxUIContext
+    trace_id?: string
+}
+
+export interface AssistantFormOption {
+    /** Button label, which is also the message that gets sent on click. */
+    value: string
+    /** 'primary', 'secondary', or 'tertiary' - default 'secondary' */
+    variant?: string
+    /** When href is set, the button opens the link rather than sending an AI message. */
+    href?: string
+}
+
+export interface AssistantForm {
+    options: AssistantFormOption[]
+}
+
+export interface MultiQuestionFormQuestionOption {
+    /** A short value to use when this option is selected, in a few words */
+    value: string
+    /** A longer description of the option, in one short sentence */
+    description?: string
+}
+
+/** Question types: select/multi_select for standalone, multi_field for composite */
+export type MultiQuestionFormQuestionType = 'select' | 'multi_select' | 'multi_field'
+
+/** Field types allowed inside a multi_field composite question */
+export type MultiQuestionFormFieldType = 'text' | 'number' | 'slider' | 'dropdown' | 'toggle'
+
+export interface MultiQuestionFormField {
+    /** Unique identifier for this field, used as the answer key */
+    id: string
+    /** Field type (required, no default) */
+    type: MultiQuestionFormFieldType
+    /** Label displayed above/beside the field */
+    label: string
+    /** Available answer options (required for dropdown) */
+    options?: MultiQuestionFormQuestionOption[]
+    /** Minimum value (for number and slider types) */
+    min?: number
+    /** Maximum value (for number and slider types) */
+    max?: number
+    /** Step size (for number and slider types) */
+    step?: number
+    /** Placeholder text (for text and number types) */
+    placeholder?: string
+    /** Whether this field can be left empty (default: false) */
+    optional?: boolean
+}
+
+export interface MultiQuestionFormQuestion {
+    /** Unique identifier for this question */
+    id: string
+    /** One word title for the question e.g. "Use case", "Team size", "Experience" */
+    title: string
+    /** The question text to display */
+    question: string
+    /**
+     * Question type. Use 'multi_field' with fields array for composite questions.
+     * @default select
+     */
+    type?: MultiQuestionFormQuestionType
+    /** Available answer options (required for select and multi_select) */
+    options?: MultiQuestionFormQuestionOption[]
+    /** Whether to show a "Type your answer" option (default: true). Used for select and multi_select types. */
+    allow_custom_answer?: boolean
+    /** Fields for multi_field type questions, grouped with a shared submit button */
+    fields?: MultiQuestionFormField[]
+}
+
+export interface MultiQuestionFormAnswers {
+    [questionId: string]: string | string[]
+}
+
+export interface MultiQuestionForm {
+    /** The questions to ask */
+    questions: MultiQuestionFormQuestion[]
+}
+
+export interface ApprovalResumePayload {
+    action: 'approve' | 'reject'
+    proposal_id: string
+    feedback?: string
+    payload?: Record<string, unknown>
+}
+
+export interface FormResumePayload {
+    action: 'form'
+    form_answers: MultiQuestionFormAnswers
+}
+
+export interface FormDismissPayload {
+    action: 'dismiss_form'
+}
+
+export interface ClientToolResultPayload {
+    action: 'client_tool_result'
+    /** Tool call id this result answers — echoed back so misdelivery fails loudly instead of silently */
+    tool_call_id?: string
+    /** Result produced by the tool's client-side handler, returned verbatim to the tool awaiting it */
+    result: Record<string, unknown>
+}
+
+export type ResumePayload = ApprovalResumePayload | FormResumePayload | FormDismissPayload | ClientToolResultPayload
+
+export interface AssistantMessageMetadata {
+    form?: AssistantForm
+    /** Thinking blocks, as well as server_tool_use and web_search_tool_result ones. Anthropic format of blocks. */
+    thinking?: Record<string, unknown>[]
+    /** Provenance for non-LLM-authored messages. Format: `slash_command:<name>`. */
+    source?: string
+}
+
+export interface AssistantToolCall {
+    id: string
+    name: string
+    args: Record<string, unknown>
+    /**
+     * `type` needed to conform to the OpenAI shape, which is expected by LangChain
+     * @default "tool_call"
+     */
+    type: 'tool_call'
+}
+
+export interface AssistantMessage extends BaseAssistantMessage {
+    type: AssistantMessageType.Assistant
+    content: string
+    meta?: AssistantMessageMetadata
+    tool_calls?: AssistantToolCall[]
+}
+
+export interface ReasoningMessage extends BaseAssistantMessage {
+    /**
+     * @deprecated The model should not be used
+     */
+    type: AssistantMessageType.Reasoning
+    content: string
+    substeps?: string[]
+}
+
+export interface ModeContext {
+    type: 'mode'
+    mode: AgentMode
+}
+
+export type ContextMessageMetadata = ModeContext | null
+
+export interface ContextMessage extends BaseAssistantMessage {
+    type: AssistantMessageType.Context
+    content: string
+    meta?: ContextMessageMetadata
+}
+
+/**
+ * The union type with all cleaned queries for the assistant. Only used for generating the schemas with an LLM.
+ */
+export type AnyAssistantGeneratedQuery =
+    | DataVisualizationNode
+    | AssistantTrendsQuery
+    | AssistantFunnelsQuery
+    | AssistantRetentionQuery
+    | AssistantStickinessQuery
+    | AssistantPathsQuery
+    | AssistantLifecycleQuery
+    | AssistantHogQLQuery
+
+export interface VisualizationItem {
+    /** @default '' */
+    query: string
+    plan?: string
+    answer:
+        | AnyAssistantGeneratedQuery
+        | TrendsQuery
+        | FunnelsQuery
+        | RetentionQuery
+        | StickinessQuery
+        | PathsQuery
+        | LifecycleQuery
+        | HogQLQuery
+        | RevenueAnalyticsGrossRevenueQuery
+        | RevenueAnalyticsMetricsQuery
+        | RevenueAnalyticsMRRQuery
+        | RevenueAnalyticsTopCustomersQuery
+    initiator?: string
+}
+
+export interface VisualizationMessage extends BaseAssistantMessage, VisualizationItem {
+    type: AssistantMessageType.Visualization
+    short_id?: InsightShortId
+}
+
+export interface FailureMessage extends BaseAssistantMessage {
+    type: AssistantMessageType.Failure
+    content?: string
+}
+
+export interface NotebookUpdateMessage extends BaseAssistantMessage {
+    type: AssistantMessageType.Notebook
+    notebook_id: string
+    content: ProsemirrorJSONContent
+    notebook_type?: Category
+    conversation_notebooks?: NotebookInfo[]
+    current_run_notebooks?: NotebookInfo[]
+    tool_calls?: AssistantToolCall[]
+}
+
+export enum PlanningStepStatus {
+    Pending = 'pending',
+    InProgress = 'in_progress',
+    Completed = 'completed',
+}
+
+export interface PlanningStep {
+    /**
+     * @deprecated The class should not be used
+     */
+    description: string
+    status: PlanningStepStatus
+}
+
+export interface PlanningMessage extends BaseAssistantMessage {
+    /**
+     * @deprecated The class should not be used
+     */
+    type: AssistantMessageType.Planning
+    steps: PlanningStep[]
+}
+
+export enum TaskExecutionStatus {
+    Pending = 'pending',
+    InProgress = 'in_progress',
+    Completed = 'completed',
+    Failed = 'failed',
+}
+
+export interface TaskExecutionItem {
+    /**
+     * @deprecated The class should not be used
+     */
+    id: string
+    description: string
+    prompt: string
+    status: TaskExecutionStatus
+    artifact_ids?: string[]
+    progress_text?: string
+    task_type: string
+}
+
+export interface TaskExecutionMessage extends BaseAssistantMessage {
+    /**
+     * @deprecated The class should not be used
+     */
+    type: AssistantMessageType.TaskExecution
+    tasks: TaskExecutionItem[]
+}
+
+export interface MultiVisualizationMessage extends BaseAssistantMessage {
+    type: AssistantMessageType.MultiVisualization
+    visualizations: VisualizationItem[]
+    commentary?: string
+}
+
+export interface VisualizationArtifactContent {
+    content_type: ArtifactContentType.Visualization
+    query: AnyAssistantGeneratedQuery | AssistantQuerySchema
+    name?: string | null
+    description?: string | null
+    plan?: string | null
+}
+
+export interface NotebookArtifactContent {
+    content_type: ArtifactContentType.Notebook
+    /** Structured blocks for the notebook content */
+    blocks: DocumentBlock[]
+    /** Title for the notebook */
+    title?: string | null
+    /** Whether this notebook has been saved to the database (not stored, set during enrichment) */
+    is_saved?: boolean
+}
+
+export type ArtifactContent = VisualizationArtifactContent | NotebookArtifactContent
+
+/** Frontend artifact message containing enriched content field. Do not use in the backend. */
+export interface ArtifactMessage extends BaseAssistantMessage {
+    type: AssistantMessageType.Artifact
+    /** The ID of the artifact (short_id for both drafts and saved insights) */
+    artifact_id: string
+    /** Source of artifact - determines which model to fetch from */
+    source: ArtifactSource
+    /** Content of artifact */
+    content: ArtifactContent
+}
+
+export type RootAssistantMessage =
+    | VisualizationMessage
+    | MultiVisualizationMessage
+    | ArtifactMessage
+    | ReasoningMessage
+    | AssistantMessage
+    | HumanMessage
+    | FailureMessage
+    | NotebookUpdateMessage
+    | PlanningMessage
+    | TaskExecutionMessage
+    | AssistantToolCallMessage
+
+export enum AssistantEventType {
+    Status = 'status',
+    Message = 'message',
+    Conversation = 'conversation',
+    Notebook = 'notebook',
+    Update = 'update',
+    Approval = 'approval',
+    Sandbox = 'sandbox',
+}
+
+export interface AssistantUpdateEvent {
+    id: string
+    tool_call_id: string
+    content: string
+}
+
+export interface SubagentUpdateEvent {
+    id: string
+    tool_call_id: string
+    content: AssistantToolCall
+}
+
+export enum AssistantGenerationStatusType {
+    Acknowledged = 'ack',
+    GenerationError = 'generation_error',
+}
+
+export interface AssistantGenerationStatusEvent {
+    type: AssistantGenerationStatusType
+}
+
+export interface AssistantToolCallMessage extends BaseAssistantMessage {
+    type: AssistantMessageType.ToolCall
+    /**
+     * Payload passed through to the frontend - specifically for calls of contextual tool.
+     * Tool call messages without a ui_payload are not passed through to the frontend.
+     */
+    ui_payload?: Record<string, any> | null
+    content: string
+    tool_call_id: string
+}
+
+/** Status value indicating an operation requires user approval before execution */
+export const PENDING_APPROVAL_STATUS = 'pending_approval' as const
+
+/** Response returned when a tool operation requires user approval */
+export interface DangerousOperationResponse {
+    status: typeof PENDING_APPROVAL_STATUS
+    proposalId: string
+    toolName: string
+    preview: string
+    payload: Record<string, any>
+}
+
+export type ApprovalDecisionStatus = 'pending' | 'approved' | 'rejected' | 'auto_rejected'
+
+export type ApprovalCardUIStatus = ApprovalDecisionStatus | 'approving' | 'rejecting' | 'custom'
+
+export type AssistantTool =
+    | 'search_session_recordings'
+    | 'create_ai_trace_parser'
+    | 'fix_hogql_query'
+    | 'analyze_user_interviews'
+    | 'create_user_interview_topic'
+    | 'create_hog_transformation_function'
+    | 'create_hog_function_filters'
+    | 'create_hog_function_inputs'
+    | 'create_message_template'
+    | 'filter_error_tracking_issues'
+    | 'search_error_tracking_issues'
+    | 'find_error_tracking_impactful_issue_event_list'
+    | 'experiment_results_summary'
+    | 'experiment_session_replays_summary'
+    | 'create_survey'
+    | 'edit_survey'
+    | 'analyze_survey_responses'
+    | 'read_taxonomy'
+    | 'search'
+    | 'read_data'
+    | 'todo_write'
+    | 'filter_revenue_analytics'
+    | 'filter_web_analytics'
+    | 'create_feature_flag'
+    | 'create_experiment'
+    | 'create_task'
+    | 'run_task'
+    | 'get_task_run'
+    | 'get_task_run_logs'
+    | 'list_tasks'
+    | 'list_task_runs'
+    | 'list_repositories'
+    | 'web_search'
+    | 'execute_sql'
+    | 'switch_mode'
+    | 'summarize_sessions'
+    | 'filter_session_recordings'
+    | 'create_insight'
+    | 'create_form'
+    | 'task'
+    | 'upsert_dashboard'
+    | 'manage_memories'
+    | 'create_notebook'
+    | 'list_data'
+    | 'list_feature_flags'
+    | 'upsert_alert'
+    | 'finalize_plan'
+    | 'call_mcp_server'
+    | 'search_llm_traces'
+    | 'run_hog_eval_test'
+    | 'list_llm_skills'
+    | 'get_llm_skill'
+    | 'get_llm_skill_file'
+    | 'create_llm_skill'
+    | 'update_llm_skill'
+    | 'archive_llm_skill'
+    | 'diagnose_proxy'
+    | 'web_analytics_doctor'
+    | 'assess_heatmap'
+    | 'summarize_website_interactions'
+    | 'marketing_diagnose_setup'
+    | 'marketing_explain_conversion_goal'
+    | 'marketing_list_conversion_goals'
+    | 'marketing_list_data_sources'
+    | 'marketing_audit_utm'
+    | 'marketing_suggest_conversion_goals'
+    | 'marketing_suggest_utm_mappings'
+    | 'summarize_replay_vision_summaries'
+    | 'draft_replay_vision_scanner_prompt'
+    | 'search_replay_vision_observations'
+    | 'upsert_account'
+    | 'upsert_account_notebook'
+    | 'open_account'
+
+export enum AgentMode {
+    ProductAnalytics = 'product_analytics',
+    SQL = 'sql',
+    SessionReplay = 'session_replay',
+    ErrorTracking = 'error_tracking',
+    Plan = 'plan',
+    Execution = 'execution',
+    Survey = 'survey',
+    Research = 'research',
+    Flags = 'flags',
+    AIObservability = 'llm_analytics',
+    Sandbox = 'sandbox',
+    UserInterview = 'user_interview',
+    CustomerAnalytics = 'customer_analytics',
+}
+
+export enum SlashCommandName {
+    SlashInit = '/init',
+    SlashRemember = '/remember',
+    SlashUsage = '/usage',
+    SlashFeedback = '/feedback',
+    SlashTicket = '/ticket',
+}
+
+/** Exact possible `urls` keys for the `navigate` tool. */
+// Extracted using the following Claude Code prompt, then tweaked manually:
+// "
+// List every key of objects `frontend/src/products.tsx::productUrls` and `frontend/src/scenes/urls.ts::urls`,
+// whose function takes either zero arguments, or only optional arguments.
+// Exclude scenes related to signup, login, onboarding, upsell or admin, as well as internal scenes, and ones about uploading files.
+// Your only output should be a list of those string keys in TypeScript enum syntax.
+// Once done, verify whether indeed each item of the output satisfies the criteria.
+// "
+export enum AssistantNavigateUrl {
+    Actions = 'actions',
+    Activity = 'activity',
+    Alerts = 'alerts',
+    Annotations = 'annotations',
+    CreateAction = 'createAction',
+    Cohorts = 'cohorts',
+    Dashboards = 'dashboards',
+    Database = 'database',
+    EarlyAccessFeatures = 'earlyAccessFeatures',
+    EventDefinitions = 'eventDefinitions',
+    ErrorTracking = 'errorTracking',
+    Experiments = 'experiments',
+    FeatureFlags = 'featureFlags',
+    Game368Hedgehogs = 'game368hedgehogs',
+    Heatmaps = 'heatmaps',
+    IngestionWarnings = 'ingestionWarnings',
+    Insights = 'insights',
+    InsightNew = 'insightNew',
+    Pipeline = 'pipeline',
+    ProjectHomepage = 'projectHomepage',
+    PropertyDefinitions = 'propertyDefinitions',
+    Max = 'max',
+    Notebooks = 'notebooks',
+    Replay = 'replay',
+    ReplaySettings = 'replaySettings',
+    RevenueAnalytics = 'revenueAnalytics',
+    SavedInsights = 'savedInsights',
+    Settings = 'settings',
+    SqlEditor = 'sqlEditor',
+    Surveys = 'surveys',
+    ToolbarLaunch = 'toolbarLaunch',
+    WebAnalytics = 'webAnalytics',
+    WebAnalyticsWebVitals = 'webAnalyticsWebVitals',
+    WebAnalyticsHealth = 'webAnalyticsHealth',
+    WebAnalyticsLive = 'webAnalyticsLive',
+    Persons = 'persons',
+}
+
+export const ASSISTANT_NAVIGATE_URLS = new Set(Object.values(AssistantNavigateUrl))

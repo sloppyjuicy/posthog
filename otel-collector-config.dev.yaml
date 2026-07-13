@@ -1,0 +1,151 @@
+extensions:
+    docker_observer:
+    health_check: # Default configuration is usually fine
+    zpages: # Default configuration is usually fine
+
+receivers:
+    receiver_creator:
+        watch_observers: [docker_observer]
+        receivers:
+            filelog:
+                rule: type == "container" and labels["com.docker.compose.project"] == "${env:COMPOSE_PROJECT}" and not (name matches "otel-collector")
+                config:
+                    include:
+                        - '`"/var/lib/docker/containers/" + container_id + "/*.log"`'
+                    include_file_path: true
+                    operators:
+                        - type: regex_replace
+                          regex_name: ansi_control_sequences
+                          field: body
+                        - id: docker-json-parser
+                          type: json_parser
+                          timestamp:
+                              parse_from: attributes.time
+                              layout: '%Y-%m-%dT%H:%M:%S.%LZ'
+                          on_error: drop
+                        - type: move
+                          from: attributes["log"]
+                          to: body
+                        - type: add
+                          field: resource["service.name"]
+                          value: '`name`'
+                        - type: add
+                          field: resource["container.name"]
+                          value: '`name`'
+                        - type: add
+                          field: resource["container.id"]
+                          value: '`container_id`'
+                        - type: add
+                          field: resource["container.image.name"]
+                          value: '`image`'
+                        - type: json_parser
+                          parse_from: body
+                          on_error: send_quiet
+                          if: "hasPrefix(body, '{')"
+                        - type: move
+                          from: attributes["log.file.name"]
+                          to: resource["log.file.name"]
+                        - type: move
+                          from: attributes["log.file.path"]
+                          to: resource["log.file.path"]
+    otlp:
+        protocols:
+            grpc:
+                endpoint: 0.0.0.0:4317 # Collector receiving OTLP gRPC
+            http:
+                endpoint: 0.0.0.0:4318 # Collector receiving OTLP HTTP
+    prometheus:
+        config:
+            scrape_configs:
+                - job_name: 'nodejs'
+                  scrape_interval: 15s
+                  metrics_path: /_metrics
+                  static_configs:
+                      - targets: ['host.docker.internal:6738']
+                # PostHog's own logs/metrics ingestion services. Their
+                # prom-client counters (logs_ingestion_*, metrics_ingestion_*,
+                # consumer lag, batch utilization) are exactly the metrics the
+                # Grafana logs dashboard charts — scraping them here pipes a
+                # real PostHog service through the metrics product locally, so
+                # they're queryable in /metrics. Ports match HTTP_SERVER_PORT
+                # in bin/mprocs.yaml (ingestion-logs 6743, ingestion-metrics
+                # 6744). Targets that aren't running are simply scraped-down.
+                # The job_name becomes the row's service_name downstream (the
+                # receiver maps it to the service.name resource attribute);
+                # static_configs labels can NOT override it.
+                - job_name: 'logs-ingestion'
+                  scrape_interval: 15s
+                  metrics_path: /_metrics
+                  static_configs:
+                      - targets: ['host.docker.internal:6743']
+                - job_name: 'metrics-ingestion'
+                  scrape_interval: 15s
+                  metrics_path: /_metrics
+                  static_configs:
+                      - targets: ['host.docker.internal:6744']
+
+exporters:
+    otlp: # Using the standard OTLP exporter
+        endpoint: '${env:JAEGER_HOST:-jaeger}:4317' # Sending OTLP gRPC to Jaeger
+        tls:
+            insecure: true # For local communication to Jaeger
+    otlphttp: # Using the standard OTLP exporter
+        endpoint: 'http://capture-logs:4318'
+        compression: none
+        tls:
+            insecure: true # For local communication to Jaeger
+        headers:
+            # special "local" token is automatically mapped to team_id 1 in dev environments
+            authorization: Bearer phc_local
+        # Give up in 30s (vs the 5 min default) when capture-logs is down.
+        retry_on_failure:
+            max_elapsed_time: 30s
+    otlphttp/logs:
+        endpoint: 'http://host.docker.internal:4320'
+        compression: none
+        tls:
+            insecure: true
+        headers:
+            # special "local" token is automatically mapped to team_id 1 in dev environments
+            authorization: Bearer phc_local
+        retry_on_failure:
+            max_elapsed_time: 30s
+    otlphttp/metrics:
+        endpoint: 'http://host.docker.internal:4320'
+        compression: none
+        tls:
+            insecure: true
+        headers:
+            authorization: Bearer phc_local
+        retry_on_failure:
+            max_elapsed_time: 30s
+
+processors:
+    # Shed load instead of buffering to multiple GB of RAM when a downstream
+    # (e.g. capture-logs) is unreachable.
+    memory_limiter:
+        check_interval: 1s
+        limit_mib: 512
+        spike_limit_mib: 128
+    batch:
+
+service:
+    pipelines:
+        traces:
+            receivers: [otlp]
+            processors: [memory_limiter, batch]
+            exporters: [otlp, otlphttp]
+        logs:
+            exporters:
+                - otlphttp/logs
+            processors:
+                - memory_limiter
+                - batch
+            receivers:
+                - otlp
+                - receiver_creator
+        metrics:
+            receivers: [otlp, prometheus]
+            processors: [memory_limiter, batch]
+            exporters: [otlphttp/metrics]
+    extensions: [docker_observer, health_check, zpages] # Enabling the declared extensions

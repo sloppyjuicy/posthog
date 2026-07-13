@@ -1,0 +1,442 @@
+import { api } from 'lib/api.mock'
+
+import { expectLogic } from 'kea-test-utils'
+import { HttpResponse } from 'msw'
+
+import { processAllSnapshots, SnapshotSourceType, SourceKey, ViewportResolution } from '@posthog/replay-shared'
+
+import { dayjs } from 'lib/dayjs'
+import { convertSnapshotsByWindowId } from 'scenes/session-recordings/__mocks__/recording_snapshots'
+import { sessionRecordingDataCoordinatorLogic } from 'scenes/session-recordings/player/sessionRecordingDataCoordinatorLogic'
+import { sessionRecordingMetaLogic } from 'scenes/session-recordings/player/sessionRecordingMetaLogic'
+import { teamLogic } from 'scenes/teamLogic'
+import { userLogic } from 'scenes/userLogic'
+
+import { resumeKeaLoadersErrors, silenceKeaLoadersErrors } from '~/initKea'
+import { HogQLQueryResponse } from '~/queries/schema/schema-general'
+import { RecordingSnapshot, SessionRecordingSnapshotSource, SessionRecordingSnapshotSourceResponse } from '~/types'
+
+import { sortedRecordingSnapshots } from '../__mocks__/recording_snapshots'
+import { sessionRecordingEventUsageLogic } from '../sessionRecordingEventUsageLogic'
+import {
+    BLOB_SOURCE_V2,
+    createDifferentiatedQueryHandler,
+    overrideSessionRecordingMocks,
+    recordingEventsJson,
+    recordingMetaJson,
+    setupSessionRecordingTest,
+    snapshotsAsJSONLines,
+} from './__mocks__/test-setup'
+import { snapshotDataLogic } from './snapshotDataLogic'
+
+const sortedRecordingSnapshotsJson = sortedRecordingSnapshots()
+
+describe('sessionRecordingDataCoordinatorLogic', () => {
+    let logic: ReturnType<typeof sessionRecordingDataCoordinatorLogic.build>
+    let snapshotLogic: ReturnType<typeof snapshotDataLogic.build>
+
+    beforeEach(() => {
+        setupSessionRecordingTest()
+
+        const props = {
+            sessionRecordingId: '2',
+            blobV2PollingDisabled: true,
+        }
+        logic = sessionRecordingDataCoordinatorLogic(props)
+        snapshotLogic = snapshotDataLogic(props)
+        logic.mount()
+        logic.actions.loadRecordingMeta()
+        jest.spyOn(api, 'get')
+        jest.spyOn(api, 'create')
+    })
+
+    describe('core assumptions', () => {
+        it('mounts other logics', async () => {
+            await expectLogic(logic).toMount([sessionRecordingEventUsageLogic, teamLogic, userLogic])
+        })
+        it('has default values', () => {
+            expect(logic.values).toMatchObject({
+                bufferedToTime: null,
+                durationMs: 0,
+                start: null,
+                end: null,
+                segments: [],
+                sessionEventsData: null,
+                sessionEventsDataLoading: false,
+            })
+        })
+    })
+
+    describe('loading session core', () => {
+        it('loads all data', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.loadRecordingMeta()
+                logic.actions.loadSnapshots()
+            })
+                .toDispatchActions([
+                    'loadSnapshots',
+                    'loadSnapshotSources',
+                    'loadRecordingMetaSuccess',
+                    snapshotLogic.actionTypes.loadSnapshotSourcesSuccess,
+                    snapshotLogic.actionTypes.loadSnapshotsForSourceSuccess,
+                    'reportUsageIfFullyLoaded',
+                ])
+                .toFinishAllListeners()
+
+            const actual = logic.values.sessionPlayerData
+            expect(actual).toMatchObject({
+                person: recordingMetaJson.person,
+                bufferedToTime: 11868,
+                snapshotsByWindowId: sortedRecordingSnapshotsJson.snapshot_data_by_window_id,
+            })
+        })
+
+        it('fetch metadata error with 500 sets loadMetaError but not isNotFound', async () => {
+            silenceKeaLoadersErrors()
+            logic.unmount()
+            overrideSessionRecordingMocks({
+                getMocks: {
+                    '/api/environments/:team_id/session_recordings/:id': () => [500, { status: 0 }],
+                },
+            })
+            const metaLogic = sessionRecordingMetaLogic({
+                sessionRecordingId: '2',
+                blobV2PollingDisabled: true,
+            })
+            logic.mount()
+            logic.actions.loadRecordingMeta()
+
+            await expectLogic(logic)
+                .toDispatchActionsInAnyOrder(['loadRecordingMetaFailure'])
+                .toFinishAllListeners()
+                .toMatchValues({
+                    sessionPlayerData: {
+                        bufferedToTime: null,
+                        start: null,
+                        end: null,
+                        durationMs: 0,
+                        segments: [],
+                        sessionRecordingId: '2',
+                        sessionRetentionPeriodDays: null,
+                        person: null,
+                        snapshotsByWindowId: {},
+                        fullyLoaded: false,
+                    },
+                })
+
+            expect(metaLogic.values.isNotFound).toBe(false)
+            expect(metaLogic.values.loadMetaError).toBe(true)
+            resumeKeaLoadersErrors()
+        })
+
+        it('fetch metadata error with 404 sets isNotFound but not loadMetaError', async () => {
+            silenceKeaLoadersErrors()
+            logic.unmount()
+            overrideSessionRecordingMocks({
+                getMocks: {
+                    '/api/environments/:team_id/session_recordings/:id': () => [404, { detail: 'Not found.' }],
+                },
+            })
+            const metaLogic = sessionRecordingMetaLogic({
+                sessionRecordingId: '2',
+                blobV2PollingDisabled: true,
+            })
+            logic.mount()
+            logic.actions.loadRecordingMeta()
+
+            await expectLogic(logic).toDispatchActionsInAnyOrder(['loadRecordingMetaFailure']).toFinishAllListeners()
+
+            expect(metaLogic.values.isNotFound).toBe(true)
+            expect(metaLogic.values.loadMetaError).toBe(false)
+            resumeKeaLoadersErrors()
+        })
+
+        it('fetch metadata success and snapshots error', async () => {
+            silenceKeaLoadersErrors()
+            logic.unmount()
+            overrideSessionRecordingMocks({
+                getMocks: {
+                    '/api/environments/:team_id/session_recordings/:id/snapshots': () => [500, { status: 0 }],
+                },
+            })
+            logic.mount()
+            logic.actions.loadRecordingMeta()
+            logic.actions.loadSnapshots()
+
+            await expectLogic(logic).toDispatchActions([
+                'loadRecordingMetaSuccess',
+                snapshotLogic.actionTypes.loadSnapshotSourcesFailure,
+            ])
+            expect(logic.values.sessionPlayerData).toMatchObject({
+                person: recordingMetaJson.person,
+                durationMs: 11868,
+                snapshotsByWindowId: {},
+                bufferedToTime: 0,
+            })
+            resumeKeaLoadersErrors()
+        })
+    })
+
+    describe('loading session events', () => {
+        beforeEach(async () => {
+            logic?.unmount()
+            snapshotLogic?.unmount()
+
+            setupSessionRecordingTest({
+                features: [],
+                customQueryHandler: createDifferentiatedQueryHandler(),
+            })
+
+            const props = {
+                sessionRecordingId: '2',
+                blobV2PollingDisabled: true,
+            }
+            logic = sessionRecordingDataCoordinatorLogic(props)
+            snapshotLogic = snapshotDataLogic(props)
+            logic.mount()
+            jest.spyOn(api, 'get')
+            jest.spyOn(api, 'create')
+        })
+
+        it('load events after metadata with 5 minute buffer', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.loadRecordingMeta()
+            })
+                .toDispatchActions(['loadRecordingMetaSuccess', 'loadEvents'])
+                .toFinishAllListeners()
+
+            // Two HogQL session/related-events queries plus a third query that fetches full
+            // properties for events with a primary property (e.g. $pageview's $pathname)
+            // — see preloadableEvents in sessionEventsDataLogic.
+            expect(api.create).toHaveBeenCalledTimes(3)
+
+            const queries = (api.create as jest.MockedFunction<typeof api.create>).mock.calls.map(
+                (call) => (call[1] as { query: HogQLQueryResponse })?.query?.query
+            )
+
+            // queries 0 varies 24 hours around start time
+            expect(queries[0]).toMatch(/WHERE timestamp > '2023-04-30 14:46:20'/)
+            expect(queries[0]).toMatch(/AND timestamp < '2023-05-02 14:46:32'/)
+
+            // queries one varies 5 minutes around start time
+            expect(queries[1]).toMatch(/WHERE timestamp > '2023-05-01 14:41:20'/)
+            expect(queries[1]).toMatch(/AND timestamp < '2023-05-01 14:51:32'/)
+
+            expect(logic.values.sessionEventsData).toHaveLength(recordingEventsJson.results.length)
+        })
+    })
+
+    describe('report usage', () => {
+        it('sends `recording loaded` event only when entire recording has loaded', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.loadSnapshots()
+            })
+                .toDispatchActionsInAnyOrder([
+                    'loadSnapshots',
+                    snapshotLogic.actionTypes.loadSnapshotsForSourceSuccess,
+                    'loadEvents',
+                    'loadEventsSuccess',
+                    'loadRecordingCommentsSuccess',
+                    'loadRecordingNotebookCommentsSuccess',
+                    'setProcessedSnapshots',
+                ])
+                .toDispatchActions([sessionRecordingEventUsageLogic.actionTypes.reportRecordingLoaded])
+        })
+
+        it('sends `recording loaded` event when full event data is the last to load', async () => {
+            // loadFullEventData shares the sessionEventsData loader, so a slow full-event-data
+            // response used to leave fullyLoaded false with nothing left to re-trigger the report
+            overrideSessionRecordingMocks({
+                postMocks: {
+                    '/api/environments/:team_id/query/:kind': async ({ request }) => {
+                        const body = (await request.json()) as Record<string, any>
+                        const query = body.query?.query || ''
+                        if (query.includes('uuid in')) {
+                            await new Promise((resolve) => setTimeout(resolve, 100))
+                        }
+                        return [200, recordingEventsJson]
+                    },
+                },
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.loadSnapshots()
+            }).toDispatchActions([sessionRecordingEventUsageLogic.actionTypes.reportRecordingLoaded])
+        })
+    })
+
+    describe('missing full snapshot detection', () => {
+        // start is the earlier of meta start_time and the first snapshot timestamp,
+        // so the recent case needs recent snapshot timestamps too
+        const incrementalOnlySnapshotsAsJSONLines = (baseTimestamp: number): string =>
+            `${JSON.stringify({
+                window_id: '187d7c761a0525d-05f175487d4b65-1d525634-384000-187d7c761a149d0',
+                data: [
+                    {
+                        type: 4,
+                        data: { href: 'http://localhost:3000/', width: 2560, height: 1304 },
+                        timestamp: baseTimestamp,
+                    },
+                    {
+                        type: 3,
+                        data: { source: 1, positions: [{ x: 2027, y: 120, id: 22, timeOffset: 0 }] },
+                        timestamp: baseTimestamp + 2000,
+                    },
+                    {
+                        type: 3,
+                        data: { source: 2, type: 2, id: 33, x: 852, y: 133, pointerType: 0 },
+                        timestamp: baseTimestamp + 9000,
+                    },
+                ],
+            })}\n`
+
+        const mountWithSnapshots = (jsonLines: string, metaOverride?: Record<string, unknown>): void => {
+            logic?.unmount()
+            snapshotLogic?.unmount()
+            setupSessionRecordingTest({
+                getMocks: {
+                    '/api/environments/:team_id/session_recordings/:id/snapshots': async ({ request }) => {
+                        const sourceParam = new URL(request.url).searchParams.get('source')
+                        if (sourceParam === 'blob_v2' || sourceParam === 'blob') {
+                            return new HttpResponse(jsonLines)
+                        }
+                        return [200, { sources: [BLOB_SOURCE_V2] }]
+                    },
+                    ...(metaOverride
+                        ? { '/api/environments/:team_id/session_recordings/:id': () => [200, metaOverride] }
+                        : {}),
+                },
+            })
+            const props = {
+                sessionRecordingId: '2',
+                blobV2PollingDisabled: true,
+            }
+            logic = sessionRecordingDataCoordinatorLogic(props)
+            snapshotLogic = snapshotDataLogic(props)
+            logic.mount()
+        }
+
+        const loadFully = async (): Promise<void> => {
+            await expectLogic(logic, () => {
+                logic.actions.loadRecordingMeta()
+                logic.actions.loadSnapshots()
+            })
+                .toDispatchActions(['loadRecordingMetaSuccess', 'reportUsageIfFullyLoaded'])
+                .toFinishAllListeners()
+            expect(logic.values.fullyLoaded).toBe(true)
+        }
+
+        it.each<{
+            case: string
+            mocks: () => { jsonLines: string; metaOverride?: Record<string, unknown> }
+            expected: { snapshotsInvalid: boolean; isRecentAndInvalid: boolean; isOldAndInvalid: boolean }
+        }>([
+            {
+                case: 'an old recording with no full snapshot is old and invalid',
+                mocks: () => ({ jsonLines: incrementalOnlySnapshotsAsJSONLines(1682952380877) }),
+                expected: { snapshotsInvalid: true, isRecentAndInvalid: false, isOldAndInvalid: true },
+            },
+            {
+                case: 'a recent recording with no full snapshot is recent and invalid',
+                mocks: () => {
+                    const recentStart = dayjs().subtract(1, 'minute')
+                    return {
+                        jsonLines: incrementalOnlySnapshotsAsJSONLines(recentStart.valueOf()),
+                        metaOverride: {
+                            ...recordingMetaJson,
+                            start_time: recentStart.toISOString(),
+                            end_time: dayjs().toISOString(),
+                        },
+                    }
+                },
+                expected: { snapshotsInvalid: true, isRecentAndInvalid: true, isOldAndInvalid: false },
+            },
+            {
+                case: 'a recording with a full snapshot is valid',
+                mocks: () => ({ jsonLines: snapshotsAsJSONLines() }),
+                expected: { snapshotsInvalid: false, isRecentAndInvalid: false, isOldAndInvalid: false },
+            },
+        ])('$case', async ({ mocks, expected }) => {
+            const { jsonLines, metaOverride } = mocks()
+            mountWithSnapshots(jsonLines, metaOverride)
+            await loadFully()
+
+            expect({
+                snapshotsInvalid: logic.values.snapshotsInvalid,
+                isRecentAndInvalid: logic.values.isRecentAndInvalid,
+                isOldAndInvalid: logic.values.isOldAndInvalid,
+            }).toEqual(expected)
+        })
+    })
+
+    // TODO need deduplication tests for blob_v2 sources before we deprecate blob_v1
+    describe('deduplicateSnapshots', () => {
+        const sources: SessionRecordingSnapshotSource[] = [
+            {
+                source: 'blob_v2',
+                start_timestamp: '2025-05-14T15:37:18.897000Z',
+                end_timestamp: '2025-05-14T15:42:18.378000Z',
+                blob_key: '1',
+            },
+        ]
+
+        const fakeViewportForTimestamp: (timestamp: number) => ViewportResolution | undefined = () => ({
+            width: '100',
+            height: '100',
+            href: '',
+        })
+
+        const callProcessing = (snapshots: RecordingSnapshot[]): Promise<RecordingSnapshot[]> => {
+            return processAllSnapshots(
+                sources,
+                {
+                    'blob_v2-1': {
+                        source: { source: SnapshotSourceType.blob_v2, blob_key: 'blob-1' },
+                        snapshots,
+                    },
+                } as Record<SourceKey, SessionRecordingSnapshotSourceResponse> | null,
+                { snapshots: {} },
+                fakeViewportForTimestamp,
+                '12345'
+            )
+        }
+
+        it('should remove duplicate snapshots and sort by timestamp', async () => {
+            const snapshots = convertSnapshotsByWindowId(sortedRecordingSnapshotsJson.snapshot_data_by_window_id)
+            const snapshotsWithDuplicates = snapshots
+                .slice(0, 2)
+                .concat(snapshots.slice(0, 2))
+                .concat(snapshots.slice(2))
+
+            expect(snapshotsWithDuplicates.length).toEqual(snapshots.length + 2)
+
+            expect(await callProcessing(snapshots)).toEqual(await callProcessing(snapshotsWithDuplicates))
+        })
+
+        it('should cope with two not duplicate snapshots with the same timestamp and delay', async () => {
+            // these two snapshots are not duplicates but have the same timestamp and delay
+            // this regression test proves that we deduplicate them against themselves
+            // prior to https://github.com/PostHog/posthog/pull/20019
+            // each time deduplicateSnapshots was called with this input
+            // the result would be one event longer, introducing, instead of removing, a duplicate
+            const verySimilarSnapshots: RecordingSnapshot[] = [
+                {
+                    windowId: 1,
+                    type: 3,
+                    data: { source: 2, type: 0, id: 33, x: 852.7421875, y: 133.1640625 },
+                    timestamp: 1682952389798,
+                },
+                {
+                    windowId: 1,
+                    type: 3,
+                    data: { source: 2, type: 2, id: 33, x: 852, y: 133, pointerType: 0 },
+                    timestamp: 1682952389798,
+                },
+            ]
+            // we call this multiple times and pass existing data in, so we need to make sure it doesn't change
+            expect(await callProcessing([...verySimilarSnapshots, ...verySimilarSnapshots])).toEqual(
+                verySimilarSnapshots
+            )
+        })
+    })
+})

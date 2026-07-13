@@ -1,4 +1,17 @@
-import { AnyPropertyFilter } from '~/types'
+import { OperatorValueSelectProps } from 'lib/components/PropertyFilters/components/OperatorValueSelect'
+import {
+    AllowedProperties,
+    ExcludedOperators,
+    ExcludedProperties,
+    SelectingKeyOnly,
+    TaxonomicFilterGroup,
+    TaxonomicFilterGroupType,
+    TaxonomicFilterProps,
+    TaxonomicFilterValue,
+} from 'lib/components/TaxonomicFilter/types'
+
+import { AnyDataNode, DatabaseSchemaField } from '~/queries/schema/schema-general'
+import { AnyPropertyFilter, FilterLogicalOperator, PropertyGroupFilter } from '~/types'
 
 export interface PropertyFilterBaseProps {
     pageKey: string
@@ -6,10 +19,59 @@ export interface PropertyFilterBaseProps {
 
 export interface PropertyFilterLogicProps extends PropertyFilterBaseProps {
     propertyFilters?: AnyPropertyFilter[] | null
-    onChange?: null | ((filters: AnyPropertyFilter[]) => void)
-    urlOverride?: string
+    onChange: (filters: AnyPropertyFilter[]) => void
+    sendAllKeyUpdates?: boolean
 }
 
+export interface PropertyGroupFilterLogicProps extends PropertyFilterBaseProps {
+    value?: PropertyGroupFilter
+    onChange: (filters: PropertyGroupFilter) => void
+}
 export interface TaxonomicPropertyFilterLogicProps extends PropertyFilterBaseProps {
+    taxonomicGroupTypes: TaxonomicFilterGroupType[]
+    taxonomicOnChange?: (group: TaxonomicFilterGroup, value: TaxonomicFilterValue, item: any) => void
+    filters: AnyPropertyFilter[]
+    setFilter: (index: number, property: AnyPropertyFilter) => void
     filterIndex: number
+    eventNames?: string[]
+    excludedProperties?: ExcludedProperties
+    propertyAllowList?: AllowedProperties
+    endpointFilters?: Record<string, any>
+}
+
+export interface PropertyFilterInternalProps {
+    pageKey?: string
+    index: number
+    onComplete: () => void
+    disablePopover: boolean
+    filters: AnyPropertyFilter[]
+    setFilter: (index: number, property: AnyPropertyFilter) => void
+    editable?: boolean
+    operatorAllowlist?: OperatorValueSelectProps['operatorAllowlist']
+    taxonomicGroupTypes?: TaxonomicFilterGroupType[]
+    taxonomicFilterOptionsFromProp?: TaxonomicFilterProps['optionsFromProp']
+    propertyAllowList?: AllowedProperties
+    eventNames?: string[]
+    schemaColumns?: DatabaseSchemaField[]
+    dataWarehouseTableName?: string
+    propertyGroupType?: FilterLogicalOperator | null
+    orFiltering?: boolean
+    addText?: string | null
+    size?: 'xsmall' | 'small' | 'medium'
+    hasRowOperator?: boolean
+    metadataSource?: AnyDataNode
+    excludedProperties?: ExcludedProperties
+    allowRelativeDateOptions?: boolean
+    excludedOperators?: ExcludedOperators
+    selectingKeyOnly?: SelectingKeyOnly
+    hideBehavioralCohorts?: boolean
+    addFilterDocLink?: string
+    endpointFilters?: Record<string, any>
+    hogQLGlobals?: Record<string, any>
+    /**
+     * `'input'` renders the replay-style input-box add-filter trigger; `'button'`
+     * (the default) renders a button. Only has an effect on the rebuild menu
+     * (`TAXONOMIC_FILTER_MENU_REBUILD`).
+     */
+    triggerVariant?: 'button' | 'input'
 }

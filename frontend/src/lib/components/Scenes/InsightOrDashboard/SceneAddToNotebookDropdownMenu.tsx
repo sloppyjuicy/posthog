@@ -1,0 +1,55 @@
+import { IconPlusSmall } from '@posthog/icons'
+
+import { ButtonPrimitive, ButtonPrimitiveProps } from 'lib/ui/Button/ButtonPrimitives'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from 'lib/ui/DropdownMenu/DropdownMenu'
+import { MenuOpenIndicator } from 'lib/ui/Menus/Menus'
+import { NotebookNodeType } from 'scenes/notebooks/types'
+
+import { NodeKind } from '~/queries/schema/schema-general'
+
+import { SceneDataAttrKeyProps } from '../utils'
+import { SceneNotebookMenuItems } from './SceneNotebookMenuItems'
+
+type SceneNotebookDropdownMenuProps = SceneDataAttrKeyProps &
+    Pick<ButtonPrimitiveProps, 'disabledReasons'> & {
+        shortId?: string
+    }
+
+export function SceneAddToNotebookDropdownMenu({
+    shortId,
+    dataAttrKey,
+    disabledReasons,
+}: SceneNotebookDropdownMenuProps): JSX.Element {
+    const isDisabled = disabledReasons ? Object.values(disabledReasons).some(Boolean) : false
+    return (
+        <DropdownMenu>
+            <DropdownMenuTrigger asChild disabled={isDisabled}>
+                <ButtonPrimitive
+                    menuItem
+                    data-attr={`${dataAttrKey}-add-to-dropdown-menu`}
+                    disabledReasons={disabledReasons}
+                >
+                    <IconPlusSmall />
+                    Add to notebook
+                    <MenuOpenIndicator className="ml-auto" />
+                </ButtonPrimitive>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" matchTriggerWidth className="min-w-none max-w-none">
+                <SceneNotebookMenuItems
+                    notebookSelectButtonProps={{
+                        resource: {
+                            type: NotebookNodeType.Query,
+                            attrs: {
+                                query: {
+                                    kind: NodeKind.SavedInsightNode,
+                                    shortId: shortId,
+                                },
+                            },
+                        },
+                    }}
+                    dataAttrKey={dataAttrKey}
+                />
+            </DropdownMenuContent>
+        </DropdownMenu>
+    )
+}

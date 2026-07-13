@@ -1,0 +1,96 @@
+{
+    "$schema": "https://turbo.build/schema.json",
+    "futureFlags": {
+        "affectedUsingTaskInputs": true
+    },
+    "tasks": {
+        "backend:test": {
+            "inputs": [
+                "backend/**/*.py",
+                "!backend/**/__pycache__/**",
+                // A few products run pytest against roots outside backend/:
+                // experiments (stats/), logs (skills/), posthog_ai (scripts/).
+                // These globs anchor per-package, so they only match where the
+                // dir exists. Do NOT collapse to a leading "**/*.py" — that
+                // resolves from the workspace root and marks every product's
+                // backend:test affected on any .py change, forcing the full suite.
+                "stats/**/*.py",
+                "skills/**/*.py",
+                "scripts/**/*.py",
+                "../../pyproject.toml",
+                "../../uv.lock",
+                "../../common/**/*.py"
+            ],
+            "outputs": [],
+            "cache": true,
+            "env": ["DATABASE_URL", "REDIS_URL", "CLICKHOUSE_HOST", "TEST"],
+            "passThroughEnv": ["PYTEST_ADDOPTS"]
+        },
+        "backend:lint": {
+            "inputs": ["backend/**/*.py", "!backend/**/__pycache__/**"],
+            "outputs": [],
+            "cache": true
+        },
+        "backend:contract-check": {
+            "inputs": ["backend/**/*.py", "!backend/**/__pycache__/**"],
+            "outputs": [],
+            "cache": true
+        },
+        "prepare": {
+            "dependsOn": ["^build"]
+        },
+        "build": {
+            "dependsOn": ["^build"],
+            "inputs": ["src", "Cargo.toml", "!**/*.pyc"],
+            "outputs": ["dist", "index.node", ".turbo"],
+            "env": ["RUST_VERSION", "SHARD_INDEX", "SHARD_COUNT"],
+            "passThroughEnv": [
+                "RUSTUP_HOME",
+                "CARGO_HOME",
+                "DATABASE_URL",
+                "REDIS_URL",
+                "NODE_OPTIONS",
+                "SSL_CERT_FILE"
+            ]
+        },
+        "test": {
+            "dependsOn": ["^build"],
+            "inputs": ["src", "tests", "Cargo.toml", "!**/*.pyc"],
+            "env": ["RUST_VERSION", "SHARD_INDEX", "SHARD_COUNT"],
+            "passThroughEnv": [
+                "RUSTUP_HOME",
+                "CARGO_HOME",
+                "DATABASE_URL",
+                "REDIS_URL",
+                "NODE_OPTIONS",
+                "PERSONS_DATABASE_URL",
+                "PERSONS_READONLY_DATABASE_URL",
+                "JEST_JUNIT_OUTPUT_DIR",
+                "JEST_JUNIT_OUTPUT_NAME",
+                "JEST_JUNIT_SUITE_NAME",
+                "JEST_JUNIT_ADD_FILE_ATTRIBUTE"
+            ]
+        },
+        "start": {
+            "dependsOn": ["^build"],
+            "persistent": true,
+            "cache": false,
+            "passThroughEnv": ["SKIP_TYPEGEN", "COREPACK_ENABLE_DOWNLOAD_PROMPT", "SSL_CERT_FILE", "JS_URL"]
+        },
+        "start-vite": {
+            "dependsOn": ["^build"],
+            "persistent": true,
+            "cache": false,
+            "passThroughEnv": ["SKIP_TYPEGEN", "COREPACK_ENABLE_DOWNLOAD_PROMPT", "SSL_CERT_FILE", "JS_URL"]
+        },
+        "dev": {
+            "dependsOn": ["^build"],
+            "persistent": true,
+            "cache": false
+        },
+        "clean": {
+            "dependsOn": ["^clean"],
+            "cache": false
+        }
+    }
+}

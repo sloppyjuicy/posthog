@@ -1,0 +1,255 @@
+import { Suspense } from 'react'
+
+import {
+    ActivityLogItem,
+    HumanizedChange,
+    defaultDescriber,
+    userNameForLogItem,
+} from 'lib/components/ActivityLog/humanizeActivity'
+import { LemonDropdown } from 'lib/lemon-ui/LemonDropdown'
+import { Link } from 'lib/lemon-ui/Link'
+import { Spinner } from 'lib/lemon-ui/Spinner'
+import { isObject } from 'lib/utils/guards'
+import { lazyWithRetry } from 'lib/utils/retryImport'
+import { urls } from 'scenes/urls'
+
+import { HogFunctionTypeType } from '~/types'
+
+import { humanizeHogFunctionType } from '../hog-function-utils'
+import type { DiffProps } from './Diff'
+
+const nameOrLinkToHogFunction = (id?: string | null, name?: string | null): string | JSX.Element => {
+    const displayName = name?.trim() ? name : 'Untitled hog function'
+    return id ? <Link to={urls.hogFunction(id)}>{displayName}</Link> : displayName
+}
+
+const LazyDiff = lazyWithRetry(() => import('./Diff').then((m) => ({ default: m.Diff })))
+
+/** Lazy so the activity describer registry (imported app-wide) doesn't pull monaco into its chunk. */
+export function Diff(props: DiffProps): JSX.Element {
+    return (
+        <Suspense
+            fallback={
+                <div className="min-h-[300px]">
+                    <Spinner />
+                </div>
+            }
+        >
+            <LazyDiff {...props} />
+        </Suspense>
+    )
+}
+
+export interface DiffLinkProps extends DiffProps {
+    children: string | JSX.Element
+}
+
+export function DiffLink({ before, after, language, children }: DiffLinkProps): JSX.Element {
+    return (
+        <LemonDropdown
+            closeOnClickInside={false}
+            overlay={
+                <div className="w-[50vw] min-w-[300px]">
+                    <Diff before={before} after={after} language={language} />
+                </div>
+            }
+        >
+            <span className="Link">{children}</span>
+        </LemonDropdown>
+    )
+}
+
+export function hogFunctionActivityDescriber(logItem: ActivityLogItem, asNotification?: boolean): HumanizedChange {
+    if (logItem.scope != 'HogFunction') {
+        console.error('HogFunction describer received a non-HogFunction activity')
+        return { description: null }
+    }
+
+    const rawType = logItem?.detail.type as HogFunctionTypeType | undefined
+    const objectNoun = rawType ? humanizeHogFunctionType(rawType) : 'hog function'
+
+    if (logItem.activity == 'created') {
+        return {
+            description: (
+                <>
+                    <strong className="ph-no-capture">{userNameForLogItem(logItem)}</strong> created the {objectNoun}:{' '}
+                    {nameOrLinkToHogFunction(logItem?.item_id, logItem?.detail.name)}
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'deleted') {
+        return {
+            description: (
+                <>
+                    <strong className="ph-no-capture">{userNameForLogItem(logItem)}</strong> deleted the {objectNoun}:{' '}
+                    {logItem.detail.name}
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'restored') {
+        const name = userNameForLogItem(logItem)
+        const functionName = nameOrLinkToHogFunction(logItem?.item_id, logItem?.detail.name)
+
+        return {
+            description: (
+                <>
+                    <strong className="ph-no-capture">{name}</strong> restored the {objectNoun}: {functionName}
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'updated') {
+        const changes: { inline: string | JSX.Element; inlist: string | JSX.Element }[] = []
+        for (const change of logItem.detail.changes ?? []) {
+            switch (change.field) {
+                case 'encrypted_inputs': {
+                    changes.push({
+                        inline: 'updated encrypted inputs for',
+                        inlist: 'updated encrypted inputs',
+                    })
+                    break
+                }
+                case 'inputs': {
+                    const beforeValues = isObject(change.before)
+                        ? (change.before as Record<string, { value?: unknown }>)
+                        : {}
+                    const afterValues = isObject(change.after)
+                        ? (change.after as Record<string, { value?: unknown }>)
+                        : {}
+
+                    const changedFields = Object.entries(afterValues)
+                        .map(([key, value]) => {
+                            const before = JSON.stringify(beforeValues[key]?.value)
+                            const after = JSON.stringify(value?.value)
+
+                            if (before !== after) {
+                                return (
+                                    <DiffLink key={key} before={before} after={after}>
+                                        {key}
+                                    </DiffLink>
+                                )
+                            }
+                            return null
+                        })
+                        .filter((x): x is JSX.Element => !!x)
+
+                    const changedSpans: JSX.Element[] = []
+                    for (let index = 0; index < changedFields.length; index++) {
+                        if (index !== 0 && index === changedFields.length - 1) {
+                            changedSpans.push(<>{' and '}</>)
+                        } else if (index > 0) {
+                            changedSpans.push(<>{', '}</>)
+                        }
+                        changedSpans.push(changedFields[index])
+                    }
+
+                    const inputOrInputs = changedFields.length === 1 ? 'input' : 'inputs'
+                    changes.push({
+                        inline: (
+                            <>
+                                updated the {inputOrInputs} {changedSpans} for
+                            </>
+                        ),
+                        inlist: (
+                            <>
+                                updated {inputOrInputs}: {changedSpans}
+                            </>
+                        ),
+                    })
+                    break
+                }
+                case 'inputs_schema':
+                case 'filters':
+                case 'hog':
+                case 'name':
+                case 'description':
+                case 'masking': {
+                    const code = (
+                        <DiffLink
+                            language={change.field === 'hog' ? 'hog' : 'json'}
+                            before={
+                                typeof change.before === 'string'
+                                    ? change.before
+                                    : JSON.stringify(change.before, null, 2)
+                            }
+                            after={
+                                typeof change.after === 'string' ? change.after : JSON.stringify(change.after, null, 2)
+                            }
+                        >
+                            {change.field === 'hog'
+                                ? 'source code'
+                                : change.field === 'inputs_schema'
+                                  ? 'inputs schema'
+                                  : change.field}
+                        </DiffLink>
+                    )
+                    changes.push({ inline: <>updated {code} for</>, inlist: <>updated {code}</> })
+                    break
+                }
+                case 'deleted': {
+                    if (change.after) {
+                        changes.push({ inline: 'deleted', inlist: `deleted the ${objectNoun}` })
+                    } else {
+                        changes.push({ inline: 'undeleted', inlist: `undeleted the ${objectNoun}` })
+                    }
+                    break
+                }
+                case 'enabled': {
+                    if (change.after) {
+                        changes.push({ inline: 'enabled', inlist: `enabled the ${objectNoun}` })
+                    } else {
+                        changes.push({ inline: 'disabled', inlist: `disabled the ${objectNoun}` })
+                    }
+                    break
+                }
+                case 'priority': {
+                    changes.push({
+                        inline: (
+                            <>
+                                changed priority from {change.before} to {change.after} for{' '}
+                            </>
+                        ),
+                        inlist: (
+                            <>
+                                changed priority from {change.before} to {change.after} for{' '}
+                            </>
+                        ),
+                    })
+                    break
+                }
+                default:
+                    changes.push({
+                        inline: `updated unknown field: ${change.field}`,
+                        inlist: `updated unknown field: ${change.field}`,
+                    })
+            }
+        }
+        const name = userNameForLogItem(logItem)
+        const functionName = nameOrLinkToHogFunction(logItem?.item_id, logItem?.detail.name)
+
+        return {
+            description:
+                changes.length == 1 ? (
+                    <>
+                        <strong className="ph-no-capture">{name}</strong> {changes[0].inline} the {objectNoun}:{' '}
+                        {functionName}
+                    </>
+                ) : (
+                    <div>
+                        <strong className="ph-no-capture">{name}</strong> updated the {objectNoun}: {functionName}
+                        <ul className="ml-5 list-disc">
+                            {changes.map((c, i) => (
+                                <li key={i}>{c.inlist}</li>
+                            ))}
+                        </ul>
+                    </div>
+                ),
+        }
+    }
+    return defaultDescriber(logItem, asNotification, nameOrLinkToHogFunction(logItem?.item_id, logItem?.detail.name))
+}

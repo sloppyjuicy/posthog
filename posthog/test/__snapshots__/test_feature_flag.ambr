@@ -1,0 +1,410 @@
+# serializer version: 1
+# name: TestFeatureFlagMatcher.test_db_matches_independent_of_string_or_number_type
+  '''
+  SELECT "posthog_filesystem"."team_id",
+         "posthog_filesystem"."id",
+         "posthog_filesystem"."path",
+         "posthog_filesystem"."depth",
+         "posthog_filesystem"."type",
+         "posthog_filesystem"."ref",
+         "posthog_filesystem"."href",
+         "posthog_filesystem"."shortcut",
+         "posthog_filesystem"."meta",
+         "posthog_filesystem"."created_at",
+         "posthog_filesystem"."created_by_id",
+         "posthog_filesystem"."surface",
+         "posthog_filesystem"."project_id"
+  FROM "posthog_filesystem"
+  WHERE (("posthog_filesystem"."surface" IS NULL
+          OR "posthog_filesystem"."surface" = 'web')
+         AND "posthog_filesystem"."ref" = '0001'
+         AND "posthog_filesystem"."team_id" = 99999
+         AND "posthog_filesystem"."type" = 'feature_flag'
+         AND NOT ("posthog_filesystem"."shortcut"
+                  AND "posthog_filesystem"."shortcut" IS NOT NULL))
+  '''
+# ---
+# name: TestFeatureFlagMatcher.test_db_matches_independent_of_string_or_number_type.1
+  '''
+  SELECT "posthog_integration"."id",
+         "posthog_integration"."team_id",
+         "posthog_integration"."kind",
+         "posthog_integration"."integration_id",
+         "posthog_integration"."config",
+         "posthog_integration"."sensitive_config",
+         "posthog_integration"."errors",
+         "posthog_integration"."created_at",
+         "posthog_integration"."created_by_id"
+  FROM "posthog_integration"
+  WHERE ("posthog_integration"."kind" = 'vercel'
+         AND "posthog_integration"."team_id" = 99999)
+  LIMIT 21
+  '''
+# ---
+# name: TestFeatureFlagMatcher.test_db_matches_independent_of_string_or_number_type.2
+  '''
+  SELECT "posthog_filesystem"."team_id",
+         "posthog_filesystem"."id",
+         "posthog_filesystem"."path",
+         "posthog_filesystem"."depth",
+         "posthog_filesystem"."type",
+         "posthog_filesystem"."ref",
+         "posthog_filesystem"."href",
+         "posthog_filesystem"."shortcut",
+         "posthog_filesystem"."meta",
+         "posthog_filesystem"."created_at",
+         "posthog_filesystem"."created_by_id",
+         "posthog_filesystem"."surface",
+         "posthog_filesystem"."project_id"
+  FROM "posthog_filesystem"
+  WHERE (("posthog_filesystem"."surface" IS NULL
+          OR "posthog_filesystem"."surface" = 'web')
+         AND "posthog_filesystem"."ref" = '0001'
+         AND "posthog_filesystem"."team_id" = 99999
+         AND "posthog_filesystem"."type" = 'feature_flag'
+         AND NOT ("posthog_filesystem"."shortcut"
+                  AND "posthog_filesystem"."shortcut" IS NOT NULL))
+  '''
+# ---
+# name: TestFeatureFlagMatcher.test_db_matches_independent_of_string_or_number_type.3
+  '''
+  SELECT "posthog_integration"."id",
+         "posthog_integration"."team_id",
+         "posthog_integration"."kind",
+         "posthog_integration"."integration_id",
+         "posthog_integration"."config",
+         "posthog_integration"."sensitive_config",
+         "posthog_integration"."errors",
+         "posthog_integration"."created_at",
+         "posthog_integration"."created_by_id"
+  FROM "posthog_integration"
+  WHERE ("posthog_integration"."kind" = 'vercel'
+         AND "posthog_integration"."team_id" = 99999)
+  LIMIT 21
+  '''
+# ---
+# name: TestFeatureFlagMatcher.test_db_matches_independent_of_string_or_number_type.4
+  '''
+  SELECT "posthog_filesystem"."team_id",
+         "posthog_filesystem"."id",
+         "posthog_filesystem"."path",
+         "posthog_filesystem"."depth",
+         "posthog_filesystem"."type",
+         "posthog_filesystem"."ref",
+         "posthog_filesystem"."href",
+         "posthog_filesystem"."shortcut",
+         "posthog_filesystem"."meta",
+         "posthog_filesystem"."created_at",
+         "posthog_filesystem"."created_by_id",
+         "posthog_filesystem"."surface",
+         "posthog_filesystem"."project_id"
+  FROM "posthog_filesystem"
+  WHERE (("posthog_filesystem"."surface" IS NULL
+          OR "posthog_filesystem"."surface" = 'web')
+         AND "posthog_filesystem"."ref" = '0001'
+         AND "posthog_filesystem"."team_id" = 99999
+         AND "posthog_filesystem"."type" = 'feature_flag'
+         AND NOT ("posthog_filesystem"."shortcut"
+                  AND "posthog_filesystem"."shortcut" IS NOT NULL))
+  '''
+# ---
+# name: TestFeatureFlagMatcher.test_db_matches_independent_of_string_or_number_type.5
+  '''
+  SELECT "posthog_integration"."id",
+         "posthog_integration"."team_id",
+         "posthog_integration"."kind",
+         "posthog_integration"."integration_id",
+         "posthog_integration"."config",
+         "posthog_integration"."sensitive_config",
+         "posthog_integration"."errors",
+         "posthog_integration"."created_at",
+         "posthog_integration"."created_by_id"
+  FROM "posthog_integration"
+  WHERE ("posthog_integration"."kind" = 'vercel'
+         AND "posthog_integration"."team_id" = 99999)
+  LIMIT 21
+  '''
+# ---
+# name: TestFeatureFlagMatcher.test_invalid_regex_match_flag
+  '''
+  SELECT "posthog_filesystem"."team_id",
+         "posthog_filesystem"."id",
+         "posthog_filesystem"."path",
+         "posthog_filesystem"."depth",
+         "posthog_filesystem"."type",
+         "posthog_filesystem"."ref",
+         "posthog_filesystem"."href",
+         "posthog_filesystem"."shortcut",
+         "posthog_filesystem"."meta",
+         "posthog_filesystem"."created_at",
+         "posthog_filesystem"."created_by_id",
+         "posthog_filesystem"."surface",
+         "posthog_filesystem"."project_id"
+  FROM "posthog_filesystem"
+  WHERE (("posthog_filesystem"."surface" IS NULL
+          OR "posthog_filesystem"."surface" = 'web')
+         AND "posthog_filesystem"."ref" = '0001'
+         AND "posthog_filesystem"."team_id" = 99999
+         AND "posthog_filesystem"."type" = 'feature_flag'
+         AND NOT ("posthog_filesystem"."shortcut"
+                  AND "posthog_filesystem"."shortcut" IS NOT NULL))
+  '''
+# ---
+# name: TestFeatureFlagMatcher.test_invalid_regex_match_flag.1
+  '''
+  SELECT "posthog_integration"."id",
+         "posthog_integration"."team_id",
+         "posthog_integration"."kind",
+         "posthog_integration"."integration_id",
+         "posthog_integration"."config",
+         "posthog_integration"."sensitive_config",
+         "posthog_integration"."errors",
+         "posthog_integration"."created_at",
+         "posthog_integration"."created_by_id"
+  FROM "posthog_integration"
+  WHERE ("posthog_integration"."kind" = 'vercel'
+         AND "posthog_integration"."team_id" = 99999)
+  LIMIT 21
+  '''
+# ---
+# name: TestFeatureFlagMatcher.test_numeric_operator_with_cohorts_and_nested_cohorts
+  '''
+  SELECT "posthog_cohort"."id",
+         "posthog_cohort"."name",
+         "posthog_cohort"."description",
+         "posthog_cohort"."team_id",
+         "posthog_cohort"."deleted",
+         "posthog_cohort"."filters",
+         "posthog_cohort"."query",
+         "posthog_cohort"."version",
+         "posthog_cohort"."pending_version",
+         "posthog_cohort"."count",
+         "posthog_cohort"."created_by_id",
+         "posthog_cohort"."created_at",
+         "posthog_cohort"."is_calculating",
+         "posthog_cohort"."last_calculation",
+         "posthog_cohort"."errors_calculating",
+         "posthog_cohort"."last_error_at",
+         "posthog_cohort"."is_static",
+         "posthog_cohort"."cohort_type",
+         "posthog_cohort"."groups"
+  FROM "posthog_cohort"
+  INNER JOIN "posthog_team" ON ("posthog_cohort"."team_id" = "posthog_team"."id")
+  WHERE (NOT "posthog_cohort"."deleted"
+         AND "posthog_team"."project_id" = 99999)
+  '''
+# ---
+# name: TestFeatureFlagMatcher.test_with_sql_injection_properties_and_other_aliases
+  '''
+  SELECT "posthog_filesystem"."team_id",
+         "posthog_filesystem"."id",
+         "posthog_filesystem"."path",
+         "posthog_filesystem"."depth",
+         "posthog_filesystem"."type",
+         "posthog_filesystem"."ref",
+         "posthog_filesystem"."href",
+         "posthog_filesystem"."shortcut",
+         "posthog_filesystem"."meta",
+         "posthog_filesystem"."created_at",
+         "posthog_filesystem"."created_by_id",
+         "posthog_filesystem"."surface",
+         "posthog_filesystem"."project_id"
+  FROM "posthog_filesystem"
+  WHERE (("posthog_filesystem"."surface" IS NULL
+          OR "posthog_filesystem"."surface" = 'web')
+         AND "posthog_filesystem"."ref" = '0001'
+         AND "posthog_filesystem"."team_id" = 99999
+         AND "posthog_filesystem"."type" = 'cohort'
+         AND NOT ("posthog_filesystem"."shortcut"
+                  AND "posthog_filesystem"."shortcut" IS NOT NULL))
+  '''
+# ---
+# name: TestFeatureFlagMatcher.test_with_sql_injection_properties_and_other_aliases.1
+  '''
+  SELECT "posthog_filesystem"."team_id",
+         "posthog_filesystem"."id",
+         "posthog_filesystem"."path",
+         "posthog_filesystem"."depth",
+         "posthog_filesystem"."type",
+         "posthog_filesystem"."ref",
+         "posthog_filesystem"."href",
+         "posthog_filesystem"."shortcut",
+         "posthog_filesystem"."meta",
+         "posthog_filesystem"."created_at",
+         "posthog_filesystem"."created_by_id",
+         "posthog_filesystem"."surface",
+         "posthog_filesystem"."project_id"
+  FROM "posthog_filesystem"
+  WHERE (("posthog_filesystem"."surface" IS NULL
+          OR "posthog_filesystem"."surface" = 'web')
+         AND "posthog_filesystem"."ref" = '0001'
+         AND "posthog_filesystem"."team_id" = 99999
+         AND "posthog_filesystem"."type" = 'feature_flag'
+         AND NOT ("posthog_filesystem"."shortcut"
+                  AND "posthog_filesystem"."shortcut" IS NOT NULL))
+  '''
+# ---
+# name: TestFeatureFlagMatcher.test_with_sql_injection_properties_and_other_aliases.2
+  '''
+  SELECT "posthog_integration"."id",
+         "posthog_integration"."team_id",
+         "posthog_integration"."kind",
+         "posthog_integration"."integration_id",
+         "posthog_integration"."config",
+         "posthog_integration"."sensitive_config",
+         "posthog_integration"."errors",
+         "posthog_integration"."created_at",
+         "posthog_integration"."created_by_id"
+  FROM "posthog_integration"
+  WHERE ("posthog_integration"."kind" = 'vercel'
+         AND "posthog_integration"."team_id" = 99999)
+  LIMIT 21
+  '''
+# ---
+# name: TestFeatureFlagMatcher.test_with_sql_injection_properties_and_other_aliases.3
+  '''
+  SELECT "posthog_cohort"."id",
+         "posthog_cohort"."name",
+         "posthog_cohort"."description",
+         "posthog_cohort"."team_id",
+         "posthog_cohort"."deleted",
+         "posthog_cohort"."filters",
+         "posthog_cohort"."query",
+         "posthog_cohort"."version",
+         "posthog_cohort"."pending_version",
+         "posthog_cohort"."count",
+         "posthog_cohort"."created_by_id",
+         "posthog_cohort"."created_at",
+         "posthog_cohort"."is_calculating",
+         "posthog_cohort"."last_calculation",
+         "posthog_cohort"."errors_calculating",
+         "posthog_cohort"."last_error_at",
+         "posthog_cohort"."is_static",
+         "posthog_cohort"."cohort_type",
+         "posthog_cohort"."groups"
+  FROM "posthog_cohort"
+  INNER JOIN "posthog_team" ON ("posthog_cohort"."team_id" = "posthog_team"."id")
+  WHERE (NOT "posthog_cohort"."deleted"
+         AND "posthog_team"."project_id" = 99999)
+  '''
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_error_race_conditions_on_person_merging
+  'BEGIN'
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_error_race_conditions_on_person_merging.1
+  '''
+  
+  SET LOCAL statement_timeout = 99999
+  '''
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_error_race_conditions_on_person_merging.10
+  '''
+  
+  SELECT key
+  FROM posthog_featureflag flag
+  JOIN posthog_team team ON flag.team_id = team.id
+  WHERE team.project_id = 99999
+    AND flag.ensure_experience_continuity = TRUE
+    AND flag.active = TRUE
+    AND flag.deleted = FALSE
+  '''
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_error_race_conditions_on_person_merging.11
+  'COMMIT'
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_error_race_conditions_on_person_merging.2
+  '''
+  
+  SELECT key
+  FROM posthog_featureflag flag
+  JOIN posthog_team team ON flag.team_id = team.id
+  WHERE team.project_id = 99999
+    AND flag.ensure_experience_continuity = TRUE
+    AND flag.active = TRUE
+    AND flag.deleted = FALSE
+  '''
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_error_race_conditions_on_person_merging.3
+  'COMMIT'
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_error_race_conditions_on_person_merging.4
+  'BEGIN'
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_error_race_conditions_on_person_merging.5
+  '''
+  
+  SET LOCAL statement_timeout = 99999
+  '''
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_error_race_conditions_on_person_merging.6
+  '''
+  
+  SELECT key
+  FROM posthog_featureflag flag
+  JOIN posthog_team team ON flag.team_id = team.id
+  WHERE team.project_id = 99999
+    AND flag.ensure_experience_continuity = TRUE
+    AND flag.active = TRUE
+    AND flag.deleted = FALSE
+  '''
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_error_race_conditions_on_person_merging.7
+  'COMMIT'
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_error_race_conditions_on_person_merging.8
+  'BEGIN'
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_error_race_conditions_on_person_merging.9
+  '''
+  
+  SET LOCAL statement_timeout = 99999
+  '''
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_race_conditions_on_person_merging
+  'BEGIN'
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_race_conditions_on_person_merging.1
+  '''
+  
+  SET LOCAL statement_timeout = 99999
+  '''
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_race_conditions_on_person_merging.2
+  '''
+  
+  SELECT key
+  FROM posthog_featureflag flag
+  JOIN posthog_team team ON flag.team_id = team.id
+  WHERE team.project_id = 99999
+    AND flag.ensure_experience_continuity = TRUE
+    AND flag.active = TRUE
+    AND flag.deleted = FALSE
+  '''
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_race_conditions_on_person_merging.3
+  'COMMIT'
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_race_conditions_on_person_merging.4
+  'BEGIN'
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_race_conditions_on_person_merging.5
+  '''
+  
+  SET LOCAL statement_timeout = 99999
+  '''
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_race_conditions_on_person_merging.6
+  '''
+  
+  SELECT key
+  FROM posthog_featureflag flag
+  JOIN posthog_team team ON flag.team_id = team.id
+  WHERE team.project_id = 99999
+    AND flag.ensure_experience_continuity = TRUE
+    AND flag.active = TRUE
+    AND flag.deleted = FALSE
+  '''
+# ---
+# name: TestHashKeyOverridesRaceConditions.test_hash_key_overrides_with_simulated_race_conditions_on_person_merging.7
+  'COMMIT'
+# ---

@@ -1,0 +1,14 @@
+[package]
+name = "health"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[dependencies]
+common-liveness = { path = "../liveness" }
+axum = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

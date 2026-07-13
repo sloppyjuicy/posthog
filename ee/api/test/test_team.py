@@ -1,366 +1,347 @@
-from rest_framework.status import (
-    HTTP_200_OK,
-    HTTP_204_NO_CONTENT,
-    HTTP_400_BAD_REQUEST,
-    HTTP_403_FORBIDDEN,
-    HTTP_404_NOT_FOUND,
-)
+import uuid
+from typing import Optional
 
-from ee.api.test.base import APILicensedTest
-from ee.models.explicit_team_membership import ExplicitTeamMembership
+from freezegun import freeze_time
+from posthog.test.base import FuzzyInt
+from unittest.mock import patch
+
+from rest_framework.status import HTTP_200_OK, HTTP_204_NO_CONTENT, HTTP_403_FORBIDDEN, HTTP_404_NOT_FOUND
+
+from posthog.constants import AvailableFeature
 from posthog.models.organization import Organization, OrganizationMembership
+from posthog.models.project import Project
 from posthog.models.team import Team
+from posthog.models.team.team_caching import get_team_in_cache
 from posthog.models.user import User
 
+from ee.api.test.base import APILicensedTest
+from ee.models.rbac.access_control import AccessControl
 
-class TestProjectEnterpriseAPI(APILicensedTest):
-    CLASS_DATA_LEVEL_SETUP = False
 
-    # Creating projects
+def team_enterprise_api_test_factory():
+    class TestTeamEnterpriseAPI(APILicensedTest):
+        CLASS_DATA_LEVEL_SETUP = False
+        CONFIG_FORCE_ACCESS_CONTROL_ON_SETUP = True
 
-    def test_create_project(self):
+        def _set_project_default_member_access(self, team: Team) -> None:
+            AccessControl.objects.create(
+                team=team,
+                resource="project",
+                resource_id=str(team.id),
+                organization_member=None,
+                role=None,
+                access_level="member",
+            )
+
+        def _assert_activity_log(self, expected: list[dict], team_id: Optional[int] = None) -> None:
+            if not team_id:
+                team_id = self.team.pk
+
+            starting_log_response = self.client.get(f"/api/environments/{team_id}/activity")
+            assert starting_log_response.status_code == 200, starting_log_response.json()
+            activity = starting_log_response.json()["results"]
+            for item in activity:
+                item.pop("id", None)
+            assert activity == expected
+
+        # Deleting projects
+
+        @patch("posthog.temporal.delete_teams.dispatch.start_delete_project_data_workflow")
+        def test_delete_team_as_org_admin_allowed(self, mock_start_deletion):
+            self.organization_membership.level = OrganizationMembership.Level.ADMIN
+            self.organization_membership.save()
+            response = self.client.delete(f"/api/environments/{self.team.id}")
+            self.assertEqual(response.status_code, HTTP_204_NO_CONTENT)
+            mock_start_deletion.assert_called_once()
+
+        def test_delete_team_as_org_member_forbidden(self):
+            self.organization_membership.level = OrganizationMembership.Level.MEMBER
+            self.organization_membership.save()
+
+            self._set_project_default_member_access(self.team)
+
+            if not self.organization.is_feature_available(AvailableFeature.ACCESS_CONTROL):
+                self.skipTest("Requires access control")
+
+            response = self.client.delete(f"/api/environments/{self.team.id}")
+            self.assertEqual(response.status_code, HTTP_403_FORBIDDEN)
+            self.assertEqual(Team.objects.filter(organization=self.organization).count(), 1)
+
+        @patch("posthog.temporal.delete_teams.dispatch.start_delete_project_data_workflow")
+        def test_delete_second_team_as_org_admin_allowed(self, mock_start_deletion):
+            self.organization_membership.level = OrganizationMembership.Level.ADMIN
+            self.organization_membership.save()
+            team = Team.objects.create(organization=self.organization)
+            response = self.client.delete(f"/api/environments/{team.id}")
+            self.assertEqual(response.status_code, HTTP_204_NO_CONTENT)
+            mock_start_deletion.assert_called_once()
+
+        def test_no_delete_team_not_administrating_organization(self):
+            self.organization_membership.level = OrganizationMembership.Level.MEMBER
+            self.organization_membership.save()
+            team = Team.objects.create(organization=self.organization)
+
+            self._set_project_default_member_access(team)
+
+            if not self.organization.is_feature_available(AvailableFeature.ACCESS_CONTROL):
+                self.skipTest("Requires access control")
+
+            response = self.client.delete(f"/api/environments/{team.id}")
+            self.assertEqual(response.status_code, HTTP_403_FORBIDDEN)
+            self.assertEqual(Team.objects.filter(organization=self.organization).count(), 2)
+
+        def test_no_delete_team_not_belonging_to_organization(self):
+            team_1 = Organization.objects.bootstrap(None)[2]
+            response = self.client.delete(f"/api/environments/{team_1.id}")
+            self.assertEqual(response.status_code, HTTP_404_NOT_FOUND)
+            self.assertTrue(Team.objects.filter(id=team_1.id).exists())
+            organization, _, _ = User.objects.bootstrap("X", "someone@x.com", "qwerty", "Someone")
+            team_2 = Team.objects.create(organization=organization)
+            response = self.client.delete(f"/api/environments/{team_2.id}")
+            self.assertEqual(response.status_code, HTTP_404_NOT_FOUND)
+            self.assertEqual(Team.objects.filter(organization=organization).count(), 2)
+
+        # Updating projects
+
+        def test_can_update_and_retrieve_person_property_names_excluded_from_correlation(self):
+            response = self.client.patch(
+                f"/api/environments/@current/",
+                {"correlation_config": {"excluded_person_property_names": ["$os"]}},
+            )
+            self.assertEqual(response.status_code, HTTP_200_OK)
+
+            response = self.client.get(f"/api/environments/@current/")
+            self.assertEqual(response.status_code, HTTP_200_OK)
+
+            response_data = response.json()
+
+            self.assertLessEqual(
+                {"correlation_config": {"excluded_person_property_names": ["$os"]}}.items(),
+                response_data.items(),
+            )
+
+        # Fetching projects
+
+        def test_fetch_team_as_org_admin_works(self):
+            self.organization_membership.level = OrganizationMembership.Level.ADMIN
+            self.organization_membership.save()
+
+            response = self.client.get(f"/api/environments/@current/")
+            response_data = response.json()
+
+            self.assertEqual(response.status_code, HTTP_200_OK)
+            self.assertLessEqual(
+                {
+                    "name": "Default project",
+                    "access_control": False,
+                    "effective_membership_level": OrganizationMembership.Level.ADMIN,
+                }.items(),
+                response_data.items(),
+            )
+
+        def test_fetch_team_as_org_member_works(self):
+            self.organization_membership.level = OrganizationMembership.Level.MEMBER
+            self.organization_membership.save()
+
+            response = self.client.get(f"/api/environments/@current/")
+            response_data = response.json()
+
+            expected_effective_level = (
+                OrganizationMembership.Level.ADMIN
+                if self.organization.is_feature_available(AvailableFeature.ACCESS_CONTROL)
+                else OrganizationMembership.Level.MEMBER
+            )
+
+            self.assertEqual(response.status_code, HTTP_200_OK)
+            self.assertLessEqual(
+                {
+                    "name": "Default project",
+                    "access_control": False,
+                    "effective_membership_level": expected_effective_level,
+                }.items(),
+                response_data.items(),
+            )
+
+        def test_fetch_team_as_org_outsider(self):
+            self.organization_membership.delete()
+            response = self.client.get(f"/api/environments/@current/")
+            response_data = response.json()
+
+            self.assertEqual(response.status_code, HTTP_404_NOT_FOUND)
+            self.assertEqual(self.not_found_response(), response_data)
+
+        def test_fetch_nonexistent_team(self):
+            response = self.client.get(f"/api/environments/234444/")
+            response_data = response.json()
+
+            self.assertEqual(response.status_code, HTTP_404_NOT_FOUND)
+            self.assertEqual(self.not_found_response(), response_data)
+
+        @freeze_time("2022-02-08")
+        def test_team_update_is_in_activity_log(self):
+            self.organization_membership.level = OrganizationMembership.Level.ADMIN
+            self.organization_membership.save()
+
+            new_name = str(uuid.uuid4())
+            response = self.client.patch(f"/api/environments/{self.team.id}/", {"name": new_name})
+            self.assertEqual(response.status_code, 200, response.json())
+
+            self._assert_activity_log(
+                [
+                    {
+                        "activity": "updated",
+                        "created_at": "2022-02-08T00:00:00Z",
+                        "detail": {
+                            "changes": [
+                                {
+                                    "action": "changed",
+                                    "after": new_name,
+                                    "before": "Default project",
+                                    "field": "name",
+                                    "type": "Team",
+                                }
+                            ],
+                            "name": new_name,
+                            "short_id": None,
+                            "trigger": None,
+                            "type": None,
+                        },
+                        "item_id": str(self.team.id),
+                        "scope": "Team",
+                        "user": {
+                            "email": "user1@posthog.com",
+                            "first_name": "",
+                        },
+                    },
+                ],
+                team_id=self.team.id,
+            )
+
+        def test_team_is_cached_on_update(self):
+            self.organization_membership.level = OrganizationMembership.Level.ADMIN
+            self.organization_membership.save()
+
+            token = self.team.api_token
+
+            response = self.client.patch(
+                f"/api/environments/{self.team.id}/",
+                {"timezone": "Europe/Istanbul", "session_recording_opt_in": True},
+            )
+            self.assertEqual(response.status_code, 200)
+
+            cached_team = get_team_in_cache(token)
+            assert cached_team is not None
+
+            self.assertEqual(cached_team.name, self.team.name)
+            self.assertEqual(cached_team.uuid, str(self.team.uuid))
+            self.assertEqual(cached_team.session_recording_opt_in, True)
+
+            # only things in CachedTeamSerializer are cached!
+            self.assertEqual(cached_team.timezone, "UTC")
+
+            # reset token should update cache as well
+            response = self.client.patch(f"/api/environments/{self.team.id}/reset_token/")
+            response_data = response.json()
+
+            cached_team = get_team_in_cache(token)
+            assert cached_team is None
+
+            cached_team = get_team_in_cache(response_data["api_token"])
+            assert cached_team is not None
+            self.assertEqual(cached_team.name, self.team.name)
+            self.assertEqual(cached_team.uuid, response.json()["uuid"])
+            self.assertEqual(cached_team.session_recording_opt_in, True)
+
+    return TestTeamEnterpriseAPI
+
+
+class TestTeamEnterpriseAPI(team_enterprise_api_test_factory()):  # type: ignore[misc]
+    def test_cannot_create_team_not_under_project(self):
         self.organization_membership.level = OrganizationMembership.Level.ADMIN
         self.organization_membership.save()
-        response = self.client.post("/api/projects/", {"name": "Test"})
-        self.assertEqual(response.status_code, 201)
-        self.assertEqual(Team.objects.count(), 2)
-        response_data = response.json()
-        self.assertDictContainsSubset(
-            {
-                "name": "Test",
-                "access_control": False,
-                "effective_membership_level": OrganizationMembership.Level.ADMIN,
-            },
-            response_data,
-        )
-        self.assertEqual(self.organization.teams.count(), 2)
-
-    def test_non_admin_cannot_create_project(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-        count = Team.objects.count()
-        response = self.client.post("/api/projects/", {"name": "Test"})
-        self.assertEqual(response.status_code, HTTP_403_FORBIDDEN)
-        self.assertEqual(Team.objects.count(), count)
-        self.assertEqual(
-            response.json(), self.permission_denied_response("Your organization access level is insufficient.")
-        )
-
-    def test_user_that_does_not_belong_to_an_org_cannot_create_a_project(self):
-        user = User.objects.create(email="no_org@posthog.com")
-        self.client.force_login(user)
-
-        response = self.client.post("/api/projects/", {"name": "Test"})
-        self.assertEqual(response.status_code, HTTP_400_BAD_REQUEST)
+        self.assertEqual(Team.objects.count(), 1)
+        self.assertEqual(Project.objects.count(), 1)
+        response = self.client.post("/api/environments/", {"name": "Test"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Team.objects.count(), 1)
+        self.assertEqual(Project.objects.count(), 1)
         self.assertEqual(
             response.json(),
-            {
-                "type": "validation_error",
-                "code": "invalid_input",
-                "detail": "You need to belong to an organization.",
-                "attr": None,
-            },
+            self.validation_error_response(
+                "Environments must be created under a specific project. Send the POST request to /api/projects/<project_id>/environments/ instead."
+            ),
         )
 
-    # Deleting projects
-
-    def test_delete_team_as_org_admin_allowed(self):
-        self.organization_membership.level = OrganizationMembership.Level.ADMIN
-        self.organization_membership.save()
-        response = self.client.delete(f"/api/projects/{self.team.id}")
-        self.assertEqual(response.status_code, HTTP_204_NO_CONTENT)
-        self.assertEqual(Team.objects.filter(organization=self.organization).count(), 0)
-
-    def test_delete_team_as_org_member_forbidden(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-        response = self.client.delete(f"/api/projects/{self.team.id}")
-        self.assertEqual(response.status_code, HTTP_403_FORBIDDEN)
-        self.assertEqual(Team.objects.filter(organization=self.organization).count(), 1)
-
-    def test_delete_open_team_as_org_member_but_project_admin_forbidden(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-        self_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.ADMIN
-        )
-        response = self.client.delete(f"/api/projects/{self.team.id}")
-        self.assertEqual(response.status_code, HTTP_403_FORBIDDEN)
-        self.assertEqual(Team.objects.filter(organization=self.organization).count(), 1)
-
-    def test_delete_private_team_as_org_member_but_project_admin_allowed(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-        self.team.access_control = True
-        self.team.save()
-        self_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.ADMIN
-        )
-        response = self.client.delete(f"/api/projects/{self.team.id}")
-        self.assertEqual(response.status_code, HTTP_204_NO_CONTENT)
-        self.assertEqual(Team.objects.filter(organization=self.organization).count(), 0)
-
-    def test_delete_second_team_as_org_admin_allowed(self):
-        self.organization_membership.level = OrganizationMembership.Level.ADMIN
-        self.organization_membership.save()
-        team = Team.objects.create(organization=self.organization)
-        response = self.client.delete(f"/api/projects/{team.id}")
-        self.assertEqual(response.status_code, HTTP_204_NO_CONTENT)
-        self.assertEqual(Team.objects.filter(organization=self.organization).count(), 1)
-
-    def test_no_delete_team_not_administrating_organization(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-        team = Team.objects.create(organization=self.organization)
-        response = self.client.delete(f"/api/projects/{team.id}")
-        self.assertEqual(response.status_code, HTTP_403_FORBIDDEN)
-        self.assertEqual(Team.objects.filter(organization=self.organization).count(), 2)
-
-    def test_no_delete_team_not_belonging_to_organization(self):
-        team_1 = Organization.objects.bootstrap(None)[2]
-        response = self.client.delete(f"/api/projects/{team_1.id}")
-        self.assertEqual(response.status_code, HTTP_404_NOT_FOUND)
-        self.assertTrue(Team.objects.filter(id=team_1.id).exists())
-        organization, _, _ = User.objects.bootstrap("X", "someone@x.com", "qwerty", "Someone")
-        team_2 = Team.objects.create(organization=organization)
-        response = self.client.delete(f"/api/projects/{team_2.id}")
-        self.assertEqual(response.status_code, HTTP_404_NOT_FOUND)
-        self.assertEqual(Team.objects.filter(organization=organization).count(), 2)
-
-    # Updating projects
-
-    def test_rename_project_as_org_member_allowed(self):
+    def test_rename_team_as_org_member_allowed(self):
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
         self.organization_membership.save()
 
-        response = self.client.patch(f"/api/projects/@current/", {"name": "Erinaceus europaeus"})
+        response = self.client.patch(f"/api/environments/@current/", {"name": "Erinaceus europaeus"})
         self.team.refresh_from_db()
 
         self.assertEqual(response.status_code, HTTP_200_OK)
         self.assertEqual(self.team.name, "Erinaceus europaeus")
 
-    def test_rename_private_project_as_org_member_forbidden(self):
+    def test_list_teams_restricted_ones_hidden(self):
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
         self.organization_membership.save()
-        self.team.access_control = True
-        self.team.save()
-
-        response = self.client.patch(f"/api/projects/@current/", {"name": "Acherontia atropos"})
-        self.team.refresh_from_db()
-
-        self.assertEqual(response.status_code, HTTP_403_FORBIDDEN)
-        self.assertEqual(self.team.name, "Default Project")
-
-    def test_rename_private_project_current_as_org_outsider_forbidden(self):
-        self.organization_membership.delete()
-
-        response = self.client.patch(f"/api/projects/@current/", {"name": "Acherontia atropos"})
-        self.team.refresh_from_db()
-
-        self.assertEqual(response.status_code, HTTP_404_NOT_FOUND)
-
-    def test_rename_private_project_id_as_org_outsider_forbidden(self):
-        self.organization_membership.delete()
-
-        response = self.client.patch(f"/api/projects/{self.team.id}/", {"name": "Acherontia atropos"})
-        self.team.refresh_from_db()
-
-        self.assertEqual(response.status_code, HTTP_404_NOT_FOUND)
-
-    def test_rename_private_project_as_org_member_and_project_member_allowed(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-        self.team.access_control = True
-        self.team.save()
-        self_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.MEMBER
+        other_team = Team.objects.create(
+            organization=self.organization,
+            name="Other",
         )
 
-        response = self.client.patch(f"/api/projects/@current/", {"name": "Acherontia atropos"})
-        self.team.refresh_from_db()
-
-        self.assertEqual(response.status_code, HTTP_200_OK)
-        self.assertEqual(self.team.name, "Acherontia atropos")
-
-    def test_enable_access_control_as_org_member_forbidden(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-
-        response = self.client.patch(f"/api/projects/@current/", {"access_control": True})
-        self.team.refresh_from_db()
-
-        self.assertEqual(response.status_code, HTTP_403_FORBIDDEN)
-        self.assertFalse(self.team.access_control)
-
-    def test_enable_access_control_as_org_admin_allowed(self):
-        self.organization_membership.level = OrganizationMembership.Level.ADMIN
-        self.organization_membership.save()
-
-        response = self.client.patch(f"/api/projects/@current/", {"access_control": True})
-        self.team.refresh_from_db()
-
-        self.assertEqual(response.status_code, HTTP_200_OK)
-        self.assertTrue(self.team.access_control)
-
-    def test_enable_access_control_as_org_member_and_project_admin_forbidden(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-        self_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.ADMIN
+        # Set up new access control system - restrict project to no default access
+        AccessControl.objects.create(
+            team=other_team,
+            access_level="none",
+            resource="project",
+            resource_id=str(other_team.id),
         )
 
-        response = self.client.patch(f"/api/projects/@current/", {"access_control": True})
-        self.team.refresh_from_db()
+        # The other team should not be returned as it's restricted for the logged-in user
+        projects_response = self.client.get(f"/api/environments/")
 
-        self.assertEqual(response.status_code, HTTP_403_FORBIDDEN)
-        self.assertFalse(self.team.access_control)
+        # 9 (above):
+        with self.assertNumQueries(FuzzyInt(14, 18)):
+            current_org_response = self.client.get(f"/api/organizations/{self.organization.id}/")
 
-    def test_disable_access_control_as_org_member_forbidden(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-        self.team.access_control = True
-        self.team.save()
-
-        response = self.client.patch(f"/api/projects/@current/", {"access_control": False})
-        self.team.refresh_from_db()
-
-        self.assertEqual(response.status_code, HTTP_403_FORBIDDEN)
-        self.assertTrue(self.team.access_control)
-
-    def test_disable_access_control_as_org_member_and_project_admin_forbidden(self):
-        # Only org-wide admins+ should be allowed to make the project open,
-        # because if a project-specific admin who is only an org member did it, they wouldn't be able to reenable it
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-        self.team.access_control = True
-        self.team.save()
-        self_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.ADMIN
-        )
-
-        response = self.client.patch(f"/api/projects/@current/", {"access_control": False})
-        self.team.refresh_from_db()
-
-        self.assertEqual(response.status_code, HTTP_403_FORBIDDEN)
-        self.assertTrue(self.team.access_control)
-
-    def test_disable_access_control_as_org_admin_allowed(self):
-        self.organization_membership.level = OrganizationMembership.Level.ADMIN
-        self.organization_membership.save()
-        self.team.access_control = True
-        self.team.save()
-
-        response = self.client.patch(f"/api/projects/@current/", {"access_control": False})
-        self.team.refresh_from_db()
-
-        self.assertEqual(response.status_code, HTTP_200_OK)
-        self.assertFalse(self.team.access_control)
-
-    # Fetching projects
-
-    def test_fetch_team_as_org_admin_works(self):
-        self.organization_membership.level = OrganizationMembership.Level.ADMIN
-        self.organization_membership.save()
-
-        response = self.client.get(f"/api/projects/@current/")
-        response_data = response.json()
-
-        self.assertEqual(response.status_code, HTTP_200_OK)
-        self.assertDictContainsSubset(
-            {
-                "name": "Default Project",
-                "access_control": False,
-                "effective_membership_level": OrganizationMembership.Level.ADMIN,
-            },
-            response_data,
-        )
-
-    def test_fetch_team_as_org_member_works(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-
-        response = self.client.get(f"/api/projects/@current/")
-        response_data = response.json()
-
-        self.assertEqual(response.status_code, HTTP_200_OK)
-        self.assertDictContainsSubset(
-            {
-                "name": "Default Project",
-                "access_control": False,
-                "effective_membership_level": OrganizationMembership.Level.MEMBER,
-            },
-            response_data,
-        )
-
-    def test_fetch_private_team_as_org_member(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-        self.team.access_control = True
-        self.team.save()
-
-        response = self.client.get(f"/api/projects/@current/")
-        response_data = response.json()
-
-        self.assertEqual(response.status_code, HTTP_403_FORBIDDEN)
+        self.assertEqual(projects_response.status_code, HTTP_200_OK)
         self.assertEqual(
-            self.permission_denied_response("You don't have sufficient permissions in the project."), response_data
+            projects_response.json().get("results"),
+            [
+                {
+                    "id": self.team.id,
+                    "uuid": str(self.team.uuid),
+                    "organization": str(self.organization.id),
+                    "project_id": self.team.project.id,
+                    "api_token": self.team.api_token,
+                    "name": self.team.name,
+                    "completed_snippet_onboarding": False,
+                    "has_completed_onboarding_for": {"product_analytics": True},
+                    "ingested_event": False,
+                    "is_demo": False,
+                    "timezone": "UTC",
+                    "access_control": False,
+                }
+            ],
         )
-
-    def test_fetch_private_team_as_org_member_and_project_member(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-        self.team.access_control = True
-        self.team.save()
-        self_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.MEMBER
+        self.assertEqual(current_org_response.status_code, HTTP_200_OK)
+        self.assertEqual(
+            current_org_response.json().get("teams"),
+            [
+                {
+                    "id": self.team.id,
+                    "uuid": str(self.team.uuid),
+                    "organization": str(self.organization.id),
+                    "project_id": self.team.project.id,
+                    "api_token": self.team.api_token,
+                    "name": self.team.name,
+                    "completed_snippet_onboarding": False,
+                    "has_completed_onboarding_for": {"product_analytics": True},
+                    "ingested_event": False,
+                    "is_demo": False,
+                    "timezone": "UTC",
+                    "access_control": False,
+                }
+            ],
         )
-
-        response = self.client.get(f"/api/projects/@current/")
-        response_data = response.json()
-
-        self.assertEqual(response.status_code, HTTP_200_OK)
-        self.assertDictContainsSubset(
-            {
-                "name": "Default Project",
-                "access_control": True,
-                "effective_membership_level": OrganizationMembership.Level.MEMBER,
-            },
-            response_data,
-        )
-
-    def test_fetch_private_team_as_org_member_and_project_admin(self):
-        self.organization_membership.level = OrganizationMembership.Level.MEMBER
-        self.organization_membership.save()
-        self.team.access_control = True
-        self.team.save()
-        self_team_membership = ExplicitTeamMembership.objects.create(
-            team=self.team, parent_membership=self.organization_membership, level=ExplicitTeamMembership.Level.ADMIN
-        )
-
-        response = self.client.get(f"/api/projects/@current/")
-        response_data = response.json()
-
-        self.assertEqual(response.status_code, HTTP_200_OK)
-        self.assertDictContainsSubset(
-            {
-                "name": "Default Project",
-                "access_control": True,
-                "effective_membership_level": OrganizationMembership.Level.ADMIN,
-            },
-            response_data,
-        )
-
-    def test_fetch_team_as_org_outsider(self):
-        self.organization_membership.delete()
-        response = self.client.get(f"/api/projects/@current/")
-        response_data = response.json()
-
-        self.assertEqual(response.status_code, HTTP_404_NOT_FOUND)
-        self.assertEqual(self.not_found_response(), response_data)
-
-    def test_fetch_nonexistent_team(self):
-        response = self.client.get(f"/api/projects/234444/")
-        response_data = response.json()
-
-        self.assertEqual(response.status_code, HTTP_404_NOT_FOUND)
-        self.assertEqual(self.not_found_response(), response_data)

@@ -1,246 +1,279 @@
-import React, { useState, useEffect } from 'react'
-import { useValues, useActions } from 'kea'
-import { Table, Modal, Button, Spin } from 'antd'
-import { percentage } from 'lib/utils'
-import { Link } from 'lib/components/Link'
-import { retentionTableLogic } from './retentionTableLogic'
-import { Tooltip } from 'lib/components/Tooltip'
-import {
-    RetentionTablePayload,
-    RetentionTablePeoplePayload,
-    RetentionTableAppearanceType,
-} from 'scenes/retention/types'
-
 import './RetentionTable.scss'
-import dayjs from 'dayjs'
-import utc from 'dayjs/plugin/utc'
-dayjs.extend(utc)
 
-import { ColumnsType } from 'antd/lib/table'
 import clsx from 'clsx'
+import { useActions, useValues } from 'kea'
+import React from 'react'
+
+import { IconChevronDown, IconChevronRight } from '@posthog/icons'
+
+import { Tooltip } from 'lib/lemon-ui/Tooltip'
+import { gradateColor } from 'lib/utils/colors'
+import { humanFriendlyNumber } from 'lib/utils/numbers'
 import { insightLogic } from 'scenes/insights/insightLogic'
 
-export function RetentionTable({ dashboardItemId = null }: { dashboardItemId?: number | null }): JSX.Element | null {
+import { themeLogic } from '~/layout/navigation-3000/themeLogic'
+
+import { OVERALL_MEAN_KEY, retentionLogic } from './retentionLogic'
+import { retentionModalLogic } from './retentionModalLogic'
+import { retentionTableLogic } from './retentionTableLogic'
+import { NO_BREAKDOWN_VALUE } from './types'
+
+export function RetentionTable({
+    inSharedMode = false,
+    embedded = false,
+}: {
+    inSharedMode?: boolean
+    embedded?: boolean
+}): JSX.Element | null {
     const { insightProps } = useValues(insightLogic)
-    const logic = retentionTableLogic(insightProps)
     const {
-        results: _results,
-        resultsLoading,
-        peopleLoading,
-        people: _people,
-        loadingMore,
-        filters: { period, date_to },
-    } = useValues(logic)
-    const results = _results as RetentionTablePayload[]
-    const people = _people as RetentionTablePeoplePayload
+        tableRowsSplitByBreakdownValue,
+        hideSizeColumn,
+        retentionVizOptions,
+        theme,
+        expandedBreakdowns,
+        retentionMeans,
+        breakdownDisplayNames,
+        tableHeaders,
+        retentionFilter,
+        isPropertyValueAggregation,
+    } = useValues(retentionTableLogic(insightProps))
+    const { toggleBreakdown, setHoveredColumn } = useActions(retentionTableLogic(insightProps))
+    const { hoveredColumn } = useValues(retentionTableLogic(insightProps))
+    const { updateInsightFilter } = useActions(retentionLogic(insightProps))
+    const { openModal } = useActions(retentionModalLogic(insightProps))
 
-    const { loadPeople, loadMorePeople } = useActions(logic)
-    const [modalVisible, setModalVisible] = useState(false)
-    const [selectedRow, selectRow] = useState(0)
-    const [isLatestPeriod, setIsLatestPeriod] = useState(false)
+    const selectedInterval = retentionFilter?.selectedInterval ?? null
+    const allowSelectingColumns = !inSharedMode && !embedded
 
-    useEffect(() => {
-        setIsLatestPeriod(periodIsLatest(date_to || null, period || null))
-    }, [date_to, period])
-    const columns: ColumnsType<Record<string, any>> = [
-        {
-            title: 'Date',
-            key: 'date',
-            render: (row) =>
-                period === 'Hour' ? dayjs(row.date).format('MMM D, h A') : dayjs.utc(row.date).format('MMM D'),
-            align: 'center',
-        },
-        {
-            title: 'Cohort Size',
-            key: 'users',
-            render: (row) => row.values[0]['count'],
-            align: 'center',
-        },
-    ]
+    const backgroundColor = theme?.['preset-1'] || '#000000' // Default to black if no color found
+    const backgroundColorMean = theme?.['preset-2'] || '#000000' // Default to black if no color found
+    const { isDarkModeOn } = useValues(themeLogic)
 
-    if (!resultsLoading && results) {
-        if (results.length === 0) {
-            return null
-        }
-        results[0].values.forEach((_: any, dayIndex: number) => {
-            columns.push({
-                title: results[dayIndex].label,
-                key: `day::${dayIndex}`,
-                render: (row) => {
-                    if (dayIndex >= row.values.length) {
-                        return ''
-                    }
-                    return renderPercentage(
-                        row.values[dayIndex]['count'],
-                        row.values[0]['count'],
-                        isLatestPeriod && dayIndex === row.values.length - 1,
-                        dayIndex === 0
-                    )
-                },
-            })
-        })
-    }
-
-    function dismissModal(): void {
-        setModalVisible(false)
-    }
+    // only one breakdown value so don't need to highlight using different colors/autoexpand it
+    const isSingleBreakdown = Object.keys(tableRowsSplitByBreakdownValue).length === 1
 
     return (
-        <>
-            <Table
-                data-attr="retention-table"
-                size="small"
-                className="retention-table"
-                pagination={{ pageSize: 99999, hideOnSinglePage: true }}
-                rowClassName={dashboardItemId ? '' : 'cursor-pointer'}
-                dataSource={results}
-                columns={columns}
-                rowKey="date"
-                loading={resultsLoading}
-                onRow={(_, rowIndex: number | undefined) => ({
-                    onClick: () => {
-                        if (!dashboardItemId && rowIndex !== undefined) {
-                            loadPeople(rowIndex)
-                            setModalVisible(true)
-                            selectRow(rowIndex)
-                        }
-                    },
-                })}
-            />
-            {results && (
-                <Modal
-                    visible={modalVisible}
-                    closable={true}
-                    onCancel={dismissModal}
-                    footer={<Button onClick={dismissModal}>Close</Button>}
-                    style={{
-                        top: 20,
-                        minWidth: results[selectedRow]?.values[0]?.count === 0 ? '10%' : '90%',
-                        fontSize: 16,
-                    }}
-                    title={results[selectedRow] ? dayjs(results[selectedRow].date).format('MMMM D, YYYY') : ''}
-                >
-                    {results && !peopleLoading ? (
-                        <div>
-                            {results[selectedRow]?.values[0]?.count === 0 ? (
-                                <span>No persons during this period.</span>
-                            ) : (
-                                <div>
-                                    <table className="table-bordered full-width">
-                                        <tbody>
-                                            <tr>
-                                                <th />
-                                                {results &&
-                                                    results
-                                                        .slice(0, results[selectedRow]?.values.length)
-                                                        .map((data, index) => <th key={index}>{data.label}</th>)}
-                                            </tr>
-                                            <tr>
-                                                <td>user_id</td>
-                                                {results &&
-                                                    results[selectedRow]?.values.map((data: any, index: number) => (
-                                                        <td key={index}>
-                                                            {data.count}&nbsp;{' '}
-                                                            {data.count > 0 && (
-                                                                <span>
-                                                                    (
-                                                                    {percentage(
-                                                                        data.count /
-                                                                            results[selectedRow]?.values[0]['count']
-                                                                    )}
-                                                                    )
-                                                                </span>
-                                                            )}
-                                                        </td>
-                                                    ))}
-                                            </tr>
-                                            {people.result &&
-                                                people.result.map((personAppearances: RetentionTableAppearanceType) => (
-                                                    <tr key={personAppearances.person.id}>
-                                                        <td className="text-overflow" style={{ minWidth: 200 }}>
-                                                            <Link
-                                                                to={`/person/${encodeURIComponent(
-                                                                    personAppearances.person.distinct_ids[0]
-                                                                )}`}
-                                                                data-attr="retention-person-link"
-                                                            >
-                                                                {personAppearances.person.name}
-                                                            </Link>
-                                                        </td>
-                                                        {personAppearances.appearances.map(
-                                                            (appearance: number, index: number) => {
-                                                                return (
-                                                                    <td
-                                                                        key={index}
-                                                                        className={
-                                                                            appearance
-                                                                                ? 'retention-success'
-                                                                                : 'retention-dropped'
-                                                                        }
-                                                                    />
-                                                                )
-                                                            }
-                                                        )}
-                                                    </tr>
-                                                ))}
-                                        </tbody>
-                                    </table>
-                                    <div
-                                        style={{
-                                            margin: '1rem',
-                                            textAlign: 'center',
-                                        }}
-                                    >
-                                        {people.next ? (
-                                            <Button
-                                                type="primary"
-                                                onClick={() => loadMorePeople()}
-                                                loading={loadingMore}
-                                            >
-                                                Load more people
-                                            </Button>
-                                        ) : null}
+        <table
+            className={clsx('RetentionTable', {
+                'RetentionTable--small-layout': retentionVizOptions?.useSmallLayout,
+                'RetentionTable--allow-selecting-columns': allowSelectingColumns,
+            })}
+            data-attr="retention-table"
+            // eslint-disable-next-line react/forbid-dom-props
+            style={
+                {
+                    '--retention-table-color': backgroundColor,
+                } as React.CSSProperties
+            }
+        >
+            <tbody>
+                <tr>
+                    <th className="bg whitespace-nowrap">Cohort</th>
+                    {!hideSizeColumn && <th className="bg">Size</th>}
+                    {tableHeaders.map((header, columnIndex) => (
+                        <th
+                            key={header}
+                            className={clsx({
+                                'RetentionTable__SelectedColumn--header': columnIndex === selectedInterval,
+                                'RetentionTable__HoveredColumn--header': columnIndex === hoveredColumn,
+                            })}
+                            onClick={() => {
+                                if (allowSelectingColumns) {
+                                    updateInsightFilter({
+                                        selectedInterval: columnIndex === selectedInterval ? null : columnIndex,
+                                    })
+                                }
+                            }}
+                            onMouseEnter={() => {
+                                if (allowSelectingColumns) {
+                                    setHoveredColumn(columnIndex)
+                                }
+                            }}
+                            onMouseLeave={() => {
+                                if (allowSelectingColumns) {
+                                    setHoveredColumn(null)
+                                }
+                            }}
+                            style={{
+                                cursor: allowSelectingColumns ? 'pointer' : 'default',
+                            }}
+                        >
+                            {header}
+                        </th>
+                    ))}
+                </tr>
+
+                {Object.entries(tableRowsSplitByBreakdownValue).map(([breakdownValue, cohortRows], breakdownIndex) => {
+                    const noBreakdown = breakdownValue === NO_BREAKDOWN_VALUE
+                    const keyForMeanData = noBreakdown ? OVERALL_MEAN_KEY : breakdownValue
+                    const meanData = retentionMeans[keyForMeanData]
+
+                    return (
+                        <React.Fragment key={breakdownIndex}>
+                            {/* Mean row */}
+                            <tr
+                                onClick={() => toggleBreakdown(breakdownValue)}
+                                className={clsx('cursor-pointer', {
+                                    'bg-slate-100':
+                                        !isSingleBreakdown && !isDarkModeOn && expandedBreakdowns[breakdownValue],
+                                })}
+                            >
+                                <td className="pr-2 whitespace-nowrap">
+                                    <div className="flex items-center gap-2">
+                                        {expandedBreakdowns[breakdownValue] ? (
+                                            <IconChevronDown />
+                                        ) : (
+                                            <IconChevronRight />
+                                        )}
+                                        <span>
+                                            {breakdownValue === NO_BREAKDOWN_VALUE
+                                                ? 'Mean'
+                                                : breakdownDisplayNames[breakdownValue] || breakdownValue}{' '}
+                                        </span>
                                     </div>
-                                </div>
-                            )}
-                        </div>
-                    ) : (
-                        <Spin />
-                    )}
-                </Modal>
-            )}
-        </>
+                                </td>
+
+                                {!hideSizeColumn && (
+                                    <td>
+                                        <span className="RetentionTable__TextTab">
+                                            {noBreakdown
+                                                ? cohortRows.length
+                                                    ? Math.round((meanData?.totalCohortSize ?? 0) / cohortRows.length)
+                                                    : 0
+                                                : (meanData?.totalCohortSize ?? 0)}
+                                        </span>
+                                    </td>
+                                )}
+
+                                {tableHeaders.map((_, interval) => (
+                                    <td
+                                        key={interval}
+                                        className={clsx({
+                                            'RetentionTable__SelectedColumn--cell': interval === selectedInterval,
+                                            'RetentionTable__HoveredColumn--cell':
+                                                interval === hoveredColumn && interval !== selectedInterval,
+                                        })}
+                                    >
+                                        <CohortDay
+                                            percentage={meanData?.meanPercentages?.[interval] ?? 0}
+                                            value={
+                                                isPropertyValueAggregation
+                                                    ? (meanData?.meanValues?.[interval] ?? 0)
+                                                    : undefined
+                                            }
+                                            clickable={false}
+                                            backgroundColor={backgroundColorMean}
+                                        />
+                                    </td>
+                                ))}
+                            </tr>
+
+                            {/* Detail rows (actual cohorts) */}
+                            {expandedBreakdowns[breakdownValue] &&
+                                cohortRows.map((row, rowIndex) => (
+                                    <tr
+                                        key={rowIndex}
+                                        onClick={() => {
+                                            if (!inSharedMode) {
+                                                openModal(
+                                                    rowIndex,
+                                                    breakdownValue === NO_BREAKDOWN_VALUE ? null : breakdownValue
+                                                )
+                                            }
+                                        }}
+                                        className={clsx({
+                                            'bg-slate-100': !isSingleBreakdown && !isDarkModeOn,
+                                        })}
+                                    >
+                                        <td className={clsx('pl-2 whitespace-nowrap', { 'pl-6': !isSingleBreakdown })}>
+                                            {row.label}
+                                        </td>
+                                        {!hideSizeColumn && (
+                                            <td>
+                                                <span className="RetentionTable__TextTab">{row.cohortSize}</span>
+                                            </td>
+                                        )}
+                                        {tableHeaders.map((_, columnIndex) => {
+                                            const column = row.values[columnIndex]
+                                            return (
+                                                <td
+                                                    key={columnIndex}
+                                                    onClick={(e) => {
+                                                        // Open the modal for this cohort and tell it which
+                                                        // interval column was clicked so it can highlight it.
+                                                        e.stopPropagation()
+                                                        if (!inSharedMode) {
+                                                            openModal(
+                                                                rowIndex,
+                                                                breakdownValue === NO_BREAKDOWN_VALUE
+                                                                    ? null
+                                                                    : breakdownValue,
+                                                                columnIndex
+                                                            )
+                                                        }
+                                                    }}
+                                                    className={clsx({
+                                                        'RetentionTable__SelectedColumn--cell':
+                                                            columnIndex === selectedInterval,
+                                                        'RetentionTable__HoveredColumn--cell':
+                                                            columnIndex === hoveredColumn,
+                                                    })}
+                                                >
+                                                    {column && (
+                                                        <CohortDay
+                                                            percentage={column.percentage}
+                                                            value={
+                                                                isPropertyValueAggregation
+                                                                    ? (column.aggregation_value ?? 0)
+                                                                    : undefined
+                                                            }
+                                                            clickable={true}
+                                                            isCurrentPeriod={column.isCurrentPeriod}
+                                                            backgroundColor={backgroundColor}
+                                                        />
+                                                    )}
+                                                </td>
+                                            )
+                                        })}
+                                    </tr>
+                                ))}
+                        </React.Fragment>
+                    )
+                })}
+            </tbody>
+        </table>
     )
 }
 
-const renderPercentage = (value: number, total: number, latest = false, periodZero = false): JSX.Element => {
-    const _percentage = total > 0 ? (100.0 * value) / total : 0
-    const percentageBasisForColor = periodZero ? 100 : _percentage // So that Period 0 is always shown consistently
-    const backgroundColor = `hsl(212, 63%, ${30 + (100 - percentageBasisForColor) * 0.65}%)`
-    const color = percentageBasisForColor >= 65 ? 'hsl(0, 0%, 80%)' : undefined
+function CohortDay({
+    percentage,
+    value,
+    clickable,
+    backgroundColor,
+    isCurrentPeriod,
+}: {
+    percentage: number
+    value?: number
+    clickable: boolean
+    backgroundColor: string
+    isCurrentPeriod?: boolean
+}): JSX.Element {
+    const backgroundColorSaturation = percentage / 100
+    const saturatedBackgroundColor = gradateColor(backgroundColor, backgroundColorSaturation, 0.1)
+    const textColor = backgroundColorSaturation > 0.4 ? '#fff' : 'var(--text-3000)' // Ensure text contrast
 
     const numberCell = (
-        <div style={{ backgroundColor, color }} className={clsx('percentage-cell', { 'period-in-progress': latest })}>
-            {_percentage.toFixed(1)}%{latest && '*'}
+        <div
+            className={clsx('RetentionTable__Tab', {
+                'RetentionTable__Tab--clickable': clickable,
+                'RetentionTable__Tab--period': isCurrentPeriod,
+            })}
+            // eslint-disable-next-line react/forbid-dom-props
+            style={!isCurrentPeriod ? { backgroundColor: saturatedBackgroundColor, color: textColor } : undefined}
+        >
+            {value !== undefined ? humanFriendlyNumber(value) : `${percentage.toFixed(1)}%`}
         </div>
     )
-    return latest ? <Tooltip title="Period in progress">{numberCell}</Tooltip> : numberCell
-}
-
-const periodIsLatest = (date_to: string | null, period: string | null): boolean => {
-    if (!date_to || !period) {
-        return true
-    }
-
-    const curr = dayjs(date_to)
-    if (
-        (period == 'Hour' && curr.isSame(dayjs(), 'hour')) ||
-        (period == 'Day' && curr.isSame(dayjs(), 'day')) ||
-        (period == 'Week' && curr.isSame(dayjs(), 'week')) ||
-        (period == 'Month' && curr.isSame(dayjs(), 'month'))
-    ) {
-        return true
-    } else {
-        return false
-    }
+    return isCurrentPeriod ? <Tooltip title="Period in progress">{numberCell}</Tooltip> : numberCell
 }

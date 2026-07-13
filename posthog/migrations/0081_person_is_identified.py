@@ -4,11 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0080_update_dashboard_funnel_filters"),
     ]
 
     operations = [
-        migrations.AddField(model_name="person", name="is_identified", field=models.BooleanField(default=False),),
+        migrations.AddField(
+            model_name="person",
+            name="is_identified",
+            field=models.BooleanField(default=False),
+        ),
     ]

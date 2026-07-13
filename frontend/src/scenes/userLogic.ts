@@ -1,0 +1,691 @@
+import { actions, afterMount, kea, listeners, path, reducers, selectors } from 'kea'
+import { forms } from 'kea-forms'
+import { loaders } from 'kea-loaders'
+import { router } from 'kea-router'
+import posthog from 'posthog-js'
+
+import api, { ApiConfig, getCookie } from 'lib/api'
+import { DashboardCompatibleScenes } from 'lib/components/SceneDashboardChoice/sceneDashboardChoiceModalLogic'
+// eslint-disable-next-line import/no-cycle
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { clearSession, isOAuthMode, setOAuthContextIds } from 'lib/oauth/oauthClient'
+import { getAppContext } from 'lib/utils/getAppContext'
+
+import { sidePanelStateLogic } from '~/layout/navigation-3000/sidepanel/sidePanelStateLogic'
+import { ProductKey } from '~/queries/schema/schema-general'
+import { AvailableFeature, NotificationSettings, OrganizationBasicType, UserRole, UserTheme, UserType } from '~/types'
+
+import { urls } from './urls'
+import type { userLogicType } from './userLogicType'
+
+export interface UserDetailsFormType {
+    first_name: string
+    email: string
+}
+
+type DigestProjectSettingKey =
+    | 'error_tracking_weekly_digest_project_enabled'
+    | 'web_analytics_weekly_digest_project_enabled'
+
+function updateDigestProjectSetting(
+    key: DigestProjectSettingKey,
+    teamId: number,
+    enabled: boolean,
+    values: { user: UserType | null },
+    actions: { updateUser: (user: Partial<UserType>) => void }
+): void {
+    if (!values.user?.notification_settings) {
+        return
+    }
+    actions.updateUser({
+        notification_settings: {
+            ...values.user.notification_settings,
+            [key]: { ...values.user.notification_settings[key], [teamId]: enabled },
+        },
+    })
+}
+
+function updateDigestProjectSettings(
+    key: DigestProjectSettingKey,
+    teamIds: number[],
+    enabled: boolean,
+    values: { user: UserType | null },
+    actions: { updateUser: (user: Partial<UserType>) => void }
+): void {
+    if (!values.user?.notification_settings) {
+        return
+    }
+    const projectSettings: Record<string, boolean> = { ...values.user.notification_settings[key] }
+    teamIds?.forEach((teamId) => {
+        projectSettings[teamId] = enabled
+    })
+    actions.updateUser({
+        notification_settings: { ...values.user.notification_settings, [key]: projectSettings } as NotificationSettings,
+    })
+}
+
+export const userLogic = kea<userLogicType>([
+    path(['scenes', 'userLogic']),
+    actions(() => ({
+        loadUser: (resetOnFailure?: boolean) => ({ resetOnFailure }),
+        updateCurrentOrganization: (organizationId: string, destination?: string) => ({ organizationId, destination }),
+        logout: (preserveLocation = false) => ({ preserveLocation }),
+        upgradeImpersonation: (reason: string) => ({ reason }),
+        updateUser: (user: Partial<UserType>, successCallback?: () => void) => ({
+            user,
+            successCallback,
+        }),
+        cancelEmailChangeRequest: true,
+        setUserScenePersonalisation: (scene: DashboardCompatibleScenes, dashboard: number) => ({ scene, dashboard }),
+        updateHasSeenProductIntroFor: (productKey: ProductKey, value: boolean = true) => ({ productKey, value }),
+        switchTeam: (teamId: string | number, destination?: string) => ({ teamId, destination }),
+        deleteUser: true,
+        updateWeeklyDigestForTeam: (teamId: number, enabled: boolean) => ({ teamId, enabled }),
+        updateWeeklyDigestForAllTeams: (teamIds: number[], enabled: boolean) => ({ teamIds, enabled }),
+        updateETWeeklyDigestForTeam: (teamId: number, enabled: boolean) => ({ teamId, enabled }),
+        updateETWeeklyDigestForAllTeams: (teamIds: number[], enabled: boolean) => ({ teamIds, enabled }),
+        updateWAWeeklyDigestForTeam: (teamId: number, enabled: boolean) => ({ teamId, enabled }),
+        updateWAWeeklyDigestForAllTeams: (teamIds: number[], enabled: boolean) => ({ teamIds, enabled }),
+        updateMemberJoinEmailForOrganization: (organizationId: string, enabled: boolean) => ({
+            organizationId,
+            enabled,
+        }),
+        updateMemberJoinEmailForAllOrganizations: (organizationIds: string[], enabled: boolean) => ({
+            organizationIds,
+            enabled,
+        }),
+        updateDataPipelineErrorThreshold: (threshold: number) => ({ threshold }),
+        credentialReviewDismissed: true,
+        updateRealtimeNotificationForTeam: (type: string, teamId: number, enabled: boolean) => ({
+            type,
+            teamId,
+            enabled,
+        }),
+        updateRealtimeNotificationForProject: (teamId: number, types: string[], enabled: boolean) => ({
+            teamId,
+            types,
+            enabled,
+        }),
+        updateAllRealtimeNotifications: (teamIds: number[], types: string[], enabled: boolean) => ({
+            teamIds,
+            types,
+            enabled,
+        }),
+        updatePipelineNotification: (pipelineId: string, enabled: boolean) => ({ pipelineId, enabled }),
+        updatePipelineNotificationForAll: (pipelineIds: string[], enabled: boolean) => ({ pipelineIds, enabled }),
+    })),
+    forms(({ actions }) => ({
+        userDetails: {
+            errors: ({ first_name, email }) => ({
+                first_name: !first_name
+                    ? 'You need to have a name.'
+                    : first_name.length > 150
+                      ? 'This name is too long. Please keep it under 151 characters.'
+                      : null,
+                email: !email
+                    ? 'You need to have an email.'
+                    : email.length > 254
+                      ? 'This email is too long. Please keep it under 255 characters.'
+                      : null,
+            }),
+            submit: (user) => {
+                actions.updateUser(user)
+            },
+        },
+    })),
+    loaders(({ values, actions }) => ({
+        user: [
+            // TODO: Because we don't actually load the app until this request completes, `user` is never `null` (will help simplify checks across the app)
+            null as UserType | null,
+            {
+                loadUser: async () => {
+                    try {
+                        return await api.get<UserType>('api/users/@me/')
+                    } catch (error: any) {
+                        console.error(error)
+                        actions.loadUserFailure(error.message)
+                    }
+                    return null
+                },
+                updateUser: async ({ user, successCallback }) => {
+                    if (!values.user) {
+                        throw new Error('Current user has not been loaded yet, so it cannot be updated!')
+                    }
+                    // Let failures throw so kea-loaders dispatches `updateUserFailure` — returning the old
+                    // user here would be treated as a success, silently masking backend errors.
+                    const response = await api.update<UserType>('api/users/@me/', user)
+                    successCallback?.()
+                    return response
+                },
+                cancelEmailChangeRequest: async () => {
+                    if (!values.user) {
+                        throw new Error('Current user has not been loaded yet, so it cannot be updated!')
+                    }
+                    try {
+                        const response = await api.update<UserType>('api/users/cancel_email_change_request/', {})
+                        lemonToast.success('The email change request was cancelled successfully.')
+                        return response
+                    } catch (error: any) {
+                        console.error(error)
+                        lemonToast.error(
+                            'Failed to cancel email change request. Please try again later or contact support.'
+                        )
+                        return values.user
+                    }
+                },
+                deleteUser: async () => {
+                    return await api.delete('api/users/@me/').then(() => {
+                        return null
+                    })
+                },
+                setUserScenePersonalisation: async ({ scene, dashboard }) => {
+                    if (!values.user) {
+                        throw new Error('Current user has not been loaded yet, so it cannot be updated!')
+                    }
+                    try {
+                        return await api.create<UserType>('api/users/@me/scene_personalisation', {
+                            scene,
+                            dashboard,
+                        })
+                    } catch (error: any) {
+                        console.error(error)
+                        actions.updateUserFailure(error.message)
+                        return values.user
+                    }
+                },
+                upgradeImpersonation: async ({ reason }) => {
+                    try {
+                        await api.create('admin/impersonation/upgrade/', { reason })
+                        actions.loadUser()
+                        lemonToast.success('Upgraded to read-write impersonation')
+
+                        // optimistically update user to read-write rather than
+                        // waiting for `loadUser` to complete
+                        return values.user ? { ...values.user, is_impersonated_read_only: false } : null
+                    } catch (error: any) {
+                        console.error(error)
+                        lemonToast.error('Failed to upgrade impersonation')
+                        return values.user
+                    }
+                },
+            },
+        ],
+    })),
+    reducers({
+        userDetails: [
+            {} as UserDetailsFormType,
+            {
+                loadUserSuccess: (_, { user }) => ({
+                    first_name: user?.first_name || '',
+                    last_name: user?.last_name || '',
+                    email: user?.email || '',
+                }),
+                updateUserSuccess: (_, { user }) => ({
+                    first_name: user?.first_name || '',
+                    last_name: user?.last_name || '',
+                    email: user?.email || '',
+                }),
+            },
+        ],
+        isImpersonationUpgradeInProgress: [
+            false,
+            {
+                upgradeImpersonation: () => true,
+                upgradeImpersonationSuccess: () => false,
+                upgradeImpersonationFailure: () => false,
+            },
+        ],
+        optimisticThemeMode: [
+            null as UserTheme | null,
+            {
+                updateUser: (prev, { user }) => (user?.theme_mode !== undefined ? user.theme_mode : prev),
+                updateUserSuccess: () => null,
+                updateUserFailure: () => null,
+            },
+        ],
+        // Set when the user clicks Continue on /account/credential-review. Suppresses
+        // the post-loadUser redirect so an in-flight stale loadUser response can't
+        // bounce the user back to the review screen after they've already dismissed it.
+        credentialReviewDismissedInSession: [
+            false,
+            {
+                credentialReviewDismissed: () => true,
+            },
+        ],
+    }),
+    listeners(({ actions, values, cache }) => ({
+        logout: ({ preserveLocation }) => {
+            if (cache.loggingOut) {
+                return
+            }
+            cache.loggingOut = true
+            posthog.reset()
+
+            // OAuth mode: there's no local Django session to end — just drop the stored cloud
+            // token and return to the local login. (A cross-origin /logout POST would do nothing.)
+            if (isOAuthMode()) {
+                clearSession()
+                window.location.href = '/login'
+                return
+            }
+
+            const form = document.createElement('form')
+            form.method = 'POST'
+            form.action = '/logout'
+            form.style.display = 'none'
+
+            const csrfInput = document.createElement('input')
+            csrfInput.type = 'hidden'
+            csrfInput.name = 'csrfmiddlewaretoken'
+            csrfInput.value = getCookie('posthog_csrftoken') || ''
+            form.appendChild(csrfInput)
+
+            if (preserveLocation) {
+                const { pathname, search, hash } = window.location
+                const nextInput = document.createElement('input')
+                nextInput.type = 'hidden'
+                nextInput.name = 'next'
+                nextInput.value = pathname + search + hash
+                form.appendChild(nextInput)
+            }
+
+            document.body.appendChild(form)
+            form.submit()
+        },
+        loadUserSuccess: ({ user }) => {
+            if (user && user.uuid) {
+                // OAuth mode has no server-rendered app context, so seed the current ids from the
+                // freshly loaded remote user. This makes them available synchronously before the first
+                // project-scoped URL is built, avoiding "Project ID is not known." (and the sibling
+                // user/org id errors) on bootstrap. The API layer reads default project/team-id params
+                // from ApiConfig; getAppContext's synchronous getters read the pushed ids (it stays a
+                // leaf module — importing ApiConfig there would create a module-init cycle).
+                if (isOAuthMode()) {
+                    if (user.team) {
+                        ApiConfig.setCurrentTeamId(user.team.id)
+                        ApiConfig.setCurrentProjectId(user.team.project_id)
+                    }
+                    if (user.organization) {
+                        ApiConfig.setCurrentOrganizationId(user.organization.id)
+                    }
+                    setOAuthContextIds({
+                        teamId: user.team?.id,
+                        organizationId: user.organization?.id,
+                        userId: user.uuid,
+                    })
+                }
+
+                if (posthog) {
+                    posthog.identify(user.distinct_id)
+                    posthog.people.set({
+                        email: user.anonymize_data ? null : user.email,
+                        realm: user.realm,
+                    })
+
+                    posthog.register({
+                        is_demo_project: user.team?.is_demo,
+                    })
+
+                    if (user.team) {
+                        posthog.group('project', user.team.uuid, {
+                            id: user.team.id,
+                            uuid: user.team.uuid,
+                            name: user.team.name,
+                            ingested_event: user.team.ingested_event,
+                            is_demo: user.team.is_demo,
+                            timezone: user.team.timezone,
+                            instance_tag: user.organization?.metadata?.instance_tag,
+                        })
+                    }
+
+                    if (user.organization) {
+                        posthog.group('organization', user.organization.id, {
+                            id: user.organization.id,
+                            name: user.organization.name,
+                            slug: user.organization.slug,
+                            created_at: user.organization.created_at,
+                            available_product_features: user.organization.available_product_features,
+                            member_count: user.organization.member_count,
+                            project_count: user.organization.teams.length,
+                            ...user.organization.metadata,
+                        })
+
+                        if (user.organization.customer_id) {
+                            posthog.group('customer', user.organization.customer_id)
+                        }
+                    }
+                }
+
+                // First-login interstitial: route users with unreviewed pre-existing API keys
+                // to the credential review screen before they enter the app. Gated server-side
+                // by UserSerializer.get_requires_credential_review.
+                //
+                // credentialReviewDismissedInSession suppresses a bounce-back if a loadUser
+                // call that was in-flight at dismiss time resolves later with stale state.
+                if (
+                    user.requires_credential_review &&
+                    !values.credentialReviewDismissedInSession &&
+                    !router.values.location.pathname.startsWith('/account/credential-review')
+                ) {
+                    router.actions.push(urls.credentialReview())
+                }
+            }
+        },
+        updateUserSuccess: () => {
+            lemonToast.dismiss('updateUser')
+            lemonToast.success('Preferences saved', {
+                toastId: 'updateUser',
+            })
+        },
+        updateUserFailure: ({ errorObject }) => {
+            lemonToast.dismiss('updateUser')
+            lemonToast.error(errorObject?.detail || 'Error saving preferences', {
+                toastId: 'updateUser',
+            })
+        },
+        deleteUserSuccess: () => {
+            actions.logout()
+            lemonToast.success('Account deleted', {
+                toastId: 'deleteUser',
+            })
+        },
+        deleteUserFailure: () => {
+            lemonToast.error('Error deleting account', {
+                toastId: 'deleteUser',
+            })
+        },
+        updateCurrentOrganization: async ({ organizationId, destination }, breakpoint) => {
+            if (values.user?.organization?.id === organizationId) {
+                return
+            }
+            await breakpoint(10)
+            await api.update('api/users/@me/', { set_current_organization: organizationId })
+
+            sidePanelStateLogic.findMounted()?.actions.closeSidePanel()
+
+            window.location.href = destination || '/'
+        },
+        updateHasSeenProductIntroFor: async ({ productKey, value }, breakpoint) => {
+            await breakpoint(10)
+            await api
+                .update('api/users/@me/', {
+                    has_seen_product_intro_for: {
+                        ...values.user?.has_seen_product_intro_for,
+                        [productKey]: value,
+                    },
+                })
+                .then(() => {
+                    actions.loadUser()
+                })
+        },
+        switchTeam: ({ teamId, destination }) => {
+            sidePanelStateLogic.findMounted()?.actions.closeSidePanel()
+
+            window.location.href = destination || urls.project(teamId)
+        },
+        updateWeeklyDigestForTeam: ({ teamId, enabled }) => {
+            if (!values.user?.notification_settings) {
+                return
+            }
+
+            actions.updateUser({
+                notification_settings: {
+                    ...values.user.notification_settings,
+                    project_weekly_digest_disabled: {
+                        ...values.user.notification_settings.project_weekly_digest_disabled,
+                        [teamId]: !enabled,
+                    },
+                },
+            })
+        },
+        updateWeeklyDigestForAllTeams: ({ teamIds, enabled }) => {
+            if (!values.user?.notification_settings) {
+                return
+            }
+
+            const projectWeeklyDigestSettings = {
+                ...values.user.notification_settings.project_weekly_digest_disabled,
+            }
+            teamIds?.forEach((teamId) => {
+                projectWeeklyDigestSettings[teamId] = !enabled
+            })
+
+            actions.updateUser({
+                notification_settings: {
+                    ...values.user.notification_settings,
+                    project_weekly_digest_disabled: projectWeeklyDigestSettings,
+                },
+            })
+        },
+        updateETWeeklyDigestForTeam: ({ teamId, enabled }) => {
+            updateDigestProjectSetting('error_tracking_weekly_digest_project_enabled', teamId, enabled, values, actions)
+        },
+        updateETWeeklyDigestForAllTeams: ({ teamIds, enabled }) => {
+            updateDigestProjectSettings(
+                'error_tracking_weekly_digest_project_enabled',
+                teamIds,
+                enabled,
+                values,
+                actions
+            )
+        },
+        updateWAWeeklyDigestForTeam: ({ teamId, enabled }) => {
+            updateDigestProjectSetting('web_analytics_weekly_digest_project_enabled', teamId, enabled, values, actions)
+        },
+        updateWAWeeklyDigestForAllTeams: ({ teamIds, enabled }) => {
+            updateDigestProjectSettings(
+                'web_analytics_weekly_digest_project_enabled',
+                teamIds,
+                enabled,
+                values,
+                actions
+            )
+        },
+        updateMemberJoinEmailForOrganization: ({ organizationId, enabled }) => {
+            if (!values.user?.notification_settings) {
+                return
+            }
+
+            actions.updateUser({
+                notification_settings: {
+                    ...values.user.notification_settings,
+                    organization_member_join_email_disabled: {
+                        ...values.user.notification_settings.organization_member_join_email_disabled,
+                        [organizationId]: !enabled,
+                    },
+                },
+            })
+        },
+        updateMemberJoinEmailForAllOrganizations: ({ organizationIds, enabled }) => {
+            if (!values.user?.notification_settings) {
+                return
+            }
+
+            const organizationMemberJoinEmailDisabled = {
+                ...values.user.notification_settings.organization_member_join_email_disabled,
+            }
+            organizationIds.forEach((id) => {
+                organizationMemberJoinEmailDisabled[id] = !enabled
+            })
+
+            actions.updateUser({
+                notification_settings: {
+                    ...values.user.notification_settings,
+                    organization_member_join_email_disabled: organizationMemberJoinEmailDisabled,
+                },
+            })
+        },
+        updateRealtimeNotificationForTeam: ({ type, teamId, enabled }) => {
+            if (!values.user?.notification_settings) {
+                return
+            }
+            const current = values.user.notification_settings.realtime_notifications_disabled ?? {}
+            const typeMap = { ...current[type], [String(teamId)]: !enabled }
+            actions.updateUser({
+                notification_settings: {
+                    realtime_notifications_disabled: { ...current, [type]: typeMap },
+                } as NotificationSettings,
+            })
+        },
+        updateRealtimeNotificationForProject: ({ teamId, types, enabled }) => {
+            if (!values.user?.notification_settings) {
+                return
+            }
+            const current = values.user.notification_settings.realtime_notifications_disabled ?? {}
+            const next = { ...current }
+            for (const type of types) {
+                next[type] = { ...next[type], [String(teamId)]: !enabled }
+            }
+            actions.updateUser({
+                notification_settings: {
+                    realtime_notifications_disabled: next,
+                } as NotificationSettings,
+            })
+        },
+        updateAllRealtimeNotifications: ({ teamIds, types, enabled }) => {
+            if (!values.user?.notification_settings) {
+                return
+            }
+            const current = values.user.notification_settings.realtime_notifications_disabled ?? {}
+            const next = { ...current }
+            for (const type of types) {
+                const typeMap = { ...next[type] }
+                for (const teamId of teamIds) {
+                    typeMap[String(teamId)] = !enabled
+                }
+                next[type] = typeMap
+            }
+            actions.updateUser({
+                notification_settings: {
+                    realtime_notifications_disabled: next,
+                } as NotificationSettings,
+            })
+        },
+        updateDataPipelineErrorThreshold: async ({ threshold }, breakpoint) => {
+            await breakpoint(500)
+
+            if (isNaN(threshold) || threshold < 0 || threshold > 100) {
+                return
+            }
+
+            values.user?.notification_settings &&
+                actions.updateUser({
+                    notification_settings: {
+                        ...values.user?.notification_settings,
+                        data_pipeline_error_threshold: threshold / 100,
+                    },
+                })
+        },
+        updatePipelineNotification: ({ pipelineId, enabled }) => {
+            if (!values.user?.notification_settings) {
+                return
+            }
+
+            actions.updateUser({
+                notification_settings: {
+                    ...values.user.notification_settings,
+                    pipeline_notifications_disabled: {
+                        ...values.user.notification_settings.pipeline_notifications_disabled,
+                        [pipelineId]: !enabled,
+                    },
+                },
+            })
+        },
+        updatePipelineNotificationForAll: ({ pipelineIds, enabled }) => {
+            if (!values.user?.notification_settings) {
+                return
+            }
+
+            const pipelineNotificationsDisabled = {
+                ...values.user.notification_settings.pipeline_notifications_disabled,
+            }
+            pipelineIds.forEach((id) => {
+                pipelineNotificationsDisabled[id] = !enabled
+            })
+
+            actions.updateUser({
+                notification_settings: {
+                    ...values.user.notification_settings,
+                    pipeline_notifications_disabled: pipelineNotificationsDisabled,
+                },
+            })
+        },
+    })),
+    selectors({
+        hasAvailableFeature: [
+            (s) => [s.user],
+            (user) => {
+                return (feature: AvailableFeature, currentUsage?: number) => {
+                    const availableProductFeatures = user?.organization?.available_product_features
+                    if (availableProductFeatures && availableProductFeatures.length > 0) {
+                        const availableFeature = availableProductFeatures.find((obj) => obj.key === feature)
+                        return availableFeature
+                            ? currentUsage
+                                ? availableFeature?.limit
+                                    ? availableFeature?.limit > currentUsage
+                                    : true
+                                : true
+                            : false
+                    }
+                    return false
+                }
+            },
+        ],
+        availableFeature: [
+            (s) => [s.user],
+            (user) => {
+                return (feature: AvailableFeature) => {
+                    const availableProductFeatures = user?.organization?.available_product_features
+                    if (availableProductFeatures && availableProductFeatures.length > 0) {
+                        return availableProductFeatures.find((obj) => obj.key === feature)
+                    }
+                    return null
+                }
+            },
+        ],
+        otherOrganizations: [
+            (s) => [s.user],
+            (user): OrganizationBasicType[] =>
+                user
+                    ? user.organizations
+                          ?.filter((organization) => organization.id !== user.organization?.id)
+                          .sort((orgA, orgB) =>
+                              orgA.id === user?.organization?.id ? -2 : orgA.name.localeCompare(orgB.name)
+                          ) || []
+                    : [],
+        ],
+
+        themeMode: [
+            (s) => [s.user, s.optimisticThemeMode],
+            (user, optimisticThemeMode): UserTheme => {
+                return optimisticThemeMode ?? user?.theme_mode ?? 'light'
+            },
+        ],
+
+        isUserNonTechnical: [
+            (s) => [s.user],
+            (user): boolean => {
+                const nonTechnicalRoles = [
+                    UserRole.Founder,
+                    UserRole.Leadership,
+                    UserRole.Marketing,
+                    UserRole.Sales,
+                    UserRole.Other,
+                ]
+                return user?.role_at_organization
+                    ? nonTechnicalRoles.includes(user.role_at_organization as UserRole)
+                    : false
+            },
+        ],
+    }),
+    afterMount(({ actions }) => {
+        const preloadedUser = getAppContext()?.current_user
+        if (preloadedUser) {
+            actions.loadUserSuccess(preloadedUser)
+        } else if (preloadedUser === null) {
+            actions.loadUserFailure('Logged out')
+        } else {
+            actions.loadUser()
+        }
+    }),
+])

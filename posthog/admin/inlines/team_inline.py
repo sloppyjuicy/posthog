@@ -1,0 +1,67 @@
+from django.utils.html import format_html
+
+from django_admin_inline_paginator.admin import TabularInlinePaginated
+
+from posthog.admin.admins.team_admin import TeamAdmin, TeamAdminForm
+from posthog.models import Team
+
+
+class TeamInline(TabularInlinePaginated):
+    extra = 0
+    model = Team
+    # The default ModelForm requires test_account_filters, so an empty [] is rejected as required and
+    # blocks disabling the org. TeamAdminForm makes it optional (and rejects non-list values).
+    form = TeamAdminForm
+    per_page = 20
+    pagination_key = "page-team"
+    show_change_link = True
+
+    fields = (
+        "id",
+        "displayed_name",
+        "api_token",
+        "app_urls",
+        "created_at",
+        "updated_at",
+        "anonymize_ips",
+        "completed_snippet_onboarding",
+        "ingested_event",
+        "session_recording_opt_in",
+        "autocapture_opt_out",
+        "signup_token",
+        "is_demo",
+        "test_account_filters",
+        "path_cleaning_filters",
+        "timezone",
+        "data_attributes",
+        "correlation_config",
+        "modifiers",
+        "plugins_opt_in",
+        "opt_out_capture",
+    )
+    readonly_fields = [
+        f
+        for f in TeamAdmin.readonly_fields
+        if f
+        not in (
+            "internal_properties",
+            "delete_recordings",
+            "remote_config_cache_actions",
+            "flags_staff_tools_link",
+            "api_token_display",
+            "admit_state",
+            "ai_gateway_actions",
+            "ai_gateway_wallet",
+            "ai_gateway_credit_history",
+            "policy_cache_blob",
+            "group_type_mappings_display",
+        )
+    ] + ["displayed_name"]
+
+    def displayed_name(self, team: Team):
+        return format_html(
+            '<a href="/admin/posthog/team/{}/change/">{}.&nbsp;{}</a>',
+            team.pk,
+            team.pk,
+            team.name,
+        )

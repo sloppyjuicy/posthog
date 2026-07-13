@@ -1,0 +1,357 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/labstack/echo-contrib/echoprometheus"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/posthog/posthog/livestream/auth"
+	"github.com/posthog/posthog/livestream/configs"
+	"github.com/posthog/posthog/livestream/events"
+	"github.com/posthog/posthog/livestream/geo"
+	"github.com/posthog/posthog/livestream/handlers"
+	"github.com/posthog/posthog/livestream/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+func main() {
+	configs.InitConfigs("configs", "./configs")
+
+	config, err := configs.LoadConfig()
+	if err != nil {
+		// TODO capture error to PostHog
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	geolocator, err := geo.NewMaxMindGeoLocator(config.MMDB.Path)
+	if err != nil {
+		// TODO capture error to PostHog
+		log.Fatalf("Failed to open MMDB: %v", err)
+	}
+
+	// Setup context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Channel to signal when HTTP server should shutdown
+	shutdownHTTP := make(chan struct{})
+
+	// Handle shutdown signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("Shutdown signal received, stopping consumers...")
+		cancel()
+		close(shutdownHTTP)
+	}()
+
+	stats := events.NewStatsKeeper()
+	sessionStats := events.NewSessionStatsKeeper(config.SessionRecording.MaxLRUEntries, 0)
+	statsRedis, err := events.NewStatsInRedis(config.Redis)
+
+	if err != nil || statsRedis == nil {
+		log.Printf("WARNING: Redis connection failed, continuing without Redis: %v", err)
+	} else {
+		defer statsRedis.Close()
+		stats.RedisStore = statsRedis
+		sessionStats.RedisStore = statsRedis
+		log.Printf("Redis stats store enabled (address: %s:%s)", config.Redis.Address, config.Redis.Port)
+	}
+
+	phEventChan := make(chan events.PostHogEvent, 10000)
+	statsChan := make(chan events.CountEvent, 10000)
+	sessionStatsChan := make(chan events.SessionRecordingEvent, 10000)
+	subChan := make(chan events.Subscription, 10000)
+	unSubChan := make(chan events.Subscription, 10000)
+
+	flushInterval := time.Duration(config.Redis.FlushIntervalMs) * time.Millisecond
+	go stats.KeepStats(statsChan, flushInterval)
+	go sessionStats.KeepStats(ctx, sessionStatsChan, flushInterval)
+
+	var consumer *events.PostHogKafkaConsumer
+	usePubSub := config.Redis.UsePubSub
+
+	if config.Consumers.Event.Enabled {
+		consumer = createEventConsumer(config.Consumers.Event, geolocator, phEventChan, statsChan, config.Parallelism)
+		defer consumer.Close()
+
+		if usePubSub {
+			cleanup, err := setupRedisPubSub(ctx, config.Redis, consumer, subChan, unSubChan)
+			if err != nil {
+				log.Printf("ERROR: Failed to set up Redis pub/sub, falling back to in-memory filter: %v", err)
+				usePubSub = false
+			} else {
+				defer cleanup()
+				log.Printf("Redis pub/sub event transport enabled (publish_workers=%d, publish_buffer_size=%d)",
+					config.Redis.PublishWorkers, config.Redis.PublishBufferSize)
+			}
+		}
+
+		go consumer.Consume(ctx)
+
+		if !usePubSub {
+			filter := events.NewFilter(subChan, unSubChan, phEventChan)
+			go filter.Run()
+		}
+	}
+
+	if config.Consumers.SessionRecording.Enabled {
+		sessionConsumer := createSessionRecordingConsumer(config.Consumers.SessionRecording, sessionStatsChan, ctx)
+		defer sessionConsumer.Close()
+	}
+
+	if config.Consumers.Notification.Enabled && statsRedis != nil {
+		notifConsumer := createNotificationConsumer(config.Consumers.Notification, statsRedis, ctx)
+		defer notifConsumer.Close()
+	}
+
+	go func() {
+		ticker := time.NewTicker(7127 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("metrics collection shutting down...")
+				return
+			case <-ticker.C:
+				if consumer != nil {
+					metrics.IncomingQueue.Set(consumer.IncomingRatio())
+					if consumer.Broker != nil {
+						metrics.RedisPublishQueue.Set(consumer.Broker.BufferRatio())
+					}
+				}
+				metrics.EventQueue.Set(float64(len(phEventChan)) / float64(cap(phEventChan)))
+				metrics.StatsQueue.Set(float64(len(statsChan)) / float64(cap(statsChan)))
+				metrics.SessionRecordingStatsQueue.Set(float64(len(sessionStatsChan)) / float64(cap(sessionStatsChan)))
+				metrics.SubQueue.Set(float64(len(subChan)) / float64(cap(subChan)))
+				metrics.UnSubQueue.Set(float64(len(unSubChan)) / float64(cap(unSubChan)))
+			}
+		}
+	}()
+
+	// Echo instance
+	e := echo.New()
+
+	// Middleware
+	e.Use(middleware.RequestID())
+	e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
+		LogLatency:       true,
+		LogRemoteIP:      true,
+		LogHost:          true,
+		LogMethod:        true,
+		LogURI:           true,
+		LogUserAgent:     true,
+		LogStatus:        true,
+		LogError:         true,
+		LogContentLength: true,
+		LogResponseSize:  true,
+		LogValuesFunc: func(c echo.Context, v middleware.RequestLoggerValues) error {
+			// Build log entry, omitting error field when empty to avoid
+			// Grafana/Loki incorrectly categorizing successful requests as errors
+			logEntry := map[string]interface{}{
+				"time":          v.StartTime.Format(time.RFC3339Nano),
+				"id":            c.Response().Header().Get(echo.HeaderXRequestID),
+				"remote_ip":     v.RemoteIP,
+				"host":          v.Host,
+				"method":        v.Method,
+				"uri":           v.URI,
+				"user_agent":    v.UserAgent,
+				"status":        v.Status,
+				"latency":       v.Latency.Nanoseconds(),
+				"latency_human": v.Latency.String(),
+				"bytes_in":      v.ContentLength,
+				"bytes_out":     v.ResponseSize,
+			}
+			if v.Error != nil {
+				logEntry["error"] = v.Error.Error()
+			}
+			jsonBytes, err := json.Marshal(logEntry)
+			if err != nil {
+				log.Printf("failed to marshal log entry: %v", err)
+				return nil
+			}
+			// Write directly to stdout without log prefix since JSON already has time field
+			_, _ = os.Stdout.Write(append(jsonBytes, '\n'))
+
+			return nil
+		},
+	}))
+	e.Use(middleware.Recover())
+	e.Use(middleware.GzipWithConfig(middleware.GzipConfig{
+		Level: 9, // Set the compression level to maximum
+	}))
+	e.Use(echoprometheus.NewMiddlewareWithConfig(
+		echoprometheus.MiddlewareConfig{DoNotUseRequestPathFor404: true, Subsystem: "livestream"}))
+
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: config.CORSAllowOrigins,
+		AllowMethods: []string{http.MethodGet, http.MethodHead},
+	}))
+
+	// Routes
+	e.GET("/", handlers.Index)
+
+	// For details why promhttp.Handler won't work: https://github.com/prometheus/client_golang/issues/622
+	e.GET("/metrics", echo.WrapHandler(promhttp.InstrumentMetricHandler(
+		prometheus.DefaultRegisterer,
+		promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{DisableCompression: true}),
+	)))
+
+	e.GET("/stats", handlers.StatsHandler(stats, sessionStats, statsRedis))
+
+	e.GET("/events", handlers.StreamEventsHandler(e.Logger, subChan, unSubChan))
+
+	if statsRedis != nil {
+		e.GET("/notifications", handlers.NotificationsHandler(statsRedis.Client()))
+	}
+
+	if config.Debug {
+		e.GET("/served", handlers.ServedHandler(stats))
+
+		e.GET("/jwt", func(c echo.Context) error {
+			claims, err := auth.GetAuth(c.Request().Header)
+			if err != nil {
+				return err
+			}
+
+			return c.JSON(http.StatusOK, claims)
+		})
+
+		e.File("/debug", "./index.html")
+		e.GET("/debug/sse", func(c echo.Context) error {
+			e.Logger.Printf("Map client connected, ip: %v", c.RealIP())
+
+			w := c.Response()
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-c.Request().Context().Done():
+					e.Logger.Printf("SSE client disconnected, ip: %v", c.RealIP())
+					return nil
+				case <-ticker.C:
+					event := handlers.Event{
+						Data: []byte("ping: " + time.Now().Format(time.RFC3339Nano)),
+					}
+					if err := event.WriteTo(w); err != nil {
+						return err
+					}
+					w.Flush()
+				}
+			}
+		})
+	}
+
+	// Start HTTP server in goroutine
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	go func() {
+		if err := e.Start(":" + port); err != nil && err != http.ErrServerClosed {
+			e.Logger.Fatal(err)
+		}
+	}()
+
+	log.Printf("Livestream server starting on %s", port)
+
+	// Wait for shutdown signal
+	<-shutdownHTTP
+
+	// Gracefully shutdown HTTP server with timeout
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := e.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
+	}
+	log.Println("HTTP server stopped")
+}
+
+func createNotificationConsumer(
+	consumerConfig configs.ConsumerConfig,
+	statsRedis *events.StatsInRedis,
+	ctx context.Context,
+) *events.NotificationKafkaConsumer {
+	consumer, err := events.NewNotificationKafkaConsumer(consumerConfig, statsRedis.Client())
+	if err != nil {
+		log.Fatalf("Failed to create notification Kafka consumer: %v", err)
+	}
+	go consumer.Consume(ctx)
+	log.Printf("Notification Kafka consumer enabled (topic: %s)", consumerConfig.Topic)
+	return consumer
+}
+
+func createSessionRecordingConsumer(
+	consumerConfig configs.ConsumerConfig,
+	sessionStatsChan chan events.SessionRecordingEvent,
+	ctx context.Context,
+) *events.SessionRecordingKafkaConsumer {
+	consumer, err := events.NewSessionRecordingKafkaConsumer(consumerConfig, sessionStatsChan)
+	if err != nil {
+		log.Fatalf("Failed to create session recording Kafka consumer: %v", err)
+	}
+	go consumer.Consume(ctx)
+	log.Printf("Session recording consumer started for topic: %s (security_protocol: %s)",
+		consumerConfig.Topic, consumerConfig.SecurityProtocol)
+	return consumer
+}
+
+func createEventConsumer(
+	consumerConfig configs.ConsumerConfig,
+	geolocator *geo.MaxMindLocator,
+	phEventChan chan events.PostHogEvent,
+	statsChan chan events.CountEvent,
+	parallelism int,
+) *events.PostHogKafkaConsumer {
+	consumer, err := events.NewPostHogKafkaConsumer(consumerConfig, geolocator, phEventChan, statsChan, parallelism)
+	if err != nil {
+		log.Fatalf("Failed to create Kafka consumer: %v", err)
+	}
+	return consumer
+}
+
+func setupRedisPubSub(
+	ctx context.Context,
+	redisConfig configs.RedisConfig,
+	consumer *events.PostHogKafkaConsumer,
+	subChan, unSubChan chan events.Subscription,
+) (cleanup func(), err error) {
+	broker, err := events.NewRedisEventBroker(redisConfig)
+	if err != nil {
+		return nil, fmt.Errorf("create Redis event broker: %w", err)
+	}
+
+	subscriberClient, err := events.NewRedisClient(redisConfig)
+	if err != nil {
+		broker.Close()
+		return nil, fmt.Errorf("create Redis subscriber client: %w", err)
+	}
+
+	tokenRouter := events.NewTokenRouter(subscriberClient, subChan, unSubChan)
+
+	consumer.Broker = broker
+	go broker.Run(ctx)
+	go tokenRouter.Run(ctx)
+
+	cleanup = func() {
+		subscriberClient.Close()
+		broker.Close()
+	}
+	return cleanup, nil
+}

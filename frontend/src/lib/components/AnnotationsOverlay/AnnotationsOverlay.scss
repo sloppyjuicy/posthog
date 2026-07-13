@@ -1,0 +1,67 @@
+.AnnotationsOverlay {
+    position: absolute;
+    top: var(--annotations-overlay-chart-area-height);
+    left: var(--annotations-overlay-chart-area-left);
+}
+
+.AnnotationsBadge {
+    position: absolute;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.5rem;
+    height: 1.5rem;
+    margin-left: var(--annotations-badge-left);
+    appearance: none !important;
+    cursor: pointer;
+    background: none;
+    border: none;
+    transform: translate(-50%, -50%);
+
+    > .LemonBadge {
+        border-color: var(--color-bg-surface-primary); // Matching the chart background
+        transition: transform 200ms ease; // Same as LemonBadge's transition
+        // Override .LemonBadge--position-self-centered
+        transform: scale(var(--annotations-badge-scale));
+        transform-origin: center;
+    }
+
+    // An emoji is illegible at the small count-badge size on the saturated data fill,
+    // so give it a larger disc and a plain surface background to read against.
+    > .LemonBadge.AnnotationsBadge__emoji {
+        --lemon-badge-size: 1.5rem;
+        --lemon-badge-font-size: 1rem;
+
+        color: inherit;
+        background: var(--color-bg-surface-primary);
+    }
+}
+
+.AnnotationsPopover {
+    --annotations-popover-width: 30rem;
+
+    z-index: var(--z-annotation-popover) !important;
+    transition:
+        left 200ms ease,
+        opacity 100ms ease,
+        transform 100ms ease;
+
+    .LemonModal {
+        min-width: var(--annotations-popover-width);
+        max-width: var(--annotations-popover-width);
+        min-height: 100%;
+        margin: 0;
+        border: none;
+        box-shadow: none;
+    }
+}
+
+.AnnotationCard {
+    .profile-package {
+        vertical-align: bottom;
+    }
+
+    h5 {
+        margin: 0;
+    }
+}

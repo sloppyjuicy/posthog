@@ -1,60 +1,392 @@
-import { LogicWrapper } from 'kea'
-import { CohortType, EventDefinition } from '~/types'
 import Fuse from 'fuse.js'
-import { SimpleOption } from './groups'
+import { LogicWrapper } from 'kea'
+import { ReactNode } from 'react'
+
+import { LocalFilter } from 'scenes/insights/filters/ActionFilter/entityFilterLogic'
+// eslint-disable-next-line import/no-cycle
+import { MaxContextTaxonomicFilterOption } from 'scenes/max/maxTypes'
+
+import { AnyDataNode, DatabaseSchemaField, DatabaseSerializedFieldType } from '~/queries/schema/schema-general'
+import {
+    ActionType,
+    CohortType,
+    EventDefinition,
+    EventPropertyFilter,
+    PersonProperty,
+    PersonPropertyFilter,
+    PropertyDefinition,
+    PropertyFilterType,
+    PropertyOperator,
+} from '~/types'
+
+import { DataWarehouseTableForInsight } from 'products/data_warehouse/frontend/types'
+
+export interface SimpleOption {
+    name: string
+    propertyFilterType?: PropertyFilterType
+    /** When the search query matched a value rather than a key, this is set to 'value'. Otherwise 'key' or omitted. */
+    matchedOn?: 'key' | 'value'
+    /** Sample value that matched the search — only set when matchedOn === 'value'. */
+    matchedValue?: string
+}
+
+export interface QuickFilterItem {
+    _type: 'quick_filter'
+    name: string
+    filterValue: string
+    operator: PropertyOperator
+    propertyKey: string
+    propertyFilterType: PropertyFilterType.Event | PropertyFilterType.Person
+    eventName?: string
+    extraProperties?: (EventPropertyFilter | PersonPropertyFilter)[]
+    /** Set on the collapsed `URL contains "<query>"` row so commit telemetry can
+     *  measure contains-shortcut adoption, matching the rebuild menu's
+     *  `wasUrlContainsShortcut`. */
+    isContainsShortcut?: boolean
+}
+
+export function isQuickFilterItem(item: unknown): item is QuickFilterItem {
+    return item != null && typeof item === 'object' && '_type' in item && item._type === 'quick_filter'
+}
+
+export function quickFilterToPropertyFilter(item: QuickFilterItem): EventPropertyFilter | PersonPropertyFilter {
+    const base = { key: item.propertyKey, value: item.filterValue, operator: item.operator }
+    if (item.propertyFilterType === PropertyFilterType.Event) {
+        return { ...base, type: PropertyFilterType.Event }
+    }
+    return { ...base, type: PropertyFilterType.Person }
+}
+
+export function quickFilterToPropertyFilters(item: QuickFilterItem): (EventPropertyFilter | PersonPropertyFilter)[] {
+    return [quickFilterToPropertyFilter(item), ...(item.extraProperties ?? [])]
+}
+
+export type TaxonomicFilterGroupValueMap = { [key in TaxonomicFilterGroupType]?: (PropertyKey | null)[] }
+export type ExcludedProperties = TaxonomicFilterGroupValueMap
+export type SelectedProperties = TaxonomicFilterGroupValueMap
+export type AllowedProperties = TaxonomicFilterGroupValueMap
+
+/**
+ * Per-group-type **denylist of property-filter operators** the host cannot represent.
+ * Acts only on the **Recent tab** — items whose stored operator is denylisted for
+ * their source group are hidden so the picker never surfaces a value the
+ * surrounding UI can't reproduce.
+ *
+ * Pairs with `selectingKeyOnly` when a host wants both (a) no operator/value
+ * slot in the row *and* (b) impossible recents kept out of the picker — the two
+ * concerns are deliberately separate so callers can use one without the other:
+ * - `selectingKeyOnly` decides whether the row renders an operator+value pair
+ *   (UI shape concern).
+ * - `excludedOperators` decides which stored operators the host is willing to
+ *   surface in Recent (history concern).
+ *
+ * NOT the same as `operatorAllowlist` on `OperatorValueSelect` — that's a flat
+ * list narrowing the *options inside* the operator dropdown for the active
+ * filter (e.g. survey trigger surfaces only `=` / `contains` regardless of
+ * filter type).
+ */
+export type ExcludedOperators = { [key in TaxonomicFilterGroupType]?: PropertyOperator[] }
+
+/**
+ * Tells `TaxonomicPropertyFilter` to render a row as key-only — the picked
+ * value IS the answer, no operator+value pair alongside it. Used when a
+ * specific filter type's operator is implicit (e.g. workflow event triggers
+ * accept any operator on event properties but treat cohort rows as key-only
+ * because the cohort *is* the value and the operator is implicitly `in`).
+ *
+ * - `true` — every row in this `PropertyFilters` is key-only.
+ * - `Partial<Record<TaxonomicFilterGroupType, boolean>>` — per-group switch.
+ *
+ * Hosts that go key-only for a group almost always also want
+ * `excludedOperators` set for that group, otherwise a recent stored with a
+ * different operator silently applies as that operator with no UI to show it.
+ * The shared `COHORTS_ONLY_SUPPORT_IN_PICKER_PROPS` preset bundles both.
+ */
+export type SelectingKeyOnly = boolean | { [key in TaxonomicFilterGroupType]?: boolean }
+
+export function isKeyOnlyForGroup(
+    selectingKeyOnly: SelectingKeyOnly | undefined,
+    groupType: TaxonomicFilterGroupType | undefined
+): boolean {
+    if (selectingKeyOnly === true) {
+        return true
+    }
+    if (!selectingKeyOnly || !groupType) {
+        return false
+    }
+    return !!selectingKeyOnly[groupType]
+}
 
 export interface TaxonomicFilterProps {
     groupType?: TaxonomicFilterGroupType
     value?: TaxonomicFilterValue
-    onChange?: (groupType: TaxonomicFilterGroupType, value: TaxonomicFilterValue, item: any) => void
+    onChange?: (group: TaxonomicFilterGroup, value: TaxonomicFilterValue, item: any) => void
+    onEnter?: (query: string) => void
     onClose?: () => void
-    groupTypes?: TaxonomicFilterGroupType[]
+    filter?: LocalFilter
+    taxonomicGroupTypes: TaxonomicFilterGroupType[]
     taxonomicFilterLogicKey?: string
     optionsFromProp?: Partial<Record<TaxonomicFilterGroupType, SimpleOption[]>>
+    eventNames?: string[]
+    schemaColumns?: DatabaseSchemaField[]
+    schemaColumnsLoading?: boolean
+    endpointFilters?: Record<string, any>
+    height?: number
+    width?: number | string
+    popoverEnabled?: boolean
+    selectFirstItem?: boolean
+    autoSelectItem?: boolean
+    /** use to filter results in a group by name, currently only working for EventProperties */
+    excludedProperties?: ExcludedProperties
+    /** use to indicate if a result in a group is selected */
+    selectedProperties?: SelectedProperties
+    propertyAllowList?: AllowedProperties // only return properties in this list, currently only working for EventProperties and PersonProperties
+    metadataSource?: AnyDataNode
+    hideBehavioralCohorts?: boolean
+    showNumericalPropsOnly?: boolean
+    dataWarehousePopoverFields?: DataWarehousePopoverField[]
+    maxContextOptions?: MaxContextTaxonomicFilterOption[]
+    initialSearchQuery?: string
+    /** Allow users to select events that haven't been captured yet (default: false) */
+    allowNonCapturedEvents?: boolean
+    hogQLGlobals?: Record<string, any>
+    /** When true, the SQL expression tab shows a hint about using `AS column_name`
+     * or `-- column_name` to get a readable breakdown label. Only shown for long expressions. */
+    hogQLExpressionShowBreakdownLabelHint?: boolean
+    /** Optionally customize definition popover contents for selected items. */
+    definitionPopoverRenderer?: DefinitionPopoverRenderer
+    /** Override the group-level minSearchQueryLength for all groups in this instance. */
+    minSearchQueryLength?: number
+    /** Override the "Suggested filters" tab label for specific contexts. */
+    suggestedFiltersLabel?: string
+    /** Hide the built-in search input when an external input drives the search query.
+     *  Note: the pill category-dropdown affordance lives inside the built-in input,
+     *  so when you hide it the host is responsible for rendering `CategoryDropdown` itself
+     *  (e.g. as the suffix of its external input, under a shared `taxonomicFilterLogicKey`). */
+    hideSearchInput?: boolean
+    /** Controlled search query — synced into the logic on each change. Use with hideSearchInput for external input control. */
+    searchQuery?: string
+    /** Surface inline `$event_type` shortcuts in Events/EventProperties groups when the search
+     *  query matches a known autocapture interaction keyword. Consumers must handle
+     *  `isQuickFilterItem(item)` in their onChange to avoid mis-selecting as an event name. */
+    enableKeywordShortcuts?: boolean
+    /** Hide recent property filters whose operator is denylisted for their source group, so the
+     *  picker never surfaces a value the surrounding UI can't represent. See `ExcludedOperators`
+     *  above for how this differs from `operatorAllowlist` on `OperatorValueSelect`. */
+    excludedOperators?: ExcludedOperators
+    /** Mark the picker (or specific groups within it) as key-only — the picked value is the final
+     *  selection, no operator+value pair is rendered alongside it. Consumed in two places:
+     *  - `taxonomicFilterLogic` records key-only selections directly to recents (column / event-name
+     *    pickers etc. — see #57309).
+     *  - `TaxonomicPropertyFilter` hides the operator+value pair on rows whose group is key-only.
+     *  See `SelectingKeyOnly` for the boolean-or-per-group-dict shape. */
+    selectingKeyOnly?: SelectingKeyOnly
+    /** Collapse URL-shaped groups (Pageview URLs) to a single `URL contains "<query>"`
+     *  shortcut row instead of listing every matching URL — mirrors the rebuild menu.
+     *  Selecting the row commits `$current_url IContains <query>` via a `QuickFilterItem`,
+     *  so a host must handle `isQuickFilterItem(item)` in onChange to honor the contains
+     *  operator. Only `TaxonomicPropertyFilter` (and the property/universal-filter hosts
+     *  behind it) opts in — that covers every current pageview-URL consumer — so the paths
+     *  picker keeps its full URL list. */
+    collapseUrlsToContainsRow?: boolean
 }
 
-export type TaxonomicFilterValue = string | number
+export interface DataWarehousePopoverField {
+    key: string
+    label: string
+    description?: string
+    allowHogQL?: boolean
+    hogQLOnly?: boolean
+    optional?: boolean
+    tableName?: string
+    type?: DatabaseSerializedFieldType
+}
 
 export interface TaxonomicFilterLogicProps extends TaxonomicFilterProps {
     taxonomicFilterLogicKey: string
 }
 
+export type TaxonomicFilterValue = string | number | null
+export type TaxonomicFilterRenderProps = {
+    value?: TaxonomicFilterValue
+    onChange: (value: TaxonomicFilterValue, item: any) => void
+    /** allows the component to access the infinite list logic e.g. to react to search results */
+    infiniteListLogicProps: InfiniteListLogicProps
+}
+export type TaxonomicFilterRender = (props: TaxonomicFilterRenderProps) => JSX.Element | null
+export type DefinitionPopoverRendererProps = {
+    item: TaxonomicDefinitionTypes
+    group: TaxonomicFilterGroup
+    defaultView: JSX.Element
+}
+export type DefinitionPopoverRenderer = (props: DefinitionPopoverRendererProps) => JSX.Element | null
+
 export interface TaxonomicFilterGroup {
     name: string
+    /** Null means this group is not searchable (like HogQL expressions). */
+    searchPlaceholder: string | null
+    /**
+     * Overrides the label in the category pill list
+     * */
+    categoryLabel?: (count: number) => ReactNode
     type: TaxonomicFilterGroupType
+    /** Component to show instead of the usual taxonomic list. */
+    render?: TaxonomicFilterRender
+    /** if you want to override the default local items search behaviour e.g. for the replay group type */
+    localItemsSearch?: (items: TaxonomicDefinitionTypes[], q: string) => TaxonomicDefinitionTypes[]
+    /** Local-only groups don't participate in server-search mechanics (top matches, skeletons). */
+    isLocalOnly?: boolean
+    /** Meta groups (Suggested, Recent, Pinned) are excluded from loading indicators, top matches, auto-tab-away, and definition popovers. */
+    isMetaGroup?: boolean
     endpoint?: string
+    /** If present, will be used instead of "endpoint" until the user presses "expand results". */
+    scopedEndpoint?: string
+    expandLabel?: (props: { count: number; expandedCount: number }) => ReactNode
+    /** Static message shown at the bottom of the list */
+    footerMessage?: ReactNode
     options?: Record<string, any>[]
     logic?: LogicWrapper
     value?: string
+    /** Name of a boolean selector on `logic` that indicates items are still loading. */
+    valueLoading?: string
     searchAlias?: string
-    getName: (object: any) => string
-    getValue: (object: any) => TaxonomicFilterValue
+    valuesEndpoint?: (propertyKey: string) => string | undefined
+    getGroup?: (instance: any) => TaxonomicFilterGroup
+    getName?: (instance: any) => string
+    getValue?: (instance: any) => TaxonomicFilterValue
+    getPopoverHeader: (instance: any) => string
+    getIcon?: (instance: any) => JSX.Element
+    /** Determines if an item should be disabled (unselectable) */
+    getIsDisabled?: (instance: any) => boolean
+    groupTypeIndex?: number
+    getFullDetailUrl?: (instance: any) => string
+    excludedProperties?: string[]
+    propertyAllowList?: string[]
+    /** Passed to the component specified via the `render` key */
+    componentProps?: Record<string, any>
+    /** Minimum number of characters before a remote search is issued. */
+    minSearchQueryLength?: number
+    /** Description shown in the empty state when minSearchQueryLength is set. */
+    searchDescription?: string
+    /** Synthetic results surfaced inline when the search query matches a keyword.
+     *  Returned items are QuickFilterItems and flow through existing isQuickFilterItem
+     *  handling in consumer onChange handlers. */
+    keywordShortcuts?: (searchQuery: string) => QuickFilterItem[]
+    /**
+     * Pre-fetch the first page (empty-query) once, cache it, and filter
+     * subsequent typed queries client-side via Fuse rather than firing a
+     * fresh request per keystroke. Used by groups whose total population
+     * comfortably fits in a single page (e.g. Cohorts) where the snappy
+     * local feel is worth losing access to results past the first page.
+     * Per-keystroke remote fetches are suppressed when this is on.
+     */
+    clientFilterFirstPage?: boolean
 }
 
 export enum TaxonomicFilterGroupType {
+    // Person and event metadata that isn't present in properties
+    Metadata = 'metadata',
     Actions = 'actions',
     Cohorts = 'cohorts',
     CohortsWithAllUsers = 'cohorts_with_all',
+    DataWarehouse = 'data_warehouse',
+    // Like DataWarehouse but restricted to external-source tables (no views/saved queries or self-managed
+    // tables) — used by CDP destination/workflow warehouse-row triggers.
+    DataWarehouseSourceTables = 'data_warehouse_source_tables',
+    DataWarehouseProperties = 'data_warehouse_properties',
+    DataWarehousePersonProperties = 'data_warehouse_person_properties',
     Elements = 'elements',
     Events = 'events',
+    InternalEvents = 'internal_events',
+    InternalEventProperties = 'internal_event_properties',
     EventProperties = 'event_properties',
+    EventFeatureFlags = 'event_feature_flags',
+    EventMetadata = 'event_metadata',
+    NumericalEventProperties = 'numerical_event_properties',
     PersonProperties = 'person_properties',
+    PersonMetadata = 'person_metadata',
     PageviewUrls = 'pageview_urls',
+    PageviewEvents = 'pageview_events',
     Screens = 'screens',
+    ScreenEvents = 'screen_events',
+    EmailAddresses = 'email_addresses',
+    AutocaptureEvents = 'autocapture_events',
     CustomEvents = 'custom_events',
     Wildcards = 'wildcard',
+    GroupsPrefix = 'groups',
+    // Types for searching
+    Persons = 'persons',
+    FeatureFlags = 'feature_flags',
+    Insights = 'insights',
+    Experiments = 'experiments',
+    Plugins = 'plugins',
+    Dashboards = 'dashboards',
+    GroupNamesPrefix = 'name_groups',
+    SessionProperties = 'session_properties',
+    HogQLExpression = 'hogql_expression',
+    Notebooks = 'notebooks',
+    LogEntries = 'log_entries',
+    ErrorTrackingIssues = 'error_tracking_issues',
+    Logs = 'logs',
+    LogAttributes = 'log_attributes',
+    LogResourceAttributes = 'log_resource_attributes',
+    MetricAttributes = 'metric_attributes',
+    Spans = 'spans',
+    SpanAttributes = 'span_attributes',
+    SpanResourceAttributes = 'span_resource_attributes',
+    // Misc
+    Replay = 'replay',
+    ReplaySavedFilters = 'replay_saved_filters',
+    RevenueAnalyticsProperties = 'revenue_analytics_properties',
+    Resources = 'resources',
+    ErrorTrackingProperties = 'error_tracking_properties',
+    ActivityLogProperties = 'activity_log_properties',
+    MCPProperties = 'mcp_properties',
+    // Max AI Context
+    MaxAIContext = 'max_ai_context',
+    // Workflows execution variables
+    WorkflowVariables = 'workflow_variables',
+    SuggestedFilters = 'suggested_filters',
+    RecentFilters = 'recent_filters',
+    PinnedFilters = 'pinned_filters',
+    Empty = 'empty',
 }
+
+export const META_GROUP_TYPES = new Set<TaxonomicFilterGroupType>([
+    TaxonomicFilterGroupType.HogQLExpression,
+    TaxonomicFilterGroupType.SuggestedFilters,
+    TaxonomicFilterGroupType.RecentFilters,
+    TaxonomicFilterGroupType.PinnedFilters,
+    TaxonomicFilterGroupType.Empty,
+    TaxonomicFilterGroupType.Wildcards,
+    TaxonomicFilterGroupType.MaxAIContext,
+])
+
+/** Selection types that reopen on their own tab/panel rather than the default "All" surface,
+ *  because they're config/edit flows (an expression editor, a data-warehouse table/column
+ *  picker) with no simple category value to verify at a glance. Honored by the legacy
+ *  `activeTab` selector and the rebuild menu's `activeChip` initializer alike. */
+export const OPEN_AS_SELF_ON_REOPEN = new Set<TaxonomicFilterGroupType>([
+    TaxonomicFilterGroupType.HogQLExpression,
+    TaxonomicFilterGroupType.DataWarehouse,
+    TaxonomicFilterGroupType.DataWarehouseSourceTables,
+    TaxonomicFilterGroupType.DataWarehouseProperties,
+])
 
 export interface InfiniteListLogicProps extends TaxonomicFilterLogicProps {
     listGroupType: TaxonomicFilterGroupType
 }
 
 export interface ListStorage {
-    results: (EventDefinition | CohortType)[]
-    searchQuery?: string // Query used for the results currently in state
+    results: TaxonomicDefinitionTypes[]
+    searchQuery?: string
     count: number
+    expandedCount?: number
     queryChanged?: boolean
     first?: boolean
+    // Wall-clock duration of the remote fetch that produced this page, in ms.
+    // Only set for server-backed loads; absent for local/empty storage.
+    loadDurationMs?: number
 }
 
 export interface LoaderOptions {
@@ -64,5 +396,39 @@ export interface LoaderOptions {
 
 export type ListFuse = Fuse<{
     name: string
+    posthogName: string | undefined
+    recentLabel: string | undefined
     item: EventDefinition | CohortType
 }> // local alias for typegen
+
+export interface SkeletonItem {
+    _skeleton: true
+    group: TaxonomicFilterGroupType
+    groupName: string
+}
+
+export function isSkeletonItem(item: unknown): item is SkeletonItem {
+    return typeof item === 'object' && item !== null && '_skeleton' in item
+}
+
+export type TaxonomicDefinitionTypes =
+    | EventDefinition
+    | PropertyDefinition
+    | CohortType
+    | ActionType
+    | PersonProperty
+    | DataWarehouseTableForInsight
+    | MaxContextTaxonomicFilterOption
+    | QuickFilterItem
+
+export const CATEGORY_DROPDOWN_VARIANTS = ['control', 'pill'] as const
+
+export type CategoryDropdownVariant = (typeof CATEGORY_DROPDOWN_VARIANTS)[number]
+
+export function isCategoryDropdownVariant(value: unknown): value is CategoryDropdownVariant {
+    return typeof value === 'string' && (CATEGORY_DROPDOWN_VARIANTS as readonly string[]).includes(value)
+}
+
+export function resolveCategoryDropdownVariant(flagValue: string | boolean | undefined): CategoryDropdownVariant {
+    return isCategoryDropdownVariant(flagValue) ? flagValue : 'control'
+}

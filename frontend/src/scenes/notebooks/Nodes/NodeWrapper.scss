@@ -1,0 +1,151 @@
+.NotebookNode {
+    --notebook-node-meta-height: 2.5rem;
+    --notebook-node-meta-padding: 0.25rem;
+    --border-color: var(--color-border-primary);
+
+    transform: translate3d(0, 0, 0);
+
+    .NotebookNode__box {
+        overflow: hidden;
+        background-color: var(--color-bg-surface-primary);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius);
+        transition:
+            border 150ms linear,
+            margin-bottom 150ms linear;
+        transform: translate3d(0, 0, 0);
+
+        .NotebookNode__meta {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: var(--notebook-node-meta-height);
+            padding: var(--notebook-node-meta-padding);
+            overflow: hidden;
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--primary-alt);
+            border-bottom: 1px solid var(--color-border-primary);
+        }
+
+        .NotebookNode__settings {
+            // Sits above .NotebookNode__content's z-index: 1 so that wrapped toolbar
+            // controls (e.g. the chart-type picker on Trends insights at narrow widths)
+            // stay clickable when the chart canvas underneath would otherwise win the
+            // hit test.
+            position: relative;
+            z-index: 2;
+            border-bottom: 1px solid var(--color-border-primary);
+        }
+
+        .NotebookNode__content {
+            z-index: 1;
+            transition: box-shadow 150ms ease-out;
+        }
+
+        .NotebookNode__resize-handle {
+            position: absolute;
+            right: 0.125rem;
+            bottom: 0.125rem;
+            z-index: 2;
+            width: 1.5rem;
+            height: 1.5rem;
+            cursor: ns-resize;
+            background:
+                linear-gradient(135deg, transparent 0 45%, var(--color-border-bold) 45% 50%, transparent 50% 100%),
+                linear-gradient(135deg, transparent 0 62%, var(--color-border-bold) 62% 67%, transparent 67% 100%);
+            border-radius: 0.125rem;
+            opacity: 0.65;
+        }
+    }
+
+    .NotebookNode__gap {
+        display: flex;
+        gap: 0.2rem;
+        align-items: center;
+        height: 1.375rem;
+        overflow: hidden;
+        opacity: 0;
+        transition: all 150ms linear 1000ms;
+    }
+
+    .InsightCard__viz {
+        height: 100%;
+    }
+
+    &--editable:hover,
+    &--selected {
+        .NotebookNode__gap {
+            height: 1.875rem;
+            opacity: 1;
+            transition: all 150ms linear;
+        }
+    }
+
+    &--auto-hide-metadata {
+        --border-color: transparent;
+
+        .NotebookNode__meta {
+            position: absolute;
+            top: 0;
+            right: 0;
+            left: 0;
+            z-index: var(--z-popover);
+            pointer-events: none;
+            visibility: hidden;
+            background-color: var(--color-bg-surface-primary);
+        }
+
+        .Notebook--editable & {
+            &:hover,
+            &.NotebookNode--selected {
+                border-color: var(--border-color);
+
+                .NotebookNode__meta {
+                    pointer-events: all;
+                    visibility: visible;
+                }
+            }
+        }
+
+        &:hover {
+            --border-color: var(--color-border-primary);
+        }
+    }
+}
+
+.NotebookNode.ph-image {
+    img {
+        flex: 1;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+    }
+}
+
+.ProseMirror.ProseMirror-focused {
+    .NotebookNode--selected {
+        --border-color: var(--border-bold);
+    }
+
+    .NotebookNode--in-selection .NotebookNode__box {
+        border-color: Highlight;
+        box-shadow: 0 0 0 1px Highlight;
+    }
+}
+
+.NotebookNodeTitle {
+    padding: 0.25rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &--editable {
+        border-radius: var(--radius);
+        transition: background-color 150ms linear;
+
+        &:hover {
+            background-color: var(--color-border-primary);
+        }
+    }
+}

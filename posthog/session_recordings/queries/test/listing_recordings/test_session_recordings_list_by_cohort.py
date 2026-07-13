@@ -1,0 +1,1155 @@
+from uuid import UUID, uuid4
+
+from freezegun import freeze_time
+from posthog.test.base import (
+    APIBaseTest,
+    ClickhouseTestMixin,
+    also_test_with_materialized_columns,
+    snapshot_clickhouse_queries,
+)
+from unittest.mock import patch
+
+from django.utils.timezone import now
+
+from dateutil.relativedelta import relativedelta
+
+from posthog.clickhouse.client import sync_execute
+from posthog.clickhouse.log_entries import TRUNCATE_LOG_ENTRIES_TABLE_SQL
+from posthog.session_recordings.queries.test.listing_recordings.test_utils import (
+    assert_query_matches_session_ids,
+    create_event,
+)
+from posthog.session_recordings.queries.test.session_replay_sql import produce_replay_summary
+from posthog.session_recordings.sql.session_replay_event_sql import TRUNCATE_SESSION_REPLAY_EVENTS_TABLE_SQL
+from posthog.test.persons import create_person
+
+from products.cohorts.backend.models.cohort import Cohort
+
+
+@freeze_time("2021-01-01T13:46:23")
+class TestSessionRecordingsListByCohort(ClickhouseTestMixin, APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        sync_execute(TRUNCATE_SESSION_REPLAY_EVENTS_TABLE_SQL())
+        sync_execute(TRUNCATE_LOG_ENTRIES_TABLE_SQL)
+
+    # wrap the util so we don't have to pass team every time
+    def _assert_query_matches_session_ids(
+        self, query: dict | None, expected: list[str], sort_results_when_asserting: bool = True
+    ) -> None:
+        assert_query_matches_session_ids(
+            team=self.team, query=query, expected=expected, sort_results_when_asserting=sort_results_when_asserting
+        )
+
+    @property
+    def an_hour_ago(self):
+        return (now() - relativedelta(hours=1)).replace(microsecond=0, second=0)
+
+    @snapshot_clickhouse_queries
+    @also_test_with_materialized_columns(person_properties=["$some_prop"])
+    def test_filter_with_cohort_properties(self) -> None:
+        with self.settings(USE_PRECALCULATED_CH_COHORT_PEOPLE=True):
+            with freeze_time("2021-08-21T20:00:00.000Z"):
+                user_one = "test_filter_with_cohort_properties-user"
+                user_two = "test_filter_with_cohort_properties-user2"
+                session_id_one = "session_not_in_cohort"
+                session_id_two = "session_in_cohort"
+
+                create_person(team=self.team, distinct_ids=[user_one], properties={"email": "bla"})
+                create_person(
+                    team=self.team,
+                    distinct_ids=[user_two],
+                    properties={"email": "bla2", "$some_prop": "some_val"},
+                )
+                cohort = Cohort.objects.create(
+                    team=self.team,
+                    name="cohort1",
+                    groups=[
+                        {
+                            "properties": [
+                                {
+                                    "key": "$some_prop",
+                                    "value": "some_val",
+                                    "type": "person",
+                                }
+                            ]
+                        }
+                    ],
+                )
+                cohort.calculate_people_ch(pending_version=0)
+
+                produce_replay_summary(
+                    distinct_id=user_one,
+                    session_id=session_id_one,
+                    first_timestamp=self.an_hour_ago,
+                    team_id=self.team.id,
+                )
+                # self.create_event(user_one, self.base_time, team=self.team)
+                produce_replay_summary(
+                    distinct_id=user_one,
+                    session_id=session_id_one,
+                    first_timestamp=self.an_hour_ago + relativedelta(seconds=30),
+                    team_id=self.team.id,
+                )
+                produce_replay_summary(
+                    distinct_id=user_two,
+                    session_id=session_id_two,
+                    first_timestamp=self.an_hour_ago,
+                    team_id=self.team.id,
+                )
+                # self.create_event(user_two, self.base_time, team=self.team)
+                produce_replay_summary(
+                    distinct_id=user_two,
+                    session_id=session_id_two,
+                    first_timestamp=self.an_hour_ago + relativedelta(seconds=30),
+                    team_id=self.team.id,
+                )
+
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": cohort.pk,
+                                "operator": "in",
+                                "type": "cohort",
+                            }
+                        ]
+                    },
+                    [session_id_two],
+                )
+
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            }
+                        ]
+                    },
+                    [session_id_one],
+                )
+
+    @snapshot_clickhouse_queries
+    @also_test_with_materialized_columns(person_properties=["$some_prop"])
+    def test_filter_with_static_and_dynamic_cohort_properties(self):
+        with self.settings(USE_PRECALCULATED_CH_COHORT_PEOPLE=True):
+            with freeze_time("2021-08-21T20:00:00.000Z"):
+                user_one = "test_filter_with_cohort_properties-user-in-static-cohort"
+                user_two = "test_filter_with_cohort_properties-user2-in-dynamic-cohort"
+                user_three = "test_filter_with_cohort_properties-user3-in-both-cohort"
+                user_four = "test_filter_with_cohort_properties-user4-not-in-any-cohort"
+
+                session_id_one = (
+                    f"in-static-cohort-test_filter_with_static_and_dynamic_cohort_properties-1-{str(uuid4())}"
+                )
+                session_id_two = (
+                    f"in-dynamic-cohort-test_filter_with_static_and_dynamic_cohort_properties-2-{str(uuid4())}"
+                )
+                session_id_three = (
+                    f"in-both-cohort-test_filter_with_static_and_dynamic_cohort_properties-3-{str(uuid4())}"
+                )
+                session_id_four = (
+                    f"not-in-any-cohort-test_filter_with_static_and_dynamic_cohort_properties-4-{str(uuid4())}"
+                )
+
+                create_person(
+                    team=self.team,
+                    distinct_ids=[user_one],
+                    properties={"email": "in@static.cohort"},
+                    uuid=UUID("00000000-0000-0000-0000-000000000001"),
+                )
+                create_person(
+                    team=self.team,
+                    distinct_ids=[user_two],
+                    properties={"email": "in@dynamic.cohort", "$some_prop": "some_val"},
+                    uuid=UUID("00000000-0000-0000-0000-000000000002"),
+                )
+                create_person(
+                    team=self.team,
+                    distinct_ids=[user_three],
+                    properties={"email": "in@both.cohorts", "$some_prop": "some_val"},
+                    uuid=UUID("00000000-0000-0000-0000-000000000003"),
+                )
+
+                dynamic_cohort = Cohort.objects.create(
+                    team=self.team,
+                    name="cohort1",
+                    groups=[
+                        {
+                            "properties": [
+                                {
+                                    "key": "$some_prop",
+                                    "value": "some_val",
+                                    "type": "person",
+                                }
+                            ]
+                        }
+                    ],
+                )
+
+                static_cohort = Cohort.objects.create(team=self.team, name="a static cohort", groups=[], is_static=True)
+                static_cohort.insert_users_by_list([user_one, user_three])
+
+                dynamic_cohort.calculate_people_ch(pending_version=0)
+                static_cohort.calculate_people_ch(pending_version=0)
+
+                replay_summaries = [
+                    (user_one, session_id_one),
+                    (user_two, session_id_two),
+                    (user_three, session_id_three),
+                ]
+                for distinct_id, session_id in replay_summaries:
+                    produce_replay_summary(
+                        distinct_id=distinct_id,
+                        session_id=session_id,
+                        first_timestamp=self.an_hour_ago,
+                        team_id=self.team.id,
+                    )
+                    produce_replay_summary(
+                        distinct_id=distinct_id,
+                        session_id=session_id,
+                        first_timestamp=self.an_hour_ago + relativedelta(seconds=30),
+                        team_id=self.team.id,
+                    )
+
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": static_cohort.pk,
+                                "operator": "in",
+                                "type": "cohort",
+                            },
+                        ]
+                    },
+                    [session_id_one, session_id_three],
+                )
+
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": static_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            },
+                        ]
+                    },
+                    [session_id_two],
+                )
+
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": dynamic_cohort.pk,
+                                "operator": "in",
+                                "type": "cohort",
+                            },
+                        ]
+                    },
+                    [session_id_two, session_id_three],
+                )
+
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": dynamic_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            },
+                        ]
+                    },
+                    [session_id_one],
+                )
+
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": dynamic_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            },
+                            {
+                                "key": "id",
+                                "value": static_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            },
+                        ]
+                    },
+                    [],
+                )
+
+                # and now with users not in any cohort
+
+                create_person(team=self.team, distinct_ids=[user_four], properties={"email": "not.in.any@cohorts.com"})
+                produce_replay_summary(
+                    distinct_id=user_four,
+                    session_id=session_id_four,
+                    team_id=self.team.id,
+                )
+
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": dynamic_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            },
+                            {
+                                "key": "id",
+                                "value": static_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            },
+                        ]
+                    },
+                    [session_id_four],
+                )
+
+    @snapshot_clickhouse_queries
+    @also_test_with_materialized_columns(person_properties=["$some_prop"])
+    def test_filter_with_events_and_cohorts(self):
+        with self.settings(USE_PRECALCULATED_CH_COHORT_PEOPLE=True):
+            with freeze_time("2021-08-21T20:00:00.000Z"):
+                user_one = "test_filter_with_events_and_cohorts-user"
+                user_two = "test_filter_with_events_and_cohorts-user2"
+                session_id_one = f"test_filter_with_events_and_cohorts-1-{str(uuid4())}"
+                session_id_two = f"test_filter_with_events_and_cohorts-2-{str(uuid4())}"
+
+                create_person(team=self.team, distinct_ids=[user_one], properties={"email": "bla"})
+                create_person(
+                    team=self.team,
+                    distinct_ids=[user_two],
+                    properties={"email": "bla2", "$some_prop": "some_val"},
+                )
+                cohort = Cohort.objects.create(
+                    team=self.team,
+                    name="cohort1",
+                    groups=[
+                        {
+                            "properties": [
+                                {
+                                    "key": "$some_prop",
+                                    "value": "some_val",
+                                    "type": "person",
+                                }
+                            ]
+                        }
+                    ],
+                )
+                cohort.calculate_people_ch(pending_version=0)
+
+                produce_replay_summary(
+                    distinct_id=user_one,
+                    session_id=session_id_one,
+                    first_timestamp=self.an_hour_ago,
+                    team_id=self.team.id,
+                )
+                create_event(
+                    user_one,
+                    self.an_hour_ago,
+                    team=self.team,
+                    event_name="custom_event",
+                    properties={"$session_id": session_id_one},
+                )
+                produce_replay_summary(
+                    distinct_id=user_one,
+                    session_id=session_id_one,
+                    first_timestamp=self.an_hour_ago + relativedelta(seconds=30),
+                    team_id=self.team.id,
+                )
+                produce_replay_summary(
+                    distinct_id=user_two,
+                    session_id=session_id_two,
+                    first_timestamp=self.an_hour_ago,
+                    team_id=self.team.id,
+                )
+                create_event(
+                    user_two,
+                    self.an_hour_ago,
+                    team=self.team,
+                    event_name="custom_event",
+                    properties={"$session_id": session_id_two},
+                )
+                produce_replay_summary(
+                    distinct_id=user_two,
+                    session_id=session_id_two,
+                    first_timestamp=self.an_hour_ago + relativedelta(seconds=30),
+                    team_id=self.team.id,
+                )
+
+                self._assert_query_matches_session_ids(
+                    {
+                        # has to be in the cohort and pageview has to be in the events
+                        # test data has one user in the cohort but no pageviews
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": cohort.pk,
+                                "operator": "in",
+                                "type": "cohort",
+                            }
+                        ],
+                        "events": [
+                            {
+                                "id": "$pageview",
+                                "type": "events",
+                                "order": 0,
+                                "name": "$pageview",
+                            }
+                        ],
+                    },
+                    [],
+                )
+
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": cohort.pk,
+                                "operator": "in",
+                                "type": "cohort",
+                            }
+                        ],
+                        "events": [
+                            {
+                                "id": "custom_event",
+                                "type": "events",
+                                "order": 0,
+                                "name": "custom_event",
+                            }
+                        ],
+                    },
+                    [session_id_two],
+                )
+
+    @snapshot_clickhouse_queries
+    @also_test_with_materialized_columns(person_properties=["$some_prop"])
+    def test_internal_account_filter_with_cohort_properties(self) -> None:
+        with self.settings(USE_PRECALCULATED_CH_COHORT_PEOPLE=True):
+            with freeze_time("2021-08-21T20:00:00.000Z"):
+                user_one = "test_filter_with_cohort_properties-user"
+                user_two = "test_filter_with_cohort_properties-user2"
+                session_id_one = "session_not_in_cohort"
+                session_id_two = "session_in_cohort"
+
+                create_person(team=self.team, distinct_ids=[user_one], properties={"email": "bla"})
+                create_person(
+                    team=self.team,
+                    distinct_ids=[user_two],
+                    properties={"email": "bla2", "$some_prop": "some_val"},
+                )
+                cohort = Cohort.objects.create(
+                    team=self.team,
+                    name="cohort1",
+                    groups=[
+                        {
+                            "properties": [
+                                {
+                                    "key": "$some_prop",
+                                    "value": "some_val",
+                                    "type": "person",
+                                }
+                            ]
+                        }
+                    ],
+                )
+                cohort.calculate_people_ch(pending_version=0)
+
+                self.team.test_account_filters = [
+                    {
+                        "key": "id",
+                        "value": cohort.pk,
+                        "operator": "not_in",
+                        "type": "cohort",
+                    }
+                ]
+                self.team.save()
+
+                produce_replay_summary(
+                    distinct_id=user_one,
+                    session_id=session_id_one,
+                    first_timestamp=self.an_hour_ago,
+                    team_id=self.team.id,
+                )
+                # self.create_event(user_one, self.base_time, team=self.team)
+                produce_replay_summary(
+                    distinct_id=user_one,
+                    session_id=session_id_one,
+                    first_timestamp=self.an_hour_ago + relativedelta(seconds=30),
+                    team_id=self.team.id,
+                )
+                produce_replay_summary(
+                    distinct_id=user_two,
+                    session_id=session_id_two,
+                    first_timestamp=self.an_hour_ago,
+                    team_id=self.team.id,
+                )
+                # self.create_event(user_two, self.base_time, team=self.team)
+                produce_replay_summary(
+                    distinct_id=user_two,
+                    session_id=session_id_two,
+                    first_timestamp=self.an_hour_ago + relativedelta(seconds=30),
+                    team_id=self.team.id,
+                )
+
+                self._assert_query_matches_session_ids(
+                    {
+                        "filter_test_accounts": True,
+                    },
+                    [session_id_one],
+                )
+
+    @snapshot_clickhouse_queries
+    def test_filter_with_cohort_when_distinct_id_has_multiple_person_ids(self) -> None:
+        """
+        Test that cohort filtering works correctly when a distinct_id has multiple person_id associations
+        in ClickHouse (e.g., from person merges). The filter should only check cohort membership
+        for the CURRENT person_id, not historical ones.
+
+        Regression test for bug where if:
+        - distinct_id had old person_id A (in cohort, but deleted/old version)
+        - distinct_id has current person_id B (not in cohort, active)
+        The filter would incorrectly match because it checked ALL person_ids before applying argMax.
+        """
+        with self.settings(USE_PRECALCULATED_CH_COHORT_PEOPLE=True):
+            with freeze_time("2021-08-21T20:00:00.000Z"):
+                distinct_id = "user-with-multiple-person-ids"
+                session_id = "session-should-not-be-filtered"
+
+                # Create person A (will be in cohort, then merged away)
+                person_a = create_person(
+                    team=self.team,
+                    distinct_ids=[distinct_id],
+                    properties={"$some_prop": "some_val"},
+                )
+
+                # Create cohort that person A is in
+                cohort = Cohort.objects.create(
+                    team=self.team,
+                    name="test_cohort",
+                    groups=[
+                        {
+                            "properties": [
+                                {
+                                    "key": "$some_prop",
+                                    "value": "some_val",
+                                    "type": "person",
+                                }
+                            ]
+                        }
+                    ],
+                )
+                cohort.calculate_people_ch(pending_version=0)
+
+                # Create person B (not in cohort)
+                person_b = create_person(
+                    team=self.team,
+                    distinct_ids=["another-distinct-id"],
+                    properties={"other_prop": "other_val"},
+                )
+
+                # Simulate person merge: move distinct_id from person A to person B
+                # This creates a situation where distinct_id has multiple person_id entries in ClickHouse
+                from posthog.models.person.util import create_person_distinct_id
+
+                # Add new version pointing to person B
+                create_person_distinct_id(
+                    team_id=self.team.id,
+                    distinct_id=distinct_id,
+                    person_id=str(person_b.uuid),
+                    is_deleted=False,
+                    version=2,  # Higher version than the original
+                )
+
+                # Mark old association as deleted
+                create_person_distinct_id(
+                    team_id=self.team.id,
+                    distinct_id=distinct_id,
+                    person_id=str(person_a.uuid),
+                    is_deleted=True,
+                    version=1,
+                )
+
+                # Create recording with the distinct_id
+                produce_replay_summary(
+                    distinct_id=distinct_id,
+                    session_id=session_id,
+                    first_timestamp=self.an_hour_ago,
+                    team_id=self.team.id,
+                )
+
+                # Test NOT IN cohort filter
+                # Should return the session because current person_id (person B) is NOT in the cohort
+                # even though old person_id (person A) was in the cohort
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            }
+                        ]
+                    },
+                    [session_id],
+                )
+
+                # Test IN cohort filter
+                # Should return empty because current person_id (person B) is NOT in the cohort
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": cohort.pk,
+                                "operator": "in",
+                                "type": "cohort",
+                            }
+                        ]
+                    },
+                    [],
+                )
+
+    @snapshot_clickhouse_queries
+    def test_not_in_cohort_with_many_users_outside_cohort(self) -> None:
+        """
+        Test that NOT IN cohort filtering works correctly when there are many users
+        outside the cohort. This is the common case for "filter out internal users"
+        where the cohort (internal users) is small but the total user base is large.
+
+        This test verifies:
+        1. Correctness: Only sessions from non-cohort members are returned
+        2. The query uses an efficient JOIN-based approach instead of IN subquery
+        """
+        with self.settings(USE_PRECALCULATED_CH_COHORT_PEOPLE=True):
+            with freeze_time("2021-08-21T20:00:00.000Z"):
+                # Create a small "internal users" cohort (like employees)
+                internal_user = "internal-employee@company.com"
+                session_internal = "session-internal-user"
+
+                # Create multiple external users (simulating a large user base)
+                external_users = [f"external-user-{i}@customer.com" for i in range(5)]
+                external_sessions = [f"session-external-{i}" for i in range(5)]
+
+                # Create internal user (in cohort)
+                create_person(
+                    team=self.team,
+                    distinct_ids=[internal_user],
+                    properties={"email": internal_user, "is_internal": True},
+                )
+
+                # Create external users (not in cohort)
+                for user in external_users:
+                    create_person(
+                        team=self.team,
+                        distinct_ids=[user],
+                        properties={"email": user, "is_internal": False},
+                    )
+
+                # Create cohort for internal users
+                internal_cohort = Cohort.objects.create(
+                    team=self.team,
+                    name="internal_users",
+                    groups=[
+                        {
+                            "properties": [
+                                {
+                                    "key": "is_internal",
+                                    "value": True,
+                                    "type": "person",
+                                }
+                            ]
+                        }
+                    ],
+                )
+                internal_cohort.calculate_people_ch(pending_version=0)
+
+                # Create session for internal user
+                produce_replay_summary(
+                    distinct_id=internal_user,
+                    session_id=session_internal,
+                    first_timestamp=self.an_hour_ago,
+                    team_id=self.team.id,
+                )
+
+                # Create sessions for external users
+                for user, session_id in zip(external_users, external_sessions):
+                    produce_replay_summary(
+                        distinct_id=user,
+                        session_id=session_id,
+                        first_timestamp=self.an_hour_ago,
+                        team_id=self.team.id,
+                    )
+
+                # Test NOT IN cohort - should return all external sessions
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": internal_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            }
+                        ]
+                    },
+                    external_sessions,
+                )
+
+                # Test IN cohort - should return only internal session
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": internal_cohort.pk,
+                                "operator": "in",
+                                "type": "cohort",
+                            }
+                        ]
+                    },
+                    [session_internal],
+                )
+
+    @snapshot_clickhouse_queries
+    def test_not_in_cohort_with_empty_cohort(self) -> None:
+        """
+        Test that NOT IN cohort filtering works when the cohort is empty.
+        All sessions should be returned since no one is in the cohort.
+        """
+        with self.settings(USE_PRECALCULATED_CH_COHORT_PEOPLE=True):
+            with freeze_time("2021-08-21T20:00:00.000Z"):
+                user = "test-user@example.com"
+                session_id = "session-with-empty-cohort"
+
+                create_person(
+                    team=self.team,
+                    distinct_ids=[user],
+                    properties={"email": user},
+                )
+
+                # Create an empty cohort (no one matches)
+                empty_cohort = Cohort.objects.create(
+                    team=self.team,
+                    name="empty_cohort",
+                    groups=[
+                        {
+                            "properties": [
+                                {
+                                    "key": "nonexistent_prop",
+                                    "value": "impossible_value",
+                                    "type": "person",
+                                }
+                            ]
+                        }
+                    ],
+                )
+                empty_cohort.calculate_people_ch(pending_version=0)
+
+                produce_replay_summary(
+                    distinct_id=user,
+                    session_id=session_id,
+                    first_timestamp=self.an_hour_ago,
+                    team_id=self.team.id,
+                )
+
+                # NOT IN empty cohort should return the session
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": empty_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            }
+                        ]
+                    },
+                    [session_id],
+                )
+
+                # IN empty cohort should return nothing
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": empty_cohort.pk,
+                                "operator": "in",
+                                "type": "cohort",
+                            }
+                        ]
+                    },
+                    [],
+                )
+
+    @snapshot_clickhouse_queries
+    def test_not_in_cohort_combined_with_other_filters(self) -> None:
+        """
+        Test that NOT IN cohort filtering works correctly when combined with
+        other property filters (like event properties or person properties).
+        """
+        with self.settings(USE_PRECALCULATED_CH_COHORT_PEOPLE=True):
+            with freeze_time("2021-08-21T20:00:00.000Z"):
+                internal_user = "internal@company.com"
+                premium_external = "premium@customer.com"
+                free_external = "free@customer.com"
+
+                session_internal = "session-internal"
+                session_premium = "session-premium"
+                session_free = "session-free"
+
+                # Create users with different properties
+                create_person(
+                    team=self.team,
+                    distinct_ids=[internal_user],
+                    properties={"is_internal": True, "plan": "internal"},
+                )
+                create_person(
+                    team=self.team,
+                    distinct_ids=[premium_external],
+                    properties={"is_internal": False, "plan": "premium"},
+                )
+                create_person(
+                    team=self.team,
+                    distinct_ids=[free_external],
+                    properties={"is_internal": False, "plan": "free"},
+                )
+
+                # Create internal users cohort
+                internal_cohort = Cohort.objects.create(
+                    team=self.team,
+                    name="internal_users",
+                    groups=[
+                        {
+                            "properties": [
+                                {
+                                    "key": "is_internal",
+                                    "value": True,
+                                    "type": "person",
+                                }
+                            ]
+                        }
+                    ],
+                )
+                internal_cohort.calculate_people_ch(pending_version=0)
+
+                # Create sessions
+                for user, session_id in [
+                    (internal_user, session_internal),
+                    (premium_external, session_premium),
+                    (free_external, session_free),
+                ]:
+                    produce_replay_summary(
+                        distinct_id=user,
+                        session_id=session_id,
+                        first_timestamp=self.an_hour_ago,
+                        team_id=self.team.id,
+                    )
+
+                # Test NOT IN cohort combined with person property filter
+                # Should return only premium external user
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": internal_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            },
+                            {
+                                "key": "plan",
+                                "value": "premium",
+                                "operator": "exact",
+                                "type": "person",
+                            },
+                        ]
+                    },
+                    [session_premium],
+                )
+
+    @snapshot_clickhouse_queries
+    def test_multiple_not_in_cohorts(self) -> None:
+        """
+        Test filtering with multiple NOT IN cohort conditions.
+        This tests the case where a user wants to exclude multiple cohorts.
+        """
+        with self.settings(USE_PRECALCULATED_CH_COHORT_PEOPLE=True):
+            with freeze_time("2021-08-21T20:00:00.000Z"):
+                internal_user = "internal@company.com"
+                beta_user = "beta@customer.com"
+                regular_user = "regular@customer.com"
+
+                session_internal = "session-internal"
+                session_beta = "session-beta"
+                session_regular = "session-regular"
+
+                # Create users
+                create_person(
+                    team=self.team,
+                    distinct_ids=[internal_user],
+                    properties={"is_internal": True, "is_beta": False},
+                )
+                create_person(
+                    team=self.team,
+                    distinct_ids=[beta_user],
+                    properties={"is_internal": False, "is_beta": True},
+                )
+                create_person(
+                    team=self.team,
+                    distinct_ids=[regular_user],
+                    properties={"is_internal": False, "is_beta": False},
+                )
+
+                # Create cohorts
+                internal_cohort = Cohort.objects.create(
+                    team=self.team,
+                    name="internal_users",
+                    groups=[{"properties": [{"key": "is_internal", "value": True, "type": "person"}]}],
+                )
+                internal_cohort.calculate_people_ch(pending_version=0)
+
+                beta_cohort = Cohort.objects.create(
+                    team=self.team,
+                    name="beta_users",
+                    groups=[{"properties": [{"key": "is_beta", "value": True, "type": "person"}]}],
+                )
+                beta_cohort.calculate_people_ch(pending_version=0)
+
+                # Create sessions
+                for user, session_id in [
+                    (internal_user, session_internal),
+                    (beta_user, session_beta),
+                    (regular_user, session_regular),
+                ]:
+                    produce_replay_summary(
+                        distinct_id=user,
+                        session_id=session_id,
+                        first_timestamp=self.an_hour_ago,
+                        team_id=self.team.id,
+                    )
+
+                # Exclude both internal and beta users (AND) - should only return regular user
+                self._assert_query_matches_session_ids(
+                    {
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": internal_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            },
+                            {
+                                "key": "id",
+                                "value": beta_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            },
+                        ]
+                    },
+                    [session_regular],
+                )
+
+    @snapshot_clickhouse_queries
+    def test_cohort_filter_with_or_operand(self) -> None:
+        """
+        Test cohort filtering with OR operand between cohorts.
+        With OR, sessions matching ANY cohort condition should be returned.
+        """
+        with self.settings(USE_PRECALCULATED_CH_COHORT_PEOPLE=True):
+            with freeze_time("2021-08-21T20:00:00.000Z"):
+                internal_user = "internal@company.com"
+                beta_user = "beta@customer.com"
+                regular_user = "regular@customer.com"
+
+                session_internal = "session-internal-or"
+                session_beta = "session-beta-or"
+                session_regular = "session-regular-or"
+
+                create_person(
+                    team=self.team,
+                    distinct_ids=[internal_user],
+                    properties={"is_internal": True, "is_beta": False},
+                )
+                create_person(
+                    team=self.team,
+                    distinct_ids=[beta_user],
+                    properties={"is_internal": False, "is_beta": True},
+                )
+                create_person(
+                    team=self.team,
+                    distinct_ids=[regular_user],
+                    properties={"is_internal": False, "is_beta": False},
+                )
+
+                internal_cohort = Cohort.objects.create(
+                    team=self.team,
+                    name="internal_users",
+                    groups=[{"properties": [{"key": "is_internal", "value": True, "type": "person"}]}],
+                )
+                internal_cohort.calculate_people_ch(pending_version=0)
+
+                beta_cohort = Cohort.objects.create(
+                    team=self.team,
+                    name="beta_users",
+                    groups=[{"properties": [{"key": "is_beta", "value": True, "type": "person"}]}],
+                )
+                beta_cohort.calculate_people_ch(pending_version=0)
+
+                for user, session_id in [
+                    (internal_user, session_internal),
+                    (beta_user, session_beta),
+                    (regular_user, session_regular),
+                ]:
+                    produce_replay_summary(
+                        distinct_id=user,
+                        session_id=session_id,
+                        first_timestamp=self.an_hour_ago,
+                        team_id=self.team.id,
+                    )
+
+                # IN internal OR IN beta - should return internal and beta sessions
+                self._assert_query_matches_session_ids(
+                    {
+                        "operand": "OR",
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": internal_cohort.pk,
+                                "operator": "in",
+                                "type": "cohort",
+                            },
+                            {
+                                "key": "id",
+                                "value": beta_cohort.pk,
+                                "operator": "in",
+                                "type": "cohort",
+                            },
+                        ],
+                    },
+                    [session_internal, session_beta],
+                )
+
+                # NOT IN internal OR NOT IN beta - should return all (everyone fails at least one NOT IN)
+                self._assert_query_matches_session_ids(
+                    {
+                        "operand": "OR",
+                        "properties": [
+                            {
+                                "key": "id",
+                                "value": internal_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            },
+                            {
+                                "key": "id",
+                                "value": beta_cohort.pk,
+                                "operator": "not_in",
+                                "type": "cohort",
+                            },
+                        ],
+                    },
+                    [session_internal, session_beta, session_regular],
+                )
+
+    @snapshot_clickhouse_queries
+    @patch("posthog.session_recordings.queries.utils.posthoganalytics.feature_enabled")
+    def test_not_in_cohort_with_anonymous_users_in_poe_mode(self, mock_feature_enabled) -> None:
+        """
+        Test that NOT IN cohort filters correctly include anonymous users in PoE mode.
+
+        This is the specific bug fix for the "filter test accounts" toggle:
+        When filtering NOT IN internal_users cohort, anonymous users (distinct_ids
+        without person records) should be included since they can't be in the cohort.
+
+        Scenario:
+        - Internal user (in cohort) -> should be filtered out
+        - External user (not in cohort) -> should be included
+        - Anonymous user (no person record) -> should be included (the fix)
+        """
+        mock_feature_enabled.return_value = True
+
+        with self.settings(
+            USE_PRECALCULATED_CH_COHORT_PEOPLE=True,
+            PERSON_ON_EVENTS_V2_OVERRIDE=True,
+        ):
+            internal_user = "internal@company.com"
+            external_user = "external@customer.com"
+            anonymous_user = "anonymous_abc123"
+
+            session_internal = "session-internal"
+            session_external = "session-external"
+            session_anonymous = "session-anonymous"
+
+            create_person(
+                team=self.team,
+                distinct_ids=[internal_user],
+                properties={"user_group": "internal"},
+            )
+            create_person(
+                team=self.team,
+                distinct_ids=[external_user],
+                properties={"user_group": "external"},
+            )
+
+            for user, session_id in [
+                (internal_user, session_internal),
+                (external_user, session_external),
+            ]:
+                produce_replay_summary(
+                    distinct_id=user,
+                    session_id=session_id,
+                    first_timestamp=self.an_hour_ago,
+                    team_id=self.team.id,
+                )
+
+            # Anonymous user: no Person row, but produce_replay_summary still creates an
+            # analytics event so the PoE events-join can find the session. bulk_create_events
+            # falls back to a random person_id when no Person exists, which matches the
+            # production shape of an anonymous (propertyless-person-mode) event.
+            produce_replay_summary(
+                distinct_id=anonymous_user,
+                session_id=session_anonymous,
+                first_timestamp=self.an_hour_ago,
+                team_id=self.team.id,
+            )
+
+            internal_cohort = Cohort.objects.create(
+                team=self.team,
+                name="internal_users",
+                groups=[{"properties": [{"key": "user_group", "value": "internal", "type": "person"}]}],
+            )
+            internal_cohort.calculate_people_ch(pending_version=0)
+
+            self._assert_query_matches_session_ids(
+                {
+                    "properties": [
+                        {
+                            "key": "id",
+                            "value": internal_cohort.pk,
+                            "operator": "not_in",
+                            "type": "cohort",
+                        }
+                    ]
+                },
+                [session_external, session_anonymous],
+            )

@@ -1,10 +1,14 @@
 import { useValues } from 'kea'
-import React, { useMemo } from 'react'
+import { useEffect, useMemo } from 'react'
+
+import { posthog } from 'lib/posthog-typed'
+
+import { AvailableFeature } from '~/types'
+
 import { organizationLogic } from '../../scenes/organizationLogic'
-import { OrganizationMembershipLevel } from '../constants'
-import { Tooltip } from 'lib/components/Tooltip'
-import { EitherMembershipLevel, membershipLevelToName } from '../utils/permissioning'
-import { teamLogic } from '../../scenes/teamLogic'
+import { isAuthenticatedTeam, teamLogic } from '../../scenes/teamLogic'
+import { EitherMembershipLevel, OrganizationMembershipLevel } from '../constants'
+import { membershipLevelToName } from '../utils/permissioning'
 
 export interface RestrictedComponentProps {
     isRestricted: boolean
@@ -15,27 +19,29 @@ export enum RestrictionScope {
     /** Current organization-wide membership level will be used. */
     Organization = 'organization',
     /** Effective level for the current project will be used. */
-    Project = 'project',
+    Project = 'project', // TODO: Rename, as this is actually the environment scope
 }
 
-export interface RestrictedAreaProps {
-    Component: (props: RestrictedComponentProps) => JSX.Element
+export interface UseRestrictedAreaProps {
     minimumAccessLevel: EitherMembershipLevel
     scope?: RestrictionScope
 }
 
-export function RestrictedArea({
-    Component,
-    minimumAccessLevel,
+export interface RestrictedAreaProps extends UseRestrictedAreaProps {
+    Component: (props: RestrictedComponentProps) => JSX.Element
+}
+
+export function useRestrictedArea({
     scope = RestrictionScope.Organization,
-}: RestrictedAreaProps): JSX.Element {
+    minimumAccessLevel,
+}: UseRestrictedAreaProps): null | string {
     const { currentOrganization } = useValues(organizationLogic)
     const { currentTeam } = useValues(teamLogic)
 
     const restrictionReason: null | string = useMemo(() => {
         let scopeAccessLevel: EitherMembershipLevel | null
         if (scope === RestrictionScope.Project) {
-            if (!currentTeam) {
+            if (!isAuthenticatedTeam(currentTeam)) {
                 return 'Loading current project…'
             }
             scopeAccessLevel = currentTeam.effective_membership_level
@@ -45,9 +51,11 @@ export function RestrictedArea({
             }
             scopeAccessLevel = currentOrganization.membership_level
         }
+
         if (scopeAccessLevel === null) {
             return `You don't have access to the current ${scope}.`
         }
+
         if (scopeAccessLevel < minimumAccessLevel) {
             if (minimumAccessLevel === OrganizationMembershipLevel.Owner) {
                 return `This area is restricted to the ${scope} owner.`
@@ -57,15 +65,22 @@ export function RestrictedArea({
             )}s and up. Your level is ${membershipLevelToName.get(scopeAccessLevel)}.`
         }
         return null
-    }, [currentOrganization])
+    }, [currentOrganization, currentTeam, minimumAccessLevel]) // oxlint-disable-line react-hooks/exhaustive-deps
 
-    return restrictionReason ? (
-        <Tooltip title={restrictionReason} placement="topLeft" delayMs={0}>
-            <span>
-                <Component isRestricted={true} restrictionReason={restrictionReason} />
-            </span>
-        </Tooltip>
-    ) : (
-        <Component isRestricted={false} restrictionReason={null} />
-    )
+    useEffect(() => {
+        if (!restrictionReason || !currentTeam?.id || !currentOrganization?.id) {
+            return
+        }
+
+        posthog.capture('restricted_area_accessed', {
+            restriction_reason: restrictionReason,
+            scope,
+            minimum_access_level: minimumAccessLevel,
+            team_id: currentTeam?.id,
+            organization_id: currentOrganization?.id,
+            platform_feature: AvailableFeature.ACCESS_CONTROL,
+        })
+    }, [restrictionReason, scope, minimumAccessLevel, currentTeam?.id, currentOrganization?.id])
+
+    return restrictionReason
 }

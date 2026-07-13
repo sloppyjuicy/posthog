@@ -1,0 +1,182 @@
+import { useActions, useValues } from 'kea'
+
+import { LemonButton, LemonSelect, LemonTag } from '@posthog/lemon-ui'
+import { LemonModal } from '@posthog/lemon-ui'
+
+import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { TestAccountFilterSwitch } from 'lib/components/TestAccountFiltersSwitch'
+import { ActionFilter } from 'scenes/insights/filters/ActionFilter/ActionFilter'
+import { MathAvailability } from 'scenes/insights/filters/ActionFilter/ActionFilterRow/ActionFilterRow'
+import { teamLogic } from 'scenes/teamLogic'
+
+import { ExperimentExposureCriteria, NodeKind } from '~/queries/schema/schema-general'
+import { FilterType } from '~/types'
+
+import { SelectableCard } from '../components/SelectableCard'
+import { EXPOSURE_DEFAULT_EVENT } from '../exposureContract'
+import { commonActionFilterProps } from '../Metrics/Selectors'
+import { exposureConfigToFilter, filterToExposureConfig } from '../utils'
+import { exposureCriteriaModalLogic } from './exposureCriteriaModalLogic'
+
+type ExposureCriteriaModalProps = {
+    onSave: (exposureCriteria: ExperimentExposureCriteria) => void
+}
+
+export function ExposureCriteriaModal({ onSave }: ExposureCriteriaModalProps): JSX.Element | null {
+    const { isExposureCriteriaModalOpen, exposureCriteria } = useValues(exposureCriteriaModalLogic)
+    const { closeExposureCriteriaModal, setExposureCriteria } = useActions(exposureCriteriaModalLogic)
+
+    const { currentTeam } = useValues(teamLogic)
+    const hasFilters = (currentTeam?.test_account_filters || []).length > 0
+
+    return (
+        <LemonModal
+            isOpen={isExposureCriteriaModalOpen}
+            onClose={closeExposureCriteriaModal}
+            width={860}
+            title="Edit exposure criteria"
+            zIndex="1169"
+            footer={
+                <div className="flex items-center gap-2">
+                    <LemonButton
+                        form="edit-experiment-exposure-form"
+                        type="secondary"
+                        onClick={() => {
+                            closeExposureCriteriaModal()
+                        }}
+                    >
+                        Cancel
+                    </LemonButton>
+                    <LemonButton
+                        form="edit-experiment-exposure-form"
+                        onClick={() => {
+                            onSave(exposureCriteria)
+                            closeExposureCriteriaModal()
+                        }}
+                        type="primary"
+                    >
+                        Save
+                    </LemonButton>
+                </div>
+            }
+        >
+            <div className="text-secondary text-sm mb-4">
+                Exposure determines when a user enters your experiment. Only events that occur after exposure are
+                counted in your metrics.
+            </div>
+            <div className="flex gap-4 mb-4">
+                <SelectableCard
+                    title="Default"
+                    description={
+                        <>
+                            When a <LemonTag>{EXPOSURE_DEFAULT_EVENT}</LemonTag> event is recorded, a user is considered{' '}
+                            <strong>exposed</strong> to the experiment and included in the analysis.
+                        </>
+                    }
+                    selected={!exposureCriteria?.exposure_config}
+                    onClick={() => {
+                        setExposureCriteria({
+                            ...exposureCriteria,
+                            exposure_config: undefined,
+                        })
+                    }}
+                />
+                <SelectableCard
+                    title="Custom"
+                    description={
+                        <>
+                            If you can't rely on the <LemonTag>{EXPOSURE_DEFAULT_EVENT}</LemonTag> event, you can select
+                            a custom event to signal that users reached the part of your app where the experiment runs.
+                            You can also filter out users you would like to exclude from the analysis.
+                        </>
+                    }
+                    selected={!!exposureCriteria?.exposure_config}
+                    onClick={() => {
+                        setExposureCriteria({
+                            ...exposureCriteria,
+                            exposure_config: {
+                                kind: NodeKind.ExperimentEventExposureConfig,
+                                event: EXPOSURE_DEFAULT_EVENT,
+                                properties: [],
+                            },
+                        })
+                    }}
+                />
+            </div>
+            {exposureCriteria?.exposure_config && (
+                <div className="mb-4">
+                    <ActionFilter
+                        bordered
+                        filters={exposureConfigToFilter(exposureCriteria.exposure_config)}
+                        setFilters={({ events, actions }: Partial<FilterType>): void => {
+                            const entity = events?.[0] || actions?.[0]
+                            if (entity) {
+                                setExposureCriteria({
+                                    ...exposureCriteria,
+                                    exposure_config: filterToExposureConfig(entity),
+                                })
+                            }
+                        }}
+                        typeKey="experiment-exposure-config"
+                        buttonCopy="Add graph series"
+                        showSeriesIndicator={true}
+                        hideRename={true}
+                        entitiesLimit={1}
+                        mathAvailability={MathAvailability.None}
+                        showNumericalPropsOnly={true}
+                        actionsTaxonomicGroupTypes={[TaxonomicFilterGroupType.Events, TaxonomicFilterGroupType.Actions]}
+                        propertiesTaxonomicGroupTypes={commonActionFilterProps.propertiesTaxonomicGroupTypes}
+                    />
+                </div>
+            )}
+            <div className="w-[405px]">
+                <div className="mb-4">
+                    <label className="block text-sm font-medium text-default mb-2">Multiple variant handling</label>
+                    <LemonSelect
+                        value={exposureCriteria?.multiple_variant_handling || 'exclude'}
+                        onChange={(value) => {
+                            setExposureCriteria({
+                                ...exposureCriteria,
+                                multiple_variant_handling: value as 'exclude' | 'first_seen',
+                            })
+                        }}
+                        options={[
+                            {
+                                value: 'exclude',
+                                label: 'Exclude from analysis',
+                                'data-attr': 'multiple-handling-exclude',
+                            },
+                            {
+                                value: 'first_seen',
+                                label: 'Use first seen variant',
+                                'data-attr': 'multiple-handling-first-seen',
+                            },
+                        ]}
+                        placeholder="Select handling method"
+                        fullWidth
+                    />
+                    <div className="text-xs text-muted mt-1">
+                        {exposureCriteria?.multiple_variant_handling === 'first_seen' &&
+                            'Users exposed to multiple variants will be analyzed using their first seen variant.'}
+                        {(!exposureCriteria?.multiple_variant_handling ||
+                            exposureCriteria?.multiple_variant_handling === 'exclude') &&
+                            'Users exposed to multiple variants will be excluded from the analysis (recommended).'}
+                    </div>
+                </div>
+                <TestAccountFilterSwitch
+                    checked={(() => {
+                        const val = exposureCriteria?.filterTestAccounts
+                        return hasFilters ? !!val : false
+                    })()}
+                    onChange={(checked: boolean) => {
+                        setExposureCriteria({
+                            ...exposureCriteria,
+                            filterTestAccounts: checked,
+                        })
+                    }}
+                    fullWidth
+                />
+            </div>
+        </LemonModal>
+    )
+}

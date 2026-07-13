@@ -1,0 +1,362 @@
+from posthog.settings.utils import get_from_env, str_to_bool
+
+CONSTANCE_DATABASE_PREFIX = "constance:posthog:"
+
+# Warning: Dynamically updating these settings should only be done through the API.
+# CONSTANCE_CONFIG: https://django-constance.readthedocs.io/en/latest/
+#
+# To edit, visit: ${SITE_URL}/admin/posthog/instancesetting/
+
+CONSTANCE_CONFIG = {
+    "RECORDINGS_PERFORMANCE_EVENTS_TTL_WEEKS": (
+        3,
+        "Number of weeks recording performance events will be kept before removing them (for all projects). Storing performance events for a shorter timeframe can help reduce Clickhouse disk usage.",
+        int,
+    ),
+    "MATERIALIZED_COLUMNS_ENABLED": (
+        get_from_env("MATERIALIZED_COLUMNS_ENABLED", True, type_cast=str_to_bool),
+        "Whether materialized columns should be created or used at query time.",
+        bool,
+    ),
+    "COMPUTE_MATERIALIZED_COLUMNS_ENABLED": (
+        get_from_env("COMPUTE_MATERIALIZED_COLUMNS_ENABLED", True, type_cast=str_to_bool),
+        "Whether materialized columns should be created or updated (existing columns will still be used at query time).",
+        bool,
+    ),
+    "AGGREGATE_BY_DISTINCT_IDS_TEAMS": (
+        get_from_env("AGGREGATE_BY_DISTINCT_IDS_TEAMS", ""),
+        "Whether unique users should be counted by distinct IDs. Speeds up queries at the cost of accuracy.",
+        str,
+    ),
+    "PERSON_ON_EVENTS_ENABLED": (
+        get_from_env("PERSON_ON_EVENTS_ENABLED", False, type_cast=str_to_bool),
+        "Whether to use query path using person_id and person_properties on events or the old query",
+        bool,
+    ),
+    "PERSON_ON_EVENTS_V2_ENABLED": (
+        get_from_env("PERSON_ON_EVENTS_V2_ENABLED", False, type_cast=str_to_bool),
+        "Whether to use query path using person_id and person_properties on events or the old query",
+        bool,
+    ),
+    "AUTO_START_ASYNC_MIGRATIONS": (
+        get_from_env("AUTO_START_ASYNC_MIGRATIONS", False, type_cast=str_to_bool),
+        "Whether the earliest unapplied async migration should be triggered automatically on server startup.",
+        bool,
+    ),
+    "ASYNC_MIGRATIONS_ROLLBACK_TIMEOUT": (
+        get_from_env("ASYNC_MIGRATION_ROLLBACK_TIMEOUT", 30, type_cast=int),
+        "The timeout for completing the full rollback of an async migration.",
+        int,
+    ),
+    "ASYNC_MIGRATIONS_DISABLE_AUTO_ROLLBACK": (
+        get_from_env("ASYNC_MIGRATIONS_DISABLE_AUTO_ROLLBACK", False, type_cast=str_to_bool),
+        "Used to disable automatic rollback of failed async migrations.",
+        bool,
+    ),
+    "ASYNC_MIGRATIONS_AUTO_CONTINUE": (
+        get_from_env("ASYNC_MIGRATIONS_AUTO_CONTINUE", True, type_cast=str_to_bool),
+        "Whether to resume the migration, when celery worker crashed.",
+        bool,
+    ),
+    "ASYNC_MIGRATIONS_BLOCK_UPGRADE": (
+        get_from_env("ASYNC_MIGRATIONS_BLOCK_UPGRADE", True, type_cast=str_to_bool),
+        "(Advanced) Whether having an async migration running, errored or required should prevent upgrades.",
+        bool,
+    ),
+    "ASYNC_MIGRATIONS_IGNORE_POSTHOG_VERSION": (
+        get_from_env("ASYNC_MIGRATIONS_IGNORE_POSTHOG_VERSION", False, type_cast=str_to_bool),
+        "(Advanced) Whether to ignore async migrations posthog version restrictions",
+        bool,
+    ),
+    "STRICT_CACHING_TEAMS": (
+        get_from_env("STRICT_CACHING_TEAMS", ""),
+        "Whether to always try to find cached data for historical intervals on trends",
+        str,
+    ),
+    "EMAIL_ENABLED": (
+        get_from_env("EMAIL_ENABLED", True, type_cast=str_to_bool),
+        "Whether email service is enabled or not.",
+        bool,
+    ),
+    "EMAIL_HOST": (
+        get_from_env("EMAIL_HOST", default=""),
+        "Hostname to connect to for establishing SMTP connections.",
+        str,
+    ),
+    "EMAIL_PORT": (
+        get_from_env("EMAIL_PORT", 25, type_cast=int),
+        "Port that should be used to connect to the email host.",
+        int,
+    ),
+    "EMAIL_HOST_USER": (
+        get_from_env(
+            "EMAIL_HOST_USER", default=""
+        ),  # we use default='' so an unconfigured value is an empty string, not a `None`
+        "Credentials to connect to the email host.",
+        str,
+    ),
+    "EMAIL_HOST_PASSWORD": (
+        get_from_env("EMAIL_HOST_PASSWORD", default=""),
+        "Credentials to connect to the email host.",
+        str,
+    ),
+    "EMAIL_USE_TLS": (
+        get_from_env("EMAIL_USE_TLS", False, type_cast=str_to_bool),
+        "Whether to use TLS protocol when connecting to the email host.",
+        bool,
+    ),
+    "EMAIL_USE_SSL": (
+        get_from_env("EMAIL_USE_SSL", False, type_cast=str_to_bool),
+        "Whether to use SSL protocol when connecting to the email host.",
+        bool,
+    ),
+    "EMAIL_DEFAULT_FROM": (
+        get_from_env("EMAIL_DEFAULT_FROM", get_from_env("DEFAULT_FROM_EMAIL", "root@localhost")),
+        "Email address that will appear as the sender in emails (From header).",
+        str,
+    ),
+    "EMAIL_REPLY_TO": (
+        get_from_env("EMAIL_REPLY_TO", default=""),
+        "Reply address to which email clients should send responses.",
+        str,
+    ),
+    "EMAIL_TIMEOUT": (
+        get_from_env("EMAIL_TIMEOUT", 30, type_cast=int),
+        "Socket timeout in seconds for SMTP connections. Bounds how long a send waits on an "
+        "unresponsive relay before raising (and being retried), instead of blocking forever.",
+        int,
+    ),
+    "ASYNC_MIGRATIONS_OPT_OUT_EMAILS": (
+        get_from_env("ASYNC_MIGRATIONS_OPT_OUT_EMAILS", False, type_cast=str_to_bool),
+        "Used to disable emails from async migrations service",
+        bool,
+    ),
+    "GITHUB_APP_SLUG": (
+        get_from_env("GITHUB_APP_SLUG", default=""),
+        "Used to redirect to the correct GitHub App installation page",
+        str,
+    ),
+    "SLACK_APP_CLIENT_ID": (
+        get_from_env("SLACK_APP_CLIENT_ID", default=""),
+        "Used to enable the 'Add to Slack' button across all projects",
+        str,
+    ),
+    "SLACK_APP_CLIENT_SECRET": (
+        get_from_env("SLACK_APP_CLIENT_SECRET", default=""),
+        "Used to enable the 'Add to Slack' button across all projects",
+        str,
+    ),
+    "SLACK_APP_SIGNING_SECRET": (
+        get_from_env("SLACK_APP_SIGNING_SECRET", default=""),
+        "Used to validate Slack events for example when unfurling links",
+        str,
+    ),
+    "SUPPORT_SLACK_APP_CLIENT_ID": (
+        get_from_env("SUPPORT_SLACK_APP_CLIENT_ID", default=""),
+        "Used to enable the 'Add to Slack' button for the SupportHog Slack app.",
+        str,
+    ),
+    "SUPPORT_SLACK_APP_CLIENT_SECRET": (
+        get_from_env("SUPPORT_SLACK_APP_CLIENT_SECRET", default=""),
+        "Used by the SupportHog Slack OAuth callback to exchange authorization codes.",
+        str,
+    ),
+    "SUPPORT_SLACK_SIGNING_SECRET": (
+        get_from_env("SUPPORT_SLACK_SIGNING_SECRET", default=""),
+        "Used to validate incoming webhook events for the Support Slack bot.",
+        str,
+    ),
+    "SUPPORT_TEAMS_APP_ID": (
+        get_from_env("SUPPORT_TEAMS_APP_ID", default=""),
+        "Azure AD Application (client) ID for the SupportHog Teams bot. Shared across all tenants.",
+        str,
+    ),
+    "SUPPORT_TEAMS_APP_SECRET": (
+        get_from_env("SUPPORT_TEAMS_APP_SECRET", default=""),
+        "Azure AD client secret for the SupportHog Teams bot.",
+        str,
+    ),
+    "SUPPORT_TEAMS_APP_TENANT_ID": (
+        get_from_env("SUPPORT_TEAMS_APP_TENANT_ID", default=""),
+        (
+            "Azure AD tenant ID where the SupportHog Teams bot app is registered. "
+            "Set this only if the Azure Bot resource was created as SingleTenant. "
+            "Leave empty for MultiTenant bots (default)."
+        ),
+        str,
+    ),
+    "SUPPORT_TEAMS_CATALOG_APP_ID": (
+        get_from_env("SUPPORT_TEAMS_CATALOG_APP_ID", default=""),
+        (
+            "Teams catalog app id (GUID) for the published SupportHog manifest. This is the id "
+            "Microsoft assigns when the manifest is listed in the Teams Store (AppSource) or uploaded "
+            "to an org catalog — different from SUPPORT_TEAMS_APP_ID, which is the bot's Azure AD "
+            "client id. Required for programmatic install via Graph /teams/{id}/installedApps."
+        ),
+        str,
+    ),
+    "CONVERSATIONS_HMAC_SIGNING_SECRET": (
+        get_from_env("CONVERSATIONS_HMAC_SIGNING_SECRET", default=""),
+        "HMAC signing secret for conversations widget identity verification in the support sidebar.",
+        str,
+    ),
+    "CONVERSATIONS_EMAIL_INBOUND_DOMAIN": (
+        get_from_env("CONVERSATIONS_EMAIL_INBOUND_DOMAIN", default=""),
+        "Mailgun receiving domain for inbound email routing, e.g. mg.posthog.com.",
+        str,
+    ),
+    "CONVERSATIONS_EMAIL_WEBHOOK_SIGNING_KEY": (
+        get_from_env("CONVERSATIONS_EMAIL_WEBHOOK_SIGNING_KEY", default=""),
+        "HMAC signing key for validating inbound Mailgun webhook authenticity.",
+        str,
+    ),
+    "CONVERSATIONS_EMAIL_MAILGUN_API_KEY": (
+        get_from_env("CONVERSATIONS_EMAIL_MAILGUN_API_KEY", default=""),
+        "Mailgun API key for domain management (add/verify/delete sending domains).",
+        str,
+    ),
+    "GITHUB_WEBHOOK_SECRET": (
+        get_from_env("GITHUB_WEBHOOK_SECRET", default=""),
+        "Used to validate GitHub webhook events (HMAC-SHA256 signature verification)",
+        str,
+    ),
+    "PARALLEL_DASHBOARD_ITEM_CACHE": (
+        get_from_env("PARALLEL_DASHBOARD_ITEM_CACHE", default=5),
+        "user to determine how many insight cache updates to run at a time",
+        int,
+    ),
+    "ALLOW_EXPERIMENTAL_ASYNC_MIGRATIONS": (
+        get_from_env("ALLOW_EXPERIMENTAL_ASYNC_MIGRATIONS", default=False),
+        "Used to enable the running of experimental async migrations",
+        bool,
+    ),
+    "RATE_LIMIT_ENABLED": (
+        get_from_env("RATE_LIMIT_ENABLED", False, type_cast=str_to_bool),
+        "Whether rate limiting is enabled",
+        bool,
+    ),
+    "CLICKHOUSE_KILL_SWITCH": (
+        get_from_env("CLICKHOUSE_KILL_SWITCH", "off"),
+        "ClickHouse overload protection. Values: 'off', 'light' (reduce resources, shed background work), 'full' (aggressive caps on everything).",
+        str,
+    ),
+    "CLICKHOUSE_KILL_SWITCH_LIGHT_TEAMS": (
+        get_from_env("CLICKHOUSE_KILL_SWITCH_LIGHT_TEAMS", default=[], type_cast=list[int]),
+        "Comma-separated team IDs always subject to the 'light' ClickHouse kill switch, even when the global kill switch is 'off'. Use this to restrict heavy or abusive teams without degrading the rest of the cluster. The global level wins if higher.",
+        list[int],
+    ),
+    "CLICKHOUSE_KILL_SWITCH_FULL_TEAMS": (
+        get_from_env("CLICKHOUSE_KILL_SWITCH_FULL_TEAMS", default=[], type_cast=list[int]),
+        "Comma-separated team IDs always subject to the 'full' ClickHouse kill switch, even when the global kill switch is 'off'. Use this to restrict heavy or abusive teams without degrading the rest of the cluster.",
+        list[int],
+    ),
+    "CLICKHOUSE_HEDGED_APP_QUERIES": (
+        get_from_env("CLICKHOUSE_HEDGED_APP_QUERIES", False, type_cast=str_to_bool),
+        "Enable hedged requests for online APP queries to ClickHouse.",
+        bool,
+    ),
+    "RATE_LIMITING_ALLOW_LIST_TEAMS": (
+        get_from_env("RATE_LIMITING_ALLOW_LIST_TEAMS", ""),
+        "Whether teams are on an allow list to bypass rate limiting. Comma separated list of team-ids",
+        str,
+    ),
+    "FLAGS_LOG_BODIES_TEAMS": (
+        get_from_env("FLAGS_LOG_BODIES_TEAMS", "{}"),
+        'Per-team /flags request and response body logging. JSON object mapping team_id (string) to a non-empty list of flag-key wildcard patterns; the response is filtered to flags matching any pattern. "{}" disables logging entirely. Examples: \'{"123": ["my-feature", "checkout-*"]}\' logs only matching flag keys for team 123. To capture every flag (rare, noisy), use [\\"*\\"] explicitly. The Rust feature-flags service polls this every ~60s. Limits: at most 100 teams, 50 patterns per team, 256 bytes per pattern.',
+        str,
+    ),
+    "REDIRECT_APP_TO_US": (
+        get_from_env("REDIRECT_APP_TO_US", False, type_cast=str_to_bool),
+        "Temporary option to redirect all app traffic from app.posthog.com to us.posthog.com.",
+        bool,
+    ),
+    "WEB_ANALYTICS_WARMING_DAYS": (
+        get_from_env("WEB_ANALYTICS_WARMING_DAYS", default=7, type_cast=int),
+        "Number of days to look back for frequently-run web analytics queries",
+        int,
+    ),
+    "WEB_ANALYTICS_WARMING_MIN_QUERY_COUNT": (
+        get_from_env("WEB_ANALYTICS_WARMING_MIN_QUERY_COUNT", default=10, type_cast=int),
+        "Minimum query count threshold for web analytics cache warming",
+        int,
+    ),
+    "WEB_ANALYTICS_WARMING_TEAMS_TO_WARM": (
+        get_from_env("WEB_ANALYTICS_WARMING_TEAMS_TO_WARM", default=[2], type_cast=list[int]),
+        "Teams that will have web analytics cache warming enabled",
+        list[int],
+    ),
+    "WEB_ANALYTICS_EVENTS_PREFILTER_TEAM_IDS": (
+        get_from_env("WEB_ANALYTICS_EVENTS_PREFILTER_TEAM_IDS", default=[2, 140988], type_cast=list[int]),
+        "Team IDs that use prefiltered events subqueries in web analytics bounce/scroll queries for better granule pruning",
+        list[int],
+    ),
+}
+
+SETTINGS_ALLOWING_API_OVERRIDE = (
+    "RECORDINGS_PERFORMANCE_EVENTS_TTL_WEEKS",
+    "AUTO_START_ASYNC_MIGRATIONS",
+    "AGGREGATE_BY_DISTINCT_IDS_TEAMS",
+    "ASYNC_MIGRATIONS_ROLLBACK_TIMEOUT",
+    "ASYNC_MIGRATIONS_DISABLE_AUTO_ROLLBACK",
+    "ASYNC_MIGRATIONS_AUTO_CONTINUE",
+    "ASYNC_MIGRATIONS_BLOCK_UPGRADE",
+    "ASYNC_MIGRATIONS_IGNORE_POSTHOG_VERSION",
+    "EMAIL_ENABLED",
+    "EMAIL_HOST",
+    "EMAIL_PORT",
+    "EMAIL_HOST_USER",
+    "EMAIL_HOST_PASSWORD",
+    "EMAIL_USE_TLS",
+    "EMAIL_USE_SSL",
+    "EMAIL_DEFAULT_FROM",
+    "EMAIL_REPLY_TO",
+    "EMAIL_TIMEOUT",
+    "ASYNC_MIGRATIONS_OPT_OUT_EMAILS",
+    "PERSON_ON_EVENTS_ENABLED",
+    "PERSON_ON_EVENTS_V2_ENABLED",
+    "STRICT_CACHING_TEAMS",
+    "GITHUB_APP_SLUG",
+    "SLACK_APP_CLIENT_ID",
+    "SLACK_APP_CLIENT_SECRET",
+    "SLACK_APP_SIGNING_SECRET",
+    "SUPPORT_SLACK_APP_CLIENT_ID",
+    "SUPPORT_SLACK_APP_CLIENT_SECRET",
+    "SUPPORT_SLACK_SIGNING_SECRET",
+    "SUPPORT_TEAMS_APP_ID",
+    "SUPPORT_TEAMS_APP_SECRET",
+    "SUPPORT_TEAMS_APP_TENANT_ID",
+    "SUPPORT_TEAMS_CATALOG_APP_ID",
+    "CONVERSATIONS_HMAC_SIGNING_SECRET",
+    "CONVERSATIONS_EMAIL_INBOUND_DOMAIN",
+    "CONVERSATIONS_EMAIL_WEBHOOK_SIGNING_KEY",
+    "CONVERSATIONS_EMAIL_MAILGUN_API_KEY",
+    "GITHUB_WEBHOOK_SECRET",
+    "PARALLEL_DASHBOARD_ITEM_CACHE",
+    "ALLOW_EXPERIMENTAL_ASYNC_MIGRATIONS",
+    "RATE_LIMIT_ENABLED",
+    "RATE_LIMITING_ALLOW_LIST_TEAMS",
+    "FLAGS_LOG_BODIES_TEAMS",
+    "CLICKHOUSE_KILL_SWITCH",
+    "CLICKHOUSE_KILL_SWITCH_LIGHT_TEAMS",
+    "CLICKHOUSE_KILL_SWITCH_FULL_TEAMS",
+    "CLICKHOUSE_HEDGED_APP_QUERIES",
+    "WEB_ANALYTICS_EVENTS_PREFILTER_TEAM_IDS",
+    "REDIRECT_APP_TO_US",
+    "WEB_ANALYTICS_WARMING_DAYS",
+    "WEB_ANALYTICS_WARMING_MIN_QUERY_COUNT",
+)
+
+# SECRET_SETTINGS can only be updated but will never be exposed through the API (we do store them plain text in the DB)
+# On the frontend UI will clearly show which configuration elements are secret and whether they have a set value or not.
+SECRET_SETTINGS = [
+    "EMAIL_HOST_PASSWORD",
+    "SLACK_APP_CLIENT_SECRET",
+    "SLACK_APP_SIGNING_SECRET",
+    "SUPPORT_SLACK_SIGNING_SECRET",
+    "SUPPORT_SLACK_APP_CLIENT_SECRET",
+    "SUPPORT_TEAMS_APP_SECRET",
+    "CONVERSATIONS_HMAC_SIGNING_SECRET",
+    "CONVERSATIONS_EMAIL_WEBHOOK_SIGNING_KEY",
+    "CONVERSATIONS_EMAIL_MAILGUN_API_KEY",
+    "GITHUB_WEBHOOK_SECRET",
+]

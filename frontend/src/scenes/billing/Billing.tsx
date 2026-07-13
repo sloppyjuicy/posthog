@@ -1,21 +1,297 @@
-import React from 'react'
-import { PageHeader } from 'lib/components/PageHeader'
-import { CurrentPlan } from './CurrentPlan'
-import { CurrentUsage } from './CurrentUsage'
-import { BillingEnrollment } from './BillingEnrollment'
-import { useValues } from 'kea'
 import './Billing.scss'
+
+import clsx from 'clsx'
+import { useActions, useValues } from 'kea'
+import { Field, Form } from 'kea-forms'
+import { router } from 'kea-router'
+import { useEffect } from 'react'
+
+import * as judge from '@posthog/brand/hoggies/png/judge'
+import { IconDocument } from '@posthog/icons'
+import { LemonButton, LemonDivider, LemonInput, Link } from '@posthog/lemon-ui'
+
+import { pngHoggie } from 'lib/brand/hoggies'
+import { StarHog } from 'lib/components/hedgehogs'
+import { RestrictionScope, useRestrictedArea } from 'lib/components/RestrictedArea'
+import { supportLogic } from 'lib/components/Support/supportLogic'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { dayjs } from 'lib/dayjs'
+import { LemonBanner } from 'lib/lemon-ui/LemonBanner'
+import { SpinnerOverlay } from 'lib/lemon-ui/Spinner/Spinner'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { toSentenceCase } from 'lib/utils/strings'
+import { couponLogic } from 'scenes/coupons/couponLogic'
+import { getProductIcon } from 'scenes/onboarding/shared/utils'
+import { membersLogic } from 'scenes/organization/membersLogic'
+import { preflightLogic } from 'scenes/PreflightCheck/preflightLogic'
+import { SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { ProductKey } from '~/queries/schema/schema-general'
+import { BillingProductV2Type } from '~/types'
+
+import { BillingHero } from './BillingHero'
 import { billingLogic } from './billingLogic'
+import { BillingNoAccess } from './BillingNoAccess'
+import { BillingProduct } from './BillingProduct'
+import { BillingSummary } from './BillingSummary'
+import { CodeSeatsSection } from './CodeSeatsSection'
+import { CreditCTAHero } from './CreditCTAHero'
+import { StripePortalButton } from './StripePortalButton'
+import { UnsubscribeCard } from './UnsubscribeCard'
+
+const HedgehogJudge = pngHoggie(judge)
+
+export const scene: SceneExport = {
+    component: Billing,
+    logic: billingLogic,
+}
 
 export function Billing(): JSX.Element {
-    const { billing } = useValues(billingLogic)
+    const {
+        billing,
+        billingLoading,
+        showLicenseDirectInput,
+        isActivateLicenseSubmitting,
+        billingError,
+        showBillingSummary,
+        showCreditCTAHero,
+        showBillingHero,
+        minimumBillingAccessLevel,
+        hasSupportAddonPlan,
+    } = useValues(billingLogic)
+    const { reportBillingShown } = useActions(billingLogic)
+    const { preflight, isCloudOrDev } = useValues(preflightLogic)
+    const { openSupportForm } = useActions(supportLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
+    const { location, searchParams } = useValues(router)
+    const { activeCoupons, couponsOverviewLoading } = useValues(couponLogic({}))
+    const { memberCount } = useValues(membersLogic)
+
+    const restrictionReason = useRestrictedArea({
+        minimumAccessLevel: minimumBillingAccessLevel,
+        scope: RestrictionScope.Organization,
+    })
+
+    useEffect(() => {
+        if (location.pathname === urls.organizationBilling() && featureFlags[FEATURE_FLAGS.USAGE_SPEND_DASHBOARDS]) {
+            router.actions.replace(urls.organizationBillingSection('overview'), searchParams)
+            return
+        }
+    }, [featureFlags, location.pathname, searchParams])
+
+    useEffect(() => {
+        if (billing) {
+            reportBillingShown()
+        }
+    }, [!!billing]) // oxlint-disable-line react-hooks/exhaustive-deps
+
+    if (preflight && !isCloudOrDev) {
+        router.actions.push(urls.default())
+    }
+
+    if ((!billing && billingLoading) || couponsOverviewLoading) {
+        return (
+            <>
+                <SpinnerOverlay sceneLevel />
+            </>
+        )
+    }
+
+    if (restrictionReason) {
+        return <BillingNoAccess reason={restrictionReason} />
+    }
+
+    if (!billing && !billingLoading) {
+        return (
+            <div className="deprecated-space-y-4">
+                <LemonBanner type="error">
+                    {
+                        'There was an issue retrieving your current billing information. If this message persists, please '
+                    }
+                    {preflight?.cloud ? (
+                        <Link onClick={() => openSupportForm({ kind: 'bug', target_area: 'billing' })}>
+                            submit a bug report
+                        </Link>
+                    ) : (
+                        <Link to="mailto:sales@posthog.com">contact sales@posthog.com</Link>
+                    )}
+                    .
+                </LemonBanner>
+            </div>
+        )
+    }
+
+    const products = billing?.products
+    const platformAndSupportProduct = products?.find((product) => product.type === ProductKey.PLATFORM_AND_SUPPORT)
 
     return (
-        <div className="billing-page">
-            <PageHeader title="Billing &amp; usage information" />
-            <CurrentUsage />
-            {billing?.plan ? <CurrentPlan plan={billing.plan} /> : <BillingEnrollment />}
-            <div style={{ marginBottom: 128 }} />
+        <div className="@container">
+            {showLicenseDirectInput && (
+                <>
+                    <Form
+                        logic={billingLogic}
+                        formKey="activateLicense"
+                        enableFormOnSubmit
+                        className="deprecated-space-y-4"
+                    >
+                        <Field name="license" label="Activate license key">
+                            <LemonInput fullWidth autoFocus />
+                        </Field>
+
+                        <LemonButton
+                            type="primary"
+                            htmlType="submit"
+                            loading={isActivateLicenseSubmitting}
+                            fullWidth
+                            center
+                        >
+                            Activate license key
+                        </LemonButton>
+                    </Form>
+                </>
+            )}
+
+            {billingError && (
+                <LemonBanner type={billingError.status} className="mb-2" action={billingError.action}>
+                    {billingError.message}
+                </LemonBanner>
+            )}
+
+            {billing?.trial ? (
+                <LemonBanner type="info" hideIcon className="max-w-300 mb-2">
+                    <div className="flex items-center gap-4">
+                        <HedgehogJudge className="w-20 h-20 flex-shrink-0" />
+                        <div>
+                            <p className="text-lg">You're on (a) trial</p>
+                            <p>
+                                You are currently on a free trial for <b>{toSentenceCase(billing.trial.target)} plan</b>{' '}
+                                until <b>{dayjs(billing.trial.expires_at).format('LL')}</b>.
+                                {billing.trial.type === 'autosubscribe' &&
+                                    ' At the end of the trial you will be automatically subscribed to the plan.'}
+                            </p>
+                        </div>
+                    </div>
+                </LemonBanner>
+            ) : null}
+
+            {(showBillingSummary || showCreditCTAHero || showBillingHero) && (
+                <div
+                    className={clsx(
+                        'flex gap-6 max-w-300',
+                        // If there's no active subscription, BillingSummary is small so we stack it and invert order with CreditCTAHero or BillingHero
+                        billing?.has_active_subscription ? 'flex-col @3xl:flex-row' : 'flex-col-reverse'
+                    )}
+                >
+                    {showBillingSummary && (
+                        <div className={clsx('flex-1', { 'flex-grow-0': showCreditCTAHero })}>
+                            <BillingSummary />
+                        </div>
+                    )}
+                    {(showCreditCTAHero || showBillingHero) && (
+                        <div className={clsx('flex-1', { 'flex-grow-1': showCreditCTAHero })}>
+                            {showCreditCTAHero && <CreditCTAHero />}
+                            {showBillingHero && platformAndSupportProduct && (
+                                <BillingHero product={platformAndSupportProduct} />
+                            )}
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {!showBillingSummary && <StripePortalButton />}
+
+            {!couponsOverviewLoading && activeCoupons.length > 0 && (
+                <div className="mt-6 max-w-300">
+                    <LemonBanner type="info" hideIcon>
+                        <div className="flex items-center gap-4">
+                            <StarHog className="w-16 h-16 flex-shrink-0" />
+                            <div>
+                                <p className="font-semibold mb-2">You have active coupons!</p>
+                                <ul className="list-disc list-inside space-y-1">
+                                    {activeCoupons.map((coupon) => (
+                                        <li key={coupon.code} className="text-sm">
+                                            <span>{coupon.campaign_name}</span>
+                                            {coupon.expires_at && (
+                                                <span className="text-muted ml-1">
+                                                    · until {dayjs(coupon.expires_at).format('LL')}
+                                                </span>
+                                            )}
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        </div>
+                    </LemonBanner>
+                </div>
+            )}
+
+            <LemonDivider className="mt-6 mb-8" />
+
+            {featureFlags[FEATURE_FLAGS.BILLING_FORECASTING_ISSUES] && (
+                <div className="flex mt-6 gap-6 max-w-300 flex-col-reverse">
+                    <LemonBanner type="warning">
+                        <strong>Note:</strong> Our forecasting engine is experiencing an issue. The projected amounts
+                        may appear incorrect. We're working on a fix and it should be resolved soon.
+                    </LemonBanner>
+                </div>
+            )}
+
+            <div className="flex justify-between mt-4">
+                <h2>Products</h2>
+            </div>
+
+            {(memberCount >= 5 && !hasSupportAddonPlan
+                ? [
+                      platformAndSupportProduct,
+                      ...(products?.filter((product) => product.type !== ProductKey.PLATFORM_AND_SUPPORT) ?? []),
+                  ].filter((product): product is BillingProductV2Type => !!product)
+                : products
+            )
+                ?.filter(
+                    (product: BillingProductV2Type) =>
+                        !product.inclusion_only || product.addons.find((a) => !a.inclusion_only)
+                )
+                ?.map((x: BillingProductV2Type) => (
+                    <div key={x.type}>
+                        <BillingProduct product={x} />
+                    </div>
+                ))}
+
+            {featureFlags[FEATURE_FLAGS.POSTHOG_CODE_BILLING] && (
+                <div className="flex flex-wrap max-w-300 pb-8">
+                    <div className="border border-primary rounded w-full bg-surface-primary">
+                        <div className="border-b border-primary rounded-t p-4">
+                            <div className="flex gap-4 items-center justify-between">
+                                <div className="flex gap-x-2">
+                                    <div>{getProductIcon('IconTerminal', { className: 'text-2xl shrink-0' })}</div>
+                                    <div>
+                                        <h3 className="font-bold mb-0">Code</h3>
+                                        <div>Seat-based billing for PostHog Code.</div>
+                                    </div>
+                                </div>
+                                <LemonButton
+                                    icon={<IconDocument />}
+                                    size="small"
+                                    to="https://posthog.com/docs/posthog-code"
+                                    tooltip="Read the docs"
+                                />
+                            </div>
+                        </div>
+                        <div className="p-8">
+                            <CodeSeatsSection />
+                        </div>
+                    </div>
+                </div>
+            )}
+            <div>
+                {billing?.subscription_level == 'paid' && !!platformAndSupportProduct ? (
+                    <>
+                        <LemonDivider />
+                        <UnsubscribeCard product={platformAndSupportProduct} />
+                    </>
+                ) : null}
+            </div>
         </div>
     )
 }

@@ -1,0 +1,37 @@
+import type { z } from 'zod'
+
+import { ExecuteSQLSchema } from '@/schema/tool-inputs'
+import type { Context, ToolBase } from '@/tools/types'
+
+import { invokeMcpTool } from './invokeTool'
+
+export const EXECUTE_SQL_TOOL_NAME = 'execute-sql'
+
+const schema = ExecuteSQLSchema
+
+type Params = z.infer<typeof schema>
+
+export const executeSqlHandler: ToolBase<typeof schema, string>['handler'] = async (
+    context: Context,
+    params: Params
+) => {
+    const result = await invokeMcpTool(context, 'execute_sql', {
+        query: params.query,
+        truncate: params.truncate ?? true,
+        ...(params.connectionId !== undefined && { connectionId: params.connectionId }),
+    })
+
+    if (!result.success) {
+        throw new Error(result.content)
+    }
+
+    return result.content
+}
+
+const tool = (): ToolBase<typeof schema, string> => ({
+    name: EXECUTE_SQL_TOOL_NAME,
+    schema,
+    handler: executeSqlHandler,
+})
+
+export default tool

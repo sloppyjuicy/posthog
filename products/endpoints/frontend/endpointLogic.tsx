@@ -1,0 +1,367 @@
+import { actions, connect, kea, listeners, path, reducers } from 'kea'
+import { loaders } from 'kea-loaders'
+import { router } from 'kea-router'
+
+import api from 'lib/api'
+import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
+import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { debounce } from 'lib/utils/async'
+import { permanentlyMount } from 'lib/utils/kea-logic-builders'
+import { slugify } from 'lib/utils/strings'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { sceneLayoutLogic } from '~/layout/scenes/sceneLayoutLogic'
+import { EndpointRequest, ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
+import { EndpointType, EndpointVersionType } from '~/types'
+
+import type { endpointLogicType } from './endpointLogicType'
+import { endpointsLogic } from './endpointsLogic'
+import { insightPickerEndpointModalLogic } from './insightPickerEndpointModalLogic'
+
+export type CodeExampleTab = 'terminal' | 'python' | 'nodejs'
+
+export const endpointLogic = kea<endpointLogicType>([
+    path(['products', 'endpoints', 'frontend', 'endpointLogic']),
+    connect(() => ({
+        actions: [
+            endpointsLogic,
+            ['loadEndpoints'],
+            sceneLayoutLogic,
+            ['setScenePanelOpen'],
+            teamLogic,
+            ['addProductIntent'],
+        ],
+    })),
+    actions({
+        setEndpointName: (endpointName: string) => ({ endpointName }),
+        setEndpointDescription: (endpointDescription: string | null) => ({ endpointDescription }),
+        setActiveCodeExampleTab: (tab: CodeExampleTab) => ({ tab }),
+        setSelectedCodeExampleVersion: (version: number | null) => ({ version }),
+        setIsUpdateMode: (isUpdateMode: boolean) => ({ isUpdateMode }),
+        setSelectedEndpointName: (selectedEndpointName: string | null) => ({ selectedEndpointName }),
+        openCreateFromInsightModal: true,
+        closeCreateFromInsightModal: true,
+        setDuplicateEndpoint: (endpoint: EndpointType | null) => ({ endpoint }),
+        createEndpoint: (request: EndpointRequest) => ({ request }),
+        createEndpointSuccess: (response: any) => ({ response }),
+        createEndpointFailure: (queryError?: string | null) => ({ queryError }),
+        updateEndpoint: (
+            name: string,
+            request: Partial<EndpointRequest>,
+            options?: { showViewButton?: boolean; version?: number }
+        ) => ({
+            name,
+            request,
+            options,
+        }),
+        updateEndpointSuccess: (
+            response: any,
+            endpointName: string,
+            options?: { showViewButton?: boolean; version?: number }
+        ) => ({
+            response,
+            endpointName,
+            options,
+        }),
+        updateEndpointFailure: (queryError?: string | null) => ({ queryError }),
+        deleteEndpoint: (name: string) => ({ name }),
+        deleteEndpointSuccess: (response: any) => ({ response }),
+        clearMaterializationStatus: true,
+        deleteEndpointFailure: () => ({}),
+        confirmToggleActive: (endpoint: EndpointType) => ({ endpoint }),
+        saveTagsInline: (tags: string[]) => ({ tags }),
+    }),
+    reducers({
+        endpointName: [null as string | null, { setEndpointName: (_, { endpointName }) => endpointName }],
+        endpointDescription: [
+            null as string | null,
+            { setEndpointDescription: (_, { endpointDescription }) => endpointDescription },
+        ],
+        activeCodeExampleTab: ['terminal' as CodeExampleTab, { setActiveCodeExampleTab: (_, { tab }) => tab }],
+        selectedCodeExampleVersion: [
+            null as number | null,
+            { setSelectedCodeExampleVersion: (_, { version }) => version },
+        ],
+        isUpdateMode: [
+            false,
+            {
+                setIsUpdateMode: (_, { isUpdateMode }) => isUpdateMode,
+            },
+        ],
+        selectedEndpointName: [
+            null as string | null,
+            {
+                setSelectedEndpointName: (_, { selectedEndpointName }) => selectedEndpointName,
+            },
+        ],
+        createFromInsightModalOpen: [
+            false,
+            {
+                openCreateFromInsightModal: () => true,
+                setDuplicateEndpoint: (_, { endpoint }) => !!endpoint,
+                closeCreateFromInsightModal: () => false,
+                createEndpointSuccess: () => false,
+            },
+        ],
+        duplicateEndpoint: [
+            null as EndpointType | null,
+            {
+                setDuplicateEndpoint: (_, { endpoint }) => endpoint,
+                createEndpointSuccess: () => null,
+            },
+        ],
+        updatingEndpoint: [
+            false,
+            {
+                updateEndpoint: () => true,
+                updateEndpointSuccess: () => false,
+                updateEndpointFailure: () => false,
+            },
+        ],
+        // Clear stale endpoint data immediately when loading a new endpoint
+        endpoint: [
+            null as EndpointVersionType | null,
+            {
+                loadEndpoint: () => null,
+            },
+        ],
+        versions: [
+            [] as EndpointVersionType[],
+            {
+                loadEndpoint: () => [],
+            },
+        ],
+        // Extend the loader reducer to clear on action
+        materializationStatus: [
+            null as EndpointType['materialization'] | null,
+            {
+                clearMaterializationStatus: () => null,
+            },
+        ],
+    }),
+    loaders(({ actions, values }) => ({
+        endpoint: [
+            null as EndpointVersionType | null,
+            {
+                loadEndpoint: async (name: string) => {
+                    if (!name) {
+                        return null
+                    }
+                    return await api.endpoint.get(name)
+                },
+            },
+        ],
+        materializationStatus: [
+            null as EndpointType['materialization'] | null,
+            {
+                loadMaterializationStatus: async ({ name, version }: { name: string; version?: number }) => {
+                    if (!name) {
+                        return null
+                    }
+                    const materializationStatus = await api.endpoint.getMaterializationStatus(name, version)
+
+                    // Update the endpoint object with the new materialization status (only for current version)
+                    if (values.endpoint && version === undefined) {
+                        const updatedEndpoint = {
+                            ...values.endpoint,
+                            materialization: materializationStatus,
+                            is_materialized: materializationStatus?.can_materialize
+                                ? !!materializationStatus.status
+                                : false,
+                        }
+                        actions.loadEndpointSuccess(updatedEndpoint)
+                    }
+
+                    return materializationStatus
+                },
+            },
+        ],
+        versions: [
+            [] as EndpointVersionType[],
+            {
+                loadVersions: async (name: string) => {
+                    if (!name) {
+                        return []
+                    }
+                    const response = await api.endpoint.listVersions(name)
+                    return response.results
+                },
+            },
+        ],
+    })),
+    listeners(({ actions, values }) => {
+        const reloadMaterializationStatus = debounce((name: string, version?: number): void => {
+            actions.loadMaterializationStatus({ name, version })
+        }, 2000)
+        return {
+            openCreateFromInsightModal: () => {
+                actions.loadEndpoints()
+            },
+            closeCreateFromInsightModal: () => {
+                actions.setDuplicateEndpoint(null)
+                insightPickerEndpointModalLogic.findMounted()?.actions.clearSelectedInsight()
+            },
+            createEndpoint: async ({ request }) => {
+                try {
+                    if (request.name) {
+                        request.name = slugify(request.name)
+                    }
+                    const response = await api.endpoint.create(request)
+                    actions.createEndpointSuccess(response)
+                } catch (error: any) {
+                    console.error('Failed to create endpoint:', error)
+                    actions.createEndpointFailure(error.detail || null)
+                }
+            },
+            createEndpointSuccess: ({ response }) => {
+                actions.setEndpointName('')
+                actions.setEndpointDescription('')
+                actions.loadEndpoints()
+                insightPickerEndpointModalLogic.findMounted()?.actions.closeModal()
+                lemonToast.success(<>Endpoint created</>, {
+                    button: {
+                        label: 'View',
+                        action: () => {
+                            // Close the scene panel (info & actions panel) if endpoint was created from insight
+                            if (response.derived_from_insight) {
+                                actions.setScenePanelOpen(false)
+                            }
+                            router.actions.push(urls.endpoint(response.name))
+                        },
+                    },
+                })
+
+                // Mark endpoint creation task as completed
+                globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.CreateFirstEndpoint)
+
+                // Track product intent for sidebar visibility
+                const intentContext = response.derived_from_insight
+                    ? ProductIntentContext.ENDPOINT_CREATED_FROM_INSIGHT
+                    : ProductIntentContext.ENDPOINT_CREATED_FROM_SQL_EDITOR
+                actions.addProductIntent({
+                    product_type: ProductKey.ENDPOINTS,
+                    intent_context: intentContext,
+                })
+            },
+            createEndpointFailure: ({ queryError }) => {
+                if (queryError) {
+                    lemonToast.error(`Failed to create endpoint: ${queryError}`)
+                } else {
+                    lemonToast.error('Failed to create endpoint')
+                }
+            },
+            updateEndpoint: async ({ name, request, options }) => {
+                try {
+                    const response = await api.endpoint.update(name, request, options?.version)
+                    actions.updateEndpointSuccess(response, name, options)
+                } catch (error: any) {
+                    console.error('Failed to update endpoint:', error)
+                    const queryError = error.attr === 'query' ? error.detail : null
+                    actions.updateEndpointFailure(queryError)
+                }
+            },
+            updateEndpointSuccess: ({ response, endpointName, options }) => {
+                actions.setEndpointDescription(null)
+                actions.loadEndpoints()
+                // Reload versions if we updated a specific version
+                if (options?.version) {
+                    actions.loadVersions(endpointName)
+                }
+                if (options?.showViewButton) {
+                    lemonToast.success(<>Endpoint updated</>, {
+                        button: {
+                            label: 'View',
+                            action: () => router.actions.push(urls.endpoint(endpointName)),
+                        },
+                    })
+                } else {
+                    lemonToast.success('Endpoint updated')
+                    actions.loadEndpoint(endpointName)
+                }
+
+                reloadMaterializationStatus(endpointName, options?.version)
+
+                // Mark activation task as completed when endpoint is activated
+                if (response.is_active) {
+                    globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.ConfigureEndpoint)
+                }
+            },
+            updateEndpointFailure: ({ queryError }) => {
+                if (queryError) {
+                    lemonToast.error(`Failed to update endpoint: ${queryError}`)
+                } else {
+                    lemonToast.error('Failed to update endpoint')
+                }
+            },
+            saveTagsInline: async ({ tags }, breakpoint) => {
+                const endpoint = values.endpoint
+                if (!endpoint) {
+                    return
+                }
+                actions.loadEndpointSuccess({ ...endpoint, tags } as EndpointVersionType)
+
+                await breakpoint(250)
+
+                try {
+                    const saved = await api.endpoint.update(endpoint.name, { tags } as Partial<EndpointRequest>)
+                    breakpoint()
+
+                    actions.loadEndpointSuccess(saved as EndpointVersionType)
+                    actions.loadEndpoints()
+                } catch (error: any) {
+                    if (error.isBreakpoint) {
+                        throw error
+                    }
+                    actions.loadEndpointSuccess(endpoint)
+                    lemonToast.error('Failed to save tags')
+                }
+            },
+            deleteEndpoint: async ({ name }) => {
+                try {
+                    await api.endpoint.delete(name)
+                    actions.deleteEndpointSuccess(name)
+                } catch (error) {
+                    console.error('Failed to delete endpoint:', error)
+                    actions.deleteEndpointFailure()
+                }
+            },
+            deleteEndpointSuccess: () => {
+                lemonToast.success('Endpoint deleted')
+                actions.loadEndpoints()
+            },
+            deleteEndpointFailure: () => {
+                lemonToast.error('Failed to delete endpoint')
+            },
+            confirmToggleActive: ({ endpoint }) => {
+                const isActivating = !endpoint.is_active
+                LemonDialog.open({
+                    title: isActivating ? 'Activate endpoint?' : 'Deactivate endpoint?',
+                    content: (
+                        <div className="text-sm text-secondary">
+                            {isActivating
+                                ? 'Are you sure you want to activate this endpoint? It will be accessible via the API.'
+                                : 'Are you sure you want to deactivate this endpoint? It will no longer be accessible via the API.'}
+                        </div>
+                    ),
+                    primaryButton: {
+                        children: isActivating ? 'Activate' : 'Deactivate',
+                        type: 'primary',
+                        status: isActivating ? undefined : 'danger',
+                        onClick: () => {
+                            actions.updateEndpoint(endpoint.name, { is_active: isActivating })
+                        },
+                        size: 'small',
+                    },
+                    secondaryButton: {
+                        children: 'Cancel',
+                        type: 'tertiary',
+                        size: 'small',
+                    },
+                })
+            },
+        }
+    }),
+    permanentlyMount(),
+])

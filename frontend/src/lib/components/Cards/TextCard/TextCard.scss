@@ -1,0 +1,20 @@
+.TextCard__body {
+    flex: 1;
+    overflow-y: auto;
+
+    ul {
+        padding-left: 1.5rem;
+        list-style-position: outside;
+        list-style-type: disc;
+    }
+
+    ol {
+        padding-left: 1.5rem;
+        list-style-position: outside;
+        list-style-type: decimal;
+    }
+
+    img {
+        max-width: 100%;
+    }
+}

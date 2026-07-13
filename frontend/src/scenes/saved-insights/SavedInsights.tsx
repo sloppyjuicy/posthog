@@ -1,447 +1,1188 @@
-import { Col, Dropdown, Input, Menu, Row, Select, Table, Tabs, Radio } from 'antd'
-import { useActions, useValues } from 'kea'
-import { Link } from 'lib/components/Link'
-import { ObjectTags } from 'lib/components/ObjectTags'
-import { deleteWithUndo, humanFriendlyDetailedTime } from 'lib/utils'
-import React from 'react'
-import { DashboardItemType, LayoutView, SavedInsightsTabs } from '~/types'
-import { savedInsightsLogic } from './savedInsightsLogic'
-import {
-    StarOutlined,
-    StarFilled,
-    LeftOutlined,
-    RightOutlined,
-    UnorderedListOutlined,
-    AppstoreFilled,
-    EllipsisOutlined,
-    LineChartOutlined,
-    BarChartOutlined,
-    PartitionOutlined,
-    TableOutlined,
-    CalendarOutlined,
-    ArrowDownOutlined,
-    MenuOutlined,
-    CaretDownFilled,
-} from '@ant-design/icons'
 import './SavedInsights.scss'
-import { organizationLogic } from 'scenes/organizationLogic'
-import { DashboardItem, displayMap, getDisplayedType } from 'scenes/dashboard/DashboardItem'
-import { membersLogic } from 'scenes/organization/Settings/membersLogic'
-import { normalizeColumnTitle } from 'lib/components/Table/utils'
-import { dashboardsModel } from '~/models/dashboardsModel'
-import { DateFilter } from 'lib/components/DateFilter/DateFilter'
-import '../insights/InsightHistoryPanel/InsightHistoryPanel.scss'
-import dayjs from 'dayjs'
 
-import { PageHeader } from 'lib/components/PageHeader'
+import { useActions, useValues } from 'kea'
+import { ComponentType } from 'react'
+
+import {
+    IconAI,
+    IconBrackets,
+    IconCorrelationAnalysis,
+    IconCursor,
+    IconFlask,
+    IconFunnels,
+    IconGraph,
+    IconHogQL,
+    IconLifecycle,
+    IconLineGraph,
+    IconLive,
+    IconLlmAnalytics,
+    IconPerson,
+    IconPieChart,
+    IconPiggyBank,
+    IconPlusSmall,
+    IconRetention,
+    IconSparkles,
+    IconRetentionHeatmap,
+    IconHeart,
+    IconHeartFilled,
+    IconStickiness,
+    IconTrash,
+    IconTrends,
+    IconUserPaths,
+    IconVideoCamera,
+    IconWarning,
+} from '@posthog/icons'
+import { LemonSelectOptions } from '@posthog/lemon-ui'
+
+import { AccessControlAction } from 'lib/components/AccessControlAction'
+import { ActivityLog } from 'lib/components/ActivityLog/ActivityLog'
+import { BulkUpdateTagsButton } from 'lib/components/BulkActions/BulkUpdateTagsButton'
+import { ObjectTags } from 'lib/components/ObjectTags/ObjectTags'
+import { Shortcut } from 'lib/components/Shortcuts/Shortcut'
+import { keyBinds } from 'lib/components/Shortcuts/shortcuts'
+import { TZLabel } from 'lib/components/TZLabel'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { dayjs } from 'lib/dayjs'
+import { IconAction, IconTableChart } from 'lib/lemon-ui/icons'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { More } from 'lib/lemon-ui/LemonButton/More'
+import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
+import { LemonDivider } from 'lib/lemon-ui/LemonDivider'
+import { LemonMenu, LemonMenuItems } from 'lib/lemon-ui/LemonMenu'
+import { LemonTable, LemonTableColumns } from 'lib/lemon-ui/LemonTable'
+import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
+import { LemonTabs } from 'lib/lemon-ui/LemonTabs'
+import { LemonTag } from 'lib/lemon-ui/LemonTag'
+import { ProfilePicture } from 'lib/lemon-ui/ProfilePicture'
+import { Tooltip } from 'lib/lemon-ui/Tooltip'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { accessLevelSatisfied } from 'lib/utils/accessControlUtils'
+import { cn } from 'lib/utils/css-classes'
+import { deleteInsightWithUndo } from 'lib/utils/deleteWithUndo'
+import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { isNonEmptyObject } from 'lib/utils/guards'
 import { SavedInsightsEmptyState } from 'scenes/insights/EmptyStates'
+import { useSummarizeInsight } from 'scenes/insights/summarizeInsight'
+import { INSIGHT_TYPE_URLS } from 'scenes/insights/utils'
+import { projectLogic } from 'scenes/projectLogic'
+import { NewInsightShortcuts } from 'scenes/saved-insights/newInsightsMenu'
+import { SavedInsightsFilters } from 'scenes/saved-insights/SavedInsightsFilters'
+import { sceneConfigurations } from 'scenes/scenes'
+import { Scene, SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
 
-const { TabPane } = Tabs
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import { NodeKind, ProductKey } from '~/queries/schema/schema-general'
+import { isNodeWithSource } from '~/queries/utils'
+import {
+    AccessControlLevel,
+    AccessControlResourceType,
+    ActivityScope,
+    InsightType,
+    QueryBasedInsightModel,
+    SavedInsightsTabs,
+} from '~/types'
 
-interface InsightType {
-    type: string
-    icon?: JSX.Element
+import { Alerts } from 'products/alerts/frontend/views/Alerts'
+
+import { ReloadInsight } from './ReloadInsight'
+import { SavedInsightListItem, savedInsightsLogic } from './savedInsightsLogic'
+
+export interface InsightTypeMetadata {
+    name: string
+    description?: string
+    /** Override the description on the insight page tab, for additional info. */
+    tooltipDescription?: string
+    icon: React.ComponentType<any>
+    inMenu: boolean
+    tooltipDocLink?: string
 }
 
-export interface InsightItem {
-    type: string
-    description: string
+export const QUERY_TYPES_METADATA: Record<NodeKind, InsightTypeMetadata> = {
+    [NodeKind.CalendarHeatmapQuery]: {
+        name: 'Calendar heatmap (BETA)',
+        description: 'Visualize total or unique users broken down by day and hour.',
+        icon: IconRetentionHeatmap,
+        inMenu: true,
+        // tooltipDescription TODO: Add tooltip description
+    },
+    [NodeKind.TrendsQuery]: {
+        name: 'Trends',
+        description: 'Visualize and break down how actions or events vary over time.',
+        icon: IconTrends,
+        inMenu: true,
+        tooltipDocLink: 'https://posthog.com/docs/product-analytics/trends/overview',
+    },
+    [NodeKind.FunnelsQuery]: {
+        name: 'Funnel',
+        description: 'Discover how many users complete or drop out of a sequence of actions.',
+        icon: IconFunnels,
+        inMenu: true,
+        tooltipDocLink: 'https://posthog.com/docs/product-analytics/funnels',
+    },
+    [NodeKind.RetentionQuery]: {
+        name: 'Retention',
+        description: 'See how many users return on subsequent days after an initial action.',
+        icon: IconRetention,
+        inMenu: true,
+        tooltipDocLink: 'https://posthog.com/docs/product-analytics/retention',
+    },
+    [NodeKind.PathsQuery]: {
+        name: 'Paths',
+        description: 'Trace the journeys users take within your product and where they drop off.',
+        icon: IconUserPaths,
+        inMenu: true,
+        tooltipDocLink: 'https://posthog.com/docs/product-analytics/paths',
+    },
+    [NodeKind.StickinessQuery]: {
+        name: 'Stickiness',
+        description: 'See what keeps users coming back by viewing the interval between repeated actions.',
+        icon: IconStickiness,
+        inMenu: true,
+        tooltipDocLink: 'https://posthog.com/docs/product-analytics/stickiness',
+    },
+    [NodeKind.LifecycleQuery]: {
+        name: 'Lifecycle',
+        description: 'Understand growth by breaking down new, resurrected, returning and dormant users.',
+        tooltipDescription: 'Understand growth by breaking down new, resurrected, returning and dormant users.',
+        icon: IconLifecycle,
+        inMenu: true,
+        tooltipDocLink: 'https://posthog.com/docs/product-analytics/lifecycle',
+    },
+    [NodeKind.FunnelCorrelationQuery]: {
+        name: 'Funnel Correlation',
+        description: 'See which events or properties correlate to a funnel result.',
+        icon: IconCorrelationAnalysis,
+        inMenu: false,
+    },
+    [NodeKind.EventsNode]: {
+        name: 'Events',
+        description: 'List and explore events.',
+        icon: IconCursor,
+        inMenu: true,
+    },
+    [NodeKind.ActionsNode]: {
+        name: 'Actions',
+        description: 'List and explore actions.',
+        icon: IconAction,
+        inMenu: true,
+    },
+    [NodeKind.DataWarehouseNode]: {
+        name: 'Data Warehouse',
+        description: 'List and explore data warehouse tables.',
+        icon: IconTableChart,
+        inMenu: true,
+    },
+    [NodeKind.FunnelsDataWarehouseNode]: {
+        name: 'Funnels Data Warehouse',
+        description: 'List and explore funnels data warehouse tables.',
+        icon: IconTableChart,
+        inMenu: true,
+    },
+    [NodeKind.LifecycleDataWarehouseNode]: {
+        name: 'Lifecycle Data Warehouse',
+        description: 'List and explore lifecycle data warehouse tables.',
+        icon: IconTableChart,
+        inMenu: true,
+    },
+    [NodeKind.GroupNode]: {
+        name: 'Groups',
+        description: 'List and explore grouped events.',
+        icon: IconCursor,
+        inMenu: false,
+    },
+    [NodeKind.EventsQuery]: {
+        name: 'Events Query',
+        description: 'List and explore events.',
+        icon: IconCursor,
+        inMenu: true,
+    },
+    [NodeKind.SessionBatchEventsQuery]: {
+        name: 'Session Batch Events',
+        description: 'Batch query for events from multiple sessions.',
+        icon: IconCursor,
+        inMenu: false,
+    },
+    [NodeKind.PersonsNode]: {
+        name: 'Persons',
+        description: 'List and explore your persons.',
+        icon: IconPerson,
+        inMenu: true,
+    },
+    [NodeKind.ActorsQuery]: {
+        name: 'Persons',
+        description: 'List of persons matching specified conditions.',
+        icon: IconPerson,
+        inMenu: false,
+    },
+    [NodeKind.InsightActorsQuery]: {
+        name: 'Persons',
+        description: 'List of persons matching specified conditions, derived from an insight.',
+        icon: IconPerson,
+        inMenu: false,
+    },
+    [NodeKind.ExperimentActorsQuery]: {
+        name: 'Persons',
+        description: 'List of persons matching specified conditions, derived from an experiment.',
+        icon: IconPerson,
+        inMenu: false,
+    },
+    [NodeKind.InsightActorsQueryOptions]: {
+        name: 'Persons',
+        description: 'Options for InsightActorsQuery.',
+        icon: IconPerson,
+        inMenu: false,
+    },
+    [NodeKind.StickinessActorsQuery]: {
+        name: 'Persons',
+        description: 'List of persons matching specified conditions, derived from an insight.',
+        icon: IconPerson,
+        inMenu: false,
+    },
+    [NodeKind.FunnelsActorsQuery]: {
+        name: 'Persons',
+        description: 'List of persons matching specified conditions, derived from an insight.',
+        icon: IconPerson,
+        inMenu: false,
+    },
+    [NodeKind.FunnelCorrelationActorsQuery]: {
+        name: 'Persons',
+        description: 'List of persons matching specified conditions, derived from an insight.',
+        icon: IconPerson,
+        inMenu: false,
+    },
+    [NodeKind.GroupsQuery]: {
+        name: 'Groups',
+        description: 'List and explore groups.',
+        icon: IconPerson,
+        inMenu: false,
+    },
+    [NodeKind.DataTableNode]: {
+        name: 'Data table',
+        description: 'Slice and dice your data in a table.',
+        icon: IconTableChart,
+        inMenu: true,
+    },
+    [NodeKind.DataVisualizationNode]: {
+        name: 'SQL',
+        description: 'Slice and dice your data in a table or chart.',
+        icon: IconTableChart,
+        inMenu: false,
+    },
+    [NodeKind.SavedInsightNode]: {
+        name: 'Insight visualization by short id',
+        description: 'View your insights.',
+        icon: IconGraph,
+        inMenu: true,
+    },
+    [NodeKind.InsightVizNode]: {
+        name: 'Insight visualization',
+        description: 'View your insights.',
+        icon: IconGraph,
+        inMenu: true,
+    },
+    [NodeKind.SessionsTimelineQuery]: {
+        name: 'Sessions',
+        description: 'Sessions timeline query.',
+        icon: IconTrends,
+        inMenu: true,
+    },
+    [NodeKind.HogQLQuery]: {
+        name: 'SQL',
+        description: 'Direct SQL query.',
+        icon: IconBrackets,
+        inMenu: true,
+    },
+    [NodeKind.HogQLMetadata]: {
+        name: 'SQL Metadata',
+        description: 'Metadata for a SQL query.',
+        icon: IconHogQL,
+        inMenu: true,
+    },
+    [NodeKind.HogQLAutocomplete]: {
+        name: 'SQL Autocomplete',
+        description: 'Autocomplete for the SQL query editor.',
+        icon: IconHogQL,
+        inMenu: false,
+    },
+    [NodeKind.DatabaseSchemaQuery]: {
+        name: 'Database Schema',
+        description: 'Introspect the PostHog database schema.',
+        icon: IconHogQL,
+        inMenu: true,
+    },
+    [NodeKind.RevenueAnalyticsMetricsQuery]: {
+        name: 'Revenue Analytics Metrics',
+        description: 'View revenue analytics customer, subscription count, ARPU, and LTV.',
+        icon: IconPiggyBank,
+        inMenu: true,
+    },
+    [NodeKind.RevenueAnalyticsOverviewQuery]: {
+        name: 'Revenue Analytics Overview',
+        description: 'View revenue analytics overview.',
+        icon: IconPiggyBank,
+        inMenu: true,
+    },
+    [NodeKind.RevenueAnalyticsGrossRevenueQuery]: {
+        name: 'Revenue Analytics Gross Revenue',
+        description: 'View gross revenue analytics.',
+        icon: IconPiggyBank,
+        inMenu: true,
+    },
+    [NodeKind.RevenueAnalyticsMRRQuery]: {
+        name: 'Revenue Analytics MRR',
+        description: 'View MRR revenue analytics.',
+        icon: IconPiggyBank,
+        inMenu: true,
+    },
+    [NodeKind.RevenueAnalyticsTopCustomersQuery]: {
+        name: 'Revenue Analytics Top Customers',
+        description: 'View revenue analytics top customers.',
+        icon: IconPiggyBank,
+        inMenu: true,
+    },
+    [NodeKind.WebOverviewQuery]: {
+        name: 'Overview Stats',
+        description: 'View overview stats for a website.',
+        icon: IconPieChart,
+        inMenu: true,
+    },
+    [NodeKind.WebStatsTableQuery]: {
+        name: 'Web Table',
+        description: 'A table of results from web analytics, with a breakdown.',
+        icon: IconPieChart,
+        inMenu: true,
+    },
+    [NodeKind.WebGoalsQuery]: {
+        name: 'Goals',
+        description: 'View goal conversions.',
+        icon: IconPieChart,
+        inMenu: true,
+    },
+    [NodeKind.WebExternalClicksTableQuery]: {
+        name: 'External click urls',
+        description: 'View clicks on external links.',
+        icon: IconPieChart,
+        inMenu: true,
+    },
+    [NodeKind.WebVitalsQuery]: {
+        name: 'Web vitals',
+        description: 'View web vitals.',
+        icon: IconPieChart,
+        inMenu: true,
+    },
+    [NodeKind.WebVitalsPathBreakdownQuery]: {
+        name: 'Web vitals path breakdown',
+        description: 'View web vitals broken down by path.',
+        icon: IconPieChart,
+        inMenu: true,
+    },
+    [NodeKind.WebPageURLSearchQuery]: {
+        name: 'Web Page URL Search',
+        description: 'Search and analyze web page URLs.',
+        icon: IconPieChart,
+        inMenu: true,
+    },
+    [NodeKind.HogQuery]: {
+        name: 'Hog',
+        description: 'Hog query.',
+        icon: IconHogQL,
+        inMenu: true,
+    },
+    [NodeKind.SessionAttributionExplorerQuery]: {
+        name: 'Session Attribution',
+        description: 'Session Attribution Explorer.',
+        icon: IconPieChart,
+        inMenu: true,
+    },
+    [NodeKind.SessionsQuery]: {
+        name: 'Sessions',
+        description: 'List and explore sessions.',
+        icon: IconTableChart,
+        inMenu: false,
+    },
+    [NodeKind.RevenueExampleEventsQuery]: {
+        name: 'Revenue Example Events',
+        description: 'Revenue Example Events Query.',
+        icon: IconTableChart,
+        inMenu: true,
+    },
+    [NodeKind.RevenueExampleDataWarehouseTablesQuery]: {
+        name: 'Revenue Example Data Warehouse Tables',
+        description: 'Revenue Example Data Warehouse Tables Query.',
+        icon: IconTableChart,
+        inMenu: true,
+    },
+    [NodeKind.ErrorTrackingQuery]: {
+        name: 'Error Tracking',
+        description: 'List and explore exception groups.',
+        icon: IconWarning,
+        inMenu: false,
+    },
+    [NodeKind.ErrorTrackingIssueCorrelationQuery]: {
+        name: 'Error Tracking Correlation',
+        description: 'Explore issues affecting other events.',
+        icon: IconCorrelationAnalysis,
+        inMenu: false,
+    },
+    [NodeKind.ErrorTrackingSimilarIssuesQuery]: {
+        name: 'Error Tracking Similar Issues',
+        description: 'Explore issues similar to the selected one.',
+        icon: IconWarning,
+        inMenu: false,
+    },
+    [NodeKind.ErrorTrackingBreakdownsQuery]: {
+        name: 'Error Tracking Breakdowns',
+        description: 'Break down error tracking issues by properties.',
+        icon: IconWarning,
+        inMenu: false,
+    },
+    [NodeKind.RecordingsQuery]: {
+        name: 'Session Recordings',
+        description: 'View available recordings.',
+        icon: IconVideoCamera,
+        inMenu: false,
+    },
+    [NodeKind.ExperimentQuery]: {
+        name: 'Experiment Result',
+        description: 'View experiment result.',
+        icon: IconFlask,
+        inMenu: false,
+    },
+    [NodeKind.ExperimentExposureQuery]: {
+        name: 'Experiment Exposure',
+        description: 'View experiment exposure.',
+        icon: IconFlask,
+        inMenu: false,
+    },
+    [NodeKind.ExperimentTrendsQuery]: {
+        name: 'Experiment Trends Result',
+        description: 'View experiment trend result.',
+        icon: IconFlask,
+        inMenu: false,
+    },
+    [NodeKind.ExperimentFunnelsQuery]: {
+        name: 'Experiment Funnels Result',
+        description: 'View experiment funnel result.',
+        icon: IconFlask,
+        inMenu: false,
+    },
+    [NodeKind.ExperimentEventExposureConfig]: {
+        name: 'Experiment Event Exposure Config',
+        description: 'Experiment event exposure configuration.',
+        icon: IconFlask,
+        inMenu: false,
+    },
+    [NodeKind.ExperimentMetric]: {
+        name: 'Experiment Metric',
+        description: 'Experiment metric configuration.',
+        icon: IconFlask,
+        inMenu: false,
+    },
+    [NodeKind.ExperimentDataWarehouseNode]: {
+        name: 'Experiment Data Warehouse',
+        description: 'Experiment data warehouse source configuration.',
+        icon: IconFlask,
+        inMenu: false,
+    },
+    [NodeKind.TeamTaxonomyQuery]: {
+        name: 'Team Taxonomy',
+        icon: IconHogQL,
+        inMenu: false,
+    },
+    [NodeKind.EventTaxonomyQuery]: {
+        name: 'Event Taxonomy',
+        icon: IconHogQL,
+        inMenu: false,
+    },
+    [NodeKind.SuggestedQuestionsQuery]: {
+        name: 'AI Suggested Questions',
+        icon: IconHogQL,
+        inMenu: false,
+    },
+    [NodeKind.ActorsPropertyTaxonomyQuery]: {
+        name: 'Actor Property Taxonomy',
+        description: "View the taxonomy of the actor's property.",
+        icon: IconHogQL,
+        inMenu: false,
+    },
+    [NodeKind.TracesQuery]: {
+        name: 'AI observability traces',
+        icon: IconLlmAnalytics,
+        inMenu: false,
+    },
+    [NodeKind.SessionQuery]: {
+        name: 'AI observability session',
+        icon: IconLlmAnalytics,
+        inMenu: false,
+    },
+    [NodeKind.TraceNeighborsQuery]: {
+        name: 'AI observability trace neighbors',
+        icon: IconLlmAnalytics,
+        inMenu: false,
+    },
+    [NodeKind.TraceQuery]: {
+        name: 'AI observability trace',
+        icon: IconLlmAnalytics,
+        inMenu: false,
+    },
+    [NodeKind.DocumentSimilarityQuery]: {
+        name: 'Document Similarity',
+        description: 'Find documents similar to a given query.',
+        icon: IconAI,
+        inMenu: false,
+    },
+    [NodeKind.VectorSearchQuery]: {
+        name: 'Vector Search',
+        icon: IconHogQL,
+        inMenu: false,
+    },
+    [NodeKind.LogsQuery]: {
+        name: 'Logs',
+        icon: IconLive,
+        inMenu: false,
+    },
+    [NodeKind.LogAttributesQuery]: {
+        name: 'LogAttributes',
+        icon: IconLive,
+        inMenu: false,
+    },
+    [NodeKind.LogValuesQuery]: {
+        name: 'LogValues',
+        icon: IconLive,
+        inMenu: false,
+    },
+    [NodeKind.MetricsQuery]: {
+        name: 'Metrics',
+        description: 'Chart a service metric over time',
+        icon: IconLive,
+        inMenu: false,
+    },
+    [NodeKind.TraceSpansQuery]: {
+        name: 'Trace Spans',
+        icon: IconLive,
+        inMenu: false,
+    },
+    [NodeKind.TraceSpansAggregationQuery]: {
+        name: 'Trace Spans Aggregation',
+        icon: IconLive,
+        inMenu: false,
+    },
+    [NodeKind.TraceSpansTreeQuery]: {
+        name: 'Trace Spans Tree',
+        icon: IconLive,
+        inMenu: false,
+    },
+    [NodeKind.TraceSpansAttributeBreakdownQuery]: {
+        name: 'Trace Spans Attribute Breakdown',
+        icon: IconLive,
+        inMenu: false,
+    },
+    [NodeKind.TraceSpansSymbolStatsQuery]: {
+        name: 'Trace Spans Symbol Stats',
+        icon: IconLive,
+        inMenu: false,
+    },
+    [NodeKind.WebAnalyticsExternalSummaryQuery]: {
+        name: 'Web Analytics External Summary',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.MarketingAnalyticsTableQuery]: {
+        name: 'Marketing Analytics Table',
+        icon: IconHogQL,
+        inMenu: false,
+    },
+    [NodeKind.MarketingAnalyticsAggregatedQuery]: {
+        name: 'Marketing Analytics Aggregated',
+        icon: IconHogQL,
+        inMenu: false,
+    },
+    [NodeKind.NonIntegratedConversionsTableQuery]: {
+        name: 'Non-Integrated Conversions Table',
+        icon: IconHogQL,
+        inMenu: false,
+    },
+    [NodeKind.UsageMetricsQuery]: {
+        name: 'Usage Metrics',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.AccountsQuery]: {
+        name: 'Accounts',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.EndpointsUsageOverviewQuery]: {
+        name: 'Endpoints usage overview',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.EndpointsUsageTableQuery]: {
+        name: 'Endpoints usage table',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.EndpointsUsageTrendsQuery]: {
+        name: 'Endpoints usage trends',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.PropertyValuesQuery]: {
+        name: 'Property values',
+        icon: IconHogQL,
+        inMenu: false,
+    },
+    [NodeKind.WebNotableChangesQuery]: {
+        name: 'Notable changes',
+        description: 'View notable changes in web analytics metrics.',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.MCPHarnessBreakdownQuery]: {
+        name: 'MCP harness breakdown',
+        description: 'MCP tool-call activity grouped by client harness.',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.MCPToolSampleIntentsQuery]: {
+        name: 'MCP tool sample intents',
+        description: 'Recent sampled intents for a single MCP tool.',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.MCPToolNeighborsQuery]: {
+        name: 'MCP tool neighbors',
+        description: 'Tools called adjacent to a single MCP tool within a conversation.',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.MCPToolStatsQuery]: {
+        name: 'MCP tool stats',
+        description: 'Summary stats for a single MCP tool.',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.MCPToolDailyStatsQuery]: {
+        name: 'MCP tool daily stats',
+        description: 'Per-day activity for a single MCP tool.',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.MCPToolDescriptionsQuery]: {
+        name: 'MCP tool descriptions',
+        description: 'Reported descriptions for a single MCP tool.',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.MCPToolTopUsersQuery]: {
+        name: 'MCP tool top users',
+        description: 'Top users of a single MCP tool.',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+    [NodeKind.MCPToolFailuresQuery]: {
+        name: 'MCP tool failures',
+        description: 'Recurring exception messages for a single MCP tool.',
+        icon: IconPieChart,
+        inMenu: false,
+    },
+}
+
+export const INSIGHT_TYPES_METADATA: Record<InsightType, InsightTypeMetadata> = {
+    [InsightType.TRENDS]: QUERY_TYPES_METADATA[NodeKind.TrendsQuery],
+    [InsightType.FUNNELS]: QUERY_TYPES_METADATA[NodeKind.FunnelsQuery],
+    [InsightType.RETENTION]: QUERY_TYPES_METADATA[NodeKind.RetentionQuery],
+    [InsightType.PATHS]: QUERY_TYPES_METADATA[NodeKind.PathsQuery],
+    [InsightType.STICKINESS]: QUERY_TYPES_METADATA[NodeKind.StickinessQuery],
+    [InsightType.LIFECYCLE]: QUERY_TYPES_METADATA[NodeKind.LifecycleQuery],
+    [InsightType.SQL]: {
+        name: 'SQL',
+        description: 'Use SQL to query your data.',
+        icon: IconHogQL,
+        inMenu: true,
+        tooltipDocLink: 'https://posthog.com/docs/data-warehouse/sql',
+    },
+    [InsightType.JSON]: {
+        name: 'Custom',
+        description: 'Save components powered by our JSON query language.',
+        icon: IconBrackets,
+        inMenu: true,
+    },
+    [InsightType.HOG]: {
+        name: 'Hog',
+        description: 'Use Hog to query your data.',
+        icon: IconHogQL,
+        inMenu: false,
+    },
+    [InsightType.WEB_ANALYTICS]: {
+        name: 'Web Analytics',
+        description: 'Web analytics insights from your website data.',
+        icon: IconLineGraph,
+        inMenu: false,
+    },
+}
+
+export const INSIGHT_TYPE_OPTIONS: LemonSelectOptions<string> = [
+    { value: 'All types', label: 'All types' },
+    ...Object.entries(INSIGHT_TYPES_METADATA)
+        .filter(([, meta]) => meta.inMenu !== false)
+        .map(([value, meta]) => ({
+            value,
+            label: meta.name,
+            icon: meta.icon ? <meta.icon /> : undefined,
+        })),
+]
+
+export const scene: SceneExport = {
+    component: SavedInsights,
+    logic: savedInsightsLogic,
+    productKey: ProductKey.PRODUCT_ANALYTICS,
+}
+
+export function InsightIcon({
+    insight,
+    className,
+}: {
+    insight: QueryBasedInsightModel
+    className?: string
+}): JSX.Element | null {
+    let Icon: ComponentType<any> | null = null
+
+    if ('query' in insight && isNonEmptyObject(insight.query)) {
+        const insightType = isNodeWithSource(insight.query) ? insight.query.source.kind : insight.query.kind
+        const insightMetadata = QUERY_TYPES_METADATA[insightType]
+        Icon = insightMetadata && insightMetadata.icon
+    }
+
+    return Icon ? <Icon className={className} /> : null
+}
+
+export function NewInsightButton(): JSX.Element {
+    const { featureFlags } = useValues(featureFlagLogic)
+
+    const insightEntries = Object.entries(INSIGHT_TYPES_METADATA).filter(
+        ([insightType]) =>
+            insightType !== InsightType.JSON && (featureFlags[FEATURE_FLAGS.HOG] || insightType !== InsightType.HOG)
+    )
+    const menuItems: LemonMenuItems = [
+        {
+            icon: <IconSparkles className="text-ai" />,
+            label: (
+                <div className="flex flex-col text-sm py-1">
+                    <strong>AI</strong>
+                    <span className="text-xs font-normal">
+                        Ask PostHog AI to create insights using natural language and query any of your data
+                    </span>
+                </div>
+            ),
+            to: urls.ai(),
+            'data-attr': 'new-insight-menu-ai',
+        },
+        {
+            title: 'Insight types',
+            items: insightEntries
+                .filter(([, metadata]) => metadata.inMenu)
+                .map(([insightType, metadata]) => ({
+                    icon: metadata.icon ? <metadata.icon /> : undefined,
+                    label: (
+                        <div className="flex flex-col text-sm py-1">
+                            <strong>{metadata.name}</strong>
+                            <span className="text-xs font-normal">{metadata.description}</span>
+                        </div>
+                    ),
+                    to: INSIGHT_TYPE_URLS[insightType as InsightType],
+                    'data-attr': `new-insight-menu-${insightType.toLowerCase()}`,
+                    onClick: () => {
+                        eventUsageLogic.actions.reportSavedInsightNewInsightClicked(insightType)
+                    },
+                })),
+        },
+    ]
+
+    return (
+        <AccessControlAction
+            resourceType={AccessControlResourceType.Insight}
+            minAccessLevel={AccessControlLevel.Editor}
+        >
+            <Shortcut
+                name="NewInsight"
+                keybind={[keyBinds.new]}
+                intent="New insight"
+                interaction="click"
+                scope={Scene.SavedInsights}
+                priority={100}
+            >
+                <LemonMenu items={menuItems} placement="bottom-end">
+                    <LemonButton
+                        type="primary"
+                        data-attr="saved-insights-new-insight-button"
+                        size="small"
+                        icon={<IconPlusSmall />}
+                        tooltip="New insight"
+                    >
+                        New
+                    </LemonButton>
+                </LemonMenu>
+            </Shortcut>
+        </AccessControlAction>
+    )
 }
 
 export function SavedInsights(): JSX.Element {
     const {
         loadInsights,
         updateFavoritedInsight,
-        loadPaginatedInsights,
-        setLayoutView,
-        setSearchTerm,
-        setTab,
-        setInsightType,
-        setCreatedBy,
         renameInsight,
         duplicateInsight,
-        addToDashboard,
-        setDates,
-        orderByUpdatedAt,
-        orderByCreator,
-        addGraph,
+        setSavedInsightsFilters,
+        bulkDeleteInsights,
     } = useActions(savedInsightsLogic)
     const {
         insights,
-        count,
-        offset,
-        nextResult,
-        previousResult,
         insightsLoading,
-        layoutView,
-        searchTerm,
-        dates: { dateFrom, dateTo },
+        filters,
+        sorting,
+        pagination,
+        alertModalId,
+        usingFilters,
+        bulkDeleteResponseLoading,
     } = useValues(savedInsightsLogic)
-    const { dashboards } = useValues(dashboardsModel)
-    const { hasDashboardCollaboration } = useValues(organizationLogic)
-    const { members } = useValues(membersLogic)
-    const insightTypes: InsightType[] = [
-        { type: 'All types' },
-        { type: 'Trends', icon: <LineChartOutlined /> },
-        { type: 'Funnels', icon: <BarChartOutlined /> },
-        { type: 'Retention', icon: <TableOutlined /> },
-        { type: 'Paths', icon: <PartitionOutlined /> },
-        { type: 'Sessions', icon: <CalendarOutlined /> },
-        { type: 'Stickiness', icon: <LineChartOutlined /> },
-        { type: 'Lifecycle', icon: <BarChartOutlined /> },
-    ]
-    const pageLimit = 15
-    const paginationCount = (): number => {
-        if (!previousResult) {
-            // no previous url means it's the first result set
-            return 1
-        }
-        if (nextResult) {
-            return offset - pageLimit
-        }
-        return count - (insights?.results.length || 0)
-    }
 
-    const columns = [
+    const { currentProjectId } = useValues(projectLogic)
+    const summarizeInsight = useSummarizeInsight()
+
+    const { tab } = filters
+
+    const columns: LemonTableColumns<SavedInsightListItem> = [
+        {
+            key: 'id',
+            width: 32,
+            render: function renderType(_, insight) {
+                return <InsightIcon insight={insight} className="text-secondary text-2xl" />
+            },
+        },
         {
             title: 'Name',
             dataIndex: 'name',
             key: 'name',
-            render: function renderName(name: string, insight: DashboardItemType) {
-                const link = displayMap[getDisplayedType(insight.filters)].link(insight)
-
+            render: function renderName(name: string, insight) {
                 return (
-                    <Col>
-                        <Row>
-                            <Link to={link} style={{ marginRight: 12 }}>
-                                <strong>{name || `Insight #${insight.id}`}</strong>
-                            </Link>
-                            <div
-                                style={{ cursor: 'pointer', width: 'fit-content' }}
-                                onClick={() =>
-                                    updateFavoritedInsight({ id: insight.id, favorited: !insight.favorited })
+                    <div className="flex items-center gap-1">
+                        <LemonTableLink
+                            to={urls.insightView(insight.short_id)}
+                            title={name || <i>{summarizeInsight(insight.query)}</i>}
+                            description={insight.description}
+                        />
+                        <AccessControlAction
+                            resourceType={AccessControlResourceType.Insight}
+                            minAccessLevel={AccessControlLevel.Editor}
+                            userAccessLevel={insight.user_access_level}
+                        >
+                            <LemonButton
+                                size="xsmall"
+                                onClick={() => updateFavoritedInsight(insight, !insight.favorited)}
+                                icon={
+                                    insight.favorited ? (
+                                        <IconHeartFilled className="text-danger" />
+                                    ) : (
+                                        <IconHeart className="text-secondary" />
+                                    )
                                 }
-                            >
-                                {insight.favorited ? (
-                                    <StarFilled className="text-warning" />
-                                ) : (
-                                    <StarOutlined className="star-outlined" />
-                                )}
-                            </div>
-                        </Row>
-                        {hasDashboardCollaboration && (
-                            <div className="text-muted-alt">{insight.description || 'No description provided'}</div>
+                                tooltip={`${insight.favorited ? 'Remove from' : 'Add to'} favorite insights`}
+                            />
+                        </AccessControlAction>
+                        {insight.search_match_type === 'similar' && (
+                            <span className="ml-auto">
+                                <Tooltip title="Not an exact match for your search, but a close one">
+                                    <LemonTag type="muted" size="small">
+                                        similar
+                                    </LemonTag>
+                                </Tooltip>
+                            </span>
                         )}
-                    </Col>
+                    </div>
+                )
+            },
+            sorter: (a, b) => (a.name || summarizeInsight(a.query)).localeCompare(b.name || summarizeInsight(b.query)),
+        },
+        {
+            title: 'Tags',
+            dataIndex: 'tags' as keyof SavedInsightListItem,
+            key: 'tags',
+            render: function renderTags(tags: string[]) {
+                return <ObjectTags tags={[...tags].sort()} staticOnly />
+            },
+        },
+        {
+            title: 'Created by',
+            dataIndex: 'created_by' as keyof SavedInsightListItem,
+            render: function Render(_: any, item: SavedInsightListItem) {
+                const { created_by } = item
+                return (
+                    <div className="flex flex-row items-center flex-nowrap">
+                        {created_by && <ProfilePicture user={created_by} size="md" showName />}
+                    </div>
+                )
+            },
+            sorter: (a, b) =>
+                (a.created_by?.first_name || a.created_by?.email || '').localeCompare(
+                    b.created_by?.first_name || b.created_by?.email || ''
+                ),
+        },
+        {
+            title: 'Created',
+            dataIndex: 'created_at',
+            render: function RenderCreated(created_at: string) {
+                return created_at ? (
+                    <div className="whitespace-nowrap text-right">
+                        <TZLabel time={created_at} />
+                    </div>
+                ) : (
+                    <span className="text-secondary">—</span>
+                )
+            },
+            align: 'right',
+            defaultSortOrder: -1,
+            sorter: (a, b) => dayjs(a.created_at || 0).diff(b.created_at || 0),
+        },
+        {
+            title: 'Last modified',
+            sorter: true,
+            defaultSortOrder: -1,
+            dataIndex: 'last_modified_at',
+            render: function renderLastModified(last_modified_at: string) {
+                return (
+                    <div className="whitespace-nowrap">{last_modified_at && <TZLabel time={last_modified_at} />}</div>
                 )
             },
         },
-        hasDashboardCollaboration
-            ? {
-                  title: 'Tags',
-                  dataIndex: 'tags',
-                  key: 'tags',
-                  render: function renderTags(tags: string[]) {
-                      return <ObjectTags tags={tags} staticOnly />
-                  },
-              }
-            : {},
         {
-            title: (
-                <div className="order-by" onClick={orderByUpdatedAt}>
-                    Last modified{' '}
-                    <div style={{ fontSize: 10, paddingLeft: 8 }}>
-                        <ArrowDownOutlined />
-                        <MenuOutlined />
+            title: 'Last viewed',
+            sorter: true,
+            defaultSortOrder: -1,
+            dataIndex: 'last_viewed_at',
+            render: function renderLastViewed(last_viewed_at: string | null) {
+                return (
+                    <div className="whitespace-nowrap">
+                        {last_viewed_at ? <TZLabel time={last_viewed_at} /> : <span className="text-muted">Never</span>}
                     </div>
-                </div>
-            ),
-            dataIndex: 'updated_at',
-            key: 'updated_at',
-            render: function renderLastModified(updated_at: string) {
-                return <span>{humanFriendlyDetailedTime(updated_at)}</span>
+                )
             },
         },
         {
-            title: (
-                <div className="order-by" onClick={orderByCreator}>
-                    {normalizeColumnTitle('Created by')}
-                </div>
-            ),
-            render: function Render(_: any, item: DashboardItemType) {
+            width: 0,
+            render: function Render(_, insight) {
                 return (
-                    <Row style={{ alignItems: 'center', justifyContent: 'space-between' }}>
-                        <div>{item.created_by ? item.created_by.first_name || item.created_by.email : '-'}</div>
-                        <Dropdown
-                            placement="bottomRight"
-                            trigger={['click']}
-                            overlayStyle={{ minWidth: 240, border: '1px solid var(--primary)' }}
-                            overlay={
-                                <Menu style={{ padding: '12px 4px' }} data-attr={`insight-${item.id}-dropdown-menu`}>
-                                    {dashboards.filter((d) => d.id !== item.id).length > 0 ? (
-                                        <Menu.SubMenu
-                                            data-attr={'insight-' + item.id + '-dropdown-move'}
-                                            key="move"
-                                            title="Add to dashboard"
-                                        >
-                                            {dashboards
-                                                .filter((d) => d.id !== item.id)
-                                                .map((dashboard, moveIndex) => (
-                                                    <Menu.Item
-                                                        data-attr={`insight-item-${item.id}-dropdown-move-${moveIndex}`}
-                                                        key={dashboard.id}
-                                                        onClick={() => addToDashboard(item, dashboard.id)}
-                                                    >
-                                                        {dashboard.name}
-                                                    </Menu.Item>
-                                                ))}
-                                        </Menu.SubMenu>
-                                    ) : null}
-                                    <Menu.Item
-                                        onClick={() => renameInsight(item.id)}
-                                        data-attr={`insight-item-${item.id}-dropdown-rename`}
-                                        title="Rename"
+                    <More
+                        overlay={
+                            <>
+                                <LemonButton to={urls.insightView(insight.short_id)} fullWidth>
+                                    View
+                                </LemonButton>
+
+                                <LemonDivider />
+
+                                <AccessControlAction
+                                    resourceType={AccessControlResourceType.Insight}
+                                    minAccessLevel={AccessControlLevel.Editor}
+                                    userAccessLevel={insight.user_access_level}
+                                >
+                                    <LemonButton to={urls.insightEdit(insight.short_id)} fullWidth>
+                                        Edit
+                                    </LemonButton>
+                                </AccessControlAction>
+
+                                <AccessControlAction
+                                    resourceType={AccessControlResourceType.Insight}
+                                    minAccessLevel={AccessControlLevel.Editor}
+                                    userAccessLevel={insight.user_access_level}
+                                >
+                                    <LemonButton
+                                        onClick={() => renameInsight(insight)}
+                                        data-attr={`insight-item-${insight.short_id}-dropdown-rename`}
+                                        fullWidth
                                     >
                                         Rename
-                                    </Menu.Item>
-                                    <Menu.Item
-                                        onClick={() => duplicateInsight(item)}
-                                        data-attr={`insight-item-${item.id}-dropdown-duplicate`}
-                                    >
-                                        Duplicate
-                                    </Menu.Item>
-                                    <Menu.Item
-                                        onClick={() =>
-                                            deleteWithUndo({
-                                                object: item,
-                                                endpoint: 'insight',
-                                                callback: loadInsights,
+                                    </LemonButton>
+                                </AccessControlAction>
+
+                                <LemonButton
+                                    onClick={() => duplicateInsight(insight)}
+                                    data-attr="duplicate-insight-from-list-view"
+                                    fullWidth
+                                >
+                                    Duplicate
+                                </LemonButton>
+
+                                <LemonDivider />
+
+                                <AccessControlAction
+                                    resourceType={AccessControlResourceType.Insight}
+                                    minAccessLevel={AccessControlLevel.Editor}
+                                    userAccessLevel={insight.user_access_level}
+                                >
+                                    <LemonButton
+                                        status="danger"
+                                        onClick={() => {
+                                            LemonDialog.open({
+                                                title: 'Delete insight?',
+                                                description:
+                                                    'Are you sure you want to delete this insight? This action can be undone.',
+                                                primaryButton: {
+                                                    children: 'Delete',
+                                                    status: 'danger',
+                                                    onClick: () =>
+                                                        void deleteInsightWithUndo({
+                                                            object: insight,
+                                                            endpoint: `projects/${currentProjectId}/insights`,
+                                                            callback: loadInsights,
+                                                        }),
+                                                },
+                                                secondaryButton: {
+                                                    children: 'Cancel',
+                                                },
                                             })
-                                        }
-                                        style={{ color: 'var(--danger)' }}
-                                        data-attr={`insight-item-${item.id}-dropdown-remove`}
+                                        }}
+                                        data-attr={`insight-item-${insight.short_id}-dropdown-remove`}
+                                        fullWidth
                                     >
-                                        Remove
-                                    </Menu.Item>
-                                </Menu>
-                            }
-                        >
-                            <EllipsisOutlined
-                                style={{ color: 'var(--primary)' }}
-                                className="insight-dropdown-actions"
-                            />
-                        </Dropdown>
-                    </Row>
+                                        Delete insight
+                                    </LemonButton>
+                                </AccessControlAction>
+                            </>
+                        }
+                    />
                 )
             },
         },
-    ]
-
-    const menuItems: InsightItem[] = [
-        { type: 'Trends', description: 'Visualize how actions or events are varying over time' },
-        { type: 'Funnels', description: 'Visualize completion and dropoff between events' },
-        { type: 'Sessions', description: 'Understand how users are spending their time in your product' },
-        { type: 'Retention', description: 'Visualize how many users return on subsequent days after a session' },
-        { type: 'Paths', description: 'Understand how traffic is flowing through your product' },
-        { type: 'Stickiness', description: 'See how many days users performed an action within a timeframe' },
-        { type: 'Lifecycle', description: 'See new, resurrected, returning, and dormant users' },
     ]
 
     return (
-        <div className="saved-insights">
-            <Row style={{ justifyContent: 'space-between', alignItems: 'baseline' }}>
-                <PageHeader title={'Insights'} />
-                <Dropdown
-                    overlay={
-                        <Menu style={{ maxWidth: 320, border: '1px solid var(--primary)' }}>
-                            {menuItems.map((menuItem: InsightItem) => (
-                                <Menu.Item
-                                    onClick={() => {
-                                        addGraph(menuItem.type)
-                                    }}
-                                    style={{ margin: 8 }}
-                                    key={menuItem.type}
-                                >
-                                    <Col>
-                                        <span style={{ fontWeight: 600 }}>{menuItem.type}</span>
-                                        <p className="text-muted" style={{ whiteSpace: 'break-spaces' }}>
-                                            {menuItem.description}
-                                        </p>
-                                    </Col>
-                                </Menu.Item>
-                            ))}
-                        </Menu>
-                    }
-                    trigger={['click']}
-                >
-                    <a className="new-insight-dropdown-btn" onClick={(e) => e.preventDefault()}>
-                        New Insight <CaretDownFilled style={{ paddingLeft: 12 }} />
-                    </a>
-                </Dropdown>
-            </Row>
+        <SceneContent className={cn('saved-insights')}>
+            <NewInsightShortcuts />
+            <SceneTitleSection
+                name={sceneConfigurations[Scene.SavedInsights].name}
+                description={sceneConfigurations[Scene.SavedInsights].description}
+                resourceType={{
+                    type: sceneConfigurations[Scene.SavedInsights].iconType || 'default_icon_type',
+                }}
+                actions={<NewInsightButton />}
+            />
+            <LemonTabs
+                activeKey={tab}
+                onChange={(tab) => setSavedInsightsFilters({ tab })}
+                tabs={[
+                    { key: SavedInsightsTabs.All, label: 'All insights' },
+                    { key: SavedInsightsTabs.Yours, label: 'My insights' },
+                    {
+                        key: SavedInsightsTabs.Alerts,
+                        label: <div className="flex items-center gap-2">Alerts</div>,
+                    },
+                    { key: SavedInsightsTabs.History, label: 'History' },
+                ]}
+                sceneInset
+            />
 
-            <Tabs defaultActiveKey="1" style={{ borderColor: '#D9D9D9' }} onChange={(tab) => setTab(tab)}>
-                <TabPane tab="All Insights" key={SavedInsightsTabs.All} />
-                <TabPane tab="Your Insights" key={SavedInsightsTabs.Yours} />
-                <TabPane tab="Favorites" key={SavedInsightsTabs.Favorites} />
-            </Tabs>
-            <Row style={{ paddingBottom: 16, justifyContent: 'space-between' }}>
-                <Col>
-                    <Input.Search
-                        allowClear
-                        enterButton
-                        placeholder="Search for insights"
-                        style={{ width: 240 }}
-                        onChange={(e) => setSearchTerm(e.target.value)}
-                        value={searchTerm || ''}
-                        onSearch={() => loadInsights()}
-                    />
-                </Col>
-                <Col>
-                    Type
-                    <Select defaultValue="All types" style={{ paddingLeft: 8, width: 120 }} onChange={setInsightType}>
-                        {insightTypes.map((insight: InsightType, index) => (
-                            <Select.Option key={index} value={insight.type}>
-                                {insight.icon}
-                                <span style={{ paddingLeft: 8 }}>{insight.type}</span>
-                            </Select.Option>
-                        ))}
-                    </Select>
-                </Col>
-                <Col>
-                    <div>
-                        <span style={{ paddingRight: 8 }}>Last modified</span>
-                        <DateFilter
-                            defaultValue="All time"
-                            disabled={false}
-                            bordered={true}
-                            dateFrom={dateFrom}
-                            dateTo={dateTo}
-                            onChange={setDates}
-                        />
-                    </div>
-                </Col>
-                <Col>
-                    Created by
-                    <Select
-                        defaultValue="All users"
-                        style={{ paddingLeft: 8, width: 120 }}
-                        onChange={(userId) => {
-                            const createdBy = userId === 'All users' ? undefined : userId
-                            setCreatedBy({ id: createdBy })
-                        }}
-                    >
-                        <Select.Option value={'All users'}>All users</Select.Option>
-                        {members.map((member) => (
-                            <Select.Option key={member.user.id} value={member.user.id}>
-                                {member.user.first_name}
-                            </Select.Option>
-                        ))}
-                    </Select>
-                </Col>
-            </Row>
-            {insights.count > 0 && (
-                <Row className="list-or-card-layout">
-                    Showing {paginationCount()} - {nextResult ? offset : count} of {count} insights
-                    <div>
-                        <Radio.Group
-                            onChange={(e) => setLayoutView(e.target.value)}
-                            value={layoutView}
-                            buttonStyle="solid"
-                        >
-                            <Radio.Button value={LayoutView.List}>
-                                <UnorderedListOutlined className="mr-05" />
-                                List
-                            </Radio.Button>
-                            <Radio.Button value={LayoutView.Card}>
-                                <AppstoreFilled className="mr-05" />
-                                Card
-                            </Radio.Button>
-                        </Radio.Group>
-                    </div>
-                </Row>
-            )}
-            {!insightsLoading && insights.count < 1 ? (
-                <SavedInsightsEmptyState />
+            {tab === SavedInsightsTabs.History ? (
+                <ActivityLog scope={ActivityScope.INSIGHT} />
+            ) : tab === SavedInsightsTabs.Alerts ? (
+                <Alerts alertId={alertModalId} />
             ) : (
                 <>
-                    {layoutView === LayoutView.List ? (
-                        <Table
-                            loading={insightsLoading}
-                            columns={columns}
-                            dataSource={insights.results}
-                            pagination={false}
-                            rowKey="id"
-                            footer={() => (
-                                <Row className="footer-pagination">
-                                    <span className="text-muted-alt">
-                                        {insights.count > 0 &&
-                                            `Showing ${paginationCount()} - ${
-                                                nextResult ? offset : count
-                                            } of ${count} insights`}
-                                    </span>
-                                    <LeftOutlined
-                                        style={{ paddingRight: 16 }}
-                                        className={`${!previousResult ? 'paginate-disabled' : ''}`}
-                                        onClick={() => {
-                                            previousResult && loadPaginatedInsights(previousResult)
+                    <SavedInsightsFilters
+                        filters={filters}
+                        setFilters={setSavedInsightsFilters}
+                        quickFilters={
+                            tab === SavedInsightsTabs.Yours
+                                ? ['insightType', 'tags', 'favorites', 'featureFlags']
+                                : undefined
+                        }
+                    />
+                    <ReloadInsight />
+                    <LemonTable
+                        loading={insightsLoading}
+                        columns={columns}
+                        dataSource={insights.results}
+                        pagination={pagination}
+                        noSortingCancellation
+                        sorting={sorting}
+                        onSort={(newSorting) =>
+                            setSavedInsightsFilters({
+                                order: newSorting
+                                    ? `${newSorting.order === -1 ? '-' : ''}${newSorting.columnKey}`
+                                    : undefined,
+                            })
+                        }
+                        rowKey="id"
+                        loadingSkeletonRows={15}
+                        nouns={['insight', 'insights']}
+                        hideSortingIndicatorWhenInactive
+                        emptyState={
+                            !insightsLoading && insights.count < 1 ? (
+                                <div className="py-8">
+                                    <SavedInsightsEmptyState filters={filters} usingFilters={usingFilters} />
+                                </div>
+                            ) : undefined
+                        }
+                        bulkSelection={{
+                            getKey: (insight: SavedInsightListItem): number => insight.id,
+                            isRowSelectable: (insight: SavedInsightListItem) =>
+                                accessLevelSatisfied(
+                                    AccessControlResourceType.Insight,
+                                    insight.user_access_level,
+                                    AccessControlLevel.Editor
+                                )
+                                    ? true
+                                    : { disabledReason: "You don't have permission to edit this insight." },
+                            rowAriaLabel: (insight: SavedInsightListItem) =>
+                                `Select insight ${insight.name || 'Untitled'}`,
+                            headerAriaLabel: 'Select all insights on this page',
+                            renderActions: (ctx) => (
+                                <>
+                                    <BulkUpdateTagsButton
+                                        resource="insights"
+                                        selectedIds={ctx.selectedKeys}
+                                        onSuccess={() => {
+                                            ctx.clearSelection()
+                                            loadInsights()
                                         }}
                                     />
-                                    <RightOutlined
-                                        className={`${!nextResult ? 'paginate-disabled' : ''}`}
+                                    <LemonButton
+                                        type="primary"
+                                        status="danger"
+                                        size="small"
+                                        icon={<IconTrash />}
+                                        loading={bulkDeleteResponseLoading}
                                         onClick={() => {
-                                            nextResult && loadPaginatedInsights(nextResult)
+                                            const count = ctx.selectedCount
+                                            const noun = count === 1 ? 'insight' : 'insights'
+                                            LemonDialog.open({
+                                                title: `Delete ${count} ${noun}?`,
+                                                description: `Are you sure you want to delete ${count} ${noun}? This action can be undone.`,
+                                                primaryButton: {
+                                                    children: 'Delete',
+                                                    status: 'danger',
+                                                    onClick: () => {
+                                                        bulkDeleteInsights({ ids: [...ctx.selectedKeys] })
+                                                        ctx.clearSelection()
+                                                    },
+                                                },
+                                                secondaryButton: {
+                                                    children: 'Cancel',
+                                                },
+                                            })
                                         }}
-                                    />
-                                </Row>
-                            )}
-                        />
-                    ) : (
-                        <Row gutter={[16, 16]}>
-                            {insights &&
-                                insights.results.map((insight: DashboardItemType, index: number) => (
-                                    <Col
-                                        xs={24}
-                                        sm={12}
-                                        md={insights.results.length > 1 ? 8 : 12}
-                                        key={insight.id}
-                                        style={{ height: 270 }}
                                     >
-                                        <DashboardItem
-                                            item={{ ...insight, color: null }}
-                                            key={insight.id + '_user'}
-                                            loadDashboardItems={() => {
-                                                loadInsights()
-                                            }}
-                                            dashboardMode={null}
-                                            onClick={() => {
-                                                const _type = getDisplayedType(insight.filters)
-                                                if (_type) {
-                                                    window.open(displayMap[_type].link(insight))
-                                                }
-                                            }}
-                                            preventLoading={true}
-                                            index={index}
-                                            isOnEditMode={false}
-                                            footer={
-                                                <div className="dashboard-item-footer">
-                                                    {
-                                                        <>
-                                                            Saved {dayjs(insight.created_at).fromNow()} by{' '}
-                                                            {insight.created_by?.first_name ||
-                                                                insight.created_by?.email ||
-                                                                'unknown'}
-                                                        </>
-                                                    }
-                                                </div>
-                                            }
-                                        />
-                                    </Col>
-                                ))}
-                        </Row>
-                    )}
+                                        Delete selected
+                                    </LemonButton>
+                                </>
+                            ),
+                        }}
+                    />
                 </>
             )}
-        </div>
+        </SceneContent>
     )
 }

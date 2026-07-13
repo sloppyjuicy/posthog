@@ -1,30 +1,113 @@
 import json
-from datetime import timedelta
-from typing import Any, Dict, List, Optional, Union, cast
+import time
+import uuid
+import random
+import urllib
+import builtins
+import dataclasses
+from datetime import datetime
+from typing import Any, Iterator, List, Optional, Union, cast  # noqa: UP035
 
-from django.db.models import Prefetch, QuerySet
-from django.db.models.query_utils import Q
+from django.conf import settings
 from django.utils import timezone
-from django.utils.timezone import now
+
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter
+from opentelemetry import trace
+from prometheus_client import Counter
 from rest_framework import mixins, request, response, serializers, viewsets
-from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import NotFound
 from rest_framework.pagination import LimitOffsetPagination
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
+from rest_framework.renderers import BaseRenderer
 from rest_framework.settings import api_settings
 from rest_framework_csv import renderers as csvrenderers
 
-from posthog.api.routing import StructuredViewSetMixin
-from posthog.models import Element, ElementGroup, Event, Filter, Person, PersonDistinctId
-from posthog.models.action import Action
-from posthog.models.event import EventManager
-from posthog.models.filters.sessions_filter import SessionEventsFilter, SessionsFilter
-from posthog.models.session_recording_event import SessionRecordingViewed
-from posthog.permissions import ProjectMembershipNecessaryPermissions, TeamMemberAccessPermission
-from posthog.queries.base import properties_to_Q
-from posthog.queries.sessions.session_recording import SessionRecording
-from posthog.utils import convert_property_value, flatten, relative_date_parse
+from posthog.schema import ProductKey
+
+from posthog.hogql import ast
+from posthog.hogql.constants import DEFAULT_RETURNED_ROWS
+from posthog.hogql.property_utils import create_property_conditions
+from posthog.hogql.query import execute_hogql_query
+
+from posthog.api.documentation import PropertiesSerializer, extend_schema
+from posthog.api.property_value_metrics import PROPERTY_VALUES_DURATION
+from posthog.api.routing import TeamAndOrgViewSetMixin
+from posthog.api.utils import action
+from posthog.auth import PersonalAPIKeyAuthentication
+from posthog.clickhouse.query_tagging import Feature, tag_queries
+from posthog.event_usage import get_request_analytics_properties
+from posthog.exceptions_capture import capture_exception
+from posthog.models import Element, Person, PropertyDefinition, User
+from posthog.models.event.legacy_events_query import LegacyEventsListQuery, get_one_event
+from posthog.models.event.util import ClickhouseEventSerializer
+from posthog.models.person.util import get_persons_mapped_by_distinct_id
+from posthog.models.team import Team
+from posthog.models.utils import UUIDT
+from posthog.personhog_client.caller_tag import personhog_caller_tag
+from posthog.rate_limit import (
+    ClickHouseBurstRateThrottle,
+    ClickHouseSustainedRateThrottle,
+    EventValuesBurstThrottle,
+    EventValuesSustainedThrottle,
+)
+from posthog.taxonomy.taxonomy import CORE_FILTER_DEFINITIONS_BY_GROUP
+from posthog.utils import convert_property_value, flatten, refresh_requested_by_client, relative_date_parse
+
+tracer = trace.get_tracer(__name__)
+
+EVENT_VALUES_COUNTER = Counter(
+    "posthog_event_values_request",
+    "Requests to the events/values endpoint",
+    labelnames=["has_event_name", "auth"],
+)
+
+QUERY_DEFAULT_EXPORT_LIMIT = 1_000
+EVENT_LIST_MAX_LIMIT = 1_000
+
+
+# Legacy property-filter keys the frontend still appends but EventsQuery's schema forbids.
+# They are render hints with no filter semantics, so dropping them preserves old behavior. Any
+# OTHER unexpected key is left in place so the schema rejects it (fail loud) rather than being
+# silently ignored.
+_LEGACY_PROPERTY_KEYS_TO_DROP = {"property_type", "property_type_format"}
+
+
+def _clean_property_node(node: dict) -> dict:
+    """Drop legacy render-hint keys from a property filter, recursing into property groups.
+
+    A group node (`{"type": "AND"/"OR", "values": [...]}`) keeps its structure so the runner's
+    `property_to_expr` preserves nested AND/OR; only leaf filters are key-filtered.
+    """
+    values = node.get("values")
+    if isinstance(values, list):
+        return {"type": node.get("type"), "values": [_clean_property_node(v) for v in values if isinstance(v, dict)]}
+    return {k: v for k, v in node.items() if k not in _LEGACY_PROPERTY_KEYS_TO_DROP}
+
+
+def _iter_leaf_property_filters(properties: "builtins.list[dict] | dict | None") -> Iterator[dict]:
+    """Yield the leaf filter dicts in a flat list or a (possibly nested) property group."""
+    stack: builtins.list[dict] = []
+    if isinstance(properties, dict):
+        stack.append(properties)
+    elif properties:
+        stack.extend(p for p in properties if isinstance(p, dict))
+    while stack:
+        node = stack.pop()
+        values = node.get("values")
+        if isinstance(values, list):
+            stack.extend(v for v in values if isinstance(v, dict))
+        else:
+            yield node
+
+
+@dataclasses.dataclass(frozen=True)
+class EventValueQueryParams:
+    event_names: list[str]
+    is_column: bool
+    key: str
+    team: Team
+    items: Iterator[tuple[str, str | list[object]]]
+    value: str | None
 
 
 class ElementSerializer(serializers.ModelSerializer):
@@ -46,296 +129,592 @@ class ElementSerializer(serializers.ModelSerializer):
         ]
 
 
-class EventSerializer(serializers.HyperlinkedModelSerializer):
-    elements = serializers.SerializerMethodField()
-    person = serializers.SerializerMethodField()
+class UncountedLimitOffsetPagination(LimitOffsetPagination):
+    """
+    the events api works with the default LimitOffsetPagination, but the
+    results don't have a count, so we need to override the pagination class
+    to remove the count from the response schema
+    """
 
-    class Meta:
-        model = Event
-        fields = [
-            "id",
-            "distinct_id",
-            "properties",
-            "elements",
-            "event",
-            "timestamp",
-            "person",
-        ]
-
-    def get_person(self, event: Event) -> Any:
-        if hasattr(event, "serialized_person"):
-            return event.serialized_person  # type: ignore
-        return None
-
-    def get_elements(self, event: Event):
-        if not event.elements_hash:
-            return []
-        if hasattr(event, "elements_group_cache"):
-            if event.elements_group_cache:  # type: ignore
-                return ElementSerializer(
-                    event.elements_group_cache.element_set.all().order_by("order"),  # type: ignore
-                    many=True,
-                ).data
-        elements = (
-            ElementGroup.objects.get(hash=event.elements_hash, team_id=event.team_id)
-            .element_set.all()
-            .order_by("order")
-        )
-        return ElementSerializer(elements, many=True).data
-
-    def to_representation(self, instance):
-        representation = super(EventSerializer, self).to_representation(instance)
-        if self.context.get("format") == "csv":
-            representation.pop("elements")
-        return representation
+    def get_paginated_response_schema(self, schema):
+        return {
+            "type": "object",
+            "properties": {
+                "next": {
+                    "type": "string",
+                    "nullable": True,
+                    "format": "uri",
+                    "example": "http://api.example.org/accounts/?{offset_param}=400&{limit_param}=100".format(
+                        offset_param=self.offset_query_param, limit_param=self.limit_query_param
+                    ),
+                },
+                "results": schema,
+            },
+        }
 
 
-class EventViewSet(StructuredViewSetMixin, mixins.RetrieveModelMixin, mixins.ListModelMixin, viewsets.GenericViewSet):
-    renderer_classes = tuple(api_settings.DEFAULT_RENDERER_CLASSES) + (csvrenderers.PaginatedCSVRenderer,)
-    queryset = Event.objects.all()
-    serializer_class = EventSerializer
-    pagination_class = LimitOffsetPagination
-    permission_classes = [IsAuthenticated, ProjectMembershipNecessaryPermissions, TeamMemberAccessPermission]
+class EventViewSet(
+    TeamAndOrgViewSetMixin,
+    mixins.RetrieveModelMixin,
+    mixins.ListModelMixin,
+    viewsets.GenericViewSet,
+):
+    scope_object = "query"
+    renderer_classes = cast(
+        tuple[type[BaseRenderer], ...],
+        (*tuple(api_settings.DEFAULT_RENDERER_CLASSES), csvrenderers.PaginatedCSVRenderer),
+    )
+    serializer_class = ClickhouseEventSerializer
+    throttle_classes = [ClickHouseBurstRateThrottle, ClickHouseSustainedRateThrottle]
+    pagination_class = UncountedLimitOffsetPagination
 
-    # Return at most this number of events in CSV export
-    CSV_EXPORT_DEFAULT_LIMIT = 10_000
-    CSV_EXPORT_MAXIMUM_LIMIT = 100_000
+    def get_throttles(self):
+        if self.action == "values":
+            return [EventValuesBurstThrottle(), EventValuesSustainedThrottle()]
+        return super().get_throttles()
 
-    def get_queryset(self):
-        queryset = cast(EventManager, super().get_queryset()).add_person_id(self.team_id)
-        if self.action == "list" or self.action == "sessions" or self.action == "actions":
-            queryset = self._filter_request(self.request, queryset)
-        order_by_param = self.request.GET.get("orderBy")
-        order_by = ["-timestamp"] if not order_by_param else list(json.loads(order_by_param))
-        return queryset.order_by(*order_by)
-
-    def _filter_request(self, request: request.Request, queryset: EventManager) -> QuerySet:
-        for key, value in request.GET.items():
-            if key == "event":
-                queryset = queryset.filter(event=request.GET["event"])
-            elif key == "after":
-                queryset = queryset.filter(timestamp__gt=request.GET["after"])
-            elif key == "before":
-                queryset = queryset.filter(timestamp__lt=request.GET["before"])
-            elif key == "person_id":
-                queryset = queryset.filter(
-                    distinct_id__in=PersonDistinctId.objects.filter(
-                        team_id=self.team_id, person_id=request.GET["person_id"]
-                    ).values("distinct_id")
-                )
-            elif key == "distinct_id":
-                queryset = queryset.filter(distinct_id=request.GET["distinct_id"])
-            elif key == "action_id":
-                queryset = queryset.filter_by_action(Action.objects.get(pk=value))  # type: ignore
-            elif key == "properties":
-                try:
-                    properties = json.loads(value)
-                except json.decoder.JSONDecodeError:
-                    raise ValidationError("Properties are unparsable!")
-
-                filter = Filter(data={"properties": properties})
-                queryset = queryset.filter(properties_to_Q(filter.properties, team_id=self.team_id))
-        return queryset
-
-    def _prefetch_events(self, events: List[Event]) -> List[Event]:
-        team_id = self.team_id
-        distinct_ids = []
-        hash_ids = []
-        for event in events:
-            distinct_ids.append(event.distinct_id)
-            if event.elements_hash:
-                hash_ids.append(event.elements_hash)
-        people = Person.objects.filter(
-            team_id=team_id, persondistinctid__distinct_id__in=distinct_ids
-        ).prefetch_related(Prefetch("persondistinctid_set", to_attr="distinct_ids_cache"))
-        if len(hash_ids) > 0:
-            groups = ElementGroup.objects.filter(team_id=team_id, hash__in=hash_ids).prefetch_related("element_set")
+    def _build_next_url(
+        self,
+        request: request.Request,
+        last_event_timestamp: datetime,
+        order_by: list[str],
+    ) -> str:
+        params = request.GET.dict()
+        reverse = "-timestamp" in order_by
+        timestamp = last_event_timestamp.astimezone().isoformat()
+        if reverse:
+            params["before"] = timestamp
         else:
-            groups = ElementGroup.objects.none()
-        for event in events:
-            try:
-                for person in people:
-                    if event.distinct_id in person.distinct_ids:
-                        event.serialized_person = {  # type: ignore
-                            "is_identified": person.is_identified,
-                            "distinct_ids": [
-                                person.distinct_ids[0],
-                            ],  # only send the first one to avoid a payload bloat
-                            "properties": {
-                                key: person.properties[key]
-                                for key in ["email", "name", "username"]
-                                if key in person.properties
-                            },
-                        }
-                        break
-            except IndexError:
-                event.serialized_person = None  # type: ignore
-            try:
-                event.elements_group_cache = [group for group in groups if group.hash == event.elements_hash][0]  # type: ignore
-            except IndexError:
-                event.elements_group_cache = None  # type: ignore
-        return events
+            params["after"] = timestamp
+        return request.build_absolute_uri(f"{request.path}?{urllib.parse.urlencode(params)}")
 
-    def list(self, request: request.Request, *args: Any, **kwargs: Any) -> response.Response:
-        is_csv_request = self.request.accepted_renderer.format == "csv"
-        monday = now() + timedelta(days=-now().weekday())
-        # Don't allow events too far into the future
-        queryset = self.get_queryset().filter(timestamp__lte=now() + timedelta(seconds=5))
-        next_url: Optional[str] = None
-
-        if self.request.GET.get("limit", None):
-            limit = int(self.request.GET.get("limit"))  # type: ignore
-        elif is_csv_request:
-            limit = self.CSV_EXPORT_DEFAULT_LIMIT
-        else:
-            limit = 100
-
-        if is_csv_request:
-            limit = min(limit, self.CSV_EXPORT_MAXIMUM_LIMIT)
-            events = queryset[:limit]
-        else:
-            events = queryset.filter(timestamp__gte=monday.replace(hour=0, minute=0, second=0))[: (limit + 1)]
-            if len(events) < limit + 1:
-                events = queryset[: limit + 1]
-            path = request.get_full_path()
-            reverse = request.GET.get("orderBy", "-timestamp") != "-timestamp"
-            if len(events) > limit:
-                next_url = request.build_absolute_uri(
-                    "{}{}{}={}".format(
-                        path,
-                        "&" if "?" in path else "?",
-                        "after" if reverse else "before",
-                        events[limit - 1].timestamp.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                    )
-                )
-            events = self.paginator.paginate_queryset(events, request, view=self)  # type: ignore
-
-        prefetched_events = self._prefetch_events(list(events))
-
-        return response.Response(
-            {
-                "next": next_url,
-                "results": EventSerializer(
-                    prefetched_events, many=True, context={"format": self.request.accepted_renderer.format}
-                ).data,
-            }
-        )
-
-    @action(methods=["GET"], detail=False)
-    def values(self, request: request.Request, **kwargs) -> response.Response:
-        result = self.get_values(request)
-        return response.Response(result)
-
-    def get_values(self, request: request.Request) -> List[Dict[str, Any]]:
-        key = request.GET.get("key")
-        params: List[Optional[Union[str, int]]] = [key, key]
-
-        if key == "custom_event":
-            event_names = (
-                Event.objects.filter(team_id=self.team_id)
-                .filter(~Q(event__in=["$autocapture", "$pageview", "$identify", "$pageleave", "$screen"]))
-                .values("event")
-                .distinct()
-            )
-            return [{"name": value["event"]} for value in event_names]
-
-        if request.GET.get("value"):
-            where = " AND properties ->> %s LIKE %s"
-            params.append(key)
-            params.append("%{}%".format(request.GET["value"]))
-        else:
-            where = ""
-
-        params.append(self.team_id)
-        params.append(relative_date_parse("-7d").strftime("%Y-%m-%d 00:00:00"))
-        params.append(timezone.now().strftime("%Y-%m-%d 23:59:59"))
-
-        # This samples a bunch of events with that property, and then orders them by most popular in that sample
-        # This is much quicker than trying to do this over the entire table
-        values = Event.objects.raw(
-            """
-            SELECT
-                value, COUNT(1) as id
-            FROM (
-                SELECT
-                    ("posthog_event"."properties" -> %s) as "value"
-                FROM
-                    "posthog_event"
-                WHERE
-                    ("posthog_event"."properties" -> %s) IS NOT NULL {} AND
-                    ("posthog_event"."team_id" = %s) AND
-                    ("posthog_event"."timestamp" >= %s) AND
-                    ("posthog_event"."timestamp" <= %s)
-                LIMIT 10000
-            ) as "value"
-            GROUP BY value
-            ORDER BY id DESC
-            LIMIT 50;
-        """.format(
-                where
+    @extend_schema(
+        description="""
+        This endpoint allows you to list and filter events.
+        It is effectively deprecated and is kept only for backwards compatibility.
+        If you ever ask about it you will be advised to not use it...
+        If you want to ad-hoc list or aggregate events, use the Query endpoint instead.
+        If you want to export all events or many pages of events you should use our CDP/Batch Exports products instead.
+        """,
+        parameters=[
+            OpenApiParameter(
+                "event",
+                OpenApiTypes.STR,
+                description="Filter list by event. For example `user sign up` or `$pageview`.",
             ),
-            params,
-        )
-        flattened = flatten([json.loads(value.value) for value in values])
-        return [{"name": convert_property_value(value)} for value in flattened]
+            OpenApiParameter(
+                "select",
+                OpenApiTypes.STR,
+                description="(Experimental) JSON-serialized array of HogQL expressions to return",
+                many=True,
+            ),
+            OpenApiParameter(
+                "where",
+                OpenApiTypes.STR,
+                description="(Experimental) JSON-serialized array of HogQL expressions that must pass",
+                many=True,
+            ),
+            OpenApiParameter("person_id", OpenApiTypes.INT, description="Filter list by person id."),
+            OpenApiParameter(
+                "distinct_id",
+                OpenApiTypes.INT,
+                description="Filter list by distinct id.",
+            ),
+            OpenApiParameter(
+                "before",
+                OpenApiTypes.DATETIME,
+                description="Only return events with a timestamp before this time. Default: now() + 5 seconds.",
+            ),
+            OpenApiParameter(
+                "after",
+                OpenApiTypes.DATETIME,
+                description="Only return events with a timestamp after this time. Default: now() - 24 hours.",
+            ),
+            OpenApiParameter(
+                "limit",
+                OpenApiTypes.INT,
+                description="The maximum number of results to return",
+            ),
+            OpenApiParameter(
+                "offset",
+                OpenApiTypes.INT,
+                description=(
+                    "Allows to skip first offset rows. Will fail for value larger than 100000. "
+                    "Read about proper way of paginating: https://posthog.com/docs/api/queries#5-use-timestamp-based-pagination-instead-of-offset"
+                ),
+                deprecated=True,
+            ),
+            PropertiesSerializer(required=False),
+            OpenApiParameter(
+                "include_person",
+                OpenApiTypes.BOOL,
+                description="Include person details for each event. Default: false.",
+            ),
+        ],
+    )
+    def list(self, request: request.Request, *args: Any, **kwargs: Any) -> response.Response:
+        tag_queries(product=ProductKey.PRODUCT_ANALYTICS, feature=Feature.QUERY)
+        try:
+            is_csv_request = self.request.accepted_renderer.format == "csv"
 
-    # ******************************************
-    # /event/sessions
-    #
-    # params:
-    # - pagination: (dict) Object containing information about pagination (offset, last page info)
-    # - distinct_id: (string) filter sessions by distinct id
-    # - duration: (float) filter sessions by recording duration
-    # - duration_operator: (string: lt, gt)
-    # - **shared filter types
-    # ******************************************
-    @action(methods=["GET"], detail=False)
-    def sessions(self, request: request.Request, *args: Any, **kwargs: Any) -> Response:
-        from posthog.queries.sessions.sessions_list import SessionsList
+            if self.request.GET.get("limit", None):
+                limit = int(self.request.GET.get("limit"))  # type: ignore
+            elif is_csv_request:
+                limit = QUERY_DEFAULT_EXPORT_LIMIT
+            else:
+                limit = DEFAULT_RETURNED_ROWS
 
-        filter = SessionsFilter(request=request, team=self.team)
+            limit = min(limit, EVENT_LIST_MAX_LIMIT)
 
-        sessions, pagination = SessionsList.run(filter=filter, team=self.team)
-        return Response({"result": sessions, "pagination": pagination})
+            try:
+                offset = int(request.GET["offset"]) if request.GET.get("offset") else 0
+            except ValueError:
+                offset = 0
 
-    @action(methods=["GET"], detail=False)
-    def session_events(self, request: request.Request, *args: Any, **kwargs: Any) -> Response:
-        from posthog.queries.sessions.sessions_list_events import SessionsListEvents
+            team = self.team
 
-        filter = SessionEventsFilter(request=request, team=self.team)
-        return Response({"result": SessionsListEvents().run(filter=filter, team=self.team)})
+            deprecate_offset = (
+                settings.PATCH_EVENT_LIST_MAX_OFFSET > 1 or team.id in settings.PATCH_EVENT_LIST_MAX_OFFSET_PER_TEAM
+            )
+            if settings.PATCH_EVENT_LIST_MAX_OFFSET > 0 or deprecate_offset:
+                if offset > 0:
+                    time.sleep(1)
+                if offset > 50000 and (deprecate_offset or random.random() < 0.01):  # 1% of queries fail
+                    raise serializers.ValidationError("Offset is deprecated. Max supported offset value is 50000")
 
-    # ******************************************
-    # /event/session_recording
-    # params:
-    # - session_recording_id: (string) id of the session recording
-    # - save_view: (boolean) save view of the recording
-    # ******************************************
-    @action(methods=["GET"], detail=False)
-    def session_recording(self, request: request.Request, *args: Any, **kwargs: Any) -> response.Response:
-        if not request.GET.get("session_recording_id"):
-            return Response(
+            properties = self._parse_properties_param(request)
+            order_by: list[str] = (
+                list(json.loads(request.GET["orderBy"])) if request.GET.get("orderBy") else ["-timestamp"]
+            )
+            order = "DESC" if len(order_by) == 1 and order_by[0] == "-timestamp" else "ASC"
+
+            restricted_context = self._get_restricted_properties_context(request, team)
+            self._reject_restricted_property_references(properties, order_by, restricted_context)
+
+            request_user = cast(Optional[User], request.user if request.user.is_authenticated else None)
+            query_result, has_more = LegacyEventsListQuery(team, request_user).run(
+                limit=limit,
+                offset=offset,
+                order=order,
+                before=request.GET.get("before"),
+                after=request.GET.get("after"),
+                event=request.GET.get("event"),
+                person_id=request.GET.get("person_id"),
+                distinct_id=request.GET.get("distinct_id"),
+                properties=properties,
+                action_id=request.GET.get("action_id"),
+            )
+
+            context = {**restricted_context}
+            if request.query_params.get("include_person", "").lower() in ("true", "1"):
+                context["people"] = self._get_people(query_result, team)
+
+            result = ClickhouseEventSerializer(
+                query_result,
+                many=True,
+                context=context,
+            ).data
+
+            next_url: Optional[str] = None
+            if not is_csv_request and has_more and query_result:
+                next_url = self._build_next_url(request, query_result[-1]["timestamp"], order_by)
+            headers = None
+            if settings.PATCH_EVENT_LIST_MAX_OFFSET > 0:
+                headers = {"X-PostHog-Warn": "https://posthog.com/docs/api/events"}
+            elif deprecate_offset and offset:
+                headers = {
+                    "X-PostHog-Warn": (
+                        "offset is deprecated. "
+                        "Use: https://posthog.com/docs/api/queries#5-use-timestamp-based-pagination-instead-of-offset"
+                    )
+                }
+            return response.Response({"next": next_url, "results": result}, headers=headers)
+
+        except Exception as ex:
+            capture_exception(ex)
+            raise
+
+    def _get_people(self, query_result: List[dict], team: Team) -> "dict[str, Person]":  # noqa: UP006
+        distinct_ids = list({event["distinct_id"] for event in query_result})
+        with personhog_caller_tag("persons/events-api"):
+            return get_persons_mapped_by_distinct_id(team.pk, distinct_ids)
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("id", OpenApiTypes.STR, OpenApiParameter.PATH),
+            OpenApiParameter(
+                "include_person",
+                OpenApiTypes.BOOL,
+                description="Include person details for the event. Default: false.",
+            ),
+        ],
+        responses={200: OpenApiTypes.OBJECT},
+    )
+    def retrieve(
+        self,
+        request: request.Request,
+        pk: Optional[Union[int, str]] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> response.Response:
+        if not isinstance(pk, str) or not UUIDT.is_valid_uuid(pk):
+            return response.Response(
                 {
-                    "detail": "The query parameter session_recording_id is required for this endpoint.",
-                    "type": "validation_error",
+                    "detail": "Invalid UUID",
                     "code": "invalid",
+                    "type": "validation_error",
                 },
                 status=400,
             )
-        session_recording = SessionRecording(
-            request=request,
-            filter=Filter(request=request, team=self.team),
-            session_recording_id=request.GET["session_recording_id"],
-            team=self.team,
-        ).run()
+        tag_queries(product=ProductKey.PRODUCT_ANALYTICS, feature=Feature.QUERY)
+        event = get_one_event(self.team, pk)
+        if event is None:
+            raise NotFound(detail=f"No events exist for event UUID {pk}")
 
-        if request.GET.get("save_view"):
-            SessionRecordingViewed.objects.get_or_create(
-                team=self.team, user=request.user, session_id=request.GET["session_recording_id"]
+        query_result = [event]
+        query_context = {**self._get_restricted_properties_context(request, self.team)}
+        if request.query_params.get("include_person", "").lower() in ("true", "1"):
+            query_context["people"] = self._get_people(query_result, self.team)
+
+        res = ClickhouseEventSerializer(query_result[0], many=False, context=query_context).data
+        return response.Response(res)
+
+    @action(methods=["GET"], detail=False, required_scopes=["query:read"])
+    def values(self, request: request.Request, **kwargs) -> response.Response:
+        # `/events/values` is hit from every taxonomic property-value picker across the app, so
+        # tag by the endpoint name rather than a generic introspection feature — that makes load
+        # from this specific path easy to attribute in query log analysis.
+        tag_queries(product=ProductKey.PRODUCT_ANALYTICS, feature=Feature.EVENTS_VALUES_API)
+        team = self.team
+
+        key = request.GET.get("key")
+        if not key:
+            raise serializers.ValidationError("You must provide a key")
+
+        event_names = request.GET.getlist("event_name", None)
+        has_event_name = bool(event_names and len(event_names) > 0)
+        is_personal_api_key = isinstance(request.successful_authenticator, PersonalAPIKeyAuthentication)
+
+        # Reject personal API key requests without event_name filter
+        if is_personal_api_key and not has_event_name:
+            raise serializers.ValidationError(
+                "The event_name parameter is required when using a personal API key. "
+                "For queries without event filters, please use the Query endpoint instead: "
+                "https://posthog.com/docs/api/query"
             )
 
-        return response.Response({"result": session_recording})
+        EVENT_VALUES_COUNTER.labels(
+            has_event_name=str(has_event_name),
+            auth="personal_api_key" if is_personal_api_key else "app",
+        ).inc()
+
+        query_params = EventValueQueryParams(
+            event_names=event_names,
+            is_column=request.GET.get("is_column", "false").lower() == "true",
+            key=key,
+            team=team,
+            items=request.GET.items(),
+            value=request.GET.get("value"),
+        )
+
+        refresh = refresh_requested_by_client(request)
+
+        if key == "custom_event":
+            return self._custom_event_values(query_params)
+        else:
+            # Check if this property is hidden (enterprise feature) or restricted by field-level access control
+            if self._is_property_hidden(key, team) or self._is_property_restricted(key, team):
+                return self._return_with_short_cache([], refreshing=False)
+
+            return self._event_property_values(query_params, refresh=refresh)
+
+    def _event_property_values(
+        self,
+        query_params: EventValueQueryParams,
+        refresh: bool | str = False,
+    ) -> response.Response:
+        from posthog.hogql_queries.property_values_query_runner import (
+            CachedPropertyValuesQueryResponse,
+            PropertyType,
+            PropertyValuesQuery,
+            PropertyValuesQueryResponse,
+            PropertyValuesQueryRunner,
+        )
+        from posthog.hogql_queries.query_runner import ExecutionMode, execution_mode_from_refresh
+
+        with (
+            PROPERTY_VALUES_DURATION.labels(endpoint_type="event").time(),
+            tracer.start_as_current_span("events_api_event_property_values") as span,
+        ):
+            span.set_attribute("team_id", query_params.team.pk)
+            span.set_attribute("property_key", query_params.key)
+            span.set_attribute("is_column", query_params.is_column)
+            span.set_attribute("has_value_filter", query_params.value is not None)
+            span.set_attribute("event_names_count", len(query_params.event_names) if query_params.event_names else 0)
+
+            property_filters = [
+                (param_key, param_value)
+                for param_key, param_value in query_params.items
+                if param_key.startswith("properties_") and isinstance(param_value, str)
+            ]
+            span.set_attribute("property_filter_count", len(property_filters))
+
+            if property_filters:
+                # Ad-hoc filtered queries are not cached — run directly
+                return self._event_property_values_filtered(query_params, property_filters)
+
+            runner = PropertyValuesQueryRunner(
+                team=query_params.team,
+                query=PropertyValuesQuery(
+                    property_type=PropertyType.EVENT,
+                    property_key=query_params.key,
+                    is_column=query_params.is_column,
+                    search_value=query_params.value,
+                    event_names=query_params.event_names or None,
+                ),
+            )
+            execution_mode = execution_mode_from_refresh(refresh)
+            if execution_mode == ExecutionMode.CACHE_ONLY_NEVER_CALCULATE and not refresh:
+                execution_mode = ExecutionMode.RECENT_CACHE_CALCULATE_ASYNC_IF_STALE_AND_BLOCKING_ON_MISS
+            result = runner.run(execution_mode, analytics_props=get_request_analytics_properties(self.request))
+            assert isinstance(result, (PropertyValuesQueryResponse, CachedPropertyValuesQueryResponse))
+            is_refreshing = (
+                isinstance(result, CachedPropertyValuesQueryResponse)
+                and result.query_status is not None
+                and not result.query_status.complete
+            )
+            span.set_attribute("result_count", len(result.results))
+            span.set_attribute("is_refreshing", is_refreshing)
+            return self._return_with_short_cache(
+                [item.model_dump(exclude_none=True) for item in result.results], refreshing=is_refreshing
+            )
+
+    def _event_property_values_filtered(
+        self,
+        query_params: EventValueQueryParams,
+        property_filters: builtins.list[tuple[str, str]],
+    ) -> response.Response:
+        # TODO: this duplicates most of PropertyValuesQueryRunner._event_query. We should prob extend
+        # PropertyValuesQuery with an optional property_filters field so the runner handles both paths
+        # in the future.
+        chain: list[str | int] = [query_params.key] if query_params.is_column else ["properties", query_params.key]
+        date_from = relative_date_parse("-7d", query_params.team.timezone_info).strftime("%Y-%m-%d 00:00:00")
+        date_to = timezone.now().astimezone(query_params.team.timezone_info).strftime("%Y-%m-%d 23:59:59")
+
+        conditions: list[ast.Expr] = [
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.GtEq,
+                left=ast.Field(chain=["timestamp"]),
+                right=ast.Constant(value=date_from),
+            ),
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.LtEq,
+                left=ast.Field(chain=["timestamp"]),
+                right=ast.Constant(value=date_to),
+            ),
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.NotEq,
+                left=ast.Field(chain=chain),
+                right=ast.Constant(value=None),
+            ),
+        ]
+
+        for param_key, param_value in property_filters:
+            filter_key = param_key.replace("properties_", "", 1)
+            try:
+                filter_values = json.loads(param_value)
+                conditions.append(create_property_conditions(filter_key, filter_values))
+            except json.JSONDecodeError:
+                conditions.append(create_property_conditions(filter_key, param_value))
+
+        if query_params.event_names:
+            event_conditions: list[ast.Expr] = [
+                ast.CompareOperation(
+                    op=ast.CompareOperationOp.Eq,
+                    left=ast.Field(chain=["event"]),
+                    right=ast.Constant(value=name),
+                )
+                for name in query_params.event_names
+            ]
+            conditions.append(ast.Or(exprs=event_conditions) if len(event_conditions) > 1 else event_conditions[0])
+
+        if query_params.value:
+            escaped = query_params.value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            conditions.append(
+                ast.CompareOperation(
+                    op=ast.CompareOperationOp.ILike,
+                    left=ast.Call(name="toString", args=[ast.Field(chain=chain)]),
+                    right=ast.Constant(value=f"%{escaped}%"),
+                )
+            )
+
+        order_by: list[ast.OrderExpr] = (
+            [
+                ast.OrderExpr(
+                    expr=ast.Call(name="length", args=[ast.Call(name="toString", args=[ast.Field(chain=chain)])]),
+                    order="ASC",
+                )
+            ]
+            if query_params.value
+            else []
+        )
+
+        query = ast.SelectQuery(
+            select=[ast.Field(chain=chain)],
+            distinct=True,
+            select_from=ast.JoinExpr(table=ast.Field(chain=["events"])),
+            where=ast.And(exprs=conditions),
+            order_by=order_by,
+            limit=ast.Constant(value=10),
+        )
+
+        result = execute_hogql_query(query, team=query_params.team)
+
+        values = []
+        for row in result.results:
+            if isinstance(row[0], float | int | bool | uuid.UUID):
+                values.append(row[0])
+            else:
+                try:
+                    values.append(json.loads(row[0]))
+                except json.JSONDecodeError:
+                    values.append(row[0])
+
+        return self._return_with_short_cache(
+            [{"name": convert_property_value(v)} for v in flatten(values)], refreshing=False
+        )
+
+    @staticmethod
+    def _return_with_short_cache(values: builtins.list, refreshing: bool = False) -> response.Response:
+        resp = response.Response({"results": values, "refreshing": refreshing})
+        resp["Cache-Control"] = "max-age=10"
+        return resp
+
+    def _parse_properties_param(self, request: request.Request) -> "builtins.list[dict] | dict | None":
+        """Parse the `properties` query param for `EventsQuery`.
+
+        A flat list of leaf filters maps to `EventsQuery.properties`; a property group
+        (`{"type": "AND"/"OR", "values": [...]}`, possibly nested) is returned intact and later
+        forwarded to the runner's `property_to_expr` via `fixedProperties`, so its AND/OR survives.
+        Legacy-only keys (`property_type`, `property_type_format`) the schema rejects are dropped;
+        missing `type` defaults to `event` as before. Invalid JSON raises the legacy 400."""
+        raw = request.GET.get("properties")
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            raise serializers.ValidationError("Properties are unparsable!")
+        if isinstance(parsed, dict) and isinstance(parsed.get("values"), list):
+            return _clean_property_node(parsed)
+        if isinstance(parsed, list):
+            return [_clean_property_node(prop) for prop in parsed if isinstance(prop, dict)]
+        return None
+
+    def _reject_restricted_property_references(
+        self,
+        properties: "builtins.list[dict] | dict | None",
+        order_by: builtins.list[str],
+        restricted_context: dict,
+    ) -> None:
+        """
+        Raise a 400 if the request references a property the user can't read.
+        """
+        restricted_event = restricted_context.get("restricted_event_properties") or set()
+        restricted_person = restricted_context.get("restricted_person_properties") or set()
+        if not restricted_event and not restricted_person:
+            return
+
+        for prop in _iter_leaf_property_filters(properties):
+            prop_type = prop.get("type", "event")
+            key = prop.get("key")
+            if prop_type == "event" and key in restricted_event:
+                raise serializers.ValidationError("Filter references a restricted property")
+            if prop_type == "person" and key in restricted_person:
+                raise serializers.ValidationError("Filter references a restricted property")
+
+        for entry in order_by:
+            if not isinstance(entry, str):
+                continue  # type: ignore
+            field = entry.lstrip("-")
+            # Accept both `properties.foo` (event) and `person.properties.foo` / `person_properties.foo`.
+            if field.startswith("properties."):
+                key = field.split(".", 1)[1]
+                if key in restricted_event:
+                    raise serializers.ValidationError("Order by references a restricted property")
+            elif field.startswith("person.properties.") or field.startswith("person_properties."):
+                key = field.split(".", 1)[1].split(".", 1)[-1]
+                if key in restricted_person:
+                    raise serializers.ValidationError("Order by references a restricted property")
+
+    def _get_restricted_properties_context(self, request: request.Request, team: Team) -> dict:
+        """Returns serializer context entries for field-level access control."""
+        from products.access_control.backend.property_access_control import get_restricted_properties_for_team
+
+        user = request.user if request.user.is_authenticated else None
+
+        restricted = get_restricted_properties_for_team(user=cast(User | None, user), team=team)
+        restricted_event_properties = {name for name, ptype in restricted if ptype == PropertyDefinition.Type.EVENT}
+        restricted_person_properties = {name for name, ptype in restricted if ptype == PropertyDefinition.Type.PERSON}
+
+        return {
+            "restricted_event_properties": restricted_event_properties,
+            "restricted_person_properties": restricted_person_properties,
+        }
+
+    @tracer.start_as_current_span("events_api_is_property_hidden")
+    def _is_property_hidden(self, key: str, team: Team) -> bool:
+        property_is_hidden = False
+        try:
+            from ee.models.property_definition import EnterprisePropertyDefinition
+
+            property_is_hidden = EnterprisePropertyDefinition.objects.filter(
+                team=team,
+                name=key,
+                type=PropertyDefinition.Type.EVENT.value,
+                hidden=True,
+            ).exists()
+        except ImportError:
+            # Enterprise features not available, continue normally
+            pass
+
+        return property_is_hidden
+
+    def _is_property_restricted(self, key: str, team: Team) -> bool:
+        """Checks if a property key is restricted for the current user."""
+        from products.access_control.backend.property_access_control import get_restricted_property_names
+
+        user = self.request.user if self.request.user.is_authenticated else None
+        restricted = get_restricted_property_names(
+            team_id=team.pk,
+            user=user,
+            property_type=PropertyDefinition.Type.EVENT,
+        )
+        return key in restricted
+
+    @tracer.start_as_current_span("events_api_custom_event_values")
+    def _custom_event_values(self, query_params: EventValueQueryParams) -> response.Response:
+        system_events = [
+            event_name
+            for event_name in CORE_FILTER_DEFINITIONS_BY_GROUP["events"].keys()
+            if event_name != "All Events"  # Skip the wildcard
+        ]
+        query = ast.SelectQuery(
+            select=[ast.Field(chain=["event"])],
+            distinct=True,
+            select_from=ast.JoinExpr(table=ast.Field(chain=["events"])),
+            where=ast.CompareOperation(
+                op=ast.CompareOperationOp.NotIn,
+                left=ast.Field(chain=["event"]),
+                right=ast.Constant(value=system_events),
+            ),
+            order_by=[ast.OrderExpr(expr=ast.Field(chain=["event"]), order="ASC")],
+        )
+
+        result = execute_hogql_query(query, team=query_params.team)
+
+        return self._return_with_short_cache([{"name": event[0]} for event in result.results], refreshing=False)
 
 
 class LegacyEventViewSet(EventViewSet):
-    legacy_team_compatibility = True
+    param_derived_from_user_current_team = "team_id"

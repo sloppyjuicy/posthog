@@ -1,40 +1,96 @@
 .taxonomic-infinite-list {
-    min-height: 200px;
+    flex-grow: 1;
+    min-height: 272px;
 
     &.empty-infinite-list {
-        width: 100%;
         display: flex;
         align-items: center;
         justify-content: center;
+        width: 100%;
+
         .no-infinite-results {
             color: #666;
         }
+    }
+
+    &.empty-infinite-list--start {
+        align-items: flex-start;
     }
 
     .taxonomic-list-row {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        color: #2d2d2d;
         padding: 4px 12px;
+        color: var(--text-3000);
         cursor: pointer;
         border: none;
-        white-space: nowrap;
-        overflow-x: auto;
 
-        &.hover {
-            background: rgba(0, 0, 0, 0.1);
+        .taxonomic-list-row-contents {
+            display: flex;
+            align-items: center;
+            user-select: none;
+
+            .taxonomic-list-row-contents-icon {
+                display: flex;
+                justify-content: center;
+                min-width: 30px;
+                margin-right: 4px;
+                margin-left: -4px;
+                font-size: 1.25rem;
+
+                svg.taxonomy-icon {
+                    flex-shrink: 0;
+                    vertical-align: middle;
+
+                    &.taxonomy-icon-muted {
+                        color: var(--color-text-secondary);
+                    }
+
+                    &.taxonomy-icon-verified {
+                        color: var(--success);
+                    }
+
+                    &.taxonomy-icon-built-in {
+                        color: var(--color-accent);
+                    }
+                }
+            }
+        }
+
+        & > div {
+            max-width: 100%;
+
+            & > span {
+                max-width: 100%;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+        }
+
+        .taxonomic-list-row-pin {
+            display: flex;
+            flex-shrink: 0;
+            align-items: center;
+            justify-content: center;
+            width: 1rem;
+            margin-left: 0.5rem;
+            pointer-events: none;
+        }
+
+        &.hover,
+        &.active {
+            background-color: var(--color-bg-primary);
+            border-radius: var(--radius);
         }
 
         &.selected {
             font-weight: bold;
         }
 
-        &.skeleton-row {
-            // center-align this antd skeleton
-            .ant-skeleton-paragraph {
-                margin-bottom: 0;
-            }
+        &.expand-row {
+            color: var(--color-accent);
         }
     }
 }

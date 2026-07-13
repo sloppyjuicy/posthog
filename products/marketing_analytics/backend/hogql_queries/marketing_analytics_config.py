@@ -1,0 +1,266 @@
+from dataclasses import dataclass
+from enum import Enum
+from typing import TYPE_CHECKING
+
+import structlog
+
+from posthog.schema import (
+    AttributionMode,
+    MarketingAnalyticsBaseColumns,
+    MarketingAnalyticsConstants,
+    MarketingAnalyticsDrillDownLevel,
+)
+
+from posthog.ph_client import feature_enabled_or_false
+
+if TYPE_CHECKING:
+    from posthog.models.team import Team
+
+from .adapters.base import MarketingSourceAdapter
+from .constants import (
+    CAMPAIGN_COST_CTE_NAME,
+    CONVERSION_GOAL_PREFIX,
+    CONVERSION_GOAL_PREFIX_ABBREVIATION,
+    DECIMAL_PRECISION,
+    DEFAULT_DISTINCT_ID_FIELD,
+    DRILL_DOWN_LEVEL_CONFIG,
+    ORGANIC_CAMPAIGN,
+    ORGANIC_SOURCE,
+    TOTAL_CLICKS_FIELD,
+    TOTAL_COST_FIELD,
+    TOTAL_IMPRESSIONS_FIELD,
+    TOTAL_REPORTED_CONVERSION_FIELD,
+    TOTAL_REPORTED_CONVERSION_VALUE_FIELD,
+    UNIFIED_CONVERSION_GOALS_CTE_ALIAS,
+)
+
+logger = structlog.get_logger(__name__)
+
+
+class AttributionModeOperator(Enum):
+    LAST_TOUCH = "arrayMax"
+    FIRST_TOUCH = "arrayMin"
+
+
+MULTI_TOUCH_MODES: frozenset[AttributionMode] = frozenset(
+    {
+        AttributionMode.LINEAR,
+        AttributionMode.TIME_DECAY,
+        AttributionMode.POSITION_BASED,
+    }
+)
+
+
+@dataclass
+class MarketingAnalyticsConfig:
+    """
+    Configuration object that centralizes all constants and naming conventions
+    for marketing analytics queries. This makes the system more configurable
+    and testable by injecting dependencies rather than hardcoding them.
+    """
+
+    # CTE and table names
+    campaign_costs_cte_name: str = CAMPAIGN_COST_CTE_NAME
+    unified_conversion_goals_cte_alias: str = UNIFIED_CONVERSION_GOALS_CTE_ALIAS
+
+    # Field names for grouping
+    campaign_field: str = MarketingSourceAdapter.campaign_name_field
+    id_field: str = MarketingSourceAdapter.campaign_id_field
+    source_field: str = MarketingSourceAdapter.source_name_field
+    match_key_field: str = MarketingSourceAdapter.match_key_field
+    ad_group_name_field: str = MarketingSourceAdapter.ad_group_name_field
+    ad_group_id_field: str = MarketingSourceAdapter.ad_group_id_field
+    ad_name_field: str = MarketingSourceAdapter.ad_name_field
+    ad_id_field: str = MarketingSourceAdapter.ad_id_field
+
+    # Column aliases for output
+    campaign_column_alias: str = MarketingAnalyticsBaseColumns.CAMPAIGN
+    source_column_alias: str = MarketingAnalyticsBaseColumns.SOURCE
+
+    # Prefixes for naming
+    conversion_goal_prefix: str = CONVERSION_GOAL_PREFIX
+    conversion_goal_abbreviation: str = CONVERSION_GOAL_PREFIX_ABBREVIATION
+    cost_per_prefix: str = MarketingAnalyticsConstants.COST_PER
+
+    # Default values
+    organic_campaign: str = ORGANIC_CAMPAIGN
+    organic_source: str = ORGANIC_SOURCE
+
+    # Field references
+    total_cost_field: str = TOTAL_COST_FIELD
+    total_clicks_field: str = TOTAL_CLICKS_FIELD
+    total_impressions_field: str = TOTAL_IMPRESSIONS_FIELD
+    total_reported_conversions_field: str = TOTAL_REPORTED_CONVERSION_FIELD
+    total_reported_conversion_value_field: str = TOTAL_REPORTED_CONVERSION_VALUE_FIELD
+    default_distinct_id_field: str = DEFAULT_DISTINCT_ID_FIELD
+
+    # Precision settings
+    decimal_precision: int = DECIMAL_PRECISION
+
+    # Drill-down level (defaults to campaign for backward compatibility)
+    drill_down_level: MarketingAnalyticsDrillDownLevel = MarketingAnalyticsDrillDownLevel.CAMPAIGN
+
+    # Attribution settings (can be overridden by team settings)
+    attribution_window_days: int = 90
+    attribution_mode: AttributionMode = AttributionMode.LAST_TOUCH
+
+    conversion_goal_precomputation_enabled: bool = False
+    costs_precomputation_enabled: bool = False
+
+    @staticmethod
+    def _precompute_flags(team: "Team") -> dict[str, bool]:
+        """Evaluate the conversion + cost precompute flags once per team instance.
+
+        `from_team` runs in every runner's `__init__` (table + aggregated + non-integrated, and each also
+        spins up a previous-period runner for compare), so a single dashboard load otherwise evaluates each
+        flag ~6 times. The team model instance is shared across the runners of a query, so caching on it
+        dedupes the evaluation to once per load without leaking across requests (a fresh team is loaded per
+        request). The multi-touch flag is evaluated separately (see `_multi_touch_enabled`) so single-touch
+        modes never trigger its evaluation.
+
+        Test authors: the cache lives on the team instance (`team._ma_precompute_flags`, and
+        `team._ma_multi_touch_flag`). A test that reuses the same team across cases (e.g. class-level setup)
+        while mocking `feature_enabled_or_false` differently per case will get the first case's stale flags.
+        Clear both attributes in setup/teardown to force re-evaluation.
+        """
+        cached = getattr(team, "_ma_precompute_flags", None)
+        if cached is not None:
+            return cached
+        groups = {"organization": str(team.organization.id)}
+        group_properties = {"organization": {"id": str(team.organization.id)}}
+        flags = {
+            "conversion": feature_enabled_or_false(
+                "marketing-analytics-precomputation",
+                str(team.uuid),
+                groups=groups,
+                group_properties=group_properties,
+            ),
+            "costs": feature_enabled_or_false(
+                "marketing-analytics-costs-precomputation",
+                str(team.uuid),
+                groups=groups,
+                group_properties=group_properties,
+            ),
+        }
+        team._ma_precompute_flags = flags  # type: ignore[attr-defined]
+        return flags
+
+    @staticmethod
+    def _multi_touch_enabled(team: "Team") -> bool:
+        """Evaluate the multi-touch attribution flag once per team instance.
+
+        Kept out of `_precompute_flags` so single-touch modes never evaluate it (a needless flag call that
+        would otherwise fire a `$feature_flag_called` event). Cached on the team instance for the same
+        per-load dedup reason.
+        """
+        cached = getattr(team, "_ma_multi_touch_flag", None)
+        if cached is not None:
+            return cached
+        enabled = feature_enabled_or_false(
+            "marketing-analytics-multi-touch-attribution",
+            str(team.uuid),
+            groups={"organization": str(team.organization.id)},
+            group_properties={"organization": {"id": str(team.organization.id)}},
+        )
+        team._ma_multi_touch_flag = enabled  # type: ignore[attr-defined]
+        return enabled
+
+    @classmethod
+    def from_team(cls, team: "Team") -> "MarketingAnalyticsConfig":
+        """Create config instance with team-specific attribution settings"""
+        config = cls()
+        if hasattr(team, "marketing_analytics_config"):
+            ma_config = team.marketing_analytics_config
+            config.attribution_window_days = ma_config.attribution_window_days
+            config.attribution_mode = AttributionMode(ma_config.attribution_mode)
+
+        flags = cls._precompute_flags(team)
+        config.conversion_goal_precomputation_enabled = flags["conversion"]
+        config.costs_precomputation_enabled = flags["costs"]
+
+        # Gate multi-touch attribution behind its flag; fall back to last-touch when disabled. Evaluated
+        # only for multi-touch modes so single-touch never triggers the flag call.
+        if config.attribution_mode in MULTI_TOUCH_MODES and not cls._multi_touch_enabled(team):
+            logger.warning(
+                "multi_touch_attribution_disabled",
+                team_id=team.pk,
+                requested_mode=config.attribution_mode.value,
+                flag_value=False,
+            )
+            config.attribution_mode = AttributionMode.LAST_TOUCH
+
+        return config
+
+    @property
+    def is_multi_touch(self) -> bool:
+        return self.attribution_mode in MULTI_TOUCH_MODES
+
+    @property
+    def attribution_mode_operator(self) -> str:
+        """Get the HogQL operator for single-touch attribution modes"""
+        if self.attribution_mode == AttributionMode.FIRST_TOUCH:
+            return AttributionModeOperator.FIRST_TOUCH.value
+        elif self.attribution_mode == AttributionMode.LAST_TOUCH:
+            return AttributionModeOperator.LAST_TOUCH.value
+        else:
+            return AttributionModeOperator.LAST_TOUCH.value
+
+    @property
+    def group_by_fields(self) -> list[str]:
+        """Get the list of fields to group by based on drill-down level.
+        At channel/source/ad-group/ad level, we repurpose the standard field names
+        since the CTE already maps them to the correct values.
+        """
+        if self.drill_down_level == MarketingAnalyticsDrillDownLevel.CHANNEL:
+            # CTE repurposes campaign_name to hold the channel value
+            return [self.campaign_field]
+        elif self.drill_down_level == MarketingAnalyticsDrillDownLevel.SOURCE:
+            return [self.source_field]
+        elif self.drill_down_level == MarketingAnalyticsDrillDownLevel.AD_GROUP:
+            # All non-aggregate columns must be in GROUP BY. The CTE emits the parent
+            # campaign hierarchy plus the ad-group fields; group by all of them.
+            return [
+                self.campaign_field,
+                self.id_field,
+                self.source_field,
+                self.ad_group_name_field,
+                self.ad_group_id_field,
+            ]
+        elif self.drill_down_level == MarketingAnalyticsDrillDownLevel.AD:
+            return [
+                self.campaign_field,
+                self.id_field,
+                self.source_field,
+                self.ad_group_name_field,
+                self.ad_group_id_field,
+                self.ad_name_field,
+                self.ad_id_field,
+            ]
+        elif self.drill_down_level in (
+            MarketingAnalyticsDrillDownLevel.MEDIUM,
+            MarketingAnalyticsDrillDownLevel.CONTENT,
+            MarketingAnalyticsDrillDownLevel.TERM,
+        ):
+            return [self.campaign_field]
+        else:
+            return [self.campaign_field, self.id_field, self.source_field]
+
+    def get_campaign_cost_field_chain(self, field_name: str) -> list[str | int]:
+        """Get field chain for campaign cost CTE fields"""
+        return [self.campaign_costs_cte_name, field_name]
+
+    def get_unified_conversion_field_chain(self, field_name: str) -> list[str | int]:
+        """Get field chain for unified conversion goals CTE fields"""
+        return [self.unified_conversion_goals_cte_alias, field_name]
+
+    def get_conversion_goal_column_name(self, index: int) -> str:
+        """Get standardized conversion goal column name"""
+        return f"{self.conversion_goal_prefix}{index}"
+
+    def get_conversion_goal_alias(self, index: int) -> str:
+        """Get conversion goal CTE alias"""
+        return f"{self.conversion_goal_abbreviation}{index}"
+
+    def get_campaign_column_alias(self) -> str:
+        """Get the display alias for the campaign/grouping column based on drill-down level"""
+        return DRILL_DOWN_LEVEL_CONFIG[self.drill_down_level]["column_alias"]

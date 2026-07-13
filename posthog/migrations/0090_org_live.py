@@ -8,7 +8,6 @@ import posthog.models.utils
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0089_auto_20201015_1031"),
     ]
@@ -29,14 +28,19 @@ class Migration(migrations.Migration):
             model_name="team",
             name="api_token",
             field=models.CharField(
-                default=posthog.models.utils.generate_random_token, max_length=200, null=True, unique=True
+                default=posthog.models.utils.generate_random_token,
+                max_length=200,
+                null=True,
+                unique=True,
             ),
         ),
         migrations.AlterField(
             model_name="team",
             name="users",
             field=models.ManyToManyField(
-                blank=True, related_name="teams_deprecated_relationship", to=settings.AUTH_USER_MODEL
+                blank=True,
+                related_name="teams_deprecated_relationship",
+                to=settings.AUTH_USER_MODEL,
             ),
         ),
         migrations.AlterField(
@@ -49,10 +53,22 @@ class Migration(migrations.Migration):
             name="name",
             field=models.CharField(default="Default Project", max_length=200, null=True),
         ),
-        migrations.RemoveConstraint(model_name="organizationinvite", name="max_uses_respected",),
-        migrations.RemoveField(model_name="organizationinvite", name="last_used_by",),
-        migrations.RemoveField(model_name="organizationinvite", name="max_uses",),
-        migrations.RemoveField(model_name="organizationinvite", name="uses",),
+        migrations.RemoveConstraint(
+            model_name="organizationinvite",
+            name="max_uses_respected",
+        ),
+        migrations.RemoveField(
+            model_name="organizationinvite",
+            name="last_used_by",
+        ),
+        migrations.RemoveField(
+            model_name="organizationinvite",
+            name="max_uses",
+        ),
+        migrations.RemoveField(
+            model_name="organizationinvite",
+            name="uses",
+        ),
         migrations.AlterField(
             model_name="organizationinvite",
             name="target_email",

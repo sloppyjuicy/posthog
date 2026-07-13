@@ -1,0 +1,226 @@
+#!/usr/bin/env node
+import * as fs from 'fs'
+import * as path from 'path'
+import { fileURLToPath } from 'url'
+
+import {
+    buildInParallel,
+    copyIndexHtml,
+    copyPublicFolder,
+    copyRRWebWorkerFiles,
+    copySnappyWASMFile,
+    createHashlessEntrypoints,
+    isDev,
+    reportTopChunks,
+    startDevServer,
+} from '@posthog/esbuilder'
+
+import { finalizeToolbarBuild, getToolbarAppBuildConfig } from './toolbar-config.mjs'
+
+export const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+// Chunks below this size aren't worth a preload tag in the HTML document
+const PRELOAD_MIN_CHUNK_BYTES = 50 * 1024
+
+startDevServer(__dirname)
+copyPublicFolder(path.resolve(__dirname, 'public'), path.resolve(__dirname, 'dist'))
+
+copyPublicFolder(
+    path.resolve(__dirname, 'node_modules', '@posthog', 'hedgehog-mode', 'assets'),
+    path.resolve(__dirname, 'dist', 'hedgehog-mode')
+)
+copySnappyWASMFile(__dirname)
+copyRRWebWorkerFiles(__dirname)
+
+writeIndexHtml()
+writeExporterHtml()
+writeRenderQueryHtml()
+await import('./build-products.mjs')
+
+const common = {
+    absWorkingDir: __dirname,
+    bundle: true,
+    writeMetaFile: !isDev,
+}
+
+await buildInParallel(
+    [
+        {
+            name: 'PostHog App',
+            globalName: 'posthogApp',
+            entryPoints: ['src/index.tsx', 'src/sharedChunkAnchors.ts'],
+            splitting: true,
+            format: 'esm',
+            outdir: path.resolve(__dirname, 'dist'),
+            heavy: true,
+            ...common,
+        },
+        {
+            name: 'Decompression Worker',
+            entryPoints: ['src/scenes/session-recordings/player/snapshot-processing/decompressionWorker.ts'],
+            format: 'esm',
+            outfile: path.resolve(__dirname, 'dist', 'decompressionWorker.js'),
+            ...common,
+        },
+        {
+            name: 'Monaco Editor Worker',
+            entryPoints: ['src/lib/monaco/workers/editor.worker.ts'],
+            format: 'esm',
+            outfile: path.resolve(__dirname, 'dist', 'monacoEditorWorker.js'),
+            ...common,
+        },
+        {
+            name: 'Monaco JSON Worker',
+            entryPoints: ['src/lib/monaco/workers/json.worker.ts'],
+            format: 'esm',
+            outfile: path.resolve(__dirname, 'dist', 'monacoJsonWorker.js'),
+            ...common,
+        },
+        {
+            name: 'Monaco TypeScript Worker',
+            entryPoints: ['src/lib/monaco/workers/ts.worker.ts'],
+            format: 'esm',
+            outfile: path.resolve(__dirname, 'dist', 'monacoTsWorker.js'),
+            ...common,
+        },
+        {
+            name: 'Exporter',
+            entryPoints: {
+                exporter: 'src/exporter/index.tsx',
+                exporterSharedChunkAnchors: 'src/sharedChunkAnchors.ts',
+            },
+            splitting: true,
+            format: 'esm',
+            outdir: path.resolve(__dirname, 'dist'),
+            heavy: true,
+            ...common,
+        },
+        {
+            name: 'Render Query',
+            globalName: 'posthogRenderQuery',
+            entryPoints: ['src/render-query/index.tsx'],
+            format: 'iife',
+            outfile: path.resolve(__dirname, 'dist', 'render-query.js'),
+            ...common,
+        },
+        {
+            ...getToolbarAppBuildConfig(__dirname),
+            ...common,
+        },
+    ],
+    {
+        async onBuildComplete(config, buildResponse) {
+            if (!buildResponse) {
+                return
+            }
+
+            const { chunks, entrypoints } = buildResponse
+
+            if (config.name === 'PostHog App') {
+                if (Object.keys(chunks).length === 0) {
+                    console.error('Could not get chunk metadata for bundle "PostHog App."')
+                    throw new Error('Could not get chunk metadata for bundle "PostHog App."')
+                }
+                if (!isDev && Object.keys(entrypoints).length === 0) {
+                    console.error('Could not get entrypoint for bundle "PostHog App."')
+                    throw new Error('Could not get entrypoint for bundle "PostHog App."')
+                }
+                if (!isDev) {
+                    reportTopChunks(buildResponse.outputs, { label: 'PostHog App chunks' })
+                    writePreloadManifest(buildResponse.outputs)
+                }
+                writeIndexHtml(chunks, entrypoints)
+            }
+
+            if (config.name === 'Exporter') {
+                if (!isDev) {
+                    reportTopChunks(buildResponse.outputs, { label: 'Exporter chunks' })
+                }
+                writeExporterHtml(chunks, entrypoints)
+            }
+
+            if (config.name === 'Render Query') {
+                writeRenderQueryHtml(chunks, entrypoints)
+            }
+
+            if (config.name === 'Toolbar') {
+                await finalizeToolbarBuild(__dirname, buildResponse)
+            }
+
+            createHashlessEntrypoints(__dirname, entrypoints)
+        },
+    }
+)
+
+/**
+ * Write dist/preload-manifest.json, read by the Django backend (posthog/utils.py) to emit
+ * <link rel="preload"/"modulepreload"> tags so the boot chain (CSS, font, App and
+ * AuthenticatedShell chunks) is fetched in parallel instead of discovered as a waterfall.
+ * Paths are URL suffixes appended to `JS_URL + '/'`.
+ */
+export function writePreloadManifest(outputs = {}) {
+    const distDir = path.resolve(__dirname, 'dist')
+    // esbuild metafile paths are relative to absWorkingDir (= __dirname), not the invoking cwd
+    const toUrl = (outputPath) => `static/${path.relative(distDir, path.resolve(__dirname, outputPath))}`
+
+    const findEntryJs = (entryPoint) =>
+        Object.entries(outputs).find(([out, meta]) => meta.entryPoint === entryPoint && out.endsWith('.js'))
+
+    const collectChunkUrls = (entryPoint) => {
+        const found = findEntryJs(entryPoint)
+        if (!found) {
+            return []
+        }
+        const [outputPath, meta] = found
+        const urls = [toUrl(outputPath)]
+        for (const imp of meta.imports || []) {
+            if (imp.kind === 'import-statement' && (outputs[imp.path]?.bytes || 0) > PRELOAD_MIN_CHUNK_BYTES) {
+                urls.push(toUrl(imp.path))
+            }
+        }
+        return urls
+    }
+
+    const cssOutput = Object.keys(outputs).find((out) => /\/index(-[^./-]+)?\.css$/.test(out))
+    const fontOutput = Object.keys(outputs).find((out) => /\/Inter(-[^./-]+)?\.woff2$/.test(out))
+
+    const dedupe = (urls) => [...new Set(urls)]
+    const manifest = {
+        css: cssOutput ? toUrl(cssOutput) : '',
+        font: fontOutput ? toUrl(fontOutput) : '',
+        // Entry first: its modulepreload starts the fetch at preload-scan time, before the
+        // loader script at the end of <head> gets to import() it.
+        js: dedupe([...collectChunkUrls('src/index.tsx'), ...collectChunkUrls('src/scenes/App.tsx')]),
+        // The backend emits these only for authenticated requests
+        authenticatedJs: dedupe(collectChunkUrls('src/scenes/AuthenticatedShell.tsx')),
+    }
+    // An empty field means an entry point, chunk, or asset name drifted from the lookups above —
+    // failing the build beats shipping green with the optimization silently off.
+    for (const [key, value] of Object.entries(manifest)) {
+        if (value.length === 0) {
+            console.error(`preload-manifest.json field "${key}" resolved empty.`)
+            throw new Error(`preload-manifest.json field "${key}" resolved empty.`)
+        }
+    }
+    fs.writeFileSync(path.resolve(distDir, 'preload-manifest.json'), JSON.stringify(manifest, null, 2))
+}
+
+export function writeIndexHtml(chunks = {}, entrypoints = []) {
+    copyIndexHtml(__dirname, 'src/index.html', 'dist/index.html', 'index', chunks, entrypoints)
+    copyIndexHtml(__dirname, 'src/layout.html', 'dist/layout.html', 'index', chunks, entrypoints)
+}
+
+export function writeExporterHtml(chunks = {}, entrypoints = []) {
+    copyIndexHtml(__dirname, 'src/exporter/index.html', 'dist/exporter.html', 'exporter', chunks, entrypoints)
+}
+
+export function writeRenderQueryHtml(chunks = {}, entrypoints = []) {
+    copyIndexHtml(
+        __dirname,
+        'src/render-query/index.html',
+        'dist/render_query.html',
+        'render-query',
+        chunks,
+        entrypoints
+    )
+}

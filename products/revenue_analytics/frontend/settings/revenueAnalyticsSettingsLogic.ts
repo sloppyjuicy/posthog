@@ -1,0 +1,412 @@
+import { actions, afterMount, connect, kea, listeners, path, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+import { beforeUnload } from 'kea-router'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
+import { dayjs } from 'lib/dayjs'
+import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { objectsEqual } from 'lib/utils/objects'
+import { databaseTableListLogic } from 'scenes/data-management/database/databaseTableListLogic'
+import { teamLogic } from 'scenes/teamLogic'
+
+import {
+    CurrencyCode,
+    DataTableNode,
+    NodeKind,
+    RevenueAnalyticsConfig,
+    RevenueAnalyticsEventItem,
+    RevenueAnalyticsGoal,
+    RevenueCurrencyPropertyConfig,
+    SubscriptionDropoffMode,
+} from '~/queries/schema/schema-general'
+import { ExternalDataSource } from '~/types'
+
+import { sourceManagementLogic } from 'products/data_warehouse/frontend/shared/logics/sourceManagementLogic'
+
+import type { revenueAnalyticsSettingsLogicType } from './revenueAnalyticsSettingsLogicType'
+
+const createEmptyConfig = (): RevenueAnalyticsConfig => ({
+    events: [],
+    goals: [],
+    filter_test_accounts: false,
+})
+
+const sortByDueDate = (goals: RevenueAnalyticsGoal[]): RevenueAnalyticsGoal[] => {
+    return goals.sort((a, b) => dayjs(a.due_date).diff(dayjs(b.due_date)))
+}
+
+type PropertyUpdater<T extends keyof RevenueAnalyticsEventItem> = {
+    eventName: string
+    property: RevenueAnalyticsEventItem[T]
+}
+
+const updatePropertyReducerBuilder =
+    (propertyKey: keyof RevenueAnalyticsEventItem) =>
+    (state: RevenueAnalyticsConfig | null, { eventName, property }: PropertyUpdater<typeof propertyKey>) => {
+        if (!state) {
+            return state
+        }
+
+        return {
+            ...state,
+            events: state.events.map((item) => {
+                if (item.eventName === eventName) {
+                    return { ...item, [propertyKey]: property }
+                }
+                return item
+            }),
+        }
+    }
+
+export const revenueAnalyticsSettingsLogic = kea<revenueAnalyticsSettingsLogicType>([
+    path(['scenes', 'data-management', 'revenue', 'revenueAnalyticsSettingsLogic']),
+    connect(() => ({
+        values: [
+            teamLogic,
+            ['currentTeam', 'currentTeamId'],
+            sourceManagementLogic,
+            ['dataWarehouseSources', 'dataWarehouseSourcesLoading'],
+            databaseTableListLogic,
+            ['database'],
+        ],
+        actions: [
+            teamLogic,
+            ['updateCurrentTeam'],
+            sourceManagementLogic,
+            ['updateSourceRevenueAnalyticsConfig', 'deleteJoin'],
+            eventUsageLogic,
+            [
+                'reportRevenueAnalyticsEventDeleted',
+                'reportRevenueAnalyticsDataSourceEnabled',
+                'reportRevenueAnalyticsDataSourceDisabled',
+                'reportRevenueAnalyticsTestAccountFilterUpdated',
+            ],
+        ],
+    })),
+    actions({
+        addEvent: (eventName: string, revenueCurrency: CurrencyCode) => ({ eventName, revenueCurrency }),
+        deleteEvent: (eventName: string) => ({ eventName }),
+
+        updateEventCouponProperty: (eventName: string, property: string) => ({ eventName, property }),
+        updateEventCurrencyProperty: (eventName: string, property: RevenueCurrencyPropertyConfig) => ({
+            eventName,
+            property,
+        }),
+        updateEventCurrencyAwareDecimalProperty: (eventName: string, property: boolean) => ({
+            eventName,
+            property,
+        }),
+        updateEventProductProperty: (eventName: string, property: string) => ({ eventName, property }),
+        updateEventRevenueProperty: (eventName: string, property: string) => ({ eventName, property }),
+        updateEventSubscriptionProperty: (eventName: string, property: string) => ({ eventName, property }),
+        updateEventSubscriptionDropoffDays: (eventName: string, property: number) => ({ eventName, property }),
+        updateEventSubscriptionDropoffMode: (eventName: string, property: SubscriptionDropoffMode) => ({
+            eventName,
+            property,
+        }),
+
+        addGoal: (goal: RevenueAnalyticsGoal) => ({ goal }),
+        deleteGoal: (index: number) => ({ index }),
+        updateGoal: (index: number, goal: RevenueAnalyticsGoal) => ({ index, goal }),
+
+        updateFilterTestAccounts: (filterTestAccounts: boolean) => ({ filterTestAccounts }),
+
+        save: true,
+        resetConfig: true,
+    }),
+    reducers(({ values }) => ({
+        revenueAnalyticsConfig: [
+            null as RevenueAnalyticsConfig | null,
+            {
+                addEvent: (state: RevenueAnalyticsConfig | null, { eventName, revenueCurrency }) => {
+                    if (!state || !eventName || typeof eventName !== 'string') {
+                        return state
+                    }
+
+                    const existingEvents = new Set(
+                        state.events.map((item: RevenueAnalyticsEventItem) => item.eventName)
+                    )
+                    if (existingEvents.has(eventName)) {
+                        return state
+                    }
+
+                    return {
+                        ...state,
+                        events: [
+                            ...state.events,
+                            {
+                                eventName,
+                                revenueProperty: '',
+                                revenueCurrencyProperty: { static: revenueCurrency },
+                                currencyAwareDecimal: false,
+                                subscriptionDropoffDays: 45,
+                                subscriptionDropoffMode: 'last_event',
+                            },
+                        ],
+                    }
+                },
+                deleteEvent: (state: RevenueAnalyticsConfig | null, { eventName }) => {
+                    if (!state) {
+                        return state
+                    }
+                    return { ...state, events: state.events.filter((item) => item.eventName !== eventName) }
+                },
+
+                updateEventCouponProperty: updatePropertyReducerBuilder('couponProperty'),
+                updateEventCurrencyAwareDecimalProperty: updatePropertyReducerBuilder('currencyAwareDecimal'),
+                updateEventCurrencyProperty: updatePropertyReducerBuilder('revenueCurrencyProperty'),
+                updateEventProductProperty: updatePropertyReducerBuilder('productProperty'),
+                updateEventRevenueProperty: updatePropertyReducerBuilder('revenueProperty'),
+                updateEventSubscriptionProperty: updatePropertyReducerBuilder('subscriptionProperty'),
+                updateEventSubscriptionDropoffDays: updatePropertyReducerBuilder('subscriptionDropoffDays'),
+                updateEventSubscriptionDropoffMode: updatePropertyReducerBuilder('subscriptionDropoffMode'),
+
+                addGoal: (state: RevenueAnalyticsConfig | null, { goal }) => {
+                    if (!state) {
+                        return state
+                    }
+
+                    const goals = sortByDueDate([...state.goals, goal])
+                    return { ...state, goals }
+                },
+                deleteGoal: (state: RevenueAnalyticsConfig | null, { index }) => {
+                    if (!state) {
+                        return state
+                    }
+
+                    const goals = sortByDueDate(state.goals.filter((_, i) => i !== index))
+
+                    return { ...state, goals }
+                },
+                updateGoal: (state: RevenueAnalyticsConfig | null, { index, goal }) => {
+                    if (!state) {
+                        return state
+                    }
+
+                    const goals = sortByDueDate(state.goals.map((item, i) => (i === index ? goal : item)))
+                    return { ...state, goals }
+                },
+                updateFilterTestAccounts: (state: RevenueAnalyticsConfig | null, { filterTestAccounts }) => {
+                    if (!state) {
+                        return state
+                    }
+                    return { ...state, filter_test_accounts: filterTestAccounts }
+                },
+                resetConfig: () => {
+                    return values.savedRevenueAnalyticsConfig
+                },
+            },
+        ],
+        savedRevenueAnalyticsConfig: [
+            // TODO: Check how to pass the preflight region here
+            values.currentTeam?.revenue_analytics_config || createEmptyConfig(),
+            {
+                updateCurrentTeam: (state, { revenue_analytics_config }) => {
+                    // Only update if revenue_analytics_config is explicitly provided
+                    if (revenue_analytics_config === undefined) {
+                        return state
+                    }
+                    // TODO: Check how to pass the preflight region here
+                    return revenue_analytics_config || createEmptyConfig()
+                },
+                loadRevenueAnalyticsConfigSuccess: (_, { revenueAnalyticsConfig }) => {
+                    return revenueAnalyticsConfig || createEmptyConfig()
+                },
+            },
+        ],
+    })),
+    selectors({
+        filterTestAccounts: [
+            (s) => [s.revenueAnalyticsConfig],
+            (revenueAnalyticsConfig: RevenueAnalyticsConfig | null) =>
+                revenueAnalyticsConfig?.filter_test_accounts || false,
+        ],
+
+        goals: [
+            (s) => [s.revenueAnalyticsConfig],
+            (revenueAnalyticsConfig: RevenueAnalyticsConfig | null) => revenueAnalyticsConfig?.goals || [],
+        ],
+
+        events: [
+            (s) => [s.revenueAnalyticsConfig],
+            (revenueAnalyticsConfig: RevenueAnalyticsConfig | null) => revenueAnalyticsConfig?.events || [],
+        ],
+        changesMadeToEvents: [
+            (s) => [s.revenueAnalyticsConfig, s.savedRevenueAnalyticsConfig],
+            (config, savedConfig): boolean => {
+                return !!config && !objectsEqual(config.events, savedConfig.events)
+            },
+        ],
+        saveEventsDisabledReason: [
+            (s) => [s.revenueAnalyticsConfig, s.changesMadeToEvents],
+            (config, changesMade): string | null => {
+                if (!config) {
+                    return 'Loading...'
+                }
+                if (!changesMade) {
+                    return 'No changes to save'
+                }
+                const eventMissingRevenueProperty = config.events.find((event) => !event.revenueProperty)
+                if (eventMissingRevenueProperty) {
+                    return `Select a numeric revenue property for "${eventMissingRevenueProperty.eventName}". If you don't see your property, make sure it's marked as numeric in Property Definitions.`
+                }
+
+                return null
+            },
+        ],
+
+        enabledDataWarehouseSources: [
+            (s) => [s.dataWarehouseSources],
+            (dataWarehouseSources): ExternalDataSource[] => {
+                return dataWarehouseSources?.results?.filter((source) => source.revenue_analytics_config.enabled) ?? []
+            },
+        ],
+
+        exampleEventsQuery: [
+            (s) => [s.savedRevenueAnalyticsConfig],
+            (revenueAnalyticsConfig: RevenueAnalyticsConfig | null) => {
+                if (!revenueAnalyticsConfig) {
+                    return null
+                }
+
+                const query: DataTableNode = {
+                    kind: NodeKind.DataTableNode,
+                    full: true,
+                    showPropertyFilter: false,
+                    source: {
+                        kind: NodeKind.RevenueExampleEventsQuery,
+                    },
+                }
+
+                return query
+            },
+        ],
+        exampleDataWarehouseTablesQuery: [
+            (s) => [s.savedRevenueAnalyticsConfig],
+            (revenueAnalyticsConfig: RevenueAnalyticsConfig | null) => {
+                if (!revenueAnalyticsConfig) {
+                    return null
+                }
+
+                const query: DataTableNode = {
+                    kind: NodeKind.DataTableNode,
+                    full: true,
+                    showPropertyFilter: false,
+                    source: {
+                        kind: NodeKind.RevenueExampleDataWarehouseTablesQuery,
+                    },
+                }
+
+                return query
+            },
+        ],
+
+        joins: [
+            (s) => [s.database],
+            (database) => {
+                return database?.joins || []
+            },
+        ],
+    }),
+    listeners(({ actions, values }) => {
+        return {
+            addGoal: () => {
+                if (values.revenueAnalyticsConfig) {
+                    actions.updateCurrentTeam({
+                        revenue_analytics_config: {
+                            ...values.revenueAnalyticsConfig,
+                            goals: values.revenueAnalyticsConfig.goals,
+                        },
+                    })
+                    lemonToast.success('Revenue analytics config saved')
+                }
+                globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.SetUpRevenueGoal)
+            },
+            deleteGoal: () => {
+                if (values.revenueAnalyticsConfig) {
+                    actions.updateCurrentTeam({
+                        revenue_analytics_config: {
+                            ...values.revenueAnalyticsConfig,
+                            goals: values.revenueAnalyticsConfig.goals,
+                        },
+                    })
+                    lemonToast.success('Revenue analytics config saved')
+                }
+            },
+            updateGoal: () => {
+                if (values.revenueAnalyticsConfig) {
+                    actions.updateCurrentTeam({
+                        revenue_analytics_config: {
+                            ...values.revenueAnalyticsConfig,
+                            goals: values.revenueAnalyticsConfig.goals,
+                        },
+                    })
+                    lemonToast.success('Revenue analytics config saved')
+                }
+            },
+            save: () => {
+                if (values.revenueAnalyticsConfig) {
+                    actions.updateCurrentTeam({
+                        revenue_analytics_config: {
+                            ...values.revenueAnalyticsConfig,
+                            events: values.revenueAnalyticsConfig.events,
+                        },
+                    })
+                    lemonToast.success('Revenue analytics config saved')
+                }
+
+                // Mark ConnectRevenueSource as completed when saving with events configured
+                if ((values.revenueAnalyticsConfig?.events?.length ?? 0) > 0) {
+                    globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.ConnectRevenueSource)
+                }
+            },
+            updateFilterTestAccounts: ({ filterTestAccounts }) => {
+                if (values.revenueAnalyticsConfig) {
+                    actions.updateCurrentTeam({
+                        revenue_analytics_config: {
+                            ...values.revenueAnalyticsConfig,
+                            filter_test_accounts: filterTestAccounts,
+                        },
+                    })
+                    lemonToast.success('Revenue analytics config saved')
+                    actions.reportRevenueAnalyticsTestAccountFilterUpdated(filterTestAccounts)
+                }
+            },
+            deleteEvent: ({ eventName }) => actions.reportRevenueAnalyticsEventDeleted(eventName),
+            updateSourceRevenueAnalyticsConfig: ({ source, config }) => {
+                const func = config.enabled
+                    ? actions.reportRevenueAnalyticsDataSourceEnabled
+                    : actions.reportRevenueAnalyticsDataSourceDisabled
+
+                // Mark ConnectRevenueSource as completed when enabling a data source
+                if (config.enabled) {
+                    globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.ConnectRevenueSource)
+                }
+
+                return func(source.source_type)
+            },
+        }
+    }),
+    loaders(({ values }) => ({
+        revenueAnalyticsConfig: {
+            loadRevenueAnalyticsConfig: async () => {
+                if (values.currentTeam) {
+                    return values.currentTeam.revenue_analytics_config || createEmptyConfig()
+                }
+                return null
+            },
+        },
+    })),
+    beforeUnload(({ actions, values }) => ({
+        enabled: () => values.changesMadeToEvents,
+        message: 'Changes you made will be discarded. Make sure you save your changes before leaving this page.',
+        onConfirm: () => {
+            actions.resetConfig()
+        },
+    })),
+    afterMount(({ actions }) => {
+        actions.loadRevenueAnalyticsConfig()
+    }),
+])

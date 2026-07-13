@@ -1,121 +1,480 @@
-from typing import Any, Dict, Optional, Union, cast
+import json
+import uuid as uuid_module
+from datetime import timedelta
+from typing import Any, Optional, TypedDict, Union, cast
+from urllib.parse import quote, urlencode
 
-import posthoganalytics
 from django import forms
 from django.conf import settings
 from django.contrib.auth import login, password_validation
+from django.contrib.sessions.backends.base import SessionBase, UpdateError
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
-from django.http import HttpResponse
-from django.shortcuts import redirect, render
+from django.shortcuts import redirect
 from django.urls.base import reverse
-from rest_framework import exceptions, generics, permissions, response, serializers, validators
-from sentry_sdk import capture_exception
-from social_core.backends.base import BaseAuth
+from django.utils import timezone
+
+import structlog
+import posthoganalytics
+from rest_framework import exceptions, generics, permissions, response, serializers, status
+from rest_framework.request import Request
 from social_core.pipeline.partial import partial
 from social_django.strategy import DjangoStrategy
+from webauthn.helpers import base64url_to_bytes
 
+from posthog.api.email_verification import EmailVerifier, is_email_verification_disabled
 from posthog.api.shared import UserBasicSerializer
-from posthog.demo import create_demo_team
-from posthog.event_usage import report_user_joined_organization, report_user_signed_up
-from posthog.models import Organization, Team, User
-from posthog.models.organization import OrganizationInvite
+from posthog.api.webauthn import (
+    WEBAUTHN_SIGNUP_CREDENTIAL_KEY,
+    WEBAUTHN_SIGNUP_EMAIL_KEY,
+    WEBAUTHN_SIGNUP_USER_UUID_KEY,
+)
+from posthog.email import is_email_available
+from posthog.event_usage import alias_invite_id, report_user_joined_organization, report_user_signed_up
+from posthog.exceptions_capture import capture_exception
+from posthog.helpers.email_utils import EmailValidationHelper, validate_display_name
+from posthog.models import InviteExpiredException, Organization, OrganizationDomain, OrganizationInvite, Team, User
+from posthog.models.organization_invite import INVITE_DAYS_VALIDITY
+from posthog.models.webauthn_credential import WebauthnCredential
 from posthog.permissions import CanCreateOrg
-from posthog.tasks import user_identify
-from posthog.utils import get_can_create_org, mask_email_address
+from posthog.rate_limit import SignupEmailPrecheckThrottle, SignupIPThrottle, SignupResendInviteThrottle
+from posthog.utils import get_can_create_org, is_relative_url
+from posthog.workos_radar import RadarAction, RadarAuthMethod, evaluate_auth_attempt
+
+from products.demo.backend.facade.api import HedgeboxMatrix, MatrixManager
+
+logger = structlog.get_logger(__name__)
+
+
+def _save_session_with_recovery(session: SessionBase) -> None:
+    """Persist session state and recover from missing-row session races."""
+    try:
+        session.save()
+    except UpdateError:
+        # If another request deleted/recreated this session row, create a new row for this request.
+        session.create()
+
+
+def verify_email_or_login(request: Request, user: User) -> None:
+    if is_email_available() and not user.is_email_verified and not is_email_verification_disabled(user):
+        next_url = request.data.get("next_url") if request and request.data else None
+
+        # We only want to redirect to a relative url so that we don't redirect away from the current domain
+        if is_relative_url(next_url):
+            EmailVerifier.create_token_and_send_email_verification(user, next_url)
+        else:
+            EmailVerifier.create_token_and_send_email_verification(user)
+    else:
+        login(request, user, backend="django.contrib.auth.backends.ModelBackend")
+
+
+def get_redirect_url(uuid: str, is_email_verified: bool, next_url: str | None = None) -> str:
+    user = User.objects.get(uuid=uuid)
+
+    require_email_verification = (
+        is_email_available()
+        and not is_email_verified
+        and not is_email_verification_disabled(user)
+        and not settings.DEMO
+    )
+
+    if require_email_verification:
+        redirect_url = "/verify_email/" + uuid
+
+        if next_url:
+            redirect_url += "?next=" + quote(next_url, safe="")
+
+        return redirect_url
+
+    return next_url or "/"
 
 
 class SignupSerializer(serializers.Serializer):
     first_name: serializers.Field = serializers.CharField(max_length=128)
-    email: serializers.Field = serializers.EmailField(
-        validators=[
-            validators.UniqueValidator(
-                queryset=User.objects.all(), message="There is already an account with this email address."
-            )
-        ]
+    last_name: serializers.Field = serializers.CharField(max_length=128, required=False, allow_blank=True)
+    email: serializers.Field = serializers.EmailField()
+    password: serializers.Field = serializers.CharField(
+        max_length=72, allow_null=True, required=False, allow_blank=True
     )
-    password: serializers.Field = serializers.CharField(allow_null=True)
-    organization_name: serializers.Field = serializers.CharField(max_length=128, required=False, allow_blank=True)
-    email_opt_in: serializers.Field = serializers.BooleanField(default=True)
+    organization_name: serializers.Field = serializers.CharField(max_length=64, required=False, allow_blank=True)
+    role_at_organization: serializers.Field = serializers.CharField(
+        max_length=128, required=False, allow_blank=True, default=""
+    )
+    referral_source: serializers.Field = serializers.CharField(max_length=1000, required=False, allow_blank=True)
+    referral_source_ai_prompt: serializers.Field = serializers.CharField(
+        max_length=1000, required=False, allow_blank=True
+    )
+    turnstile_token: serializers.Field = serializers.CharField(required=False, allow_blank=True, default="")
+    challenge_nonce: serializers.Field = serializers.CharField(required=False, allow_blank=True, default="")
+
+    # Slightly hacky: self vars for internal use
+    is_social_signup: bool
+    is_passkey_signup: bool
+    _user: User
+    _team: Team
+    _organization: Organization
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_social_signup = False
+        self.is_passkey_signup = False
+
+    def get_fields(self) -> dict[str, serializers.Field]:
+        fields = super().get_fields()
+        if settings.DEMO:
+            # There's no password in the demo env
+            # To log in, a user just needs to attempt sign up with an email that's already in use
+            fields.pop("password")
+        return fields
 
     def validate_password(self, value):
-        if value is not None:
+        if value is not None and value != "":
             password_validation.validate_password(value)
         return value
 
+    def validate_first_name(self, value: str) -> str:
+        return validate_display_name(value)
+
+    def validate_last_name(self, value: str) -> str:
+        return validate_display_name(value)
+
+    def validate_organization_name(self, value: str) -> str:
+        return validate_display_name(value)
+
+    def validate(self, data):
+        request = self.context.get("request")
+        passkey_credential = request.session.get(WEBAUTHN_SIGNUP_CREDENTIAL_KEY) if request else None
+        password = data.get("password")
+
+        # Password signup: if a password is provided, use it even if passkey data exists
+        if password:
+            pass
+        # Passkey signup: credential in session, no password needed
+        elif passkey_credential:
+            self.is_passkey_signup = True
+        # Social signup: password not required
+        elif self.is_social_signup:
+            pass
+        # Demo mode: password not required
+        elif settings.DEMO:
+            pass
+        # Regular signup: password required
+        else:
+            raise serializers.ValidationError(
+                {"password": serializers.ErrorDetail("This field is required.", code="required")}
+            )
+
+        return data
+
+    def validate_email(self, value):
+        request = self.context.get("request")
+        passkey_credential = request.session.get(WEBAUTHN_SIGNUP_CREDENTIAL_KEY) if request else None
+        session_email = request.session.get(WEBAUTHN_SIGNUP_EMAIL_KEY) if request else None
+        password = request.data.get("password") if request else None
+
+        # For passkey signup (only if no password provided), use the email from session (already validated during registration)
+        if passkey_credential and session_email and not password:
+            if session_email.lower() != value.lower():
+                raise serializers.ValidationError(
+                    "Email does not match the email used for passkey registration", code="email_mismatch"
+                )
+
+            value = session_email
+
+        if not settings.DEMO and EmailValidationHelper.user_exists(value):
+            raise serializers.ValidationError("There is already an account with this email address.", code="unique")
+        return value
+
+    def is_email_auto_verified(self):
+        if self.is_social_signup:
+            return True
+        domain = self.validated_data.get("email", "").split("@")[-1].lower()
+        return domain in settings.EMAIL_VERIFICATION_SKIP_FOR_DOMAINS
+
     def create(self, validated_data, **kwargs):
+        if settings.DEMO:
+            return self.enter_demo(validated_data)
+
+        request = self.context["request"]
+        passkey_credential = request.session.get(WEBAUTHN_SIGNUP_CREDENTIAL_KEY)
+        password = validated_data.get("password")
+
+        # If a password is provided, clear passkey session data and use password signup
+        if password and passkey_credential:
+            request.session.pop(WEBAUTHN_SIGNUP_CREDENTIAL_KEY, None)
+            request.session.pop(WEBAUTHN_SIGNUP_EMAIL_KEY, None)
+            request.session.pop(WEBAUTHN_SIGNUP_USER_UUID_KEY, None)
+            _save_session_with_recovery(request.session)
+            passkey_credential = None
+
+        if not self.is_social_signup:
+            auth_method = RadarAuthMethod.PASSKEY if passkey_credential else RadarAuthMethod.PASSWORD
+            evaluate_auth_attempt(
+                request=request._request,
+                email=validated_data["email"],
+                action=RadarAction.SIGNUP,
+                auth_method=auth_method,
+                turnstile_token=validated_data.get("turnstile_token", ""),
+                challenge_nonce=validated_data.get("challenge_nonce", ""),
+            )
+
         is_instance_first_user: bool = not User.objects.exists()
 
-        organization_name = validated_data.pop("organization_name", validated_data["first_name"])
+        validated_data.pop("turnstile_token", None)
+        validated_data.pop("challenge_nonce", None)
 
-        self._organization, self._team, self._user = User.objects.bootstrap(
-            organization_name=organization_name, create_team=self.create_team, **validated_data,
-        )
+        default_org_name = f"{validated_data['first_name']}'s Organization"[:64]
+        organization_name = validated_data.pop("organization_name", default_org_name)
+        role_at_organization = validated_data.pop("role_at_organization", "")
+        referral_source = validated_data.pop("referral_source", "")
+        referral_source_ai_prompt = validated_data.pop("referral_source_ai_prompt", "")
+
+        # For passkey signup, set password to None and use the pre-generated UUID
+        if passkey_credential:
+            validated_data["password"] = None
+            user_uuid_str = request.session.get(WEBAUTHN_SIGNUP_USER_UUID_KEY)
+            if user_uuid_str:
+                validated_data["uuid"] = uuid_module.UUID(user_uuid_str)
+
+        try:
+            with transaction.atomic():
+                self._organization, self._team, self._user = User.objects.bootstrap(
+                    organization_name=organization_name,
+                    create_team=self.create_team,
+                    is_staff=is_instance_first_user,
+                    is_email_verified=self.is_email_auto_verified(),
+                    role_at_organization=role_at_organization,
+                    **validated_data,
+                )
+
+                # Create WebauthnCredential from session data for passkey signup
+                if passkey_credential:
+                    WebauthnCredential.objects.create(
+                        user=self._user,
+                        credential_id=base64url_to_bytes(passkey_credential["credential_id"]),
+                        public_key=base64url_to_bytes(passkey_credential["public_key"]),
+                        algorithm=passkey_credential["algorithm"],
+                        counter=passkey_credential["sign_count"],
+                        transports=passkey_credential.get("transports", []),
+                        verified=True,
+                        label="Passkey",
+                    )
+                    # Self-created during signup, so it counts as already-acknowledged for the
+                    # credential review interstitial. Otherwise the user would be asked to revoke
+                    # the only credential they just minted to log in with.
+                    self._user.credentials_reviewed_at = timezone.now()
+                    self._user.save(update_fields=["credentials_reviewed_at"])
+
+        except IntegrityError as e:
+            # This can happen if:
+            # 1. A user with this email was created between validation and creation (race condition)
+            # 2. For passkey signup, a user was created after passkey registration but before signup completion
+            # 3. A user is created with uuid that another user has
+            logger.warning(
+                "signup_integrity_error",
+                email=validated_data.get("email"),
+                is_passkey_signup=bool(passkey_credential),
+                error=str(e),
+            )
+            raise exceptions.ValidationError(
+                {"email": "There is already an account with this email address."},
+                code="unique",
+            )
+
+        # Clear passkey signup session data
+        if passkey_credential:
+            request.session.pop(WEBAUTHN_SIGNUP_CREDENTIAL_KEY, None)
+            request.session.pop(WEBAUTHN_SIGNUP_EMAIL_KEY, None)
+            request.session.pop(WEBAUTHN_SIGNUP_USER_UUID_KEY, None)
+            _save_session_with_recovery(request.session)
+
         user = self._user
 
-        # Temp (due to FF-release [`new-onboarding-2822`]): Activate the setup/onboarding process if applicable
-        if self.enable_new_onboarding(user):
-            self._organization.setup_section_2_completed = False
-            self._organization.save()
-
-        login(
-            self.context["request"], user, backend="django.contrib.auth.backends.ModelBackend",
-        )
-
         report_user_signed_up(
-            user.distinct_id,
+            user,
             is_instance_first_user=is_instance_first_user,
             is_organization_first_user=True,
             new_onboarding_enabled=(not self._organization.setup_section_2_completed),
             backend_processor="OrganizationSignupSerializer",
             user_analytics_metadata=user.get_analytics_metadata(),
             org_analytics_metadata=user.organization.get_analytics_metadata() if user.organization else None,
+            role_at_organization=role_at_organization,
+            referral_source=referral_source,
+            referral_source_ai_prompt=referral_source_ai_prompt,
         )
+
+        verify_email_or_login(request, user)
 
         return user
 
-    def create_team(self, organization: Organization, user: User) -> Team:
-        if self.enable_new_onboarding(user):
-            return create_demo_team(organization=organization)
-        else:
-            return Team.objects.create_with_data(user=user, organization=organization)
+    def enter_demo(self, validated_data) -> User:
+        """Demo signup/login flow."""
+        email = validated_data["email"]
+        first_name = validated_data["first_name"]
+        organization_name = validated_data["organization_name"]
+        # In the demo env, social signups gets staff privileges
+        # - grep SOCIAL_AUTH_GOOGLE_OAUTH2_WHITELISTED_DOMAINS for more info
+        is_staff = self.is_social_signup
+        matrix = HedgeboxMatrix()
+        manager = MatrixManager(matrix, use_pre_save=True)
+        with transaction.atomic():
+            (
+                self._organization,
+                self._team,
+                self._user,
+            ) = manager.ensure_account_and_save(email, first_name, organization_name, is_staff=is_staff)
 
-    def to_representation(self, instance) -> Dict:
+        login(
+            self.context["request"],
+            self._user,
+            backend="django.contrib.auth.backends.ModelBackend",
+        )
+        return self._user
+
+    def create_team(self, organization: Organization, user: User) -> Team:
+        return Team.objects.create_with_data(initiating_user=user, organization=organization)
+
+    def to_representation(self, instance) -> dict:
+        request = self.context.get("request")
+        next_url = request.data.get("next_url") if request and request.data else None
+        # We only want to redirect to a relative url so that we don't redirect away from the current domain
+        if next_url and not is_relative_url(next_url):
+            next_url = None
+
         data = UserBasicSerializer(instance=instance).data
-        data["redirect_url"] = "/personalization" if self.enable_new_onboarding() else "/ingestion"
+        data["redirect_url"] = get_redirect_url(data["uuid"], data["is_email_verified"], next_url)
         return data
 
-    def enable_new_onboarding(self, user: Optional[User] = None) -> bool:
-        if user is None:
-            user = self._user
-        return posthoganalytics.feature_enabled("new-onboarding-2822", user.distinct_id)
+
+class SignupEmailPrecheckSerializer(serializers.Serializer):
+    email: serializers.Field = serializers.EmailField()
+
+
+class PendingInvitePayload(TypedDict):
+    organization_name: str
+
+
+def _get_pending_invite_for_email(email: str) -> Optional[OrganizationInvite]:
+    # Pre-filter in SQL to a generous validity window for efficiency, then defer to the
+    # model's `is_expired` for the authoritative check so any future expansion of that
+    # method (e.g. revocation flag) automatically applies here.
+    invites = (
+        OrganizationInvite.objects.filter(
+            target_email__iexact=email,
+            created_at__gt=timezone.now() - timedelta(days=INVITE_DAYS_VALIDITY),
+        )
+        .select_related("organization")
+        .order_by("-created_at")
+    )
+    return next((i for i in invites if not i.is_expired()), None)
+
+
+class SignupEmailPrecheckViewset(generics.GenericAPIView):
+    serializer_class = SignupEmailPrecheckSerializer
+    permission_classes = (permissions.AllowAny,)
+    throttle_classes = [] if settings.E2E_TESTING else [SignupEmailPrecheckThrottle]
+
+    def post(self, request: Request, *args: Any, **kwargs: Any) -> response.Response:
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data["email"]
+        email_exists = False if settings.DEMO else EmailValidationHelper.user_exists(email)
+        if email_exists:
+            return response.Response(
+                {
+                    "email_exists": True,
+                    "code": "account_exists",
+                    "detail": "There is already an account with this email address.",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        invite = _get_pending_invite_for_email(email)
+        pending_invite: Optional[PendingInvitePayload] = None
+        if invite is not None:
+            # We deliberately do NOT return the invite UUID here. The signup form shows a
+            # nudge banner, and the user has to round-trip through the invite email to
+            # actually accept — preserving the pre-PR security property that only the
+            # mailbox owner can consume the invite.
+            pending_invite = {"organization_name": invite.organization.name}
+        return response.Response(
+            {"email_exists": False, "pending_invite": pending_invite},
+            status=status.HTTP_200_OK,
+        )
+
+
+class SignupResendInviteSerializer(serializers.Serializer):
+    email: serializers.Field = serializers.EmailField()
+
+
+class SignupResendInviteViewset(generics.GenericAPIView):
+    """Re-send the existing invite email for a given address, if one exists.
+
+    Pairs with the precheck nudge banner: a user who landed on /signup with a pending invite
+    can ask PostHog to re-deliver the original invite email. Returns the same shape whether
+    or not an invite exists, but precheck has already disclosed the existence — this endpoint
+    just makes the round-trip via email easier.
+    """
+
+    serializer_class = SignupResendInviteSerializer
+    permission_classes = (permissions.AllowAny,)
+    throttle_classes = [] if settings.E2E_TESTING else [SignupResendInviteThrottle]
+
+    def post(self, request: Request, *args: Any, **kwargs: Any) -> response.Response:
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data["email"]
+        invite = _get_pending_invite_for_email(email)
+        if invite is not None and is_email_available():
+            from posthog.tasks.email import send_invite
+
+            send_invite.apply_async(kwargs={"invite_id": str(invite.id)})
+        return response.Response({"sent": invite is not None}, status=status.HTTP_200_OK)
 
 
 class SignupViewset(generics.CreateAPIView):
     serializer_class = SignupSerializer
     # Enables E2E testing of signup flow
     permission_classes = (permissions.AllowAny,) if settings.E2E_TESTING else (CanCreateOrg,)
+    throttle_classes = [] if settings.E2E_TESTING else [SignupIPThrottle]
 
 
 class InviteSignupSerializer(serializers.Serializer):
     first_name: serializers.Field = serializers.CharField(max_length=128, required=False)
-    password: serializers.Field = serializers.CharField(required=False)
-    email_opt_in: serializers.Field = serializers.BooleanField(default=True)
+    password: serializers.Field = serializers.CharField(max_length=72, required=False)
+    role_at_organization: serializers.Field = serializers.CharField(
+        max_length=128, required=False, allow_blank=True, default=""
+    )
+    turnstile_token: serializers.Field = serializers.CharField(required=False, allow_blank=True, default="")
+    challenge_nonce: serializers.Field = serializers.CharField(required=False, allow_blank=True, default="")
 
     def validate_password(self, value):
         password_validation.validate_password(value)
         return value
 
+    def validate_first_name(self, value: str) -> str:
+        return validate_display_name(value)
+
     def to_representation(self, instance):
-        serializer = UserBasicSerializer(instance=instance)
-        return serializer.data
+        data = UserBasicSerializer(instance=instance).data
+        # Setup-delegation invites hand off onboarding to the invitee — route them straight into
+        # onboarding instead of the default post-signup landing page, otherwise the sceneLogic
+        # redirect race can drop them on the homepage.
+        next_url = "/onboarding" if self.context.get("delegated_onboarding") else None
+        data["redirect_url"] = get_redirect_url(data["uuid"], data["is_email_verified"], next_url)
+        return data
 
-    def validate(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    def validate(self, data: dict[str, Any]) -> dict[str, Any]:
+        request = self.context.get("request")
+        passkey_credential = request.session.get(WEBAUTHN_SIGNUP_CREDENTIAL_KEY) if request else None
 
-        if "request" not in self.context or not self.context["request"].user.is_authenticated:
+        if not request or not request.user.is_authenticated:
             # If there's no authenticated user and we're creating a new one, attributes are required.
 
-            for attr in ["first_name", "password"]:
+            required_fields = ["first_name"]
+            if not passkey_credential:
+                required_fields.append("password")
+
+            for attr in required_fields:
                 if not data.get(attr):
                     raise serializers.ValidationError({attr: "This field is required."}, code="required")
 
@@ -128,56 +487,167 @@ class InviteSignupSerializer(serializers.Serializer):
         user: Optional[User] = None
         is_new_user: bool = False
 
-        if self.context["request"].user.is_authenticated:
-            user = cast(User, self.context["request"].user)
+        role_at_organization = validated_data.pop("role_at_organization", "")
+
+        request = self.context["request"]
+        passkey_credential = request.session.get(WEBAUTHN_SIGNUP_CREDENTIAL_KEY)
+        session_email = request.session.get(WEBAUTHN_SIGNUP_EMAIL_KEY)
+        session_user_uuid = request.session.get(WEBAUTHN_SIGNUP_USER_UUID_KEY)
+
+        # If a password is provided, clear passkey session data and use password signup
+        if validated_data.get("password") and passkey_credential:
+            request.session.pop(WEBAUTHN_SIGNUP_CREDENTIAL_KEY, None)
+            request.session.pop(WEBAUTHN_SIGNUP_EMAIL_KEY, None)
+            request.session.pop(WEBAUTHN_SIGNUP_USER_UUID_KEY, None)
+            _save_session_with_recovery(request.session)
+            passkey_credential = None
+            session_email = None
+            session_user_uuid = None
+
+        if request.user.is_authenticated:
+            user = cast(User, request.user)
 
         invite_id = self.context["view"].kwargs.get("invite_id")
 
         try:
+            # nosemgrep: idor-lookup-without-org, idor-taint-user-input-to-org-model (invite UUID serves as auth token)
             invite: OrganizationInvite = OrganizationInvite.objects.select_related("organization").get(id=invite_id)
-        except (OrganizationInvite.DoesNotExist):
+        except OrganizationInvite.DoesNotExist:
             raise serializers.ValidationError("The provided invite ID is not valid.")
+
+        if not user and invite.target_email:
+            auth_method = RadarAuthMethod.PASSKEY if passkey_credential else RadarAuthMethod.PASSWORD
+            evaluate_auth_attempt(
+                request=request._request,
+                email=invite.target_email,
+                action=RadarAction.SIGNUP,
+                auth_method=auth_method,
+                turnstile_token=validated_data.get("turnstile_token", ""),
+                challenge_nonce=validated_data.get("challenge_nonce", ""),
+            )
+
+        validated_data.pop("turnstile_token", None)
+        validated_data.pop("challenge_nonce", None)
+
+        # Only check SSO enforcement if we're not already logged in
+        if (
+            not user
+            and invite.target_email
+            and OrganizationDomain.objects.get_sso_enforcement_for_email_address(invite.target_email)
+        ):
+            raise serializers.ValidationError(
+                "Sign up with a password is disabled because SSO login is enforced for this domain. Please log in with your SSO credentials.",
+                code="sso_enforced",
+            )
 
         with transaction.atomic():
             if not user:
                 is_new_user = True
+                if passkey_credential and (not session_email or not session_user_uuid):
+                    raise serializers.ValidationError(
+                        "Passkey signup session expired. Please register your passkey again.",
+                        code="passkey_session_expired",
+                    )
+
+                if (
+                    passkey_credential
+                    and session_email
+                    and invite.target_email
+                    and session_email.lower() != invite.target_email.lower()
+                    and not validated_data.get("password")
+                ):
+                    raise serializers.ValidationError(
+                        "Email does not match the email used for passkey registration", code="email_mismatch"
+                    )
+
                 try:
+                    if passkey_credential and not validated_data.get("password"):
+                        validated_data.pop("password", None)
+                        password = None
+                    else:
+                        password = validated_data.pop("password")
+                    first_name = validated_data.pop("first_name")
+                    extra_fields: dict[str, Any] = {**validated_data}
+                    if passkey_credential and session_user_uuid and not password:
+                        extra_fields["uuid"] = uuid_module.UUID(session_user_uuid)
+
+                    invite_email = invite.target_email
+                    if not invite_email:
+                        raise serializers.ValidationError("Invite is missing a target email")
+
                     user = User.objects.create_user(
-                        invite.target_email,
-                        validated_data.pop("password"),
-                        validated_data.pop("first_name"),
-                        **validated_data,
+                        invite_email,
+                        password,
+                        first_name,
+                        is_email_verified=False,
+                        role_at_organization=role_at_organization,
+                        **extra_fields,
                     )
                 except IntegrityError:
                     raise serializers.ValidationError(
                         f"There already exists an account with email address {invite.target_email}. Please log in instead."
                     )
 
+            # Capture the delegation flag BEFORE invite.use(): use() deletes the invite row,
+            # so the in-memory boolean is the only safe source of truth for any post-use
+            # branching. A future refactor adding refresh_from_db() here would otherwise
+            # silently drop delegated invitees on the homepage instead of routing them into
+            # onboarding.
+            is_delegation = bool(invite.is_setup_delegation)
             try:
                 invite.use(user)
             except ValueError as e:
                 raise serializers.ValidationError(str(e))
 
+            if is_delegation:
+                self.context["delegated_onboarding"] = True
+
+            if passkey_credential:
+                WebauthnCredential.objects.create(
+                    user=user,
+                    credential_id=base64url_to_bytes(passkey_credential["credential_id"]),
+                    public_key=base64url_to_bytes(passkey_credential["public_key"]),
+                    algorithm=passkey_credential["algorithm"],
+                    counter=passkey_credential["sign_count"],
+                    transports=passkey_credential.get("transports", []),
+                    verified=True,
+                    label="Passkey",
+                )
+                # Treat the passkey as the user's 2FA factor when the org enforces 2FA. Otherwise
+                # they land behind an undismissable setup modal that only offers TOTP enrollment
+                if invite.organization.enforce_2fa and not user.passkeys_enabled_for_2fa:
+                    user.passkeys_enabled_for_2fa = True
+                    user.save(update_fields=["passkeys_enabled_for_2fa"])
+                # Self-created during invite signup; treat as already-acknowledged so the
+                # credential review interstitial doesn't ask the user to revoke their own passkey.
+                user.credentials_reviewed_at = timezone.now()
+                user.save(update_fields=["credentials_reviewed_at"])
+
         if is_new_user:
-            login(
-                self.context["request"], user, backend="django.contrib.auth.backends.ModelBackend",
-            )
+            verify_email_or_login(self.context["request"], user)
 
             report_user_signed_up(
-                user.distinct_id,
+                user,
                 is_instance_first_user=False,
                 is_organization_first_user=False,
                 new_onboarding_enabled=(not invite.organization.setup_section_2_completed),
                 backend_processor="OrganizationInviteSignupSerializer",
                 user_analytics_metadata=user.get_analytics_metadata(),
                 org_analytics_metadata=user.organization.get_analytics_metadata() if user.organization else None,
+                role_at_organization=role_at_organization,
+                referral_source="signed up from invite link",
             )
 
         else:
             report_user_joined_organization(organization=invite.organization, current_user=user)
 
-        # Update user props
-        user_identify.identify_task.delay(user_id=user.id)
+        alias_invite_id(user, str(invite.id))
+
+        if passkey_credential:
+            request.session.pop(WEBAUTHN_SIGNUP_CREDENTIAL_KEY, None)
+            request.session.pop(WEBAUTHN_SIGNUP_EMAIL_KEY, None)
+            request.session.pop(WEBAUTHN_SIGNUP_USER_UUID_KEY, None)
+            _save_session_with_recovery(request.session)
 
         return user
 
@@ -197,46 +667,91 @@ class InviteSignupViewset(generics.CreateAPIView):
             raise exceptions.ValidationError("Please provide an invite ID to continue.")
 
         try:
+            # nosemgrep: idor-lookup-without-org, idor-taint-user-input-to-org-model (invite UUID serves as auth token)
             invite: OrganizationInvite = OrganizationInvite.objects.get(id=invite_id)
         except (OrganizationInvite.DoesNotExist, ValidationError):
             raise serializers.ValidationError("The provided invite ID is not valid.")
 
         user = request.user if request.user.is_authenticated else None
 
-        invite.validate(user=user)
+        invite.validate(
+            user=user,
+            invite_email=invite.target_email,
+            request_path=f"/signup/{invite_id}",
+        )
 
         return response.Response(
             {
                 "id": str(invite.id),
-                "target_email": mask_email_address(invite.target_email),
+                "target_email": invite.target_email,
                 "first_name": invite.first_name,
                 "organization_name": invite.organization.name,
             }
         )
 
 
-## Social Signup
-## views & serializers
+# Social Signup
+# views & serializers
 class SocialSignupSerializer(serializers.Serializer):
     """
     Signup serializer when the account is created using social authentication.
     Pre-processes information not obtained from SSO provider to create organization.
     """
 
-    organization_name: serializers.Field = serializers.CharField(max_length=128)
-    email_opt_in: serializers.Field = serializers.BooleanField(default=True)
+    organization_name: serializers.Field = serializers.CharField(max_length=64)
+    first_name: serializers.Field = serializers.CharField(max_length=128)
+    role_at_organization: serializers.Field = serializers.CharField(max_length=123, required=False, default="")
+    referral_source: serializers.Field = serializers.CharField(
+        max_length=1000, required=False, allow_blank=True, default=""
+    )
+    referral_source_ai_prompt: serializers.Field = serializers.CharField(
+        max_length=1000, required=False, allow_blank=True, default=""
+    )
+
+    def validate_first_name(self, value: str) -> str:
+        return validate_display_name(value)
+
+    def validate_organization_name(self, value: str) -> str:
+        return validate_display_name(value)
 
     def create(self, validated_data, **kwargs):
         request = self.context["request"]
 
         if not request.session.get("backend"):
             raise serializers.ValidationError(
-                "Inactive social login session. Go to /login and log in before continuing.",
+                "Inactive social login session. Go to /login and log in before continuing."
             )
 
-        request.session["organization_name"] = validated_data["organization_name"]
-        request.session["email_opt_in"] = validated_data["email_opt_in"]
-        request.session.set_expiry(3600)  # 1 hour to complete process
+        email = request.session.get("email")
+        organization_name = validated_data["organization_name"]
+        role_at_organization = validated_data["role_at_organization"]
+        referral_source = validated_data.get("referral_source", "")
+        referral_source_ai_prompt = validated_data.get("referral_source_ai_prompt", "")
+        first_name = validated_data["first_name"]
+
+        serializer = SignupSerializer(
+            data={
+                "organization_name": organization_name,
+                "first_name": first_name,
+                "email": email,
+                "password": None,
+                "role_at_organization": role_at_organization,
+                "referral_source": referral_source,
+                "referral_source_ai_prompt": referral_source_ai_prompt,
+            },
+            context={"request": request},
+        )
+        serializer.is_social_signup = True
+
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        logger.info(
+            f"social_create_user_signup",
+            full_name_len=len(first_name),
+            email_len=len(email),
+            user=user.id,
+        )
+
         return {"continue_url": reverse("social:complete", args=[request.session["backend"]])}
 
     def to_representation(self, instance: Any) -> Any:
@@ -267,154 +782,254 @@ class CompanyNameForm(forms.Form):
     emailOptIn = forms.BooleanField(required=False)
 
 
-def finish_social_signup(request):
-    """
-    TODO: DEPRECATED in favor of posthog.api.signup.SocialSignupSerializer
-    """
-    if not get_can_create_org():
-        return redirect("/login?error=no_new_organizations")
-
-    if request.method == "POST":
-        form = CompanyNameForm(request.POST)
-        if form.is_valid():
-            request.session["organization_name"] = form.cleaned_data["companyName"]
-            request.session["email_opt_in"] = bool(form.cleaned_data["emailOptIn"])
-            return redirect(reverse("social:complete", args=[request.session["backend"]]))
-    else:
-        form = CompanyNameForm()
-    return render(request, "signup_to_organization_company.html", {"user_name": request.session["user_name"]})
+def lookup_invite_for_saml(email: str, organization_domain_id: str) -> Optional[OrganizationInvite]:
+    # nosemgrep: idor-lookup-without-org (ID from SAML response)
+    organization_domain = OrganizationDomain.objects.get(id=organization_domain_id)
+    if not organization_domain:
+        return None
+    return (
+        OrganizationInvite.objects.filter(target_email=email, organization=organization_domain.organization)
+        .order_by("-created_at")
+        .first()
+    )
 
 
 def process_social_invite_signup(
-    strategy: DjangoStrategy, invite_id: str, email: str, full_name: str
-) -> Union[HttpResponse, User]:
+    strategy: DjangoStrategy, invite_id: str, email: str, full_name: str, user: Optional[User] = None
+) -> Optional[User]:
     try:
+        # nosemgrep: idor-lookup-without-org (invite UUID from server session serves as auth token)
         invite: Union[OrganizationInvite, TeamInviteSurrogate] = OrganizationInvite.objects.select_related(
-            "organization",
+            "organization"
         ).get(id=invite_id)
     except (OrganizationInvite.DoesNotExist, ValidationError):
         try:
             invite = TeamInviteSurrogate(invite_id)
         except Team.DoesNotExist:
-            return redirect(f"/signup/{invite_id}?error_code=invalid_invite&source=social_create_user")
+            return None
 
-    try:
+    # Capture before invite.use() — use() deletes the invite row, so the in-memory boolean is
+    # the only safe source of truth for delegation routing.
+    is_delegation = bool(getattr(invite, "is_setup_delegation", False))
+    if user:
+        invite.validate(user=user, email=email)
+        invite.use(user, prevalidated=True)
+        if is_delegation:
+            strategy.session_set("next", "/onboarding")
+        return user
+    else:
         invite.validate(user=None, email=email)
-    except exceptions.ValidationError as e:
-        return redirect(
-            f"/signup/{invite_id}?error_code={e.get_codes()[0]}&error_detail={e.args[0]}&source=social_create_user"
-        )
 
+        try:
+            _user = strategy.create_user(email=email, first_name=full_name, password=None, is_email_verified=True)
+            invite.use(_user, prevalidated=True)
+        except Exception as e:
+            capture_exception(e)
+            message = "Account unable to be created. This account may already exist. Please try again or use different credentials."
+            raise ValidationError(message, code="unknown", params={"source": "social_create_user"})
+
+        if is_delegation:
+            strategy.session_set("next", "/onboarding")
+        return _user
+
+
+def process_social_domain_jit_provisioning_signup(
+    strategy: DjangoStrategy, email: str, full_name: str, user: Optional[User] = None
+) -> Optional[User]:
+    # Check if the user is on an allowed domain
+    domain = email.split("@")[-1]
     try:
-        user = strategy.create_user(email=email, first_name=full_name, password=None)
-    except Exception as e:
-        capture_exception(e)
-        message = "Account unable to be created. This account may already exist. Please try again"
-        " or use different credentials."
-        return redirect(f"/signup/{invite_id}?error_code=unknown&error_detail={message}&source=social_create_user")
-
-    invite.use(user, prevalidated=True)
-
-    return user
-
-
-def process_social_domain_whitelist_signup(email: str, full_name: str) -> Optional[User]:
-    domain_organization: Optional[Organization] = None
-    user: Optional[User] = None
-
-    # TODO: This feature is currently available only in self-hosted
-    if not settings.MULTI_TENANCY:
-        # Check if the user is on a whitelisted domain
-        domain = email.split("@")[-1]
-        # TODO: Handle multiple organizations with the same whitelisted domain
-        domain_organization = Organization.objects.filter(domain_whitelist__contains=[domain]).first()
-
-    if domain_organization:
-        user = User.objects.create_and_join(
-            organization=domain_organization, email=email, password=None, first_name=full_name
+        logger.info(f"process_social_domain_jit_provisioning_signup", domain=domain)
+        domain_instance = OrganizationDomain.objects.get(domain__iexact=domain)
+    except OrganizationDomain.DoesNotExist:
+        logger.info(
+            f"process_social_domain_jit_provisioning_signup_domain_does_not_exist",
+            domain=domain,
         )
+        return user
+    else:
+        logger.info(
+            f"process_social_domain_jit_provisioning_signup_domain_exists",
+            domain=domain,
+            is_verified=domain_instance.is_verified,
+            jit_provisioning_enabled=domain_instance.jit_provisioning_enabled,
+            scim_enabled=domain_instance.idp_config.scim_enabled,
+        )
+        if domain_instance.is_verified and domain_instance.jit_provisioning_enabled:
+            if not user:
+                try:
+                    invite: OrganizationInvite = OrganizationInvite.objects.get(
+                        target_email=email, organization=domain_instance.organization
+                    )
+                    invite.validate(user=None, email=email)
+                    # Capture before invite.use() deletes the invite row.
+                    is_delegation = bool(getattr(invite, "is_setup_delegation", False))
+
+                    try:
+                        user = strategy.create_user(
+                            email=email, first_name=full_name, password=None, is_email_verified=True
+                        )
+                        assert isinstance(user, User)  # type hinting
+                        invite.use(user, prevalidated=True)
+                    except Exception as e:
+                        capture_exception(e)
+                        message = "Account unable to be created. This account may already exist. Please try again or use different credentials."
+                        raise ValidationError(message, code="unknown", params={"source": "social_create_user"})
+
+                    if is_delegation:
+                        strategy.session_set("next", "/onboarding")
+
+                except (OrganizationInvite.DoesNotExist, InviteExpiredException):
+                    user = User.objects.create_and_join(
+                        organization=domain_instance.organization,
+                        email=email,
+                        password=None,
+                        first_name=full_name,
+                        is_email_verified=True,
+                    )
+                    logger.info(
+                        f"process_social_domain_jit_provisioning_join_complete",
+                        domain=domain,
+                        user=user.email,
+                        organization=domain_instance.organization_id,
+                    )
+
+            # Existing user:
+            # Auto-join because JIT provisioning is enabled
+            # SCIM (if enabled) will update roles/groups after they join
+            if not user.organizations.filter(pk=domain_instance.organization_id).exists():
+                user.join(organization=domain_instance.organization)
+                logger.info(
+                    f"process_social_domain_jit_provisioning_join_existing",
+                    domain=domain,
+                    user=user.email,
+                    organization=domain_instance.organization_id,
+                    scim_enabled=domain_instance.idp_config.scim_enabled,
+                )
 
     return user
-
-
-def process_social_saml_signup(backend: BaseAuth, email: str, full_name: str) -> Optional[User]:
-    """
-    With SAML we have automatic provisioning because the IdP should already handle the logic of which users to allow to
-    login.
-    """
-
-    if backend.name != "saml":
-        return None
-
-    return User.objects.create_and_join(
-        organization=Organization.objects.filter(for_internal_metrics=False).order_by("created_at").first(),  # type: ignore
-        email=email,
-        password=None,
-        first_name=full_name,
-    )
 
 
 @partial
-def social_create_user(strategy: DjangoStrategy, details, backend, request, user=None, *args, **kwargs):
-    if user:
-        return {"is_new": False}
+def social_create_user(
+    strategy: DjangoStrategy,
+    details,
+    backend,
+    request,
+    user: Union[User, None] = None,
+    *args,
+    **kwargs,
+):
+    posthoganalytics.tag("details", json.dumps(details))
+    invite_id = strategy.session_get("invite_id")
     backend_processor = "social_create_user"
-    user_email = details["email"][0] if isinstance(details["email"], (list, tuple)) else details["email"]
-    user_name = (
-        details["fullname"]
-        or f"{details['first_name'] or ''} {details['last_name'] or ''}".strip()
-        or details["username"]
+    email = details["email"][0] if isinstance(details["email"], list | tuple) else details["email"]
+    full_name = (
+        details.get("fullname")
+        or f"{details.get('first_name') or ''} {details.get('last_name') or ''}".strip()
+        or details.get("username")
     )
-    strategy.session_set("user_name", user_name)
+
+    # Handle SAML invites (organization_domain_id is the relay_state)
+    organization_domain_id = kwargs.get("response", {}).get("idp_name")
+    if not invite_id and organization_domain_id:
+        invite = lookup_invite_for_saml(email, organization_domain_id)
+        invite_id = invite.id if invite else None
+
+    if user:
+        # If the user is already authenticated, we're looking for outstanding invites for them
+        # on the organization domain or if JIT provisioning is enabled, we'll provision them.
+        logger.info(f"social_create_user_is_not_new")
+
+        if not user.is_email_verified:
+            # Email isn't verified yet — anyone could have set these local credentials.
+            # Wipe them before linking the SSO identity.
+            logger.info(f"social_create_user_is_not_new_unverified_clearing_local_credentials")
+            user.set_unusable_password()
+            WebauthnCredential.objects.filter(user=user).delete()
+            user.passkeys_enabled_for_2fa = False
+            user.is_email_verified = True
+            user.save()
+
+        if invite_id:
+            process_social_invite_signup(strategy, invite_id, user.email, user.first_name, user)
+        else:
+            process_social_domain_jit_provisioning_signup(strategy, user.email, user.first_name, user)
+
+        return {"is_new": False}
+
+    strategy.session_set("user_name", full_name)
     strategy.session_set("backend", backend.name)
     from_invite = False
-    invite_id = strategy.session_get("invite_id")
 
-    if not user_email or not user_name:
-        missing_attr = "email" if not user_email else "name"
+    if not email or not full_name:
+        missing_attr = "email" if not email else "name"
+        posthoganalytics.tag("email", email)
+        posthoganalytics.tag("name", full_name)
         raise ValidationError(
-            {missing_attr: "This field is required and was not provided by the IdP."}, code="required"
+            {missing_attr: "This field is required and was not provided by the IdP."},
+            code="required",
         )
+
+    # If we get here then it's a new user. We'll check for outstanding invites for them
+    # on the organization domain or if JIT provisioning is enabled, we'll provision them.
+    # And fallback to a form where they can create an organization.
+    logger.info(f"social_create_user", full_name_len=len(full_name), email_len=len(email))
 
     if invite_id:
         from_invite = True
-        user = process_social_invite_signup(strategy, invite_id, user_email, user_name)
+        user = process_social_invite_signup(strategy, invite_id, email, full_name)
+        if user is None:
+            return redirect("/login?error_code=invalid_invite")
 
     else:
-        # Domain whitelist?
-        user = process_social_domain_whitelist_signup(user_email, user_name)
+        # JIT Provisioning?
+        user = process_social_domain_jit_provisioning_signup(strategy, email, full_name)
+        logger.info(
+            f"social_create_user_jit_user",
+            full_name_len=len(full_name),
+            email_len=len(email),
+            user=user.id if user else None,
+        )
         if user:
-            backend_processor = "domain_whitelist"
-
-        # SAML
-        if not user:
-            # Domain whitelist?
-            user = process_social_saml_signup(backend, user_email, user_name)
-            if user:
-                backend_processor = "saml"
+            backend_processor = "domain_whitelist"  # This is actually `jit_provisioning` (name kept for backwards-compatibility purposes)
+            from_invite = True  # jit_provisioning means they're definitely not organization_first_user
 
         if not user:
-            organization_name = strategy.session_get("organization_name", None)
-            email_opt_in = strategy.session_get("email_opt_in", None)
-            if not organization_name or email_opt_in is None:
-                return redirect(finish_social_signup)
-
-            serializer = SignupSerializer(
-                data={
-                    "organization_name": organization_name,
-                    "email_opt_in": email_opt_in,
-                    "first_name": user_name,
-                    "email": user_email,
-                    "password": None,
-                },
-                context={"request": request},
+            logger.info(
+                f"social_create_user_jit_failed",
+                full_name_len=len(full_name),
+                email_len=len(email),
             )
 
-            serializer.is_valid(raise_exception=True)
-            user = serializer.save()
+            if not get_can_create_org(request.user):
+                if email and OrganizationDomain.objects.get_verified_for_email_address(email):
+                    # There's a claimed and verified domain for the user's email address domain, but JIT provisioning is not enabled. To avoid confusion
+                    # don't let the user create a new org (very likely they won't want this) and show an appropriate error response.
+                    return redirect("/login?error_code=jit_not_enabled")
+                else:
+                    return redirect("/login?error_code=no_new_organizations")
+            strategy.session_set("email", email)
+            organization_name = strategy.session_get("organization_name")
+            next_url = strategy.session_get("next")
+
+            query_params = {
+                "organization_name": organization_name or "",
+                "first_name": full_name or "",
+                "email": email or "",
+                "next": next_url or "",
+            }
+            query_params_string = urlencode(query_params)
+            logger.info(
+                "social_create_user_confirm_organization",
+                full_name_len=len(full_name),
+                email_len=len(email),
+            )
+
+            return redirect(f"/organization/confirm-creation?{query_params_string}")
 
     report_user_signed_up(
-        distinct_id=user.distinct_id,
+        user,
         is_instance_first_user=User.objects.count() == 1,
         is_organization_first_user=not from_invite,
         new_onboarding_enabled=False,
@@ -422,6 +1037,7 @@ def social_create_user(strategy: DjangoStrategy, details, backend, request, user
         social_provider=backend.name,
         user_analytics_metadata=user.get_analytics_metadata(),
         org_analytics_metadata=user.organization.get_analytics_metadata() if user.organization else None,
+        referral_source="social signup - no info",
     )
 
     return {"is_new": True, "user": user}

@@ -1,0 +1,17 @@
+#
+# This Dockerfile is used for locally running Playwright in a Linux environment.
+# We do this to ensure our reference images for visual regression tests are the same during development and in CI.
+#
+
+FROM ghcr.io/posthog/playwright:v1.60.0
+
+WORKDIR /work
+
+RUN npm install -g pnpm
+
+COPY package.json pnpm-lock.yaml ./
+COPY patches/ patches/
+
+RUN pnpm install --frozen-lockfile
+
+COPY tsconfig.json ./

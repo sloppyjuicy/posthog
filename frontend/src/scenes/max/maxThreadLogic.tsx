@@ -1,0 +1,2672 @@
+import { createParser } from 'eventsource-parser'
+import {
+    BuiltLogic,
+    actions,
+    afterMount,
+    connect,
+    kea,
+    key,
+    listeners,
+    path,
+    props,
+    propsChanged,
+    reducers,
+    selectors,
+} from 'kea'
+import { loaders } from 'kea-loaders'
+import { router } from 'kea-router'
+import { subscriptions } from 'kea-subscriptions'
+import posthog from 'posthog-js'
+
+import api, { ApiError } from 'lib/api'
+import { JSONContent } from 'lib/components/RichContentEditor/types'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { dayjs } from 'lib/dayjs'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { uuid } from 'lib/utils/dom'
+import { maxContextLogic } from 'scenes/max/maxContextLogic'
+import { notebookLogic } from 'scenes/notebooks/Notebook/notebookLogic'
+import { NotebookTarget } from 'scenes/notebooks/types'
+import { sceneLogic } from 'scenes/sceneLogic'
+import { Scene } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+import { userLogic } from 'scenes/userLogic'
+
+import { sidePanelStateLogic } from '~/layout/navigation-3000/sidepanel/sidePanelStateLogic'
+import { openNotebook } from '~/models/notebooksModel'
+import {
+    AgentMode,
+    ApprovalDecisionStatus,
+    AssistantEventType,
+    AssistantGenerationStatusEvent,
+    AssistantGenerationStatusType,
+    AssistantMessage,
+    AssistantMessageType,
+    AssistantUpdateEvent,
+    FailureMessage,
+    HumanMessage,
+    MultiQuestionForm,
+    MultiQuestionFormAnswers,
+    PENDING_APPROVAL_STATUS,
+    ResumePayload,
+    RootAssistantMessage,
+    SubagentUpdateEvent,
+    TaskExecutionStatus,
+} from '~/queries/schema/schema-assistant-messages'
+import {
+    Conversation,
+    ConversationDetail,
+    ConversationQueueMessage,
+    ConversationStatus,
+    ConversationType,
+    PendingApproval,
+    SidePanelTab,
+} from '~/types'
+
+import {
+    getRandomThinkingMessage,
+    isTerminalRunStatus,
+    INITIAL_PERMISSION_MODE,
+    runStreamLogic,
+} from 'products/posthog_ai/frontend/api/logics'
+import { LogEntry, parseLogEvent } from 'products/posthog_ai/frontend/lib/parse-logs'
+
+import { handsFreeLogic } from './handsFreeLogic'
+import { summariseAssistantThread } from './handsFreeUtils'
+import {
+    EnhancedToolCall,
+    MODE_DEFINITIONS,
+    TOOL_DEFINITIONS,
+    ToolRegistration,
+    getModeDisplayName,
+} from './max-constants'
+import { PENDING_AI_PROMPT_KEY } from './max-storage-keys'
+import { MaxBillingContext, maxBillingContextLogic } from './maxBillingContextLogic'
+import { maxGlobalLogic } from './maxGlobalLogic'
+import { SCENE_PANEL_ID, SIDE_PANEL_PANEL_ID, maxLogic } from './maxLogic'
+import type { maxThreadLogicType } from './maxThreadLogicType'
+import { AttachedContext, MaxUIContext } from './maxTypes'
+import { posthogAiContextLogic } from './posthogAiContextLogic'
+import { MAX_SLASH_COMMANDS, SlashCommand } from './slash-commands'
+import { getToolCallDescriptionAndWidgetDef } from './toolCallDisplay'
+import {
+    activeSceneLogicHasMaxContext,
+    findPendingClientToolCall,
+    getAgentModeForScene,
+    isAssistantMessage,
+    isAssistantToolCallMessage,
+    isHumanMessage,
+    isSubagentUpdateEvent,
+    threadEndsWithMultiQuestionForm,
+} from './utils'
+
+// On a dashboard, the first message can fire before the dashboard has loaded, when
+// dashboardLogic.maxContext still returns []. askMax waits (bounded) for the load so the
+// dashboard context is included. Bounded so a stuck/failed load never blocks sending.
+export const MAX_DASHBOARD_CONTEXT_WAIT_MS = 8000
+const DASHBOARD_CONTEXT_POLL_INTERVAL_MS = 100
+
+export type MessageStatus = 'loading' | 'completed' | 'error'
+
+export type ThreadMessage = RootAssistantMessage & {
+    status: MessageStatus
+}
+
+const FAILURE_MESSAGE: FailureMessage & ThreadMessage = {
+    type: AssistantMessageType.Failure,
+    content: 'Oops! It looks like I’m having trouble answering this. Could you please try again?',
+    status: 'completed',
+}
+
+export interface MaxThreadLogicProps {
+    panelId?: string // identifies the MaxLogic instance backing this panel (scene tab id or side panel)
+    conversationId: string
+    conversation?: ConversationDetail | null
+    skipInitialLoad?: boolean
+}
+
+export const maxThreadLogic = kea<maxThreadLogicType>([
+    // Mirror maxLogic's key fallback: the bare /ai scene has no panelId, and both logics must
+    // resolve to the same `scene` instance (maxThreadLogic connects to maxLogic({ panelId })).
+    key((props) => `${props.conversationId}-${props.panelId || SCENE_PANEL_ID}`),
+
+    path((key) => ['scenes', 'max', 'maxThreadLogic', key]),
+
+    props({} as MaxThreadLogicProps),
+
+    propsChanged(({ actions, values, props }) => {
+        if (!props.conversation) {
+            return
+        }
+
+        // Handle new messages post-mount; initial load in afterMount.
+        if (
+            !values.streamingActive &&
+            props.conversation.messages &&
+            props.conversation.messages.length > values.threadMessageCount
+        ) {
+            actions.setThread(updateMessagesWithCompletedStatus(props.conversation.messages))
+        }
+
+        // Check if the meta fields like the `status` field have changed
+        const newConversation = removeConversationMessages(props.conversation)
+        if (!values.conversation || JSON.stringify(values.conversation) !== JSON.stringify(newConversation)) {
+            actions.setConversation(newConversation)
+        }
+    }),
+
+    connect(({ panelId, conversationId }: MaxThreadLogicProps) => ({
+        values: [
+            maxGlobalLogic,
+            ['dataProcessingAccepted', 'toolMap', 'tools', 'availableStaticTools'],
+            maxLogic({ panelId }),
+            [
+                'question',
+                'autoRun',
+                'threadLogicKey as activeThreadKey',
+                'activeStreamingThreads',
+                'conversationId as parentConversationId',
+                'pendingBindTaskId',
+            ],
+            maxContextLogic,
+            ['compiledContext'],
+            maxBillingContextLogic,
+            ['billingContext'],
+            featureFlagLogic,
+            ['featureFlags'],
+            sceneLogic,
+            ['sceneId'],
+            // Mounts this conversation's sandbox attachment store so its `attachments` are readable
+            // at send time even when no context-chip UI is rendered (a fresh conversation never
+            // mounts it itself).
+            posthogAiContextLogic({ conversationId }),
+            ['attachments as sandboxAttachments'],
+            // Surfaces the sandbox stream's input-area state to components outside ThreadView's
+            // BindLogic subtree (the input area renders for LangGraph conversations too, so they
+            // can't bind the keyed stream logic themselves).
+            runStreamLogic({ streamKey: conversationId, conversationId }),
+            ['pendingPermissionRequest as pendingSandboxPermissionRequest', 'currentMode as sandboxCurrentMode'],
+        ],
+        actions: [
+            maxLogic({ panelId }),
+            [
+                'askMax',
+                'setQuestion',
+                'loadConversationHistory',
+                'prependOrReplaceConversation as updateGlobalConversationCache',
+                'incrActiveStreamingThreads',
+                'decrActiveStreamingThreads',
+                'setConversationId',
+                'setAutoRun',
+                'loadConversationHistorySuccess',
+                'setPendingBindTaskId',
+            ],
+            maxGlobalLogic,
+            ['loadConversation'],
+            // Pulling the action in (rather than calling the instance's actions directly) mounts this
+            // conversation's stream logic as a dependency, so its listeners actually run. ThreadView
+            // only mounts it while a sandbox conversation is rendered — too late for the first message
+            // of a new one.
+            runStreamLogic({ streamKey: conversationId, conversationId }),
+            [
+                'openSseForRun as openSandboxSse',
+                'pushHumanMessage as pushSandboxHumanMessage',
+                'pushErrorItem as pushSandboxError',
+                'setRunOpening as setSandboxRunOpening',
+                'bootstrapRun as bootstrapSandboxRun',
+                'reset as resetSandboxStream',
+                'cancelRun as cancelSandboxRun',
+            ],
+            posthogAiContextLogic({ conversationId }),
+            ['clearAttachments as clearSandboxAttachments'],
+        ],
+    })),
+
+    actions({
+        // null prompt means resuming streaming or continuing previous generation
+        reconnectToStream: true,
+        streamConversation: (
+            streamData: {
+                agent_mode: AgentMode | null
+                is_sandbox?: boolean
+                content: string | null
+                conversation?: string
+                contextual_tools?: Record<string, any>
+                ui_context?: any
+                resume_payload?: ResumePayload | null
+            },
+            generationAttempt: number,
+            addToThread: boolean = true
+        ) => ({ streamData, generationAttempt, addToThread }),
+        stopGeneration: true,
+        completeThreadGeneration: true,
+        // Narrow teardown: flips only streamingActive -> false. Used by the sandbox error/terminal
+        // listeners where completeThreadGeneration's queue-drain (auto-starting the next message)
+        // would be wrong after a failure.
+        endStreaming: true,
+        addMessage: (message: ThreadMessage) => ({ message }),
+        replaceMessage: (index: number, message: ThreadMessage) => ({
+            index,
+            message,
+        }),
+        setThread: (thread: ThreadMessage[]) => ({ thread }),
+        setMessageStatus: (index: number, status: MessageStatus) => ({
+            index,
+            status,
+        }),
+        retryLastMessage: true,
+        resetRetryCount: true,
+        resetCancelCount: true,
+        setConversation: (conversation: Conversation) => ({ conversation }),
+        resetThread: true,
+        finalizeStreamingMessages: true,
+        setTraceId: (traceId: string) => ({ traceId }),
+        selectCommand: (command: SlashCommand) => ({ command }),
+        activateCommand: (command: SlashCommand) => ({ command }),
+        setAgentMode: (agentMode: AgentMode | null) => ({ agentMode }),
+        setIsSandboxMode: (isSandboxMode: boolean) => ({ isSandboxMode }),
+        syncAgentModeFromConversation: (agentMode: AgentMode | null) => ({
+            agentMode,
+        }),
+        setSupportOverrideEnabled: (enabled: boolean) => ({ enabled }),
+        processNotebookUpdate: (notebookId: string, notebookContent: JSONContent) => ({ notebookId, notebookContent }),
+        appendMessageToConversation: (message: string) => ({ message }),
+        enqueueQueuedMessage: (payload: {
+            content: string
+            uiContext?: MaxUIContext
+            contextualTools?: Record<string, any>
+            billingContext?: MaxBillingContext | null
+            agentMode?: AgentMode | null
+        }) => payload,
+        updateQueuedMessage: (queueId: string, content: string) => ({
+            queueId,
+            content,
+        }),
+        deleteQueuedMessage: (queueId: string) => ({ queueId }),
+        consumeQueuedMessage: (message: ConversationQueueMessage) => ({ message }),
+        setQueuedMessages: (messages: ConversationQueueMessage[]) => ({ messages }),
+        setQueueLimit: (limit: number) => ({ limit }),
+        clearQueuedMessages: true,
+        setForAnotherAgenticIteration: (value: boolean) => ({ value }),
+        setToolCallUpdate: (
+            update: AssistantUpdateEvent | SubagentUpdateEvent,
+            toolMap: Record<string, ToolRegistration>
+        ) => ({
+            update,
+            toolMap,
+        }),
+        setCancelLoading: (cancelLoading: boolean) => ({ cancelLoading }),
+        setPendingApproval: (proposalId: string) => ({ proposalId }),
+        clearPendingApproval: true,
+        appendSandboxEntry: (entry: LogEntry) => ({ entry }),
+        prewarmSandbox: true,
+        releaseSandboxPrewarm: true,
+        refreshSandboxEntries: true,
+        resetSandboxEntries: true,
+        continueAfterForm: (formAnswers: MultiQuestionFormAnswers) => ({
+            formAnswers,
+        }),
+        continueAfterFormDismissal: true,
+        continueWithClientToolResult: (result: Record<string, unknown>, toolCallId: string) => ({ result, toolCallId }),
+        executePendingClientToolCall: true,
+        continueAfterApproval: (proposalId: string) => ({ proposalId }),
+        continueAfterRejection: (proposalId: string, feedback?: string) => ({
+            proposalId,
+            feedback,
+        }),
+        setResolvedApprovalStatus: (
+            proposalId: string,
+            status: 'approved' | 'rejected' | 'auto_rejected',
+            feedback?: string
+        ) => ({
+            proposalId,
+            status,
+            feedback,
+        }),
+        addPendingApprovalData: (approval: PendingApproval) => ({ approval }),
+        loadPendingApprovalsData: (approvals: PendingApproval[]) => ({ approvals }),
+    }),
+
+    reducers(({ props }) => ({
+        conversation: [
+            props.conversation ? (removeConversationMessages(props.conversation) ?? null) : null,
+            {
+                setConversation: (_, { conversation }) => conversation,
+            },
+        ],
+
+        threadRaw: [
+            updateMessagesWithCompletedStatus(props.conversation?.messages ?? []),
+            {
+                addMessage: (state, { message }) => [...state, message],
+                replaceMessage: (state, { message, index }) => [
+                    ...state.slice(0, index),
+                    message,
+                    ...state.slice(index + 1),
+                ],
+                setMessageStatus: (state, { index, status }) => [
+                    ...state.slice(0, index),
+                    {
+                        ...state[index],
+                        status,
+                    },
+                    ...state.slice(index + 1),
+                ],
+                setThread: (_, { thread }) => thread,
+                // Remove streaming messages on failure so server state becomes source of truth
+                finalizeStreamingMessages: (state) => state.filter((msg) => msg.status !== 'loading'),
+                completeThreadGeneration: (state) =>
+                    state.map((msg) => (msg.status === 'loading' ? { ...msg, status: 'completed' as const } : msg)),
+            },
+        ],
+
+        // Specific case when the conversation is in progress on the backend, but the device doesn't have an open stream
+        conversationLoading: [
+            props.conversation?.status === ConversationStatus.InProgress,
+            {
+                setConversation: (_, { conversation }) =>
+                    conversation && conversation.status === ConversationStatus.InProgress,
+            },
+        ],
+
+        streamingActive: [
+            false,
+            {
+                reconnectToStream: () => true,
+                streamConversation: () => true,
+                completeThreadGeneration: () => false,
+                endStreaming: () => false,
+            },
+        ],
+
+        // Trace ID is used for the conversation metrics in the UI
+        traceId: [null as string | null, { setTraceId: (_, { traceId }) => traceId, cleanThread: () => null }],
+
+        agentMode: [
+            null as AgentMode | null,
+            {
+                setAgentMode: (_, { agentMode }) => agentMode,
+                syncAgentModeFromConversation: (_, { agentMode }) => agentMode,
+            },
+        ],
+
+        // Tracks if user manually selected agent mode after submission - if true, don't sync from conversation
+        agentModeLockedByUser: [
+            false,
+            {
+                setAgentMode: () => true,
+                askMax: () => false,
+            },
+        ],
+
+        isSandboxMode: [
+            false,
+            {
+                setIsSandboxMode: (_, { isSandboxMode }) => isSandboxMode,
+            },
+        ],
+
+        // Edge case, storing the prompt when askMax is called but AIConsent hasn't been given (yet)
+        pendingPrompt: [
+            null as string | null,
+            {
+                askMax: (_, { prompt }) => prompt,
+                completeThreadGeneration: () => null,
+                stopGeneration: () => null,
+            },
+        ],
+
+        queuedMessages: [
+            [] as ConversationQueueMessage[],
+            {
+                loadQueueDataSuccess: (_, { queueData }) => queueData.messages,
+                setQueuedMessages: (_, { messages }) => messages,
+                consumeQueuedMessage: (state, { message }) => state.filter((item) => item.id !== message.id),
+                clearQueuedMessages: () => [],
+            },
+        ],
+
+        queueLimit: [
+            0,
+            {
+                loadQueueDataSuccess: (_, { queueData }) => queueData.limit,
+                setQueueLimit: (_, { limit }) => limit,
+            },
+        ],
+
+        queueSubmitting: [
+            false,
+            {
+                enqueueQueuedMessage: () => true,
+                setQueuedMessages: () => false,
+            },
+        ],
+
+        // Whether generation should be immediately continued due to tool execution
+        isAnotherAgenticIterationScheduled: [
+            false,
+            {
+                setForAnotherAgenticIteration: (_, { value }) => value,
+                askMax: () => false,
+                completeThreadGeneration: () => false,
+            },
+        ],
+
+        toolCallUpdateMap: [
+            new Map<string, string[]>(),
+            {
+                setToolCallUpdate: (
+                    value,
+                    {
+                        update,
+                        toolMap,
+                    }: {
+                        update: AssistantUpdateEvent | SubagentUpdateEvent
+                        toolMap: Record<string, ToolRegistration>
+                    }
+                ) => {
+                    const currentValue = value.get(update.tool_call_id) || []
+                    const newMap = new Map(value)
+                    let newValue: string
+                    if (isSubagentUpdateEvent(update)) {
+                        const [description, _] = getToolCallDescriptionAndWidgetDef(
+                            update.content as unknown as EnhancedToolCall,
+                            toolMap
+                        )
+                        newValue = description
+                    } else {
+                        newValue = update.content
+                    }
+                    if (currentValue.includes(newValue) || newValue === '') {
+                        return value
+                    }
+                    newMap.set(update.tool_call_id, [...currentValue, newValue])
+                    return newMap
+                },
+            },
+        ],
+
+        cancelLoading: [
+            false,
+            {
+                stopGeneration: () => true,
+                setCancelLoading: (_, { cancelLoading }) => cancelLoading,
+            },
+        ],
+
+        // Stable thinking message that doesn't change during streaming
+        currentThinkingMessage: [
+            null as string | null,
+            {
+                askMax: () => getRandomThinkingMessage(),
+                reconnectToStream: () => getRandomThinkingMessage(),
+                streamConversation: () => getRandomThinkingMessage(),
+                addMessage: () => getRandomThinkingMessage(),
+                completeThreadGeneration: () => null,
+            },
+        ],
+
+        retryCount: [
+            0,
+            {
+                retryLastMessage: (state) => state + 1,
+                resetThread: () => 0,
+                resetRetryCount: () => 0,
+            },
+        ],
+
+        cancelCount: [
+            0,
+            {
+                stopGeneration: (state) => state + 1,
+                resetThread: () => 0,
+                resetCancelCount: () => 0,
+            },
+        ],
+
+        // Track pending approval proposals for auto-rejection when user sends a new message
+        // Initialized from props.conversation.pending_approvals if there's a pending approval on load
+        pendingApprovalProposalId: [
+            (props.conversation?.pending_approvals?.find((a) => a.decision_status === 'pending')?.proposal_id ??
+                null) as string | null,
+            {
+                setPendingApproval: (_, { proposalId }) => proposalId,
+                clearPendingApproval: () => null,
+                // Also set pendingApprovalProposalId when loading a conversation with a pending approval
+                setConversation: (state, { conversation }) => {
+                    // Find all pending approvals from the conversation
+                    const pendingApprovals =
+                        conversation?.pending_approvals?.filter((a) => a.decision_status === 'pending') ?? []
+
+                    // If there are no pending approvals, clear the state
+                    if (pendingApprovals.length === 0) {
+                        return null
+                    }
+
+                    // If current state is still in the pending list, keep it
+                    if (state && pendingApprovals.some((a) => a.proposal_id === state)) {
+                        return state
+                    }
+
+                    // Otherwise, use the first (newest) pending approval
+                    return pendingApprovals[0]?.proposal_id ?? null
+                },
+            },
+        ],
+
+        // Track resolved approval statuses by proposalId (persists across re-renders)
+        // Note: Only resolved statuses are stored here, not 'pending' (cards start in pending state)
+        // Also stores optional feedback for rejections
+        resolvedApprovalStatuses: [
+            {} as Record<string, { status: 'approved' | 'rejected' | 'auto_rejected'; feedback?: string }>,
+            {
+                setResolvedApprovalStatus: (state, { proposalId, status, feedback }) => ({
+                    ...state,
+                    [proposalId]: { status, feedback },
+                }),
+            },
+        ],
+
+        // Store full pending approval data by proposal_id (for rendering approval cards)
+        // Initialized from props.conversation.pending_approvals on first mount
+        pendingApprovalsData: [
+            Object.fromEntries((props.conversation?.pending_approvals ?? []).map((a) => [a.proposal_id, a])) as Record<
+                string,
+                PendingApproval
+            >,
+            {
+                addPendingApprovalData: (state, { approval }) => ({
+                    ...state,
+                    [approval.proposal_id]: approval,
+                }),
+                loadPendingApprovalsData: (_, { approvals }) =>
+                    Object.fromEntries(approvals.map((a) => [a.proposal_id, a])),
+                // Handle conversation updates - merge existing data with incoming to preserve streaming approvals
+                setConversation: (state, { conversation }) => {
+                    const incomingApprovals = Object.fromEntries(
+                        (conversation?.pending_approvals ?? []).map((a) => [a.proposal_id, a])
+                    ) as Record<string, PendingApproval>
+
+                    // Merge: existing data takes precedence (streaming approvals are more up-to-date)
+                    // This prevents losing approval cards when setConversation is called during askMax
+                    const hasExistingData = Object.keys(state).length > 0
+                    if (hasExistingData) {
+                        return {
+                            ...incomingApprovals,
+                            ...state,
+                        }
+                    }
+
+                    return incomingApprovals
+                },
+            },
+        ],
+
+        // Whether support agents have explicitly acknowledged they want to use an existing conversation
+        supportOverrideEnabled: [
+            false,
+            {
+                setSupportOverrideEnabled: (_, { enabled }) => enabled,
+                // Reset when changing conversations
+                setConversation: () => false,
+            },
+        ],
+
+        sandboxEntries: [
+            [] as LogEntry[],
+            {
+                appendSandboxEntry: (state, { entry }) => [...state, entry],
+                refreshSandboxEntries: (state) => [...state],
+                resetSandboxEntries: () => [],
+                setConversation: () => [],
+                resetThread: () => [],
+            },
+        ],
+    })),
+
+    loaders(({ values }) => ({
+        queueData: [
+            { messages: [] as ConversationQueueMessage[], limit: 0 },
+            {
+                loadQueueData: async () => {
+                    if (!values.queueingEnabled || !values.conversation?.id) {
+                        return { messages: [], limit: 0 }
+                    }
+                    try {
+                        const queue = await api.conversations.queue.list(values.conversation.id)
+                        return {
+                            messages: queue.messages,
+                            limit: queue.max_queue_messages,
+                        }
+                    } catch (error: any) {
+                        posthog.captureException(error)
+                        if (error instanceof ApiError && error.status === 404) {
+                            return { messages: [], limit: 0 }
+                        }
+                        lemonToast.error(error?.data?.detail || 'Failed to load queued messages.')
+                        return { messages: [], limit: 0 }
+                    }
+                },
+            },
+        ],
+    })),
+
+    listeners((logic) => ({
+        streamConversation: async (
+            {
+                streamData: { agent_mode: agentMode, is_sandbox: isSandbox, ...streamData },
+                generationAttempt,
+                addToThread = true,
+            },
+            breakpoint
+        ) => {
+            const { actions, values, cache, mount, props } = logic as BuiltLogic<maxThreadLogicType>
+            // Set active streaming threads, so we know streaming is active
+            const releaseStreamingLock = mount() // lock the logic - don't unmount before we're done streaming
+            actions.incrActiveStreamingThreads()
+
+            // Generate a new trace ID for this interaction
+            const traceId = uuid()
+            actions.setTraceId(traceId)
+
+            // Sandbox runtime: route the message to a non-streaming products/tasks Run, then hand the
+            // SSE connection off to runStreamLogic. The LangGraph EventSource loop below is never
+            // entered for sandbox conversations.
+            //
+            // An *existing* sandbox conversation (`agent_runtime === 'sandbox'`) uses the dedicated
+            // `/sandbox/` routing endpoint. A *brand-new* conversation has no row yet — it's created
+            // lazily on the first message — so `agent_runtime` isn't known here; we detect the
+            // `is_sandbox` flag and let the conversation-create endpoint create it + return the run
+            // IDs as JSON (both endpoints return the identical { task_id, run_id, just_created_run }).
+            const isExistingSandboxConversation = values.conversation?.agent_runtime === 'sandbox'
+            const isSandboxConversation = isExistingSandboxConversation || !!isSandbox
+
+            // Echo the human message into whichever thread the renderer actually shows. A sandbox
+            // conversation renders runStreamLogic's threadItems (not this logic's thread) and
+            // echoes via pushSandboxHumanMessage below; adding it to the legacy thread too would
+            // briefly show a duplicate (until the runtime resolves to the ThreadView) that vanishes
+            // on reload, since sandbox turns live in the run log, not the legacy conversation messages.
+            if (generationAttempt === 0 && streamData.content && addToThread && !isSandboxConversation) {
+                const message: ThreadMessage = {
+                    type: AssistantMessageType.Human,
+                    content: streamData.content,
+                    status: 'completed',
+                    trace_id: traceId,
+                }
+                actions.addMessage(message)
+            }
+
+            if (isSandboxConversation) {
+                // ThreadView renders runStreamLogic's threadItems, not this logic's thread,
+                // so the human message must be echoed there to show up in the UI.
+                if (generationAttempt === 0 && streamData.content && addToThread) {
+                    actions.pushSandboxHumanMessage(streamData.content)
+                    // Pull the current scene's `maxContext` into the sandbox attachments at send
+                    // (consumption) time so on-scene entities flow into `sandboxAttachments` below.
+                    // Nothing else dispatches this, so without it scene context never auto-attaches.
+                    posthogAiContextLogic({ conversationId: props.conversationId }).actions.syncSceneAttachments()
+                }
+                try {
+                    const conversationId = values.conversation?.id || values.conversationId
+                    if (conversationId && streamData.content) {
+                        // The sandbox runtime has no agent modes — they're a legacy LangGraph concept. If the
+                        // user still picked one, carry it through as a context note so the agent can acknowledge it.
+                        const attachedContext: AttachedContext[] = [...values.sandboxAttachments]
+                        if (values.agentMode) {
+                            attachedContext.push({
+                                type: 'text',
+                                value: `The user selected a mode: "${getModeDisplayName(values.agentMode)}". It was in the legacy implementation. Acknowledge the mode if the user refers to it.`,
+                            })
+                        }
+                        // Optimistic boot indicator: light the "spinning up sandbox" provisioning state
+                        // for the duration of the open POST, before any SSE state exists. `openSandboxSse`
+                        // (success) clears it via the reducer; the failure/no-handle paths clear it below.
+                        actions.setSandboxRunOpening(true)
+                        // Single create-or-resume opener: it creates the conversation row on first use,
+                        // starts/continues the Run, and returns the (task, run) handle. A message always
+                        // provisions a run (a null handle only happens on a warm with a full pool).
+                        const handle = await api.conversations.open(conversationId, {
+                            content: streamData.content,
+                            trace_id: traceId,
+                            attached_context: attachedContext,
+                            initial_permission_mode: INITIAL_PERMISSION_MODE,
+                            // Bind a brand-new conversation to an existing Task (inbox "Open task") so the
+                            // backend resumes that Task's run. Only the first message carries it.
+                            ...(values.pendingBindTaskId ? { task_id: values.pendingBindTaskId } : {}),
+                        })
+                        if (handle) {
+                            // The sent message consumes any in-flight warm — it's now the active run, so
+                            // drop the release handle to avoid cancelling the run out from under it.
+                            cache.warmRun = null
+                            // The bind is one-shot: the conversation now exists bound to the Task, so
+                            // follow-ups target it directly — don't re-send task_id.
+                            if (values.pendingBindTaskId) {
+                                actions.setPendingBindTaskId(null)
+                            }
+                            actions.openSandboxSse({
+                                taskId: handle.task_id,
+                                runId: handle.run_id,
+                                // Fresh runs need everything from the top; follow-ups resume from latest.
+                                startLatest: !handle.just_created_run,
+                                // Correlate SSE-side telemetry with the trace this run was sent under.
+                                traceId,
+                            })
+                            // The streaming lock must span the whole SSE stream so the input stays
+                            // guarded until `_posthog/turn_complete` or a terminal/error event —
+                            // mirrors the LangGraph path holding the lock for its entire stream.
+                            // Released exactly once by the runStreamLogic listeners below; the
+                            // closure nulls itself so a second terminal event is a no-op.
+                            cache.sandboxStreamRelease = (): void => {
+                                cache.sandboxStreamRelease = null
+                                actions.decrActiveStreamingThreads()
+                                releaseStreamingLock()
+                            }
+                            return
+                        }
+                    }
+                } catch (e) {
+                    posthog.captureException(e)
+                    actions.pushSandboxError('Failed to send your message. Please try again.')
+                }
+                // The POST failed or no run was started — nothing will stream. Drop the optimistic boot
+                // indicator and release the lock now.
+                actions.setSandboxRunOpening(false)
+                actions.decrActiveStreamingThreads()
+                releaseStreamingLock()
+                return
+            }
+
+            let caughtException = false
+
+            try {
+                cache.generationController = new AbortController()
+                actions.resetSandboxEntries()
+
+                // Ensure we have valid data for the API call
+                const apiData: any = { ...streamData }
+                apiData.trace_id = traceId
+
+                if (values.billingContext && values.featureFlags[FEATURE_FLAGS.MAX_BILLING_CONTEXT]) {
+                    apiData.billing_context = values.billingContext
+                }
+
+                if (agentMode) {
+                    apiData.agent_mode = agentMode
+                }
+
+                const response = await api.conversations.stream(apiData, {
+                    signal: cache.generationController.signal,
+                })
+
+                const reader = response.body?.getReader()
+                if (!reader) {
+                    return
+                }
+
+                const decoder = new TextDecoder()
+                const pendingEventHandlers: Promise<void>[] = []
+                const parser = createParser({
+                    onEvent: async ({ data, event }) => {
+                        pendingEventHandlers.push(
+                            onEventImplementation(event as string, data, {
+                                actions,
+                                values,
+                                props,
+                                agentMode,
+                                cache,
+                            })
+                        )
+                    },
+                })
+
+                while (true) {
+                    const { done, value } = await reader.read()
+                    parser.feed(decoder.decode(value))
+                    if (done) {
+                        await Promise.all(pendingEventHandlers) // Wait for all onEvent handlers to complete
+                        break
+                    }
+                }
+            } catch (e) {
+                caughtException = true
+                // Cancel any next iteration
+                actions.setForAnotherAgenticIteration(false)
+
+                // Retry logic
+                async function retry(): Promise<void> {
+                    await breakpoint(1000 * (generationAttempt + 1))
+                    // Need to decrement the active streaming threads here, as we exit early.
+                    actions.decrActiveStreamingThreads()
+                    actions.streamConversation(
+                        {
+                            content: streamData.content,
+                            conversation: streamData.conversation,
+                            contextual_tools: streamData.contextual_tools,
+                            ui_context: streamData.ui_context,
+                            agent_mode: agentMode,
+                        },
+                        generationAttempt + 1
+                    )
+                }
+
+                if (e instanceof DOMException && e.name === 'AbortError') {
+                    posthog.capture('max conversation turn completed', {
+                        status: 'cancelled',
+                        conversation_id: values.conversation?.id,
+                        trace_id: traceId,
+                        agent_mode: agentMode,
+                        generation_attempt: generationAttempt,
+                    })
+                }
+
+                if (!(e instanceof DOMException) || e.name !== 'AbortError') {
+                    posthog.captureException(e)
+                    let releaseException = true
+                    // Generic message by default
+                    const relevantErrorMessage = { ...FAILURE_MESSAGE, id: uuid() }
+                    const offlineMessage = 'You appear to be offline. Please check your internet connection.'
+
+                    // Network errors surface differently across browsers and may be wrapped by handleFetch:
+                    //   Chrome/Edge: "Failed to fetch"
+                    //   Firefox:     "NetworkError when attempting to fetch resource."
+                    //   Safari:      "Load failed"
+                    //   handleFetch: ApiError with status === undefined (fetch itself threw)
+                    const isNetworkError =
+                        (e instanceof Error && /failed to fetch|network\s*error|load failed/i.test(e.message)) ||
+                        (e instanceof ApiError && !e.status)
+
+                    if (isNetworkError) {
+                        if (values.conversation?.status === ConversationStatus.InProgress) {
+                            if (generationAttempt > 15) {
+                                relevantErrorMessage.content = offlineMessage
+                            } else {
+                                await retry()
+                                return
+                            }
+                        } else {
+                            relevantErrorMessage.content = offlineMessage
+                        }
+                    } else if (e instanceof ApiError) {
+                        if (e.status === 400) {
+                            // Validation exception for non-retryable errors, such as idempotency conflict
+                            if (!e.data?.attr && e.data?.code === 'invalid_input') {
+                                releaseException = false
+                            }
+
+                            // Validation exception for the content length
+                            if (e.data?.attr === 'content') {
+                                relevantErrorMessage.content =
+                                    'Oops! Your message is too long. Ensure it has no more than 40000 characters.'
+                            } else if (e.detail) {
+                                relevantErrorMessage.content = e.detail
+                            }
+                        }
+
+                        // 409 means the conversation is already in progress.
+                        // Reconnect to the existing stream instead of resending the message.
+                        if (e.status === 409 && generationAttempt <= 5) {
+                            // Mark that the next stream replay should clear the thread on the
+                            // first real event. We defer the clear (rather than doing it now)
+                            // so the user keeps seeing the existing thread + loading indicator
+                            // while we reconnect. The stream replays all events from the
+                            // beginning so we must rebuild from scratch to avoid duplicates.
+                            cache.clearThreadOnReplay = true
+                            await breakpoint(1000 * (generationAttempt + 1))
+                            actions.decrActiveStreamingThreads()
+                            actions.streamConversation(
+                                {
+                                    content: null,
+                                    conversation: streamData.conversation,
+                                    agent_mode: agentMode,
+                                    is_sandbox: isSandbox || undefined,
+                                },
+                                generationAttempt + 1
+                            )
+                            return
+                        }
+
+                        if (e.status === 429) {
+                            // Use server-provided message (includes research beta messaging)
+                            relevantErrorMessage.content =
+                                e.detail ||
+                                `You've reached PostHog AI's usage limit for the moment. Please try again ${e.formattedRetryAfter}.`
+                        }
+
+                        if (e.status === 402) {
+                            relevantErrorMessage.content =
+                                'Your organization reached its AI credit usage limit. Increase the limits in [Billing](/organization/billing), or ask an org admin to do so.'
+                        }
+
+                        if (e.status && e.status >= 500) {
+                            relevantErrorMessage.content =
+                                'Something is wrong with our servers. Please try again later.'
+                        }
+                    } else {
+                        console.error(e)
+                    }
+
+                    if (releaseException) {
+                        posthog.capture('max conversation turn completed', {
+                            status: 'failure',
+                            conversation_id: values.conversation?.id,
+                            trace_id: traceId,
+                            agent_mode: agentMode,
+                            generation_attempt: generationAttempt,
+                            error_status_code: e instanceof ApiError ? e.status : undefined,
+                            error_type: isNetworkError
+                                ? 'network_error'
+                                : e instanceof ApiError
+                                  ? 'api_error'
+                                  : 'unknown_error',
+                        })
+                        // Remove streaming messages and reload from server (source of truth)
+                        actions.finalizeStreamingMessages()
+                        actions.addMessage(relevantErrorMessage)
+                        if (values.conversation?.id) {
+                            actions.loadConversation(values.conversation.id)
+                        }
+                    }
+                }
+            }
+            actions.decrActiveStreamingThreads()
+            if (values.isAnotherAgenticIterationScheduled) {
+                // Continue generation after applying tool - null message in askMax "just resume generation with current context"
+                actions.askMax(null)
+            } else {
+                // Otherwise wrap things up
+                if (!caughtException) {
+                    const hasGenerationError = values.threadRaw.some((msg) => msg.status === 'error')
+                    posthog.capture('max conversation turn completed', {
+                        status: hasGenerationError ? 'generation_error' : 'success',
+                        conversation_id: values.conversation?.id,
+                        trace_id: traceId,
+                        agent_mode: agentMode,
+                        generation_attempt: generationAttempt,
+                    })
+                }
+                actions.completeThreadGeneration()
+            }
+            cache.generationController = undefined
+            releaseStreamingLock() // release the lock
+        },
+    })),
+    // Sandbox runs stream through this conversation's runStreamLogic instance, so the streaming
+    // lock taken in streamConversation can only be released when that instance signals the turn
+    // ended — on turn completion, a terminal run status, or a stream error. Its action types are
+    // per-instance (the key is in the path), so they're resolved from props at build time.
+    listeners(({ props, cache, actions, values }) => {
+        const sandboxStreamActionTypes = runStreamLogic({ streamKey: props.conversationId }).actionTypes
+        // Normal turn completion: full turn-end, including the sandbox queue-drain that starts the
+        // next queued message (completeThreadGeneration's intended next-turn behavior).
+        const completeSandboxTurn = (): void => {
+            cache.sandboxStreamRelease?.()
+            if (values.streamingActive) {
+                actions.completeThreadGeneration()
+            }
+        }
+        // Error / terminal status: just stop streaming. Must NOT run completeThreadGeneration's
+        // queue-drain — auto-starting the next queued message after a failure is wrong. The
+        // streamingActive guard also keeps history-replay terminal events (replayedFromHistory,
+        // dispatched during bootstrapRun with no live turn) from firing teardown.
+        const endSandboxStream = (): void => {
+            cache.sandboxStreamRelease?.()
+            if (values.streamingActive) {
+                actions.endStreaming()
+            }
+        }
+        return {
+            [sandboxStreamActionTypes.markTurnComplete]: completeSandboxTurn,
+            // handleTerminalStatus fires for every task_run_state frame, including the initial
+            // non-terminal queued/in_progress ones — only tear down on an actually terminal
+            // status, mirroring runStreamLogic's own guard.
+            [sandboxStreamActionTypes.handleTerminalStatus]: ({ status }: { status: string }) => {
+                if (isTerminalRunStatus(status)) {
+                    endSandboxStream()
+                }
+            },
+            [sandboxStreamActionTypes.handleStreamError]: endSandboxStream,
+        }
+    }),
+    listeners(({ actions, values, cache, props }) => ({
+        setConversation: ({ conversation }) => {
+            const nextConversationId = conversation?.id ?? null
+            if (cache.lastConversationId !== nextConversationId) {
+                cache.lastConversationId = nextConversationId
+                actions.setQueuedMessages([])
+                actions.setQueueLimit(0)
+                if (values.queueingEnabled && conversation?.id) {
+                    actions.loadQueueData()
+                }
+            }
+            // Sync agentMode from conversation only if user hasn't manually selected a mode after submission
+            if (!values.agentModeLockedByUser && conversation?.agent_mode) {
+                actions.syncAgentModeFromConversation(conversation.agent_mode as AgentMode)
+            }
+            if (conversation?.is_sandbox) {
+                actions.setIsSandboxMode(true)
+            }
+            if (
+                values.queueingEnabled &&
+                conversation?.pending_approvals?.some((approval) => approval.decision_status === 'pending')
+            ) {
+                actions.clearQueuedMessages()
+            }
+            // Note: pending approvals loading is handled in the reducer (pendingApprovalsData.setConversation)
+        },
+        setQuestion: ({ question }) => {
+            // Sandbox pre-warming. Debounce on the first non-whitespace keystroke so the sandbox
+            // boots while the user is still typing; release if the input empties.
+            // LangGraph conversations are unaffected.
+            if (values.conversation?.agent_runtime !== 'sandbox') {
+                return
+            }
+            // Don't warm if a run is already active — the live Run is the desired state.
+            if (values.threadLoading) {
+                return
+            }
+            if (question.trim() === '') {
+                // Input emptied — cancel a pending warm trigger and schedule release after 5s.
+                cache.disposables.dispose('prewarm-debounce')
+                if (cache.prewarmed) {
+                    cache.disposables.add(() => {
+                        const timer = setTimeout(() => actions.releaseSandboxPrewarm(), 5000)
+                        return () => clearTimeout(timer)
+                    }, 'prewarm-release')
+                }
+                return
+            }
+            // Non-empty input: cancel any pending release, then debounce the warm.
+            cache.disposables.dispose('prewarm-release')
+            if (cache.prewarmed) {
+                return
+            }
+            cache.disposables.add(() => {
+                const timer = setTimeout(() => actions.prewarmSandbox(), 250)
+                return () => clearTimeout(timer)
+            }, 'prewarm-debounce')
+        },
+        prewarmSandbox: async () => {
+            cache.disposables.dispose('prewarm-debounce')
+            if (values.conversation?.agent_runtime !== 'sandbox' || !values.conversationId) {
+                return
+            }
+            // Guard against duplicate warms and warming over an active run.
+            if (cache.prewarmed || cache.prewarming || values.threadLoading) {
+                return
+            }
+            cache.prewarming = true
+            cache.pendingRelease = false
+            try {
+                // Warm = open with no message: boots a Run that idles awaiting the first message. The
+                // returned handle lets a later release cancel exactly that Run via the relay (a full
+                // pool returns null — nothing to release).
+                const warm = await api.conversations.open(values.conversationId, {
+                    content: null,
+                    initial_permission_mode: INITIAL_PERMISSION_MODE,
+                })
+                cache.warmRun = warm ? { taskId: warm.task_id, runId: warm.run_id } : null
+                cache.prewarmed = true
+                // If the user abandoned the input while this POST was in flight, the blur/empty
+                // release hit the early-exit (nothing was warm yet). Honor it now so the freshly
+                // warmed sandbox isn't leaked until the agent-server's idle self-cancel.
+                if (cache.pendingRelease) {
+                    cache.pendingRelease = false
+                    actions.releaseSandboxPrewarm()
+                }
+            } catch (e) {
+                // Pre-warming is best-effort latency optimization; a failure just means the first
+                // message takes the cold path. Don't surface it to the user.
+                posthog.captureException(e)
+            } finally {
+                cache.prewarming = false
+            }
+        },
+        releaseSandboxPrewarm: async () => {
+            cache.disposables.dispose('prewarm-debounce')
+            cache.disposables.dispose('prewarm-release')
+            if (!cache.prewarmed || !values.conversationId) {
+                // A warm POST may still be in flight — record the intent so its success handler
+                // releases the sandbox instead of dropping the request on the floor.
+                if (cache.prewarming) {
+                    cache.pendingRelease = true
+                }
+                cache.prewarmed = false
+                return
+            }
+            // A warm consumed by a sent message must not be released — only release on abandon.
+            cache.prewarmed = false
+            const warmRun = cache.warmRun as { taskId: string; runId: string } | undefined
+            cache.warmRun = null
+            if (warmRun) {
+                // Release = cancel the warm Run through the generic relay (owned by the renderer logic);
+                // it transitions to terminal and drops out of the warm-pool count.
+                actions.cancelSandboxRun(warmRun)
+            }
+        },
+        enqueueQueuedMessage: async ({ content, contextualTools, uiContext, billingContext, agentMode }) => {
+            if (!values.queueingEnabled || !values.conversation?.id) {
+                actions.setQueuedMessages([])
+                actions.setQueueLimit(0)
+                return
+            }
+            try {
+                const queuePayload: {
+                    content: string
+                    contextual_tools?: Record<string, any>
+                    ui_context?: MaxUIContext
+                    billing_context?: MaxBillingContext
+                    agent_mode?: AgentMode
+                } = {
+                    content,
+                    contextual_tools: contextualTools,
+                }
+
+                if (uiContext != null) {
+                    queuePayload.ui_context = uiContext
+                }
+
+                if (billingContext != null) {
+                    queuePayload.billing_context = billingContext
+                }
+
+                if (agentMode != null) {
+                    queuePayload.agent_mode = agentMode
+                }
+
+                const queue = await api.conversations.queue.enqueue(values.conversation.id, queuePayload)
+                actions.setQueuedMessages(queue.messages)
+                actions.setQueueLimit(queue.max_queue_messages)
+            } catch (error: any) {
+                posthog.captureException(error)
+                actions.setQueuedMessages(values.queuedMessages)
+                if (error instanceof ApiError && error.status === 409) {
+                    lemonToast.error('You can only queue two messages at a time.')
+                    return
+                }
+                lemonToast.error(error?.data?.detail || 'Failed to queue the message.')
+            }
+        },
+        updateQueuedMessage: async ({ queueId, content }) => {
+            if (!values.queueingEnabled || !values.conversation?.id) {
+                actions.setQueuedMessages([])
+                actions.setQueueLimit(0)
+                return
+            }
+            try {
+                const queue = await api.conversations.queue.update(values.conversation.id, queueId, content)
+                actions.setQueuedMessages(queue.messages)
+                actions.setQueueLimit(queue.max_queue_messages)
+            } catch (error: any) {
+                posthog.captureException(error)
+                lemonToast.error(error?.data?.detail || 'Failed to update the queued message.')
+            }
+        },
+        deleteQueuedMessage: async ({ queueId }) => {
+            if (!values.queueingEnabled || !values.conversation?.id) {
+                actions.setQueuedMessages([])
+                actions.setQueueLimit(0)
+                return
+            }
+            if (!queueId) {
+                return
+            }
+            const fallbackQueue = values.queuedMessages.filter((item) => item.id !== queueId)
+            actions.setQueuedMessages(fallbackQueue)
+            try {
+                const queue = await api.conversations.queue.delete(values.conversation.id, queueId)
+                actions.setQueuedMessages(queue.messages)
+                actions.setQueueLimit(queue.max_queue_messages)
+            } catch (error: any) {
+                posthog.captureException(error)
+                if (error instanceof ApiError && error.status === 404) {
+                    return
+                }
+                actions.setQueuedMessages(fallbackQueue)
+            }
+        },
+        consumeQueuedMessage: async ({ message }) => {
+            if (!values.queueingEnabled || !values.conversation?.id) {
+                actions.setQueuedMessages([])
+                actions.setQueueLimit(0)
+                return
+            }
+            const queueId = message.id
+            if (!queueId) {
+                return
+            }
+            const fallbackQueue = values.queuedMessages.filter((item) => item.id !== queueId)
+            actions.setQueuedMessages(fallbackQueue)
+            try {
+                const queue = await api.conversations.queue.delete(values.conversation.id, queueId)
+                actions.setQueuedMessages(queue.messages)
+                actions.setQueueLimit(queue.max_queue_messages)
+            } catch (error: any) {
+                posthog.captureException(error)
+                if (error instanceof ApiError && error.status === 404) {
+                    return
+                }
+                actions.setQueuedMessages(fallbackQueue)
+            }
+        },
+        clearQueuedMessages: async () => {
+            if (!values.queueingEnabled || !values.conversation?.id) {
+                actions.setQueuedMessages([])
+                actions.setQueueLimit(0)
+                return
+            }
+            try {
+                const queue = await api.conversations.queue.clear(values.conversation.id)
+                actions.setQueuedMessages(queue.messages)
+                actions.setQueueLimit(queue.max_queue_messages)
+            } catch (error: any) {
+                posthog.captureException(error)
+                lemonToast.error(error?.data?.detail || 'Failed to clear queued messages.')
+            }
+        },
+        setPendingApproval: () => {
+            if (values.queueingEnabled) {
+                actions.clearQueuedMessages()
+            }
+        },
+        askMax: async ({ prompt, addToThread = true, uiContext }, breakpoint) => {
+            // Only process if this thread is the currently active one
+            if (values.conversationId !== values.activeThreadKey) {
+                return
+            }
+            // A sent message consumes any sandbox pre-warm: the warm Run is the in-progress run the
+            // sandbox routing follows up on, so cancel pending timers and clear the flag WITHOUT
+            // issuing a release/DELETE.
+            cache.disposables.dispose('prewarm-debounce')
+            cache.disposables.dispose('prewarm-release')
+            cache.prewarmed = false
+            cache.warmRun = null
+            // A sent message consumes the warm — drop any in-flight release intent so the
+            // run the message follows up on isn't cancelled out from under it.
+            cache.pendingRelease = false
+            // Wait for the open dashboard to finish loading before collecting context (see the
+            // constants above for why). The scene is re-read every tick, so the gate releases the
+            // moment the dashboard's metadata lands — and immediately if the user navigates away
+            // mid-wait (no longer on a dashboard, or onto a different one that's already loaded).
+            const isDashboardSceneLoading = (): boolean => {
+                if (sceneLogic.values.activeSceneId !== Scene.Dashboard) {
+                    return false
+                }
+                const activeSceneLogic = sceneLogic.values.activeSceneLogic
+                if (!activeSceneLogic) {
+                    // No dashboard scene logic to wait on — its key hasn't resolved or it can't be
+                    // built. Nothing will land, so don't block: send now rather than stalling for the
+                    // full cap and shipping without context anyway.
+                    return false
+                }
+                if (!activeSceneLogicHasMaxContext(activeSceneLogic)) {
+                    // The logic exists but isn't mounted yet — building, or briefly unmounted mid
+                    // dashboard→dashboard navigation. Keep waiting (bounded by the cap) so context
+                    // collection picks up the dashboard once it mounts.
+                    return true
+                }
+                return !(activeSceneLogic.values as { dashboard?: unknown }).dashboard
+            }
+            // Measure real elapsed time, not tick count: breakpoint() only guarantees a *minimum*
+            // delay, so a busy event loop would make a tick counter under-report the wait — letting
+            // it run past the cap and skewing the telemetry below. performance.now() is monotonic.
+            const dashboardWaitStart = performance.now()
+            while (
+                isDashboardSceneLoading() &&
+                performance.now() - dashboardWaitStart < MAX_DASHBOARD_CONTEXT_WAIT_MS
+            ) {
+                await breakpoint(DASHBOARD_CONTEXT_POLL_INTERVAL_MS)
+            }
+            if (isDashboardSceneLoading()) {
+                // We hit the wait cap while the dashboard was still loading, so the message ships
+                // without dashboard context (the original "Max can't see this dashboard" symptom).
+                // Capture it so we can tell whether the cap is ever the binding constraint in prod.
+                const activeLoadedScene = sceneLogic.values.activeLoadedScene
+                const sceneProps = activeLoadedScene?.paramsToProps?.(activeLoadedScene?.sceneParams) || {}
+                posthog.capture('max dashboard context wait timed out', {
+                    waited_ms: Math.round(performance.now() - dashboardWaitStart),
+                    dashboard_id: (sceneProps as { id?: number | string }).id,
+                    conversation_id: values.conversation?.id || values.conversationId,
+                })
+            }
+            const contextualTools = Object.fromEntries(values.tools.map((tool) => [tool.identifier, tool.context]))
+            // Always send voice_mode as an explicit boolean when handsFreeLogic is mounted,
+            // not just when active. Otherwise a typed turn following a spoken one inherits
+            // the earlier <voice_mode> system instruction from conversation history and
+            // keeps formatting for speech (no markdown, spelled-out numbers).
+            const handsFree = handsFreeLogic.findMounted({ panelId: props.panelId })
+            const voiceMode = handsFree ? { voice_mode: handsFree.values.isActive } : undefined
+            const mergedUiContext =
+                uiContext || voiceMode
+                    ? { ...values.compiledContext, ...uiContext, ...voiceMode }
+                    : values.compiledContext || undefined
+            const billingContext =
+                values.billingContext && values.featureFlags[FEATURE_FLAGS.MAX_BILLING_CONTEXT]
+                    ? values.billingContext
+                    : undefined
+
+            if (
+                values.queueingEnabled &&
+                values.threadLoading &&
+                addToThread &&
+                typeof prompt === 'string' &&
+                prompt.trim() !== ''
+            ) {
+                if (values.queueIsFull) {
+                    lemonToast.error('You can only queue two messages at a time.')
+                    return
+                }
+                actions.enqueueQueuedMessage({
+                    content: prompt,
+                    contextualTools,
+                    uiContext: mergedUiContext,
+                    billingContext,
+                    agentMode: values.agentMode,
+                })
+                actions.setQuestion('')
+                if (props.panelId === SIDE_PANEL_PANEL_ID && sidePanelStateLogic.isMounted()) {
+                    sidePanelStateLogic.actions.setSidePanelOptions(null)
+                }
+                return
+            }
+            if (!values.dataProcessingAccepted) {
+                // Persist prompt to sessionStorage in case of OAuth redirect during consent flow
+                if (prompt) {
+                    try {
+                        sessionStorage.setItem(
+                            PENDING_AI_PROMPT_KEY,
+                            JSON.stringify({
+                                prompt,
+                                timestamp: Date.now(),
+                            })
+                        )
+                    } catch {
+                        // sessionStorage might be unavailable
+                    }
+                }
+                return // Skip - this will be re-fired by the `onApprove` on `AIConsentPopoverWrapper`
+            }
+
+            // Clear any stored prompt since we're proceeding with submission
+            try {
+                sessionStorage.removeItem(PENDING_AI_PROMPT_KEY)
+            } catch {
+                // sessionStorage might be unavailable
+            }
+
+            // Build auto-rejection payload if there's a pending approval that hasn't already been resolved
+            // (pendingApprovalProposalId might get re-set during streaming even after user approved/rejected)
+            let autoRejectPayload: { action: 'reject'; proposal_id: string; feedback?: string } | undefined = undefined
+            const pendingProposalId = values.pendingApprovalProposalId
+            const alreadyResolved = pendingProposalId
+                ? !!values.resolvedApprovalStatuses[pendingProposalId]?.status
+                : false
+            if (pendingProposalId && !alreadyResolved) {
+                autoRejectPayload = {
+                    action: 'reject',
+                    proposal_id: pendingProposalId,
+                    feedback: prompt ?? undefined,
+                }
+                actions.clearPendingApproval()
+                actions.setResolvedApprovalStatus(pendingProposalId, 'auto_rejected')
+            }
+            // A pending task-bind (inbox "Open task") makes this first message a sandbox task-resume:
+            // the conversation is created bound to the Task and its run is resumed. Force sandbox mode
+            // so the message routes through the sandbox `open` endpoint (which carries the task_id).
+            // Reducers apply synchronously, so the `is_sandbox` derivation below sees the new value.
+            if (values.pendingBindTaskId && !values.isSandboxMode) {
+                actions.setIsSandboxMode(true)
+            }
+            const agentMode = values.agentMode
+
+            // Clear the question
+            actions.setQuestion('')
+            // Drop #panel=max:… options so reload doesn't re-run auto-send from the hash
+            if (props.panelId === SIDE_PANEL_PANEL_ID && sidePanelStateLogic.isMounted()) {
+                sidePanelStateLogic.actions.setSidePanelOptions(null)
+            }
+            // For a new conversations, set the frontend conversation ID
+            if (!values.conversation) {
+                actions.setConversationId(values.conversationId)
+            } else {
+                const updatedConversation = {
+                    ...values.conversation,
+                    agent_mode: agentMode || values.conversation?.agent_mode,
+                    status: ConversationStatus.InProgress,
+                    updated_at: dayjs().toISOString(),
+                }
+                // Update the current status
+                actions.setConversation(updatedConversation)
+                // Update the global conversation cache
+                actions.updateGlobalConversationCache(updatedConversation)
+            }
+
+            actions.streamConversation(
+                {
+                    agent_mode: values.isSandboxMode ? null : agentMode,
+                    is_sandbox: values.isSandboxMode || undefined,
+                    content: prompt,
+                    contextual_tools: contextualTools,
+                    ui_context: mergedUiContext,
+                    conversation: values.conversation?.id || values.conversationId,
+                    // Include auto-rejection payload if there was a pending approval
+                    resume_payload: autoRejectPayload,
+                },
+                0,
+                addToThread
+            )
+        },
+        stopGeneration: async () => {
+            if (!values.conversation?.id) {
+                actions.setCancelLoading(false)
+                return
+            }
+
+            try {
+                if (values.conversation.agent_runtime === 'sandbox') {
+                    // Sandbox runs cancel through the generic tasks relay (the renderer owns the run id).
+                    actions.cancelSandboxRun()
+                } else {
+                    await api.conversations.cancel(values.conversation.id)
+                }
+                cache.generationController?.abort()
+                actions.clearQueuedMessages()
+                actions.resetThread()
+                // Optimistically clear the loading flags so the composer button returns to "send"
+                // immediately, instead of racing the fire-and-forget loadConversation refetch below
+                // (whose success handler is gated on streamingActive). The refetch still reconciles
+                // the true server status moments later.
+                if (values.conversation) {
+                    const canceledConversation = { ...values.conversation, status: ConversationStatus.Idle }
+                    actions.setConversation(canceledConversation)
+                    actions.updateGlobalConversationCache(canceledConversation)
+                }
+            } catch (e: any) {
+                posthog.captureException(e)
+                lemonToast.error(e?.data?.detail || 'Failed to cancel the generation.')
+            }
+
+            actions.loadConversation(values.conversation.id)
+            actions.setCancelLoading(false)
+        },
+
+        reconnectToStream: () => {
+            const id = values.conversationId
+            if (!id) {
+                return
+            }
+            // Only skip if this *instance* already has an open stream
+            if (cache.generationController) {
+                return
+            }
+            // Don't reconnect if there's a pending form - user needs to fill it out first
+            if (values.multiQuestionFormPending) {
+                return
+            }
+            actions.streamConversation(
+                {
+                    conversation: id,
+                    content: null,
+                    agent_mode: values.isSandboxMode ? null : values.agentMode,
+                    is_sandbox: values.isSandboxMode || undefined,
+                },
+                0
+            )
+        },
+
+        retryLastMessage: () => {
+            const lastMessage = values.threadRaw.filter(isHumanMessage).pop() as HumanMessage | undefined
+            if (lastMessage) {
+                actions.askMax(lastMessage.content)
+            }
+        },
+
+        completeThreadGeneration: () => {
+            actions.executePendingClientToolCall()
+
+            const handsFree = handsFreeLogic.findMounted({ panelId: props.panelId })
+            if (handsFree?.values.isActive) {
+                handsFree.actions.speakAssistantResponse(summariseAssistantThread(values.threadRaw))
+            }
+
+            // Update the conversation history to include the new conversation
+            actions.loadConversationHistory({ doNotUpdateCurrentThread: true })
+
+            if (!values.conversation) {
+                return
+            }
+
+            const newConversation = {
+                ...values.conversation,
+                status: ConversationStatus.Idle,
+            }
+
+            actions.setConversation(newConversation)
+            actions.updateGlobalConversationCache(newConversation)
+
+            // Fetch the full conversation to get state fields
+            // (those which aren't included in the streaming response)
+            actions.loadConversation(values.conversation.id)
+
+            const shouldConsumeSandboxQueue = values.isSandboxMode && values.queuedMessages.length > 0
+
+            if (values.queueingEnabled && values.conversation?.id && !shouldConsumeSandboxQueue) {
+                actions.loadQueueData()
+            }
+
+            // Process queued messages for sandbox conversations.
+            // Regular conversations handle queue consumption on the backend
+            // (process_chat_agent_activity pops and starts new workflows).
+            // Sandbox mode doesn't have this, so the frontend drives it: combine every queued
+            // follow-up into one send. `addToThread: false` skips the optimistic echo so the message
+            // renders only when the live stream echoes it back (stream-confirmed), not at drain time.
+            if (shouldConsumeSandboxQueue) {
+                const combined = values.queuedMessages.map((message) => message.content).join('\n\n')
+                actions.clearQueuedMessages()
+                actions.askMax(combined, false)
+            }
+
+            // Must go last. Otherwise, the logic will be unmounted before the lifecycle finishes.
+            if (values.activeThreadKey !== values.conversationId && cache.unmount) {
+                cache.unmount()
+            }
+        },
+
+        loadConversationHistorySuccess: ({ conversationHistory, payload }) => {
+            // payload is an object with doNotUpdateCurrentThread for loadConversationHistory,
+            // but it's a string (conversationId) for loadConversation
+            const doNotUpdate = typeof payload === 'object' && payload?.doNotUpdateCurrentThread
+            if (props.skipInitialLoad || doNotUpdate || values.autoRun || values.streamingActive) {
+                return
+            }
+            // Don't auto-reconnect if there's a pending form
+            if (values.multiQuestionFormPending) {
+                return
+            }
+            const conversation = conversationHistory.find((c) => c.id === values.conversationId)
+            if (!conversation) {
+                return
+            }
+
+            // Keep conversation and thread in sync to avoid empty thread after history updates.
+            actions.setConversation(conversation)
+            if (conversation.messages?.length && !values.threadRaw.length) {
+                actions.setThread(updateMessagesWithCompletedStatus(conversation.messages))
+            }
+        },
+        selectCommand: ({ command }) => {
+            if (command.arg) {
+                actions.setQuestion(command.name + ' ')
+            } else {
+                actions.setQuestion(command.name)
+            }
+        },
+        activateCommand: ({ command }) => {
+            if (command.arg) {
+                actions.setQuestion(command.name + ' ') // Rest must be filled in by the user
+            } else {
+                actions.askMax(command.name)
+            }
+        },
+        processNotebookUpdate: async ({ notebookId, notebookContent }) => {
+            try {
+                const currentPath = router.values.location.pathname
+                const notebookPath = urls.notebook(notebookId)
+
+                if (currentPath.includes(notebookPath)) {
+                    // We're already on the notebook page, refresh it
+                    let logic = notebookLogic.findMounted({ shortId: notebookId })
+                    if (logic) {
+                        logic.actions.setLocalContent(notebookContent, true, true)
+                    }
+                } else {
+                    // Navigate to the notebook
+                    await openNotebook(notebookId, NotebookTarget.Scene, undefined, (logic) => {
+                        logic.actions.setLocalContent(notebookContent, true, true)
+                    })
+                }
+            } catch (error) {
+                posthog.captureException(error)
+                console.error('Failed to navigate to notebook:', error)
+            }
+        },
+        appendMessageToConversation: async ({ message }) => {
+            const conversationId = values.conversationId
+            if (!conversationId) {
+                return
+            }
+
+            await api.conversations.appendMessage(conversationId, message)
+
+            actions.addMessage({
+                type: AssistantMessageType.Assistant,
+                content: message,
+                id: uuid(),
+                status: 'completed',
+            })
+        },
+        continueAfterForm: ({ formAnswers }) => {
+            actions.streamConversation(
+                {
+                    agent_mode: values.isSandboxMode ? null : values.agentMode,
+                    is_sandbox: values.isSandboxMode || undefined,
+                    content: null,
+                    conversation: values.conversationId,
+                    resume_payload: { action: 'form', form_answers: formAnswers },
+                },
+                0,
+                false // Don't add to thread - no human message to show
+            )
+        },
+        continueAfterFormDismissal: () => {
+            actions.streamConversation(
+                {
+                    agent_mode: values.isSandboxMode ? null : values.agentMode,
+                    is_sandbox: values.isSandboxMode || undefined,
+                    content: null,
+                    conversation: values.conversationId,
+                    resume_payload: { action: 'dismiss_form' },
+                },
+                0,
+                false // Don't add to thread - no human message to show
+            )
+        },
+        executePendingClientToolCall: async () => {
+            // Guard on streamingActive, not threadLoading: conversationLoading is still true here
+            // because completeThreadGeneration resets the status after dispatching this action
+            if (values.conversationId !== values.activeThreadKey || values.streamingActive) {
+                return
+            }
+            // Include statically-marked tools so a deregistered handler refuses instead of stranding the call
+            const clientToolNames = new Set([
+                ...Object.values(values.toolMap)
+                    .filter((tool) => tool.clientExecution)
+                    .map((tool) => tool.identifier as string),
+                ...Object.entries(TOOL_DEFINITIONS)
+                    .filter(([, definition]) => definition.clientExecuted)
+                    .map(([name]) => name),
+            ])
+            const pending = findPendingClientToolCall(values.threadRaw, clientToolNames)
+            if (!pending) {
+                return
+            }
+            // One attempt per call: a failing resume turn re-fires completeThreadGeneration with
+            // the same dangling call, which would re-run the handler's side effects unboundedly
+            cache.resumedClientToolCallIds ??= new Set<string>()
+            if (cache.resumedClientToolCallIds.has(pending.toolCallId)) {
+                return
+            }
+            cache.resumedClientToolCallIds.add(pending.toolCallId)
+            const handler = values.toolMap[pending.toolName]?.clientExecution
+            let result: Record<string, unknown>
+            if (!handler) {
+                result = {
+                    client_execution_error:
+                        'The PostHog view that executes this tool client-side is no longer open, so the call could not be completed.',
+                }
+            } else {
+                try {
+                    result = (await handler(pending.args)) ?? {}
+                } catch (error) {
+                    result = { client_execution_error: String(error) }
+                }
+            }
+            // A user message during the handler abandons the interrupt server-side — drop the
+            // resume unless the same call is still dangling
+            const stillPending = findPendingClientToolCall(values.threadRaw, clientToolNames)
+            if (
+                values.conversationId !== values.activeThreadKey ||
+                values.streamingActive ||
+                stillPending?.toolCallId !== pending.toolCallId
+            ) {
+                return
+            }
+            actions.continueWithClientToolResult(result, pending.toolCallId)
+        },
+        continueWithClientToolResult: ({ result, toolCallId }) => {
+            actions.streamConversation(
+                {
+                    agent_mode: values.isSandboxMode ? null : values.agentMode,
+                    is_sandbox: values.isSandboxMode || undefined,
+                    content: null,
+                    conversation: values.conversationId,
+                    // Refresh tool context so the resumed generation sees state the handler just changed
+                    contextual_tools: Object.fromEntries(values.tools.map((tool) => [tool.identifier, tool.context])),
+                    resume_payload: { action: 'client_tool_result', tool_call_id: toolCallId, result },
+                },
+                0,
+                false // Don't add to thread - no human message to show
+            )
+        },
+        continueAfterApproval: ({ proposalId }) => {
+            actions.clearQueuedMessages()
+            // Persist the approved status so the card can display it
+            // NOTE: We don't call clearPendingApproval() here - the component should stay
+            // mounted to show the resolved state. The alreadyResolved check in askMax
+            // prevents auto-rejection for resolved approvals.
+            actions.setResolvedApprovalStatus(proposalId, 'approved')
+            // Resume the conversation with the approval payload
+            actions.streamConversation(
+                {
+                    agent_mode: values.isSandboxMode ? null : values.agentMode,
+                    is_sandbox: values.isSandboxMode || undefined,
+                    content: null,
+                    conversation: values.conversationId,
+                    contextual_tools: Object.fromEntries(values.tools.map((tool) => [tool.identifier, tool.context])),
+                    resume_payload: { action: 'approve', proposal_id: proposalId },
+                },
+                0,
+                false // Don't add to thread - no human message to show
+            )
+        },
+        continueAfterRejection: ({ proposalId, feedback }) => {
+            actions.clearQueuedMessages()
+            // Persist the rejected status and feedback so the card can display it
+            // NOTE: We don't call clearPendingApproval() here - the component should stay
+            // mounted to show the resolved state with feedback. The alreadyResolved check
+            // in askMax prevents auto-rejection for resolved approvals.
+            actions.setResolvedApprovalStatus(proposalId, 'rejected', feedback)
+            // Resume the conversation with the rejection payload
+            actions.streamConversation(
+                {
+                    agent_mode: values.isSandboxMode ? null : values.agentMode,
+                    is_sandbox: values.isSandboxMode || undefined,
+                    content: null,
+                    conversation: values.conversationId,
+                    contextual_tools: Object.fromEntries(values.tools.map((tool) => [tool.identifier, tool.context])),
+                    resume_payload: {
+                        action: 'reject',
+                        proposal_id: proposalId,
+                        feedback,
+                    },
+                },
+                0,
+                false // Don't add to thread - no human message to show
+            )
+        },
+    })),
+
+    selectors({
+        conversationId: [
+            (s, p) => [s.conversation, p.conversationId],
+            (conversation, propsConversationId) => (conversation?.id ? conversation.id : propsConversationId),
+        ],
+
+        // The exact id this instance was keyed with. React must bind the per-conversation sandbox
+        // logics with the same id connect() used above, or the two would resolve different instances.
+        sandboxConversationKey: [(_, p) => [p.conversationId], (conversationId): string => conversationId],
+
+        // A converted conversation: now on the sandbox runtime but still carrying its legacy
+        // LangGraph history. Drives the dual render (full legacy thread → "history was converted"
+        // divider → live sandbox thread). Reads `threadRaw`, not `threadGrouped`, so the streaming
+        // thinking-loader injected into `threadGrouped` can't be mistaken for legacy content.
+        isConvertedConversation: [
+            (s) => [s.conversation, s.threadRaw],
+            (conversation, threadRaw): boolean => conversation?.agent_runtime === 'sandbox' && threadRaw.length > 0,
+        ],
+
+        effectiveApprovalStatuses: [
+            (s) => [s.resolvedApprovalStatuses, s.pendingApprovalsData],
+            (resolved, pendingApprovalsData): Record<string, { status: ApprovalDecisionStatus; feedback?: string }> => {
+                // Get statuses from pending approvals data
+                const baseStatuses: Record<string, { status: ApprovalDecisionStatus; feedback?: string }> = {}
+                for (const [proposalId, approval] of Object.entries(pendingApprovalsData)) {
+                    baseStatuses[proposalId] = { status: approval.decision_status }
+                }
+
+                // Frontend resolved statuses take precedence
+                return {
+                    ...baseStatuses,
+                    ...resolved,
+                }
+            },
+        ],
+
+        isSharedThread: [
+            (s) => [s.conversation, userLogic.selectors.user],
+            (conversation, user): boolean => !!conversation?.user && !!user && conversation.user.uuid !== user.uuid,
+        ],
+
+        // Whether the current user is impersonating and viewing an existing conversation
+        isImpersonatingExistingConversation: [
+            (s) => [s.conversation, s.supportOverrideEnabled, userLogic.selectors.user],
+            (conversation, supportOverrideEnabled, user): boolean => {
+                // Only when user is impersonating
+                if (!user?.is_impersonated) {
+                    return false
+                }
+                // If conversation was created during impersonation (is_internal), allow typing
+                if (conversation?.is_internal) {
+                    return false
+                }
+                // Only applies to existing conversations
+                if (!conversation?.title) {
+                    return false
+                }
+                // Support agent has explicitly acknowledged they want to continue
+                if (supportOverrideEnabled) {
+                    return false
+                }
+                return true
+            },
+        ],
+
+        threadLoading: [
+            (s) => [s.conversationLoading, s.streamingActive],
+            (conversationLoading, streamingActive) => conversationLoading || streamingActive,
+        ],
+
+        queueingEnabled: [
+            // Sandbox conversations always queue follow-ups sent mid-turn (the backend queue endpoints
+            // aren't flag-gated, and the sandbox runtime drives the drain itself); LangGraph stays
+            // behind the rollout flag.
+            (s) => [s.featureFlags, s.isSandboxMode],
+            (featureFlags, isSandboxMode): boolean =>
+                !!featureFlags[FEATURE_FLAGS.POSTHOG_AI_QUEUE_MESSAGES_SYSTEM] || isSandboxMode,
+        ],
+
+        queueIsFull: [
+            (s) => [s.queuedMessages, s.queueLimit],
+            (queuedMessages, queueLimit): boolean =>
+                queueLimit !== null && queueLimit > 0 ? queuedMessages.length >= queueLimit : false,
+        ],
+
+        queueDisabledReason: [
+            (s) => [s.queueingEnabled, s.threadLoading, s.queueIsFull],
+            (queueingEnabled, threadLoading, queueIsFull): string | undefined =>
+                queueingEnabled && threadLoading && queueIsFull ? 'Queue is full' : undefined,
+        ],
+
+        threadGrouped: [
+            (s) => [
+                s.threadRaw,
+                s.threadLoading,
+                s.toolCallUpdateMap,
+                s.pendingApprovalsData,
+                s.resolvedApprovalStatuses,
+                s.currentThinkingMessage,
+            ],
+            (
+                thread,
+                threadLoading,
+                toolCallUpdateMap,
+                pendingApprovalsData,
+                resolvedApprovalStatuses,
+                currentThinkingMessage
+            ): ThreadMessage[] => {
+                // Filter out messages that shouldn't be displayed
+                let processedThread: ThreadMessage[] = []
+
+                for (let i = 0; i < thread.length; i++) {
+                    const currentMessage: ThreadMessage = thread[i]
+                    // Skip empty assistant messages with no content, tool calls, or thinking
+                    if (
+                        currentMessage.type === AssistantMessageType.Assistant &&
+                        currentMessage.content.length === 0 &&
+                        (!currentMessage.tool_calls || currentMessage.tool_calls.length === 0) &&
+                        (!currentMessage.meta ||
+                            !currentMessage.meta.thinking ||
+                            currentMessage.meta.thinking.length === 0)
+                    ) {
+                        continue
+                    }
+                    processedThread.push(currentMessage)
+                }
+
+                // Enhance messages with tool call status
+                processedThread = enhanceThreadToolCalls(
+                    processedThread,
+                    thread,
+                    threadLoading,
+                    toolCallUpdateMap,
+                    pendingApprovalsData,
+                    resolvedApprovalStatuses
+                )
+
+                // Add thinking message if loading
+                if (threadLoading) {
+                    const finalMessageSoFar = processedThread.at(-1)
+
+                    const thinkingMessage: AssistantMessage & ThreadMessage = {
+                        type: AssistantMessageType.Assistant,
+                        content: '',
+                        status: 'completed',
+                        id: 'loader',
+                        meta: {
+                            thinking: [
+                                {
+                                    type: 'thinking',
+                                    thinking: currentThinkingMessage ?? getRandomThinkingMessage(),
+                                },
+                            ],
+                        },
+                    }
+
+                    // Check if there are any tool calls in progress
+                    const toolCallsInProgress = processedThread
+                        .flatMap((message) => (isAssistantMessage(message) ? message.tool_calls : []))
+                        .filter((toolCall) => toolCall && (toolCall as any).status === TaskExecutionStatus.InProgress)
+
+                    // Don't add thinking message if:
+                    // 1. There are tool calls in progress, OR
+                    // 2. The last message is a streaming ASSISTANT message (no ID or it starts with 'temp-') - it will show its own thinking/content
+                    // 3. There's a pending multi-question form - the form input handles the loading state
+                    // Note: Human messages should always trigger thinking loader, only assistant messages can be "streaming"
+                    const lastMessageIsStreamingAssistant =
+                        finalMessageSoFar &&
+                        isAssistantMessage(finalMessageSoFar) &&
+                        (!finalMessageSoFar.id || finalMessageSoFar.id.startsWith('temp-'))
+                    const hasPendingForm = threadEndsWithMultiQuestionForm(processedThread)
+                    const shouldAddThinkingMessage =
+                        toolCallsInProgress.length === 0 && !lastMessageIsStreamingAssistant && !hasPendingForm
+
+                    if (shouldAddThinkingMessage) {
+                        // Add thinking message to indicate processing
+                        processedThread.push(thinkingMessage)
+                    }
+
+                    // Special case for empty thread
+                    if (processedThread.length === 0) {
+                        processedThread.push(thinkingMessage)
+                    }
+                }
+
+                return processedThread
+            },
+        ],
+
+        threadMessageCount: [(s) => [s.threadRaw], (threadRaw) => threadRaw.length],
+
+        formPending: [
+            (s) => [s.threadRaw],
+            (threadRaw) => {
+                const lastMessage = threadRaw[threadRaw.length - 1]
+                if (lastMessage && isAssistantMessage(lastMessage)) {
+                    return !!lastMessage.meta?.form
+                }
+                return false
+            },
+        ],
+
+        multiQuestionFormPending: [
+            (s) => [s.threadRaw],
+            (threadRaw) => {
+                return threadEndsWithMultiQuestionForm(threadRaw)
+            },
+        ],
+
+        // Returns the multi-question form data if one is pending
+        activeMultiQuestionForm: [
+            (s) => [s.threadRaw],
+            (threadRaw): MultiQuestionForm | null => {
+                if (!threadEndsWithMultiQuestionForm(threadRaw)) {
+                    return null
+                }
+                const lastMessage = threadRaw[threadRaw.length - 1]
+                if (!isAssistantMessage(lastMessage)) {
+                    return null
+                }
+                const formArgs = lastMessage.tool_calls?.find((tc) => tc.name === 'create_form')?.args
+                if (!formArgs || !Array.isArray(formArgs.questions)) {
+                    return null
+                }
+                return formArgs as unknown as MultiQuestionForm
+            },
+        ],
+
+        // Returns the pending dangerous operation approval data if one is pending
+        activeDangerousOperationApproval: [
+            (s) => [s.pendingApprovalProposalId, s.pendingApprovalsData, s.resolvedApprovalStatuses],
+            (pendingApprovalProposalId, pendingApprovalsData, resolvedApprovalStatuses) => {
+                if (!pendingApprovalProposalId || resolvedApprovalStatuses[pendingApprovalProposalId]?.status) {
+                    return null
+                }
+                const approval = pendingApprovalsData[pendingApprovalProposalId]
+                if (!approval) {
+                    return null
+                }
+                return {
+                    status: 'pending_approval' as const,
+                    proposalId: approval.proposal_id,
+                    toolName: approval.tool_name,
+                    preview: approval.preview,
+                    payload: approval.payload as Record<string, any>,
+                }
+            },
+        ],
+
+        inputDisabled: [
+            (s) => [
+                s.formPending,
+                s.multiQuestionFormPending,
+                s.threadLoading,
+                s.dataProcessingAccepted,
+                s.isSharedThread,
+                s.isImpersonatingExistingConversation,
+                s.pendingApprovalProposalId,
+                s.resolvedApprovalStatuses,
+            ],
+            (
+                formPending,
+                multiQuestionFormPending,
+                threadLoading,
+                dataProcessingAccepted,
+                isSharedThread,
+                isImpersonatingExistingConversation,
+                pendingApprovalProposalId,
+                resolvedApprovalStatuses
+            ) => {
+                // Check if there's an unresolved pending approval
+                const hasPendingApproval =
+                    pendingApprovalProposalId !== null && !resolvedApprovalStatuses[pendingApprovalProposalId]?.status
+
+                return (
+                    isSharedThread ||
+                    formPending ||
+                    multiQuestionFormPending ||
+                    (threadLoading && !dataProcessingAccepted) ||
+                    isImpersonatingExistingConversation ||
+                    hasPendingApproval
+                )
+            },
+        ],
+
+        contextDisabledReason: [
+            (s) => [
+                s.formPending,
+                s.multiQuestionFormPending,
+                s.threadLoading,
+                s.activeStreamingThreads,
+                s.isImpersonatingExistingConversation,
+            ],
+            (
+                formPending,
+                multiQuestionFormPending,
+                threadLoading,
+                activeStreamingThreads,
+                isImpersonatingExistingConversation
+            ): string | undefined => {
+                // Allow users to cancel the generation
+                if (threadLoading) {
+                    return undefined
+                }
+
+                // Support agents should create new conversations instead of using existing ones
+                if (isImpersonatingExistingConversation) {
+                    return 'You should create new conversations during impersonation. Use the checkbox to override.'
+                }
+
+                if (formPending) {
+                    return 'Please choose one of the options above'
+                }
+
+                if (multiQuestionFormPending) {
+                    return 'Please answer, skip, or dismiss the form above'
+                }
+
+                // Prevent submission if too many active streaming threads (limit: 10)
+                if (activeStreamingThreads >= 10) {
+                    return 'You have too many chats running. Please wait for one to finish.'
+                }
+
+                return undefined
+            },
+        ],
+
+        submissionDisabledReason: [
+            (s) => [s.contextDisabledReason, s.question, s.queueDisabledReason],
+            (contextDisabledReason, question, queueDisabledReason): string | undefined => {
+                // Context-related reasons take precedence (form pending, streaming, etc.)
+                if (contextDisabledReason) {
+                    return contextDisabledReason
+                }
+
+                if (!question) {
+                    return 'I need some input first'
+                }
+
+                if (queueDisabledReason) {
+                    return queueDisabledReason
+                }
+
+                return undefined
+            },
+        ],
+
+        filteredCommands: [
+            (s) => [s.question, s.featureFlags, s.threadLoading, s.conversation],
+            (
+                question: string,
+                featureFlags: Record<string, boolean | string>,
+                threadLoading: boolean,
+                conversation: Conversation | null
+            ): SlashCommand[] => {
+                // Sandbox runtime drops core-memory commands; LangGraph keeps the full set.
+                const isSandboxRuntime = conversation?.agent_runtime === 'sandbox'
+
+                return MAX_SLASH_COMMANDS.filter(
+                    (command) =>
+                        command.name.toLowerCase().startsWith(question.toLowerCase()) &&
+                        (!command.flag || featureFlags[command.flag]) &&
+                        (!command.requiresIdle || !threadLoading) &&
+                        (!command.hiddenInSandbox || !isSandboxRuntime)
+                )
+            },
+        ],
+
+        showDeepResearchModeToggle: [
+            (s) => [s.conversation, s.featureFlags],
+            (conversation, featureFlags) =>
+                // if a conversation is already marked as research, or has already started (has title/is in progress), don't show the toggle
+                !!featureFlags[FEATURE_FLAGS.MAX_DEEP_RESEARCH] &&
+                conversation?.type !== ConversationType.DeepResearch &&
+                !conversation?.title &&
+                conversation?.status !== ConversationStatus.InProgress,
+        ],
+
+        showContextUI: [
+            (s) => [s.conversation, s.featureFlags],
+            (conversation, featureFlags) =>
+                featureFlags[FEATURE_FLAGS.MAX_DEEP_RESEARCH]
+                    ? conversation?.type !== ConversationType.DeepResearch
+                    : true,
+        ],
+    }),
+
+    afterMount(async (logic) => {
+        const { actions, values, props, cache } = logic
+        cache.lastConversationId = props.conversationId
+        for (const l of maxThreadLogic.findAllMounted()) {
+            if (l !== logic && l.props.conversationId === props.conversationId) {
+                // We found a logic with the same conversationId, but a different panelId
+                if (l.values.conversation) {
+                    actions.setConversation(l.values.conversation)
+                }
+                if (l.values.threadRaw) {
+                    actions.setThread(l.values.threadRaw)
+                }
+                if (l.values.queuedMessages.length > 0) {
+                    actions.setQueuedMessages(l.values.queuedMessages)
+                }
+                if (l.values.queueLimit != null) {
+                    actions.setQueueLimit(l.values.queueLimit)
+                }
+                break
+            }
+        }
+
+        // Check for URL-based mode from side panel options (e.g., #panel=max:mode=research:question)
+        // This must be done in maxThreadLogic's afterMount to ensure the correct instance sets the mode
+        if (
+            props.panelId === SIDE_PANEL_PANEL_ID &&
+            !values.agentMode &&
+            sidePanelStateLogic.isMounted() &&
+            sidePanelStateLogic.values.selectedTab === SidePanelTab.Max &&
+            sidePanelStateLogic.values.selectedTabOptions
+        ) {
+            const options = sidePanelStateLogic.values.selectedTabOptions
+            if (typeof options === 'string' && options.startsWith('mode=')) {
+                const colonIndex = options.indexOf(':', 5)
+                const modeValue = colonIndex === -1 ? options.slice(5) : options.slice(5, colonIndex)
+                // Parse the mode value (gated modes fall back to null if their feature flags are off)
+                let parsedMode: AgentMode | null = null
+                if (modeValue === 'auto') {
+                    parsedMode = null
+                } else if (modeValue === 'research') {
+                    parsedMode = values.featureFlags[FEATURE_FLAGS.MAX_DEEP_RESEARCH] ? AgentMode.Research : null
+                } else if (modeValue === 'plan') {
+                    parsedMode = values.featureFlags[FEATURE_FLAGS.PHAI_PLAN_MODE] ? AgentMode.Plan : null
+                } else if (modeValue === 'sandbox') {
+                    if (values.featureFlags[FEATURE_FLAGS.PHAI_SANDBOX_MODE]) {
+                        actions.setIsSandboxMode(true)
+                    }
+                    parsedMode = null
+                } else if ((Object.values(AgentMode) as string[]).includes(modeValue)) {
+                    const modeDef = MODE_DEFINITIONS[modeValue as keyof typeof MODE_DEFINITIONS]
+                    if (modeDef?.flag && !values.featureFlags[FEATURE_FLAGS[modeDef.flag]]) {
+                        parsedMode = null
+                    } else {
+                        parsedMode = modeValue as AgentMode
+                    }
+                }
+                if (parsedMode !== undefined) {
+                    actions.setAgentMode(parsedMode)
+                }
+            }
+        }
+
+        if (values.queueingEnabled && values.conversation?.id) {
+            actions.loadQueueData()
+        }
+
+        if (values.autoRun && values.question) {
+            actions.askMax(values.question)
+            actions.setAutoRun(false)
+            return
+        }
+
+        if (props.skipInitialLoad) {
+            return
+        }
+
+        // Skip for new chats; only proceed for real backend conversations.
+        const parentConversationId = values.parentConversationId
+        if (!parentConversationId) {
+            return
+        }
+
+        // Fetch message history if threadRaw is empty (may already be populated by cross-tab sync)
+        if (values.threadRaw.length === 0) {
+            await maxGlobalLogic.asyncActions.loadConversation(parentConversationId)
+        }
+
+        // The await yields to the microtask queue — bail if the user navigated away.
+        if (!(logic as BuiltLogic<maxThreadLogicType>).isMounted()) {
+            return
+        }
+
+        // Grab freshly loaded conversation from cache; if missing, the load failed, so skip reconnect
+        const conversation = maxGlobalLogic.values.conversationHistory.find((c) => c.id === parentConversationId)
+        if (!conversation || conversation.messages === undefined) {
+            return
+        }
+
+        // Sandbox history-load branch. Sandbox conversations don't persist messages Django-side —
+        // history lives in S3 ACP logs, read via the products/tasks logs/ endpoint. Hand off to
+        // runStreamLogic, which replays logs/ then opens SSE if non-terminal. The LangGraph
+        // reconnect path below is never entered for sandbox runtimes (coexistence).
+        if (conversation.agent_runtime === 'sandbox') {
+            // runStreamLogic and posthogAiContextLogic are connected (so already mounted) for this
+            // conversation. Reset their per-conversation state before replaying this run's history.
+            actions.resetSandboxStream()
+            actions.clearSandboxAttachments()
+            if (conversation.task) {
+                const runId = conversation.task.latest_run
+                if (runId) {
+                    actions.bootstrapSandboxRun({
+                        taskId: conversation.task.id,
+                        runId,
+                    })
+                }
+            }
+            return
+        }
+
+        // Ensure threadRaw is hydrated before streaming, so setThread doesn't overwrite stream tokens.
+        if (values.threadRaw.length === 0 && conversation.messages.length > 0) {
+            actions.setThread(updateMessagesWithCompletedStatus(conversation.messages))
+        }
+
+        // 4. Reconnect to in-progress stream if needed; setThread here is a no-op due to message count guard.
+        if (
+            conversation.status === ConversationStatus.InProgress &&
+            !values.streamingActive &&
+            !cache.generationController &&
+            !values.multiQuestionFormPending
+        ) {
+            actions.reconnectToStream()
+        }
+    }),
+
+    subscriptions(({ actions, values }) => ({
+        sceneId: (sceneId: Scene | null) => {
+            // Defer to next tick to allow URL-based mode setting to complete first
+            // This prevents race conditions where the subscription fires during mount
+            // before setAgentMode from URL params has updated the state
+            setTimeout(() => {
+                // Guard against accessing values after the logic is unmounted
+                try {
+                    // Only auto-set mode when no conversation is active and user hasn't manually set mode (e.g., via URL params)
+                    if (!values.conversation && !values.agentModeLockedByUser) {
+                        const suggestedMode = getAgentModeForScene(sceneId, values.featureFlags)
+                        if (suggestedMode !== values.agentMode) {
+                            // Use sync action to not lock - allows conversation to still update mode if agent changes it
+                            actions.syncAgentModeFromConversation(suggestedMode)
+                        }
+                    }
+                } catch {
+                    // Logic was unmounted before setTimeout fired - ignore
+                }
+            }, 0)
+        },
+        queueingEnabled: (enabled: boolean) => {
+            if (enabled) {
+                actions.loadQueueData()
+            }
+        },
+    })),
+])
+
+/**
+ * Enhances AssistantMessages with tool call completion status by matching
+ * AssistantToolCallMessage.tool_call_id with AssistantMessage.tool_calls[].id
+ * Also marks the last AssistantMessage with planning (todo_write tool calls)
+ */
+function enhanceThreadToolCalls(
+    group: ThreadMessage[],
+    fullThread: ThreadMessage[],
+    isLoading: boolean,
+    toolCallUpdateMap: Map<string, string[]>,
+    pendingApprovalsData: Record<string, PendingApproval>,
+    resolvedApprovalStatuses: Record<string, { status: 'approved' | 'rejected' | 'auto_rejected'; feedback?: string }>
+): ThreadMessage[] {
+    // Create a map of tool_call_id -> AssistantToolCallMessage for quick lookup
+    // Search in the full thread to find ToolCall messages (which are filtered from groups)
+    const toolCallCompletions = new Map<string, ThreadMessage>()
+
+    for (const message of fullThread) {
+        // Use simple type check instead of isAssistantToolCallMessage, which requires ui_payload
+        // This allows us to match tool call completions in stories/tests without ui_payload
+        if (message.type === AssistantMessageType.ToolCall && 'tool_call_id' in message) {
+            toolCallCompletions.set((message as any).tool_call_id, message)
+        }
+    }
+
+    // Create sets of tool call IDs based on approval status
+    // An approval is truly pending if:
+    // 1. It's in pendingApprovalsData with decision_status === 'pending', AND
+    // 2. It's NOT in resolvedApprovalStatuses (which takes precedence)
+    const toolCallsWithPendingApproval = new Set<string>()
+    // Track tool calls that have been rejected (declined by user)
+    const toolCallsWithRejectedApproval = new Set<string>()
+    for (const approval of Object.values(pendingApprovalsData)) {
+        const frontendResolved = resolvedApprovalStatuses[approval.proposal_id]
+        if (approval.original_tool_call_id) {
+            // Frontend resolved status takes precedence over backend status
+            if (frontendResolved?.status) {
+                if (frontendResolved.status === 'rejected' || frontendResolved.status === 'auto_rejected') {
+                    toolCallsWithRejectedApproval.add(approval.original_tool_call_id)
+                }
+            } else if (approval.decision_status === 'pending') {
+                toolCallsWithPendingApproval.add(approval.original_tool_call_id)
+            } else if (approval.decision_status === 'rejected') {
+                toolCallsWithRejectedApproval.add(approval.original_tool_call_id)
+            }
+        }
+    }
+
+    // Find the last human message to determine the final group
+    let lastHumanMessageIndex = -1
+    // Find the last AssistantMessage that has todo_write tool calls (planning)
+    let lastPlanningMessageId: string | undefined
+    for (let i = group.length - 1; i >= 0; i--) {
+        const message = group[i]
+        if (lastHumanMessageIndex === -1 && isHumanMessage(message)) {
+            lastHumanMessageIndex = i
+        }
+        if (
+            !lastPlanningMessageId &&
+            isAssistantMessage(message) &&
+            message.tool_calls &&
+            message.tool_calls.some((tc) => tc.name === 'todo_write')
+        ) {
+            lastPlanningMessageId = message.id
+            break
+        }
+    }
+
+    // Enhance assistant messages with tool call status
+    return group.map((message, messageIndex) => {
+        // A message is in the final group if it comes after or is the last human message
+        const isFinalGroup = messageIndex >= lastHumanMessageIndex
+        if (isAssistantMessage(message) && message.tool_calls && message.tool_calls.length > 0) {
+            const isLastPlanningMessage = message.id === lastPlanningMessageId
+            const enhancedMessage = { ...message }
+            enhancedMessage.tool_calls = message.tool_calls.map<EnhancedToolCall>((toolCall) => {
+                const resultMessage = toolCallCompletions.get(toolCall.id)
+                const isCompleted = !!resultMessage
+                // create_form is an interactive tool - it's "completed" once rendered (waiting for user input)
+                const isInteractiveTool = toolCall.name === 'create_form'
+                // Tool calls with pending approvals should show as "in progress" (awaiting approval)
+                const hasPendingApproval = toolCallsWithPendingApproval.has(toolCall.id)
+                // Tool calls with rejected approvals should show as "failed" (user declined)
+                const hasRejectedApproval = toolCallsWithRejectedApproval.has(toolCall.id)
+                const isFailed =
+                    hasRejectedApproval ||
+                    (!isCompleted && !isInteractiveTool && !hasPendingApproval && (!isFinalGroup || !isLoading))
+                return {
+                    ...toolCall,
+                    status: isFailed
+                        ? TaskExecutionStatus.Failed
+                        : isCompleted || (isInteractiveTool && !isLoading)
+                          ? TaskExecutionStatus.Completed
+                          : TaskExecutionStatus.InProgress,
+                    isLastPlanningMessage: toolCall.name === 'todo_write' && isLastPlanningMessage,
+                    updates: toolCallUpdateMap.get(toolCall.id) ?? [],
+                    result: isAssistantToolCallMessage(resultMessage) ? resultMessage : undefined,
+                }
+            })
+            return enhancedMessage
+        }
+        // Messages we don't enhance are returned by reference so their identity stays stable
+        // across recomputes — this is what lets React.memo(Message) skip them on each token.
+        return message
+    })
+}
+
+/** Assistant streaming event handler. */
+export async function onEventImplementation(
+    event: string,
+    data: string,
+    {
+        actions,
+        values,
+        props,
+        agentMode,
+        cache,
+    }: Pick<BuiltLogic<maxThreadLogicType>, 'actions' | 'values' | 'props' | 'cache'> & {
+        agentMode: AgentMode | null
+    }
+): Promise<void> {
+    // On 409 reconnect, the stream replays all events from the beginning.
+    // Clear the thread on the first real event so the replay rebuilds it
+    // from scratch — this avoids duplicates and ordering conflicts.
+    if (cache.clearThreadOnReplay) {
+        cache.clearThreadOnReplay = false
+        actions.setThread([])
+    }
+
+    // A Conversation object is only received when the conversation is new
+    if (event === AssistantEventType.Conversation) {
+        const parsedResponse = parseResponse<Conversation>(data)
+        if (!parsedResponse) {
+            return
+        }
+        const conversationWithTitle = {
+            ...parsedResponse,
+            title: parsedResponse.title || 'New chat',
+            agent_mode: agentMode,
+        }
+
+        actions.setConversation(conversationWithTitle)
+        actions.updateGlobalConversationCache(conversationWithTitle)
+    } else if (event === AssistantEventType.Update) {
+        const parsedResponse = parseResponse<AssistantUpdateEvent | SubagentUpdateEvent>(data)
+        if (!parsedResponse) {
+            return
+        }
+        actions.setToolCallUpdate(parsedResponse, values.toolMap)
+        return
+    } else if (event === AssistantEventType.Message) {
+        const parsedResponse = parseResponse<RootAssistantMessage>(data)
+        if (!parsedResponse) {
+            return
+        }
+        if (isHumanMessage(parsedResponse)) {
+            // Find the most recent Human message (the provisional bubble we added on ask)
+            const lastHumanIndex = [...values.threadRaw]
+                .map((m, i) => [m, i] as const)
+                .reverse()
+                .find(([m]) => isHumanMessage(m))?.[1]
+
+            const lastHumanMessage = lastHumanIndex != null ? values.threadRaw[lastHumanIndex] : null
+            // Match the streamed human echo to the provisional bubble by trace_id when the server
+            // provides one, otherwise fall back to content so an echo without a trace_id replaces
+            // the provisional message instead of appending a duplicate.
+            const shouldReplace =
+                isHumanMessage(lastHumanMessage) &&
+                (parsedResponse.trace_id
+                    ? lastHumanMessage.trace_id === parsedResponse.trace_id
+                    : lastHumanMessage.content === parsedResponse.content)
+
+            if (lastHumanIndex != null && shouldReplace) {
+                actions.replaceMessage(lastHumanIndex, {
+                    ...parsedResponse,
+                    status: 'completed',
+                })
+            } else {
+                // Fallback – if we somehow don't have a provisional Human message, just add it
+                actions.addMessage({ ...parsedResponse, status: 'completed' })
+                if (values.queueingEnabled && values.conversation?.id) {
+                    actions.loadQueueData()
+                }
+            }
+        } else if (isAssistantToolCallMessage(parsedResponse)) {
+            if (parsedResponse.ui_payload != null) {
+                for (const [toolName, toolResult] of Object.entries(parsedResponse.ui_payload)) {
+                    if (values.availableStaticTools.some((tool) => tool.identifier === toolName)) {
+                        continue // Static tools (mode-level) don't operate via ui_payload
+                    }
+                    // Track pending approval proposals for auto-rejection and to disable input
+                    const proposalId = toolResult?.proposalId || toolResult?.proposal_id
+                    if (toolResult?.status === PENDING_APPROVAL_STATUS && proposalId) {
+                        actions.setPendingApproval(proposalId)
+                    }
+                    await values.toolMap[toolName]?.callback?.(toolResult, props.conversationId)
+                }
+            }
+            actions.addMessage({
+                ...parsedResponse,
+                status: 'completed',
+            })
+        } else {
+            if (isAssistantMessage(parsedResponse) && parsedResponse.id && parsedResponse.tool_calls?.length) {
+                for (const { name: toolName, args: toolResult } of parsedResponse.tool_calls) {
+                    if (!values.availableStaticTools.some((tool) => tool.identifier === toolName)) {
+                        continue // Non-static tools (contextual) operate via ui_payload instead
+                    }
+                    await values.toolMap[toolName]?.callback?.(toolResult, props.conversationId)
+                }
+            }
+            // Check if a message with the same ID already exists
+            const existingMessageIndex = parsedResponse.id
+                ? values.threadRaw.findIndex((msg) => msg.id === parsedResponse.id)
+                : -1
+
+            const isLoading = !parsedResponse.id || parsedResponse.id.startsWith('temp-')
+            if (existingMessageIndex >= 0) {
+                // When streaming a message with an already-present ID, we simply replace it
+                // (primarily when streaming in-progress messages with a temp- ID)
+                actions.replaceMessage(existingMessageIndex, {
+                    ...parsedResponse,
+                    status: isLoading ? 'loading' : 'completed',
+                })
+            } else if (isLoading) {
+                // When a new temp message is streamed for the first time, we append it
+                actions.addMessage({
+                    ...parsedResponse,
+                    status: 'loading',
+                })
+            } else {
+                // When we get the completed messages at the end of a generation,
+                // we replace from the last completed message to arrive at the final state
+                const lastCompletedMessageIndex = values.threadRaw.findLastIndex((msg) => msg.status === 'completed')
+                actions.replaceMessage(lastCompletedMessageIndex + 1, {
+                    ...parsedResponse,
+                    status: 'completed',
+                })
+            }
+        }
+    } else if (event === AssistantEventType.Status) {
+        const parsedResponse = parseResponse<AssistantGenerationStatusEvent>(data)
+        if (!parsedResponse) {
+            return
+        }
+
+        if (parsedResponse.type === AssistantGenerationStatusType.GenerationError) {
+            actions.setMessageStatus(values.threadRaw.length - 1, 'error')
+        }
+    } else if (event === AssistantEventType.Approval) {
+        const parsedResponse = parseResponse<PendingApproval>(data)
+
+        if (!parsedResponse) {
+            return
+        }
+        // Store the approval data for rendering
+        actions.addPendingApprovalData(parsedResponse)
+        // Track pending approval for auto-rejection
+        actions.setPendingApproval(parsedResponse.proposal_id)
+    } else if (event === AssistantEventType.Sandbox) {
+        const parsedResponse = parseResponse<Record<string, unknown>>(data)
+        if (!parsedResponse) {
+            return
+        }
+
+        if (!cache.sandboxToolMap) {
+            cache.sandboxToolMap = new Map<string, LogEntry>()
+            cache.sandboxEventIndex = 0
+        }
+
+        const entry = parseLogEvent(
+            parsedResponse,
+            `sandbox-${cache.sandboxEventIndex++}`,
+            cache.sandboxToolMap as Map<string, LogEntry>
+        )
+        if (!entry) {
+            // Null return from an ACP tool_call/tool_call_update means the tool map
+            // entry was mutated in-place. Refresh to trigger re-render.
+            actions.refreshSandboxEntries()
+            return
+        }
+
+        // For agent text messages, render as normal assistant messages in the thread
+        if (entry.type === 'agent') {
+            const lastMsg = values.threadRaw[values.threadRaw.length - 1]
+            if (isAssistantMessage(lastMsg) && lastMsg.id?.startsWith('sandbox-')) {
+                // Append to existing streaming message
+                actions.replaceMessage(values.threadRaw.length - 1, {
+                    ...lastMsg,
+                    content: (lastMsg.content || '') + (entry.message || ''),
+                    status: 'loading',
+                })
+            } else {
+                actions.addMessage({
+                    type: AssistantMessageType.Assistant,
+                    id: `sandbox-${entry.id}`,
+                    content: entry.message || '',
+                    status: 'loading',
+                })
+            }
+        }
+
+        // Accumulate all sandbox entries (tool calls, console output, etc.) for rendering
+        actions.appendSandboxEntry(entry)
+    }
+}
+
+/**
+ * Parses the generation result from the API. Some generation chunks might be sent in batches.
+ * @param response
+ */
+function parseResponse<T>(response: string): T | null | undefined {
+    try {
+        const parsed = JSON.parse(response)
+        return parsed as T | null | undefined
+    } catch {
+        return null
+    }
+}
+
+function removeConversationMessages({ messages, ...conversation }: ConversationDetail): Conversation {
+    return conversation
+}
+
+/**
+ * Update the status of the messages to completed, so the UI displays additional actions.
+ */
+function updateMessagesWithCompletedStatus(thread: RootAssistantMessage[]): ThreadMessage[] {
+    return thread.map((message) => ({
+        ...message,
+        status: 'completed',
+    }))
+}

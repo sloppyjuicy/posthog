@@ -1,0 +1,450 @@
+import os
+import json
+import random
+import logging
+from contextlib import contextmanager
+from typing import Any, Optional
+
+import pytest
+from unittest import mock
+from unittest.mock import patch
+
+from django.core.cache import cache
+from django.db import (
+    DEFAULT_DB_ALIAS,
+    Error as DjangoDatabaseError,
+    connections,
+)
+from django.http import JsonResponse
+from django.test import Client
+
+import psycopg2
+import requests
+import kombu.connection
+import kombu.exceptions
+import django_redis.exceptions
+
+from posthog.health import is_kafka_connected, logger
+
+
+@pytest.mark.django_db
+def test_readyz_returns_200_if_everything_is_ok(client: Client):
+    resp = get_readyz(client)
+    assert resp.status_code == 200, resp.content
+
+
+@pytest.mark.django_db
+def test_readyz_supports_excluding_checks(client: Client):
+    with simulate_postgres_error():
+        resp = get_readyz(client, exclude=["postgres", "postgres_flags", "postgres_migrations_uptodate"])
+
+    assert resp.status_code == 200, resp.content
+    data = resp.json()
+    assert {
+        check: status for check, status in data.items() if check in {"postgres", "postgres_migrations_uptodate"}
+    } == {"postgres": False, "postgres_migrations_uptodate": False}
+
+
+@pytest.mark.django_db
+def test_readyz_can_handle_random_database_errors(client: Client):
+    with simulate_postgres_psycopg2_error():
+        resp = get_readyz(client)
+
+    assert resp.status_code == 503, resp.content
+    data = resp.json()
+    assert {
+        check: status for check, status in data.items() if check in {"postgres", "postgres_migrations_uptodate"}
+    } == {"postgres": False, "postgres_migrations_uptodate": False}
+
+
+@pytest.mark.django_db
+def test_readyz_decide_can_handle_random_database_errors(client: Client):
+    with simulate_postgres_psycopg2_error():
+        resp = get_readyz(client, role="decide")
+
+    assert resp.status_code == 200, resp.content
+    data = resp.json()
+    assert data == {"postgres_flags": False, "cache": True}
+
+
+def test_livez_returns_200_and_doesnt_require_any_dependencies(client: Client):
+    """
+    We want the livez endpoint to involve no database queries at all, it should
+    just be an indicator that the python process hasn't hung.
+    """
+
+    with (
+        simulate_postgres_error(),
+        simulate_clickhouse_cannot_connect(),
+        simulate_celery_cannot_connect(),
+        simulate_cache_cannot_connect(),
+    ):
+        resp = get_livez(client)
+
+    assert resp.status_code == 200, resp.content
+    data = resp.json()
+    assert data == {"http": True}
+
+
+# Role based tests
+#
+# We basically want to provide a mechanism that allows for checking if the
+# process should be considered healthy based on the "role" it is playing. Here
+# kafka being down should result in failure, but failure in postgres should not.
+#
+# TODO: I've been quite explicit and verbose with the below, but it could be
+# more readable how each role should behave.
+
+
+@pytest.mark.django_db
+def test_readyz_accepts_role_events_and_filters_by_relevant_services(client: Client):
+    with simulate_postgres_error():
+        resp = get_readyz(client=client, role="events")
+
+    assert resp.status_code == 200, resp.content
+
+    with simulate_clickhouse_cannot_connect():
+        resp = get_readyz(client=client, role="events")
+
+    assert resp.status_code == 200, resp.content
+
+    with simulate_celery_cannot_connect():
+        resp = get_readyz(client=client, role="events")
+
+    assert resp.status_code == 200, resp.content
+
+    with simulate_cache_cannot_connect():
+        resp = get_readyz(client=client, role="events")
+
+    assert resp.status_code == 200, resp.content
+
+
+@pytest.mark.django_db
+def test_readyz_accepts_role_web_and_filters_by_relevant_services(client: Client):
+    with simulate_postgres_error():
+        resp = get_readyz(client=client, role="web")
+
+    assert resp.status_code == 503, resp.content
+
+    with simulate_clickhouse_cannot_connect():
+        resp = get_readyz(client=client, role="web")
+
+    assert resp.status_code == 200, resp.content
+
+    with simulate_celery_cannot_connect():
+        resp = get_readyz(client=client, role="web")
+
+    # NOTE: we don't want the web server to die if e.g. redis is down, there are
+    # many things that still function without it
+    assert resp.status_code == 200, resp.content
+
+    with simulate_cache_cannot_connect():
+        resp = get_readyz(client=client, role="web")
+
+    # NOTE: redis being down is bad atm as e.g. Axes uses it to handle login
+    # attempt rate limiting and doesn't fail gracefully
+    assert resp.status_code == 503, resp.content
+
+
+@pytest.mark.django_db
+def test_readyz_accepts_role_worker_and_filters_by_relevant_services(client: Client):
+    with simulate_postgres_error():
+        resp = get_readyz(client=client, role="worker")
+
+    assert resp.status_code == 503, resp.content
+
+    with simulate_clickhouse_cannot_connect():
+        resp = get_readyz(client=client, role="worker")
+
+    assert resp.status_code == 503, resp.content
+
+    with simulate_celery_cannot_connect():
+        resp = get_readyz(client=client, role="worker")
+
+    assert resp.status_code == 503, resp.content
+
+    with simulate_cache_cannot_connect():
+        resp = get_readyz(client=client, role="worker")
+
+    assert resp.status_code == 200, resp.content
+
+
+@pytest.mark.django_db
+def test_readyz_accepts_role_streaming_and_stays_ready_without_postgres(client: Client):
+    # The streaming tier serves Redis-backed SSE only; coupling its readiness to
+    # Postgres would pull healthy stream-serving pods out of the load balancer
+    # exactly when the database is saturated.
+    with simulate_postgres_error():
+        resp = get_readyz(client=client, role="streaming")
+
+    assert resp.status_code == 200, resp.content
+
+    with simulate_clickhouse_cannot_connect(), simulate_celery_cannot_connect():
+        resp = get_readyz(client=client, role="streaming")
+
+    assert resp.status_code == 200, resp.content
+
+    with simulate_cache_cannot_connect():
+        resp = get_readyz(client=client, role="streaming")
+
+    # Redis is the one hard dependency: streams are fed from it.
+    assert resp.status_code == 503, resp.content
+
+
+@pytest.mark.django_db
+def test_readyz_accepts_no_role_and_fails_on_everything(client: Client):
+    """
+    If we don't specify any role, we assume we want all dependencies to be
+    checked.
+    """
+
+    with simulate_postgres_error():
+        resp = get_readyz(client=client)
+
+    assert resp.status_code == 503, resp.content
+
+    with simulate_postgres_psycopg2_error():
+        resp = get_readyz(client=client)
+
+    assert resp.status_code == 503, resp.content
+
+    with simulate_clickhouse_cannot_connect():
+        resp = get_readyz(client=client)
+
+    assert resp.status_code == 503, resp.content
+
+    with simulate_celery_cannot_connect():
+        resp = get_readyz(client=client)
+
+    assert resp.status_code == 503, resp.content
+
+    with simulate_cache_cannot_connect():
+        resp = get_readyz(client=client)
+
+    assert resp.status_code == 503, resp.content
+
+
+@pytest.mark.django_db
+def test_readyz_accepts_role_decide_and_filters_by_relevant_services(client: Client):
+    with simulate_postgres_error():
+        resp = get_readyz(client=client, role="decide")
+
+    assert resp.status_code == 200, resp.content
+
+    with simulate_clickhouse_cannot_connect():
+        resp = get_readyz(client=client, role="decide")
+
+    assert resp.status_code == 200, resp.content
+
+    with simulate_celery_cannot_connect():
+        resp = get_readyz(client=client, role="decide")
+
+    assert resp.status_code == 200, resp.content
+
+    with simulate_cache_cannot_connect():
+        resp = get_readyz(client=client, role="decide")
+
+    assert resp.status_code == 200, resp.content
+
+    # only when both redis and postgres are down do we fail
+    with simulate_cache_cannot_connect(), simulate_postgres_error():
+        resp = get_readyz(client=client, role="decide")
+
+    assert resp.status_code == 503, resp.content
+
+
+@pytest.mark.django_db
+def test_readyz_complains_if_role_does_not_exist(client: Client):
+    """
+    We want to be sure that, if we specify a role, we end up using the expected
+    dependencies. We are liberal with the exclude attribute, such that we are a
+    little flexible but for role we are a little more strict. We might change
+    or remove the name of a service role, in this case we should keep the
+    old service name is still available for lookup.
+    """
+    resp = get_readyz(client=client, role="some-unknown-role")
+    assert resp.status_code == 400, resp.content
+    data = resp.json()
+    assert data["error"] == "InvalidRole"
+
+
+def get_readyz(client: Client, exclude: Optional[list[str]] = None, role: Optional[str] = None) -> Any:
+    return client.get("/_readyz", data={"exclude": exclude or [], "role": role or ""})
+
+
+def get_livez(client: Client) -> Any:
+    return client.get("/_livez")
+
+
+def return_given_error_or_random(error: Optional[Exception] = None):
+    """
+    This randomly chooses between returning the given error or a random base exception. Useful
+    for testing how we handle unexpected exceptions in health checks.
+    """
+    if random.choice([True, False]):
+        return error
+
+    return Exception(
+        "random error: Make sure your checks support handling random errors! See `return_given_error_or_random` for more info."
+    )
+
+
+@contextmanager
+def simulate_postgres_error():
+    """
+    Causes any call to cursor to raise the upper most Error in djangos db
+    Exception hierachy
+    """
+    with patch.object(connections[DEFAULT_DB_ALIAS], "cursor") as cursor_mock:
+        cursor_mock.side_effect = return_given_error_or_random(DjangoDatabaseError("failed to connect"))
+        yield
+
+
+@contextmanager
+def simulate_postgres_psycopg2_error():
+    """
+    Causes psycopg2 to raise an error
+    """
+    with patch.object(connections[DEFAULT_DB_ALIAS], "cursor") as cursor_mock:
+        cursor_mock.side_effect = return_given_error_or_random(psycopg2.OperationalError)
+        yield
+
+
+@contextmanager
+def simulate_clickhouse_cannot_connect():
+    """
+    Simulates ClickHouse being unreachable by returning a 500 error response
+    """
+    from posthog.security.outbound_proxy import internal_requests
+
+    with patch.object(internal_requests, "get") as requests_mock:
+        response = requests.Response()
+        response.status_code = 500
+        requests_mock.return_value = response
+        yield
+
+
+@contextmanager
+def simulate_celery_cannot_connect():
+    """
+    Causes celery to raise a broker connection error
+    """
+    with patch.object(kombu.connection.Connection, "ensure_connection") as ensure_connection_mock:
+        ensure_connection_mock.side_effect = return_given_error_or_random(kombu.exceptions.ConnectionError)
+        yield
+
+
+@contextmanager
+def simulate_cache_cannot_connect():
+    """
+    Causes the django cache library to raise a redis ConnectionError. I couldn't
+    find a cache agnostic way to make this happen. In tests we're using local
+    memory backend rather than redis, so this is not a perfect representation of
+    reality.
+    """
+    with patch.object(cache, "has_key") as has_key_mock:
+        has_key_mock.side_effect = return_given_error_or_random(
+            django_redis.exceptions.ConnectionInterrupted(mock.Mock())
+        )
+        yield
+
+
+@contextmanager
+def simulate_prestop_marker():
+    """
+    Simulates the prestop marker file existing by mocking os.path.exists.
+    """
+    original_exists = os.path.exists
+
+    def mock_exists(path):
+        if path == "/tmp/posthog_prestop":
+            return True
+        return original_exists(path)
+
+    with patch("posthog.health.os.path.exists", side_effect=mock_exists):
+        yield
+
+
+def test_readyz_returns_503_when_prestop_marker_exists(client: Client):
+    with simulate_prestop_marker():
+        resp = get_readyz(client)
+
+    assert isinstance(resp, JsonResponse)
+    assert resp.status_code == 503
+    assert json.loads(resp.content) == {"shutting_down": True}
+
+
+@pytest.mark.django_db
+def test_readyz_returns_503_when_prestop_marker_exists_with_role(client: Client):
+    with simulate_prestop_marker():
+        resp = get_readyz(client, role="web")
+
+    assert isinstance(resp, JsonResponse)
+    assert resp.status_code == 503
+    assert json.loads(resp.content) == {"shutting_down": True}
+
+
+@pytest.mark.django_db
+def test_readyz_skips_prestop_check_when_setting_is_empty(client: Client):
+    with patch("posthog.health.settings.PRESTOP_MARKER_FILE", ""):
+        with simulate_prestop_marker():
+            resp = get_readyz(client)
+
+    assert isinstance(resp, JsonResponse)
+    assert resp.status_code == 200
+
+
+@pytest.mark.parametrize("debug,test", [(False, True), (True, False)])
+def test_is_kafka_connected_short_circuits_under_debug_or_test(debug, test):
+    # Either DEBUG or TEST avoids the live probe — keeps local dev and the test
+    # suite from needing a real broker.
+    with patch("posthog.health.settings.DEBUG", debug), patch("posthog.health.settings.TEST", test):
+        assert is_kafka_connected() is True
+
+
+@pytest.mark.parametrize(
+    "break_producer",
+    [
+        pytest.param(
+            lambda m: setattr(m, "side_effect", Exception("producer build failed")),
+            id="producer_build_raises",
+        ),
+        pytest.param(
+            lambda m: setattr(m.return_value.producer.list_topics, "side_effect", Exception("broker unreachable")),
+            id="list_topics_raises",
+        ),
+    ],
+)
+def test_is_kafka_connected_returns_false_when_probe_fails(break_producer):
+    # Either step failing — building the producer or the metadata round-trip — is
+    # treated as the broker being unreachable.
+    with (
+        patch("posthog.health.settings.DEBUG", False),
+        patch("posthog.health.settings.TEST", False),
+        patch("posthog.health.get_producer") as get_producer_mock,
+    ):
+        break_producer(get_producer_mock)
+        assert is_kafka_connected() is False
+
+
+def test_is_kafka_connected_returns_true_when_metadata_succeeds():
+    with (
+        patch("posthog.health.settings.DEBUG", False),
+        patch("posthog.health.settings.TEST", False),
+        patch("posthog.health.get_producer") as get_producer_mock,
+    ):
+        get_producer_mock.return_value.producer.list_topics.return_value = mock.Mock()
+        assert is_kafka_connected() is True
+        get_producer_mock.return_value.producer.list_topics.assert_called_once_with(timeout=3)
+
+
+@pytest.fixture(autouse=True)
+def debug_log_level():
+    """
+    We capture exceptions and log them at level debug. For easy debugging we set
+    the logger level to debug so pytest can capture and display the output
+    """
+    original_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    yield
+    logger.setLevel(original_level)

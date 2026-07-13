@@ -1,3 +1,5 @@
+# ruff: noqa: T201 allow print statements
+
 import os
 
 from django.core.management.base import BaseCommand
@@ -6,7 +8,8 @@ from django.db import connection
 
 def load_sql(filename):
     path = os.path.join(os.path.dirname(__file__), "../sql/", filename)
-    return open(path).read()
+    with open(path, encoding="utf_8") as f:
+        return f.read()
 
 
 class Command(BaseCommand):
@@ -17,7 +20,6 @@ class Command(BaseCommand):
         parser.add_argument("--reverse", action="store_true", help="unpartition event table")
 
     def handle(self, *args, **options):
-
         if options["reverse"]:
             print("Reversing partitions...")
             with connection.cursor() as cursor:

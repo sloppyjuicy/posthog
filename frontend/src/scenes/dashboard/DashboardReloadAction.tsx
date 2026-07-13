@@ -1,108 +1,199 @@
-import React, { useState } from 'react'
-import { Checkbox, Dropdown, Menu, Radio, Space } from 'antd'
-import { dashboardLogic } from 'scenes/dashboard/dashboardLogic'
-import { DownOutlined, LoadingOutlined, ReloadOutlined } from '@ant-design/icons'
 import { useActions, useValues } from 'kea'
-import dayjs from 'dayjs'
-import { humanFriendlyDuration } from 'lib/utils'
-import clsx from 'clsx'
-import { Tooltip } from 'lib/components/Tooltip'
+import { useEffect, useState } from 'react'
+
+import { IconCheck, IconX } from '@posthog/icons'
+import { IconRefresh } from '@posthog/icons'
+import { LemonBadge, LemonButton, LemonSwitch, Spinner } from '@posthog/lemon-ui'
+
+import { Shortcut } from 'lib/components/Shortcuts/Shortcut'
+import { keyBinds } from 'lib/components/Shortcuts/shortcuts'
+import { TZLabel } from 'lib/components/TZLabel'
+import { dayjs } from 'lib/dayjs'
+import { usePageVisibilityCb } from 'lib/hooks/usePageVisibility'
+import { LemonMenuOverlay } from 'lib/lemon-ui/LemonMenu/LemonMenu'
+import { LemonRadio } from 'lib/lemon-ui/LemonRadio'
+import { humanFriendlyDuration } from 'lib/utils/durations'
+import { dashboardLogic } from 'scenes/dashboard/dashboardLogic'
+import { Scene } from 'scenes/sceneTypes'
 
 export const LastRefreshText = (): JSX.Element => {
-    const { lastRefreshed } = useValues(dashboardLogic)
+    const { effectiveLastRefresh } = useValues(dashboardLogic)
     return (
-        <>
-            Last updated <b>{lastRefreshed ? dayjs(lastRefreshed).fromNow() : 'a while ago'}</b>
-        </>
+        <div className="flex items-center gap-1">
+            {effectiveLastRefresh && dayjs().diff(dayjs(effectiveLastRefresh), 'hour') < 24 && (
+                <div className="flex items-center gap-1">
+                    <span>Last refreshed</span>
+                    <TZLabel time={effectiveLastRefresh} />
+                </div>
+            )}
+        </div>
     )
 }
 
-// in seconds
-const intervalOptions = [
-    ...Array.from([60, 120, 300, 900], (v) => ({
-        label: humanFriendlyDuration(v),
-        value: v,
-    })),
-]
+/** Loading / progress / pessimistic last refresh — same as the left side of `DashboardReloadAction`, without refresh controls. */
+export function DashboardRefreshStatusText(): JSX.Element {
+    const { itemsLoading, refreshMetrics, dashboardLoadData } = useValues(dashboardLogic)
+    const isInitialLoad =
+        dashboardLoadData?.action === 'initial_load' || dashboardLoadData?.action === 'initial_load_with_variables'
+    return (
+        <span className="text-muted text-sm whitespace-nowrap">
+            {itemsLoading ? (
+                <span className="flex items-center gap-1">
+                    <Spinner textColored className="text-sm" />
+                    {refreshMetrics.total ? (
+                        <>
+                            {isInitialLoad ? 'Loaded' : 'Refreshed'} {refreshMetrics.completed} out of{' '}
+                            {refreshMetrics.total}
+                        </>
+                    ) : (
+                        <>{isInitialLoad ? 'Loading' : 'Refreshing'}...</>
+                    )}
+                </span>
+            ) : (
+                <LastRefreshText />
+            )}
+        </span>
+    )
+}
+
+const REFRESH_INTERVAL_SECONDS = [1800, 3600]
+if (process.env.NODE_ENV === 'development') {
+    REFRESH_INTERVAL_SECONDS.unshift(10)
+}
+const INTERVAL_OPTIONS = Array.from(REFRESH_INTERVAL_SECONDS, (value) => ({
+    label: humanFriendlyDuration(value),
+    value: value,
+}))
 
 export function DashboardReloadAction(): JSX.Element {
-    const { itemsLoading, autoRefresh, refreshMetrics } = useValues(dashboardLogic)
-    const { refreshAllDashboardItemsManual, setAutoRefresh } = useActions(dashboardLogic)
-    const [open, setOpen] = useState(false)
+    const { itemsLoading, autoRefresh, blockRefresh, nextAllowedDashboardRefresh } = useValues(dashboardLogic)
+    const { triggerDashboardRefresh, setAutoRefresh, setPageVisibility, cancelDashboardRefresh } =
+        useActions(dashboardLogic)
+
+    usePageVisibilityCb(setPageVisibility)
+
+    const refreshDisabledReason =
+        !itemsLoading &&
+        blockRefresh &&
+        nextAllowedDashboardRefresh &&
+        dayjs(nextAllowedDashboardRefresh).isAfter(dayjs())
+            ? `Next bulk refresh possible ${dayjs(nextAllowedDashboardRefresh).fromNow()}`
+            : ''
+
+    // Force a re-render when nextAllowedDashboardRefresh is reached, since the blockRefresh
+    // selector uses now() which isn't reactive - it only recomputes on dependency changes
+    const [, setRenderTrigger] = useState(0)
+    useEffect(() => {
+        if (nextAllowedDashboardRefresh) {
+            const msUntilRefreshAllowed = dayjs(nextAllowedDashboardRefresh).diff(dayjs())
+            if (msUntilRefreshAllowed > 0) {
+                const timeoutId = setTimeout(() => setRenderTrigger((n) => n + 1), msUntilRefreshAllowed + 100)
+                return () => clearTimeout(timeoutId)
+            }
+        }
+    }, [nextAllowedDashboardRefresh])
+
+    const options = INTERVAL_OPTIONS.map((option) => {
+        return {
+            ...option,
+            disabledReason: !autoRefresh.enabled ? 'Enable auto refresh to set the interval' : undefined,
+        }
+    })
 
     return (
-        <>
-            <Dropdown.Button
-                overlay={
-                    <Menu data-attr="auto-refresh-picker" id="auto-refresh-picker">
-                        <div
-                            id="auto-refresh-check"
-                            key="auto-refresh-check"
-                            onClick={(e) => {
-                                e.stopPropagation()
-                                setOpen(true)
-                                setAutoRefresh(!autoRefresh.enabled, autoRefresh.interval)
-                            }}
-                        >
-                            <Tooltip title={`Refresh dashboard automatically`} placement="bottomLeft">
-                                <Checkbox
-                                    onChange={(e) => {
-                                        e.stopPropagation()
-                                        e.preventDefault()
-                                    }}
-                                    checked={autoRefresh.enabled}
-                                />
-                                <label
-                                    style={{
-                                        marginLeft: 10,
-                                        cursor: 'pointer',
-                                    }}
-                                >
-                                    Auto refresh
-                                </label>
-                            </Tooltip>
-                        </div>
-                        <Menu.Divider />
-                        <Menu.ItemGroup title="Refresh interval">
-                            <Radio.Group
-                                onChange={(e) => {
-                                    setAutoRefresh(true, parseInt(e.target.value))
-                                }}
-                                value={autoRefresh.interval}
-                                style={{ width: '100%' }}
-                            >
-                                <Space direction="vertical" style={{ width: '100%' }}>
-                                    {intervalOptions.map(({ label, value }) => (
-                                        <Radio key={value} value={value} style={{ width: '100%' }}>
-                                            {label}
-                                        </Radio>
-                                    ))}
-                                </Space>
-                            </Radio.Group>
-                        </Menu.ItemGroup>
-                    </Menu>
-                }
-                trigger={['click']}
-                onClick={() => refreshAllDashboardItemsManual()}
-                icon={<DownOutlined />}
-                disabled={itemsLoading}
-                buttonsRender={([leftButton, rightButton]) => [
-                    React.cloneElement(leftButton as React.ReactElement, { style: { paddingLeft: 10 } }),
-                    rightButton,
-                ]}
-                visible={open}
-                onVisibleChange={(toOpen) => setOpen(toOpen)}
+        <div className="relative flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 sm:flex-nowrap">
+            <DashboardRefreshStatusText />
+
+            <Shortcut
+                name="DashboardRefresh"
+                keybind={[keyBinds.refresh]}
+                intent="Refresh dashboard"
+                interaction="click"
+                scope={Scene.Dashboard}
             >
-                <span className="dashboard-items-action-icon">
-                    {itemsLoading ? <LoadingOutlined /> : <ReloadOutlined />}
-                </span>
-                <span className={clsx('dashboard-items-action-refresh-text', { hidden: itemsLoading })}>
-                    <LastRefreshText />
-                </span>
-                <span className={clsx('dashboard-items-action-refresh-text', 'completed', { hidden: !itemsLoading })}>
-                    Refreshed {refreshMetrics.completed} out of {refreshMetrics.total}
-                </span>
-            </Dropdown.Button>
-        </>
+                <div className="relative inline-flex">
+                    <LemonButton
+                        onClick={() => (itemsLoading ? cancelDashboardRefresh() : triggerDashboardRefresh())}
+                        type="secondary"
+                        icon={
+                            itemsLoading ? (
+                                <IconX />
+                            ) : blockRefresh &&
+                              nextAllowedDashboardRefresh &&
+                              dayjs(nextAllowedDashboardRefresh).isAfter(dayjs()) ? (
+                                <IconCheck />
+                            ) : (
+                                <IconRefresh />
+                            )
+                        }
+                        size="small"
+                        data-attr="dashboard-items-action-refresh"
+                        tooltip={itemsLoading ? 'Cancel refresh' : undefined}
+                        disabledReason={refreshDisabledReason}
+                        sideAction={{
+                            'data-attr': 'dashboard-items-action-refresh-dropdown',
+                            dropdown: {
+                                closeOnClickInside: false,
+                                placement: 'bottom-end',
+                                overlay: (
+                                    <LemonMenuOverlay
+                                        items={[
+                                            {
+                                                label: () => (
+                                                    <LemonSwitch
+                                                        onChange={(checked) =>
+                                                            setAutoRefresh(checked, autoRefresh.interval)
+                                                        }
+                                                        label="Auto refresh while on page"
+                                                        checked={autoRefresh.enabled}
+                                                        fullWidth
+                                                        className="mt-1 mb-2"
+                                                    />
+                                                ),
+                                            },
+                                            ...(autoRefresh.enabled
+                                                ? [
+                                                      {
+                                                          title: 'Refresh interval',
+                                                          items: [
+                                                              {
+                                                                  label: () => (
+                                                                      <LemonRadio
+                                                                          value={autoRefresh.interval}
+                                                                          options={options}
+                                                                          onChange={(value: number) => {
+                                                                              setAutoRefresh(true, value)
+                                                                          }}
+                                                                          className="mx-2 mb-1"
+                                                                      />
+                                                                  ),
+                                                              },
+                                                          ],
+                                                      },
+                                                  ]
+                                                : []),
+                                        ]}
+                                    />
+                                ),
+                            },
+                        }}
+                    >
+                        {itemsLoading ? 'Cancel' : 'Refresh'}
+                    </LemonButton>
+                </div>
+            </Shortcut>
+
+            <LemonBadge
+                size="small"
+                content={
+                    <>
+                        <IconRefresh className="mr-0" /> {humanFriendlyDuration(autoRefresh.interval)}
+                    </>
+                }
+                visible={autoRefresh.enabled}
+                position="top-right"
+                status="muted"
+            />
+        </div>
     )
 }

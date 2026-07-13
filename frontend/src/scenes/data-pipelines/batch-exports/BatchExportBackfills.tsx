@@ -1,0 +1,253 @@
+import { useActions, useValues } from 'kea'
+
+import { IconRefresh } from '@posthog/icons'
+import { LemonButton, LemonDialog, LemonTable, LemonTag, Tooltip } from '@posthog/lemon-ui'
+
+import { NotFound } from 'lib/components/NotFound'
+import { TZLabel } from 'lib/components/TZLabel'
+import { IconCancel } from 'lib/lemon-ui/icons'
+import { LemonProgress } from 'lib/lemon-ui/LemonProgress'
+
+import { BatchExportBackfill } from '~/types'
+
+import { BatchExportBackfillModal } from './BatchExportBackfillModal'
+import { BatchExportBackfillsLogicProps, batchExportBackfillsLogic } from './batchExportBackfillsLogic'
+import { BatchExportLoadingSkeleton } from './BatchExportLoadingSkeleton'
+import { statusToLemonTagType, statusToProgressStrokeColor } from './utils'
+
+export function BatchExportBackfills({ id, context }: BatchExportBackfillsLogicProps): JSX.Element {
+    const logic = batchExportBackfillsLogic({ id, context })
+    const { batchExportConfig, batchExportConfigLoading } = useValues(logic)
+
+    if (!batchExportConfig) {
+        if (batchExportConfigLoading) {
+            return <BatchExportLoadingSkeleton />
+        }
+        return <NotFound object="batch export" />
+    }
+
+    return (
+        <div className="flex flex-col gap-2">
+            <BatchExportBackfillsControls id={id} />
+            <BatchExportLatestBackfills id={id} context={context} />
+            <BatchExportBackfillModal id={id} context={context} />
+        </div>
+    )
+}
+
+function BatchExportBackfillsControls({ id }: BatchExportBackfillsLogicProps): JSX.Element {
+    const logic = batchExportBackfillsLogic({ id })
+    const { loading } = useValues(logic)
+    const { loadBackfills, openBackfillModal } = useActions(logic)
+
+    return (
+        <div className="flex gap-2 items-center justify-between">
+            <LemonButton onClick={loadBackfills} loading={loading} type="secondary" icon={<IconRefresh />} size="small">
+                Refresh
+            </LemonButton>
+
+            <LemonButton type="primary" onClick={() => openBackfillModal()}>
+                Start backfill
+            </LemonButton>
+        </div>
+    )
+}
+
+function BatchExportLatestBackfills({ id, context }: BatchExportBackfillsLogicProps): JSX.Element {
+    const logic = batchExportBackfillsLogic({ id, context })
+    const { latestBackfills, loading, hasMoreBackfillsToLoad, batchExportConfig, recordLabel } = useValues(logic)
+    const { cancelBackfill, loadOlderBackfills, openBackfillModal } = useActions(logic)
+
+    if (!batchExportConfig) {
+        return <NotFound object="batch export" />
+    }
+
+    return (
+        <>
+            <LemonTable<BatchExportBackfill>
+                dataSource={latestBackfills}
+                loading={loading}
+                loadingSkeletonRows={5}
+                footer={
+                    hasMoreBackfillsToLoad && (
+                        <div className="flex items-center m-2">
+                            <LemonButton center fullWidth onClick={loadOlderBackfills} loading={loading}>
+                                Load more rows
+                            </LemonButton>
+                        </div>
+                    )
+                }
+                columns={[
+                    {
+                        title: 'Status',
+                        key: 'status',
+                        width: 0,
+                        render: (_, backfill) => {
+                            const status = backfill.status
+                            return (
+                                <LemonTag type={statusToLemonTagType(status)} size="medium">
+                                    {status}
+                                </LemonTag>
+                            )
+                        },
+                    },
+                    {
+                        title: 'Progress',
+                        key: 'progress',
+                        render: (_, backfill) => {
+                            const status = backfill.status
+                            const progress = backfill.progress
+                            if (progress && progress.progress != null) {
+                                let label = ''
+                                if (progress.finished_runs != null && progress.total_runs != null) {
+                                    if (progress.total_runs === 0) {
+                                        label = '(0 runs)'
+                                    } else {
+                                        const runsLabel = progress.total_runs === 1 ? 'run' : 'runs'
+                                        label = `(${progress.finished_runs}/${progress.total_runs} ${runsLabel})`
+                                    }
+                                }
+
+                                return (
+                                    <span className="flex gap-2 items-center">
+                                        <LemonProgress
+                                            percent={progress.progress * 100}
+                                            strokeColor={statusToProgressStrokeColor(status)}
+                                            className="min-w-[80px]"
+                                        />
+                                        <span className="flex-shrink-0 whitespace-nowrap">{label}</span>
+                                    </span>
+                                )
+                            }
+                            return ''
+                        },
+                    },
+                    {
+                        title: 'ID',
+                        key: 'runId',
+                        render: (_, backfill) => backfill.id,
+                    },
+                    {
+                        title: `Total ${recordLabel}`,
+                        key: 'total_records_count',
+                        render: (_, backfill) => {
+                            if (backfill.total_records_count == null) {
+                                return ''
+                            }
+                            const isEstimate = backfill.status === 'Running' || backfill.status === 'Starting'
+                            const formatted = backfill.total_records_count.toLocaleString()
+                            if (isEstimate) {
+                                return (
+                                    <Tooltip title="Estimated count, may change as the backfill progresses">
+                                        <div className="cursor-help border-b border-dashed border-current w-fit">
+                                            ~{formatted}
+                                        </div>
+                                    </Tooltip>
+                                )
+                            }
+                            return formatted
+                        },
+                    },
+                    {
+                        title: 'Interval start',
+                        key: 'intervalStart',
+                        tooltip: 'Start of the time range to backfill',
+                        render: (_, backfill) => {
+                            return backfill.start_at ? (
+                                <TZLabel time={backfill.start_at} formatDate="MMMM DD, YYYY" formatTime="HH:mm:ss" />
+                            ) : (
+                                'Beginning of time'
+                            )
+                        },
+                    },
+                    {
+                        title: 'Interval end',
+                        key: 'intervalEnd',
+                        tooltip: 'End of the time range to backfill',
+                        render: (_, backfill) => {
+                            return backfill.end_at ? (
+                                <TZLabel time={backfill.end_at} formatDate="MMMM DD, YYYY" formatTime="HH:mm:ss" />
+                            ) : (
+                                'Until present'
+                            )
+                        },
+                    },
+                    {
+                        title: 'Started',
+                        key: 'started',
+                        tooltip: 'Date and time when this backfill started',
+                        render: (_, backfill) => (backfill.created_at ? <TZLabel time={backfill.created_at} /> : ''),
+                    },
+                    {
+                        title: 'Finished',
+                        key: 'finished',
+                        tooltip: 'Date and time when this backfill finished',
+                        render: (_, backfill) => (backfill.finished_at ? <TZLabel time={backfill.finished_at} /> : ''),
+                    },
+                    {
+                        key: 'actions',
+                        width: 0,
+                        render: function RenderActions(_, backfill) {
+                            if (backfillIsCancelable(backfill.status)) {
+                                return (
+                                    <div className="flex gap-1">
+                                        <BackfillCancelButton backfill={backfill} cancelBackfill={cancelBackfill} />
+                                    </div>
+                                )
+                            }
+                        },
+                    },
+                ]}
+                emptyState={
+                    <div className="deprecated-space-y-2">
+                        <div>No backfills in this time range.</div>
+                        <LemonButton type="primary" onClick={() => openBackfillModal()}>
+                            Start backfill
+                        </LemonButton>
+                    </div>
+                }
+            />
+        </>
+    )
+}
+
+function BackfillCancelButton({
+    backfill,
+    cancelBackfill,
+}: {
+    backfill: BatchExportBackfill
+    cancelBackfill: (backfill: BatchExportBackfill) => void
+}): JSX.Element {
+    return (
+        <span className="flex gap-1 items-center">
+            <LemonButton
+                size="small"
+                type="secondary"
+                icon={<IconCancel />}
+                tooltip="Cancel backfill"
+                onClick={() =>
+                    LemonDialog.open({
+                        title: 'Cancel backfill?',
+                        description: (
+                            <>
+                                <p>This will cancel the selected backfill.</p>
+                            </>
+                        ),
+                        width: '20rem',
+                        primaryButton: {
+                            children: 'Cancel backfill',
+                            onClick: () => cancelBackfill(backfill),
+                        },
+                        secondaryButton: {
+                            children: 'Go back',
+                        },
+                    })
+                }
+            />
+        </span>
+    )
+}
+
+const backfillIsCancelable = (status: BatchExportBackfill['status']): boolean => {
+    return status === 'Running' || status === 'Starting'
+}

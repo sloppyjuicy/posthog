@@ -1,0 +1,249 @@
+import { useActions, useValues } from 'kea'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+
+import { IconInfo } from '@posthog/icons'
+import { LemonButton, LemonInput, LemonSelect } from '@posthog/lemon-ui'
+
+import { RestrictionScope, useRestrictedArea } from 'lib/components/RestrictedArea'
+import { TeamMembershipLevel } from 'lib/constants'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+import { Spinner } from 'lib/lemon-ui/Spinner'
+import { Tooltip } from 'lib/lemon-ui/Tooltip'
+import { debounce } from 'lib/utils/async'
+import { teamLogic } from 'scenes/teamLogic'
+
+import { AttributionMode } from '~/queries/schema/schema-general'
+
+import { marketingAnalyticsSettingsLogic } from '../../logic/marketingAnalyticsSettingsLogic'
+import {
+    ATTRIBUTION_WINDOW_OPTIONS,
+    DEFAULT_ATTRIBUTION_MODE,
+    DEFAULT_ATTRIBUTION_WINDOW_DAYS,
+    MAX_ATTRIBUTION_WINDOW_DAYS,
+    MIN_ATTRIBUTION_WINDOW_DAYS,
+} from '../../logic/utils'
+
+const SINGLE_TOUCH_OPTIONS = [
+    { value: AttributionMode.FirstTouch, label: 'First touch' },
+    { value: AttributionMode.LastTouch, label: 'Last touch' },
+]
+
+const MULTI_TOUCH_OPTIONS = [
+    { value: AttributionMode.Linear, label: 'Linear' },
+    { value: AttributionMode.TimeDecay, label: 'Time decay' },
+    { value: AttributionMode.PositionBased, label: 'Position based' },
+]
+
+const MULTI_TOUCH_MODES = new Set([AttributionMode.Linear, AttributionMode.TimeDecay, AttributionMode.PositionBased])
+
+export function AttributionSettings(): JSX.Element {
+    const hasMultiTouchAttribution = useFeatureFlag('MARKETING_ANALYTICS_MULTI_TOUCH_ATTRIBUTION')
+    const { marketingAnalyticsConfig } = useValues(marketingAnalyticsSettingsLogic)
+    const {
+        updateAttributionWindowDays: updateAttributionWindowDaysAction,
+        updateAttributionMode: updateAttributionModeAction,
+    } = useActions(marketingAnalyticsSettingsLogic)
+    const { currentTeamLoading } = useValues(teamLogic)
+    const restrictedReason = useRestrictedArea({
+        scope: RestrictionScope.Project,
+        minimumAccessLevel: TeamMembershipLevel.Admin,
+    })
+
+    const attributionModeOptions = useMemo(
+        () => (hasMultiTouchAttribution ? [...SINGLE_TOUCH_OPTIONS, ...MULTI_TOUCH_OPTIONS] : SINGLE_TOUCH_OPTIONS),
+        [hasMultiTouchAttribution]
+    )
+
+    // Get attribution settings from config with defaults
+    const attribution_window_days = marketingAnalyticsConfig?.attribution_window_days ?? DEFAULT_ATTRIBUTION_WINDOW_DAYS
+    const rawAttributionMode = marketingAnalyticsConfig?.attribution_mode ?? DEFAULT_ATTRIBUTION_MODE
+    // Fall back to last touch if the stored mode is multi-touch but the flag is off
+    const attribution_mode =
+        !hasMultiTouchAttribution && MULTI_TOUCH_MODES.has(rawAttributionMode)
+            ? AttributionMode.LastTouch
+            : rawAttributionMode
+
+    // Local state for immediate UI updates
+    const [localDays, setLocalDays] = useState(attribution_window_days)
+    const [isCustomValue, setIsCustomValue] = useState(
+        !ATTRIBUTION_WINDOW_OPTIONS.some((option) => option.value === localDays)
+    )
+    const [localAttributionMode, setLocalAttributionMode] = useState(attribution_mode)
+
+    // Sync local state when store value changes
+    useEffect(() => {
+        setLocalDays(attribution_window_days)
+    }, [attribution_window_days, setIsCustomValue, setLocalDays])
+
+    useEffect(() => {
+        setIsCustomValue(!ATTRIBUTION_WINDOW_OPTIONS.some((option) => option.value === localDays))
+    }, [localDays])
+
+    const hasError = !(localDays >= MIN_ATTRIBUTION_WINDOW_DAYS && localDays <= MAX_ATTRIBUTION_WINDOW_DAYS)
+
+    useEffect(() => {
+        setLocalAttributionMode(attribution_mode)
+    }, [attribution_mode])
+
+    // Debounce the team update to avoid excessive API calls
+    const debouncedUpdateDays = useMemo(
+        () => debounce((days: number) => updateAttributionWindowDaysAction(days), 500),
+        [updateAttributionWindowDaysAction]
+    )
+
+    // Handle dropdown change: update UI immediately, debounce team update
+    const handleDaysChange = useCallback(
+        (days: number | string): void => {
+            if (days === 'custom') {
+                setIsCustomValue(true)
+                return
+            }
+            setIsCustomValue(false)
+            const numericDays = typeof days === 'string' ? parseInt(days, 10) : days
+            setLocalDays(numericDays)
+            debouncedUpdateDays(numericDays)
+        },
+        [debouncedUpdateDays]
+    )
+
+    // Handle attribution mode change: update UI immediately, update backend
+    const handleAttributionModeChange = useCallback(
+        (mode: AttributionMode): void => {
+            setLocalAttributionMode(mode)
+            updateAttributionModeAction(mode)
+        },
+        [updateAttributionModeAction]
+    )
+
+    const handleCustomInputChange = useCallback((value: number | undefined): void => {
+        if (value !== undefined) {
+            setLocalDays(value)
+        }
+    }, [])
+
+    const handleKeyDown = useCallback(
+        (e: React.KeyboardEvent): void => {
+            if (e.key === 'Enter' && !hasError) {
+                debouncedUpdateDays(localDays)
+            }
+        },
+        [hasError, localDays, debouncedUpdateDays]
+    )
+
+    const saveCustomInput = useCallback((): void => {
+        if (!hasError && localDays !== attribution_window_days) {
+            debouncedUpdateDays(localDays)
+        }
+    }, [hasError, localDays, attribution_window_days, debouncedUpdateDays])
+
+    return (
+        <div className="space-y-4">
+            <div>
+                <h3 className="text-lg font-semibold mb-2 flex items-center gap-2">
+                    Attribution Settings
+                    {currentTeamLoading && <Spinner className="text-muted" />}
+                </h3>
+                <p className="text-muted-foreground text-sm mb-4">
+                    Configure how conversions are attributed to marketing campaigns.
+                </p>
+            </div>
+
+            <div className="space-y-6">
+                <div>
+                    <label className="text-sm font-medium mb-2 flex items-center gap-1">
+                        Attribution Window
+                        <Tooltip
+                            delayMs={0}
+                            title="The attribution window determines how far back in time to look for marketing touchpoints when attributing conversions. Example: With a 30-day window, if someone converts today, we'll look back 30 days for any UTM campaigns they interacted with. Recommendation: Use 30-60 days for short sales cycles, 90+ days for longer consideration periods."
+                        >
+                            <IconInfo className="text-muted-alt hover:text-default cursor-help" />
+                        </Tooltip>
+                    </label>
+                    <div className="max-w-md flex items-center gap-2">
+                        <LemonSelect
+                            value={isCustomValue ? 'custom' : localDays}
+                            onChange={handleDaysChange}
+                            options={ATTRIBUTION_WINDOW_OPTIONS}
+                            data-attr="attribution-window-select"
+                            className="w-50"
+                            disabledReason={restrictedReason}
+                        />
+                        <LemonInput
+                            type="number"
+                            value={localDays}
+                            onChange={handleCustomInputChange}
+                            onKeyDown={handleKeyDown}
+                            placeholder={`${MIN_ATTRIBUTION_WINDOW_DAYS}-${MAX_ATTRIBUTION_WINDOW_DAYS}`}
+                            min={MIN_ATTRIBUTION_WINDOW_DAYS}
+                            max={MAX_ATTRIBUTION_WINDOW_DAYS}
+                            className="w-32"
+                            status={hasError ? 'danger' : undefined}
+                            data-attr="attribution-window-custom-input"
+                            disabledReason={restrictedReason}
+                        />
+                        <LemonButton
+                            type="primary"
+                            size="small"
+                            onClick={saveCustomInput}
+                            disabledReason={
+                                hasError
+                                    ? `Please enter a valid value between ${MIN_ATTRIBUTION_WINDOW_DAYS} and ${MAX_ATTRIBUTION_WINDOW_DAYS} days`
+                                    : localDays === attribution_window_days
+                                      ? 'No changes to save'
+                                      : restrictedReason
+                            }
+                            data-attr="attribution-window-save-button"
+                        >
+                            Save
+                        </LemonButton>
+                    </div>
+                    <p className={`text-xs text-muted-foreground mt-1 ${hasError ? 'text-danger' : ''}`}>
+                        {hasError
+                            ? `Please enter a value between ${MIN_ATTRIBUTION_WINDOW_DAYS} and ${MAX_ATTRIBUTION_WINDOW_DAYS} days`
+                            : 'How far back to look for marketing touchpoints when attributing conversions'}
+                    </p>
+                </div>
+
+                <div>
+                    <label className="text-sm font-medium mb-2 flex items-center gap-1">
+                        Attribution Mode
+                        <Tooltip
+                            delayMs={0}
+                            title="Attribution mode determines how credit for a conversion is distributed across marketing touchpoints. First touch: 100% credit to the first touchpoint. Last touch: 100% credit to the last touchpoint. Linear: Equal credit across all touchpoints. Time decay: More credit to recent touchpoints, with credit halving at regular intervals. Position based: 40% first, 40% last, 20% distributed among middle touchpoints."
+                        >
+                            <IconInfo className="text-muted-alt hover:text-default cursor-help" />
+                        </Tooltip>
+                    </label>
+                    <div className="max-w-md">
+                        <div className="flex items-center gap-1 bg-border rounded p-1">
+                            {attributionModeOptions.map((option) => (
+                                <LemonButton
+                                    key={option.value}
+                                    type={localAttributionMode === option.value ? 'primary' : 'tertiary'}
+                                    size="small"
+                                    onClick={() => handleAttributionModeChange(option.value)}
+                                    data-attr={`attribution-mode-${option.value.toLowerCase().replace('_', '-')}`}
+                                    className="flex-1"
+                                    disabledReason={restrictedReason}
+                                >
+                                    {option.label}
+                                </LemonButton>
+                            ))}
+                        </div>
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-1">
+                        {localAttributionMode === AttributionMode.FirstTouch
+                            ? 'Credit the first marketing touchpoint in the customer journey'
+                            : localAttributionMode === AttributionMode.LastTouch
+                              ? 'Credit the last marketing touchpoint before conversion'
+                              : localAttributionMode === AttributionMode.Linear
+                                ? 'Distribute credit equally across all touchpoints'
+                                : localAttributionMode === AttributionMode.TimeDecay
+                                  ? `More credit to touchpoints closer to the conversion. Credit halves every ${Math.round(localDays / 4)} days.`
+                                  : 'First and last touchpoints get 40% each, remaining 20% split among middle touchpoints'}
+                    </p>
+                </div>
+            </div>
+        </div>
+    )
+}

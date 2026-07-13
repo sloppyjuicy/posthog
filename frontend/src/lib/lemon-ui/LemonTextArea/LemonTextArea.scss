@@ -1,0 +1,33 @@
+.LemonTextArea {
+    display: block;
+    width: 100%;
+    min-height: 2.5rem;
+    padding: 0.5rem;
+    font-size: 0.875rem;
+    line-height: 1.4;
+    color: var(--text-3000);
+    text-align: left;
+    text-overflow: ellipsis;
+    cursor: text;
+    background: none;
+    background-color: var(--color-bg-fill-input);
+    outline: none;
+    box-shadow: none;
+
+    &:disabled {
+        cursor: not-allowed;
+        opacity: var(--opacity-disabled);
+    }
+}
+
+.LemonTextArea--preview {
+    ul {
+        list-style-position: inside;
+        list-style-type: disc;
+    }
+
+    ol {
+        list-style-position: inside;
+        list-style-type: decimal;
+    }
+}

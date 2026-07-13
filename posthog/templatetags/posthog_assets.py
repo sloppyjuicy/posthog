@@ -1,5 +1,4 @@
 import re
-from typing import List
 
 from django.conf import settings
 from django.template import Library
@@ -26,18 +25,7 @@ def absolute_asset_url(path: str) -> str:
 
 
 @register.simple_tag
-def utmify_email_url(url: str, campaign: str) -> str:
-    """
-    Returns a versioned absolute asset URL (located within PostHog's static files).
-    Example:
-        {% utmify_email_url 'http://app.posthog.com' 'weekly_report' %}
-        =>  "http://app.posthog.com?utm_source=posthog&utm_medium=email&utm_campaign=weekly_report"
-    """
-    return f"{url}{'&' if '?' in url else '?'}utm_source=posthog&utm_medium=email&utm_campaign={campaign}"
-
-
-@register.simple_tag
-def human_social_providers(providers: List[str]) -> str:
+def human_social_providers(providers: list[str]) -> str:
     """
     Returns a human-friendly name for a social login provider.
     Example:
@@ -52,7 +40,7 @@ def human_social_providers(providers: List[str]) -> str:
             return "GitHub"
         elif prov == "gitlab":
             return "GitLab"
-        return "Single sign-on (SSO)"
+        return "single sign-on (SAML)"
 
     return ", ".join(map(friendly_provider, providers))
 
@@ -65,6 +53,4 @@ def strip_protocol(path: str) -> str:
       {% strip_protocol 'https://app.posthog.com' %}
       =>  "app.posthog.com"
     """
-    print("I'm here!")
-    print(path)
     return re.sub(r"https?:\/\/", "", path)

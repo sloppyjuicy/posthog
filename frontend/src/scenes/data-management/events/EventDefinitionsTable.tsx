@@ -1,0 +1,281 @@
+import { useActions, useValues } from 'kea'
+import { useState } from 'react'
+
+import { IconApps, IconPlus } from '@posthog/icons'
+import { LemonButton, LemonInput, LemonSelect, LemonSelectOptions, Link } from '@posthog/lemon-ui'
+
+import { BulkUpdateTagsButton } from 'lib/components/BulkActions/BulkUpdateTagsButton'
+import { ObjectTags } from 'lib/components/ObjectTags/ObjectTags'
+import { TagSelect } from 'lib/components/TagSelect'
+import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { TZLabel } from 'lib/components/TZLabel'
+import ViewRecordingsPlaylistButton from 'lib/components/ViewRecordingButton/ViewRecordingsPlaylistButton'
+import { EVENT_DEFINITIONS_PER_PAGE } from 'lib/constants'
+import { LemonBanner } from 'lib/lemon-ui/LemonBanner'
+import { LemonTable, LemonTableColumn, LemonTableColumns } from 'lib/lemon-ui/LemonTable'
+import { cn } from 'lib/utils/css-classes'
+import { DefinitionHeader, getEventDefinitionIcon } from 'scenes/data-management/events/DefinitionHeader'
+import { EventDefinitionModal } from 'scenes/data-management/events/EventDefinitionModal'
+import { EventDefinitionProperties } from 'scenes/data-management/events/EventDefinitionProperties'
+import { eventDefinitionsTableLogic } from 'scenes/data-management/events/eventDefinitionsTableLogic'
+import { verifiedFilterFromOption, verifiedFilterValue, verifiedOptions } from 'scenes/data-management/utils'
+import { sceneConfigurations } from 'scenes/scenes'
+import { Scene } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import { EventDefinition, EventDefinitionType, FilterLogicalOperator } from '~/types'
+
+const eventTypeOptions: LemonSelectOptions<EventDefinitionType> = [
+    { value: EventDefinitionType.Event, label: 'All events', 'data-attr': 'event-type-option-event' },
+    {
+        value: EventDefinitionType.EventCustom,
+        label: 'Custom events',
+        'data-attr': 'event-type-option-event-custom',
+    },
+    {
+        value: EventDefinitionType.EventPostHog,
+        label: 'PostHog events',
+        'data-attr': 'event-type-option-event-posthog',
+    },
+]
+
+export function EventDefinitionsTable(): JSX.Element {
+    const { eventDefinitions, eventDefinitionsLoading, filters, showVerifiedFilter } =
+        useValues(eventDefinitionsTableLogic)
+    const { loadEventDefinitions, setFilters, applyBulkTagUpdates } = useActions(eventDefinitionsTableLogic)
+    const [isCreateModalOpen, setIsCreateModalOpen] = useState(false)
+
+    const columns: LemonTableColumns<EventDefinition> = [
+        {
+            key: 'icon',
+            width: 0,
+            render: function Render(_, definition: EventDefinition) {
+                return <span className="text-xl text-secondary">{getEventDefinitionIcon(definition)}</span>
+            },
+        },
+        {
+            title: 'Name',
+            key: 'name',
+            render: function Render(_, definition: EventDefinition) {
+                return (
+                    <DefinitionHeader
+                        definition={definition}
+                        to={urls.eventDefinition(definition.id)}
+                        taxonomicGroupType={TaxonomicFilterGroupType.Events}
+                    />
+                )
+            },
+            sorter: true,
+        },
+        {
+            title: 'Last seen',
+            key: 'last_seen_at',
+            className: 'definition-column-last_seen_at',
+            render: function Render(_, definition: EventDefinition) {
+                return definition.last_seen_at ? <TZLabel time={definition.last_seen_at} /> : <span>-</span>
+            },
+            sorter: true,
+        },
+        {
+            title: 'Tags',
+            key: 'tags',
+            render: function Render(_, definition: EventDefinition) {
+                return <ObjectTags tags={definition.tags ?? []} staticOnly />
+            },
+        } as LemonTableColumn<EventDefinition, keyof EventDefinition | undefined>,
+        {
+            key: 'actions',
+            width: 180,
+            render: function RenderActions(_, definition: EventDefinition) {
+                return (
+                    <ViewRecordingsPlaylistButton
+                        filters={{
+                            filter_group: {
+                                type: FilterLogicalOperator.And,
+                                values: [
+                                    {
+                                        type: FilterLogicalOperator.And,
+                                        values: [
+                                            {
+                                                id: definition.name,
+                                                type: 'events',
+                                                order: 0,
+                                                name: definition.name,
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                        }}
+                        size="small"
+                        type="secondary"
+                        data-attr="event-definitions-table-view-recordings"
+                    />
+                )
+            },
+        },
+    ]
+
+    return (
+        <SceneContent data-attr="manage-events-table">
+            <SceneTitleSection
+                name={sceneConfigurations[Scene.EventDefinition].name}
+                description={sceneConfigurations[Scene.EventDefinition].description}
+                resourceType={{
+                    type: sceneConfigurations[Scene.EventDefinition].iconType || 'default_icon_type',
+                    forceIcon: <IconApps />,
+                }}
+            />
+            <LemonBanner type="info">
+                Looking for{' '}
+                {filters.event_type === 'event_custom'
+                    ? 'custom '
+                    : filters.event_type === 'event_posthog'
+                      ? 'PostHog '
+                      : ''}
+                event usage statistics?{' '}
+                <Link
+                    to={urls.insightNewHogQL({
+                        query:
+                            'SELECT event, count()\n' +
+                            'FROM events\n' +
+                            'WHERE {filters}\n' +
+                            (filters.event_type === 'event_custom'
+                                ? "AND event NOT LIKE '$%'\n"
+                                : filters.event_type === 'event_posthog'
+                                  ? "AND event LIKE '$%'\n"
+                                  : '') +
+                            'GROUP BY event\n' +
+                            'ORDER BY count() DESC',
+                        filters: { dateRange: { date_from: '-24h' } },
+                    })}
+                >
+                    Query with SQL
+                </Link>
+            </LemonBanner>
+
+            <div className={cn('flex flex-wrap justify-between items-center gap-2')}>
+                <LemonInput
+                    type="search"
+                    placeholder="Search for events"
+                    onChange={(v) => setFilters({ event: v || '' })}
+                    value={filters.event}
+                    className="flex-1 min-w-60"
+                />
+                <div className="flex items-center gap-2 flex-shrink-0">
+                    <span>Tags:</span>
+                    <TagSelect
+                        defaultLabel="Any tags"
+                        value={filters.tags || []}
+                        onChange={(tags) => {
+                            setFilters({ tags })
+                        }}
+                        data-attr="event-tags-filter"
+                        size="small"
+                    />
+                    <span>Type:</span>
+                    <LemonSelect
+                        value={filters.event_type}
+                        options={eventTypeOptions}
+                        data-attr="event-type-filter"
+                        dropdownMatchSelectWidth={false}
+                        onChange={(value) => {
+                            setFilters({ event_type: value as EventDefinitionType })
+                        }}
+                        size="small"
+                    />
+                    {showVerifiedFilter && (
+                        <>
+                            <span>Status:</span>
+                            <LemonSelect
+                                value={verifiedFilterValue(filters.verified)}
+                                options={verifiedOptions}
+                                data-attr="event-verified-filter"
+                                dropdownMatchSelectWidth={false}
+                                onChange={(value) => {
+                                    setFilters({
+                                        verified: verifiedFilterFromOption(value),
+                                    })
+                                }}
+                                size="small"
+                            />
+                        </>
+                    )}
+                    <LemonButton
+                        type="primary"
+                        icon={<IconPlus />}
+                        onClick={() => setIsCreateModalOpen(true)}
+                        data-attr="create-event-definition-button"
+                    >
+                        Create event
+                    </LemonButton>
+                </div>
+            </div>
+
+            <EventDefinitionModal isOpen={isCreateModalOpen} onClose={() => setIsCreateModalOpen(false)} />
+
+            <LemonTable
+                columns={columns}
+                data-attr="events-definition-table"
+                loading={eventDefinitionsLoading}
+                rowKey="id"
+                pagination={{
+                    controlled: true,
+                    currentPage: eventDefinitions?.page ?? 1,
+                    entryCount: eventDefinitions?.count ?? 0,
+                    pageSize: EVENT_DEFINITIONS_PER_PAGE,
+                    onForward: eventDefinitions.next
+                        ? () => {
+                              loadEventDefinitions(eventDefinitions.next)
+                          }
+                        : undefined,
+                    onBackward: eventDefinitions.previous
+                        ? () => {
+                              loadEventDefinitions(eventDefinitions.previous)
+                          }
+                        : undefined,
+                }}
+                onSort={(newSorting) =>
+                    setFilters({
+                        ordering: newSorting
+                            ? `${newSorting.order === -1 ? '-' : ''}${newSorting.columnKey}`
+                            : undefined,
+                    })
+                }
+                expandable={{
+                    expandedRowRender: function RenderPropertiesTable(definition) {
+                        return (
+                            <div className="p-4">
+                                <EventDefinitionProperties definition={definition} />
+                            </div>
+                        )
+                    },
+                    rowExpandable: () => true,
+                    noIndent: true,
+                }}
+                bulkSelection={{
+                    getKey: (definition: EventDefinition): string => definition.id,
+                    rowAriaLabel: (definition: EventDefinition) => `Select event ${definition.name}`,
+                    headerAriaLabel: 'Select all events on this page',
+                    noun: ['event', 'events'],
+                    renderActions: (ctx) => (
+                        <BulkUpdateTagsButton
+                            resource="event_definitions"
+                            selectedIds={ctx.selectedKeys}
+                            onSuccess={(result) => {
+                                applyBulkTagUpdates(result.updated)
+                                ctx.clearSelection()
+                            }}
+                        />
+                    ),
+                }}
+                dataSource={eventDefinitions.results}
+                useURLForSorting={false}
+                emptyState="No event definitions"
+                nouns={['event', 'events']}
+            />
+        </SceneContent>
+    )
+}

@@ -1,0 +1,1940 @@
+use crate::{
+    cohorts::cohort_models::{Cohort, CohortId, CohortType},
+    config::{Config, DEFAULT_TEST_CONFIG},
+    flags::{
+        flag_group_type_mapping::{
+            GroupTypeCacheManager, GroupTypeFetchError, GroupTypeMapping, GroupTypeMappingFetcher,
+        },
+        flag_models::{EvaluationMetadata, FeatureFlag, FeatureFlagList, FeatureFlagRow},
+    },
+    properties::property_models::PropertyType,
+    team::team_models::Team,
+};
+use anyhow::Error;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use common_database::{get_pool, Client, CustomDatabaseError};
+use common_hypercache::{HyperCacheConfig, HyperCacheReader};
+use common_redis::{Client as RedisClientTrait, RedisClient};
+use common_types::{Person, PersonId};
+use rand::{distributions::Alphanumeric, Rng};
+use serde_json::{json, Value};
+use sqlx::{pool::PoolConnection, Error as SqlxError, Postgres, Row};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+use uuid::Uuid;
+
+pub fn random_string(prefix: &str, length: usize) -> String {
+    let suffix: String = rand::thread_rng()
+        .sample_iter(Alphanumeric)
+        .take(length)
+        .map(char::from)
+        .collect();
+    format!("{prefix}{suffix}")
+}
+
+/// Generate the HyperCache key for team metadata.
+/// Format: posthog:1:cache/team_tokens/{api_token}/team_metadata/full_metadata.json
+pub fn team_token_hypercache_key(api_token: &str) -> String {
+    format!("posthog:1:cache/team_tokens/{api_token}/team_metadata/full_metadata.json")
+}
+
+/// Update team data in HyperCache with proper pickle encoding.
+/// Use this when modifying team settings in tests and need to update the cache.
+/// Format: Pickle(JSON string) to match Django's cache format.
+pub async fn update_team_in_hypercache(
+    client: Arc<dyn RedisClientTrait + Send + Sync>,
+    team: &Team,
+) -> Result<(), Error> {
+    let json_string = serde_json::to_string(team)?;
+    let pickled_bytes =
+        serde_pickle::to_vec(&json_string, Default::default()).expect("Failed to pickle team");
+    let cache_key = team_token_hypercache_key(&team.api_token);
+    client.set_bytes(cache_key, pickled_bytes, None).await?;
+    Ok(())
+}
+
+/// Write a raw team-token hypercache entry that omits `project_id`, simulating a cache entry
+/// written before that field existed. `verify_token_and_get_team` then deserializes it with
+/// `project_id == None` (via `#[serde(default)]`), which is the only way to exercise the
+/// `project_id_for_team` fallback — the typed `update_team_in_hypercache` always carries the field.
+pub async fn update_team_in_hypercache_without_project_id(
+    client: Arc<dyn RedisClientTrait + Send + Sync>,
+    team: &Team,
+) -> Result<(), Error> {
+    let mut value = serde_json::to_value(team)?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("project_id");
+    }
+    let json_string = serde_json::to_string(&value)?;
+    let pickled_bytes =
+        serde_pickle::to_vec(&json_string, Default::default()).expect("Failed to pickle team");
+    let cache_key = team_token_hypercache_key(&team.api_token);
+    client.set_bytes(cache_key, pickled_bytes, None).await?;
+    Ok(())
+}
+
+pub async fn insert_new_team_in_redis(
+    client: Arc<dyn RedisClientTrait + Send + Sync>,
+) -> Result<Team, Error> {
+    let id = rand::thread_rng().gen_range(1_000_000..i32::MAX);
+    let token = random_string("phc_", 12);
+    let team = Team {
+        id,
+        name: "team".to_string(),
+        api_token: token,
+        cookieless_server_hash_mode: Some(0),
+        timezone: "UTC".to_string(),
+        ..Default::default()
+    };
+
+    // Serialize team to JSON string, then pickle to match Django's cache format: Pickle(JSON)
+    let json_string = serde_json::to_string(&team)?;
+    let pickled_bytes =
+        serde_pickle::to_vec(&json_string, Default::default()).expect("Failed to pickle team");
+    let cache_key = team_token_hypercache_key(&team.api_token);
+    client.set_bytes(cache_key, pickled_bytes, None).await?;
+
+    Ok(team)
+}
+
+/// Write flags to the hypercache key for `team_id` in Redis.
+/// Auto-generates single-stage `evaluation_metadata` with no transitive-dependency
+/// information (all flags in one stage, `transitive_deps[id] = []` for each flag).
+///
+/// Not suitable for tests that combine inter-flag dependencies with `flag_keys`
+/// filtering — use `insert_flags_with_metadata_for_team_in_redis` instead.
+pub async fn insert_flags_for_team_in_redis(
+    client: Arc<dyn RedisClientTrait + Send + Sync>,
+    team_id: i32,
+    json_value: Option<String>,
+) -> Result<(), Error> {
+    // Parse the flags array
+    let flags_array: serde_json::Value = match json_value {
+        Some(value) => serde_json::from_str(&value)
+            .expect("Failed to parse JSON for flags array in test setup"),
+        None => json!([{
+            "id": 1,
+            "key": "flag1",
+            "name": "flag1 description",
+            "active": true,
+            "deleted": false,
+            "team_id": team_id,
+            "filters": {
+                "groups": [
+                    {
+                        "properties": [
+                            {
+                                "key": "email",
+                                "value": "a@b.com",
+                                "type": "person",
+                            },
+                        ]
+                    },
+                ],
+            },
+        }]),
+    };
+
+    // Build evaluation_metadata that mirrors what Django writes:
+    // all flag IDs in a single stage (no deps), each with an empty transitive set.
+    let flag_ids: Vec<i32> = flags_array
+        .as_array()
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|f| f.get("id").and_then(|v| v.as_i64()).map(|v| v as i32))
+        .collect();
+    let transitive_deps: serde_json::Map<String, serde_json::Value> = flag_ids
+        .iter()
+        .map(|id| (id.to_string(), json!([])))
+        .collect();
+
+    let evaluation_metadata = json!({
+        "dependency_stages": [flag_ids],
+        "flags_with_missing_deps": [],
+        "transitive_deps": transitive_deps
+    });
+
+    insert_flags_with_metadata_for_team_in_redis(client, team_id, flags_array, evaluation_metadata)
+        .await
+}
+
+/// Write flags with custom `evaluation_metadata` to the hypercache key in Redis.
+/// Use for tests with dependency chains or other custom metadata needs.
+/// `insert_flags_for_team_in_redis` delegates here with auto-generated metadata.
+pub async fn insert_flags_with_metadata_for_team_in_redis(
+    client: Arc<dyn RedisClientTrait + Send + Sync>,
+    team_id: i32,
+    flags_array: serde_json::Value,
+    evaluation_metadata: serde_json::Value,
+) -> Result<(), Error> {
+    let json_string = json!({
+        "flags": flags_array,
+        "evaluation_metadata": evaluation_metadata
+    })
+    .to_string();
+    let pickled_bytes =
+        serde_pickle::to_vec(&json_string, Default::default()).expect("Failed to pickle flags");
+
+    let cache_key = format!("posthog:1:cache/teams/{team_id}/feature_flags/flags.json");
+    client.set_bytes(cache_key, pickled_bytes, None).await?;
+
+    Ok(())
+}
+
+pub async fn setup_redis_client(url: Option<String>) -> Arc<dyn RedisClientTrait + Send + Sync> {
+    let redis_url = match url {
+        Some(value) => value,
+        None => "redis://localhost:6379/".to_string(),
+    };
+    // Use reasonable test timeout defaults
+    const TEST_RESPONSE_TIMEOUT_MS: u64 = 1000; // 1s for tests - longer than production to avoid flaky tests
+    const TEST_CONNECTION_TIMEOUT_MS: u64 = 5000; // 5s connection timeout
+
+    let client = RedisClient::with_config(
+        redis_url,
+        common_redis::CompressionConfig::disabled(),
+        common_redis::RedisValueFormat::default(),
+        Some(Duration::from_millis(TEST_RESPONSE_TIMEOUT_MS)),
+        Some(Duration::from_millis(TEST_CONNECTION_TIMEOUT_MS)),
+    )
+    .await
+    .expect("Failed to create redis client");
+    Arc::new(client)
+}
+
+/// Read the members of the flag-definitions self-heal rebuild-requests sorted set.
+/// Used by tests asserting the endpoint enqueues (or doesn't) on a cache miss.
+pub async fn read_flag_definitions_rebuild_requests(redis_url: &str) -> Vec<String> {
+    let redis = setup_redis_client(Some(redis_url.to_string())).await;
+    redis
+        .zrangebyscore(
+            "flag_definitions:rebuild_requests".to_string(),
+            "-inf".to_string(),
+            "+inf".to_string(),
+        )
+        .await
+        .unwrap_or_default()
+}
+
+/// An S3 client that reports every key as NotFound. Lets integration tests force a
+/// genuine HyperCache `CacheMiss` (redis miss + S3 NotFound) without a real object
+/// store, so a `/flags/definitions` miss classifies as `cache_miss` rather than
+/// `s3_error`.
+pub struct AlwaysMissS3Client;
+
+#[async_trait]
+impl common_hypercache::S3Client for AlwaysMissS3Client {
+    async fn get_string(
+        &self,
+        _bucket: &str,
+        key: &str,
+    ) -> Result<String, common_hypercache::S3Error> {
+        Err(common_hypercache::S3Error::NotFound(key.to_string()))
+    }
+
+    async fn put_string(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), common_hypercache::S3Error> {
+        Ok(())
+    }
+
+    async fn delete(&self, _bucket: &str, _key: &str) -> Result<(), common_hypercache::S3Error> {
+        Ok(())
+    }
+}
+
+/// A dummy S3 client (always NotFound) for injecting into the test server.
+pub fn dummy_s3_client() -> Arc<dyn common_hypercache::S3Client + Send + Sync> {
+    Arc::new(AlwaysMissS3Client)
+}
+
+/// Create a HyperCacheReader for tests using the provided Redis client.
+/// Uses default test configuration for S3 (which won't be used in most tests
+/// since Redis should have the data).
+/// Returns Arc<HyperCacheReader> to match the production pattern where the reader
+/// is shared across requests.
+pub async fn setup_hypercache_reader(
+    redis_client: Arc<dyn RedisClientTrait + Send + Sync>,
+) -> Arc<HyperCacheReader> {
+    let config = HyperCacheConfig::new(
+        "feature_flags".to_string(),
+        "flags.json".to_string(),
+        "us-east-1".to_string(),
+        "posthog".to_string(),
+    );
+    Arc::new(
+        HyperCacheReader::new(redis_client, config)
+            .await
+            .expect("Failed to create HyperCacheReader"),
+    )
+}
+
+/// Create a HyperCacheReader with a mock Redis client and a dummy S3 client
+/// that always returns NotFound. Parameterized for reuse across different
+/// HyperCache namespaces (feature_flags, team_metadata, etc.).
+#[cfg(test)]
+fn setup_mock_hypercache_reader(
+    redis_client: Arc<dyn RedisClientTrait + Send + Sync>,
+    namespace: &str,
+    object_name: &str,
+    token_based: bool,
+) -> Arc<HyperCacheReader> {
+    use common_s3::{S3Client, S3Error};
+
+    struct DummyS3Client;
+
+    #[async_trait]
+    impl S3Client for DummyS3Client {
+        async fn get_string(&self, _bucket: &str, key: &str) -> Result<String, S3Error> {
+            Err(S3Error::NotFound(key.to_string()))
+        }
+
+        async fn put_string(&self, _bucket: &str, _key: &str, _value: &str) -> Result<(), S3Error> {
+            Ok(())
+        }
+
+        async fn delete(&self, _bucket: &str, _key: &str) -> Result<(), S3Error> {
+            Ok(())
+        }
+    }
+
+    let mut config = HyperCacheConfig::new(
+        namespace.to_string(),
+        object_name.to_string(),
+        "us-east-1".to_string(),
+        "posthog".to_string(),
+    );
+    config.token_based = token_based;
+    let s3_client: Arc<dyn S3Client + Send + Sync> = Arc::new(DummyS3Client);
+    Arc::new(HyperCacheReader::new_with_s3_client(
+        redis_client,
+        s3_client,
+        config,
+    ))
+}
+
+/// Create a feature_flags HyperCacheReader with a mock Redis client.
+#[cfg(test)]
+pub fn setup_hypercache_reader_with_mock_redis(
+    redis_client: Arc<dyn RedisClientTrait + Send + Sync>,
+) -> Arc<HyperCacheReader> {
+    setup_mock_hypercache_reader(redis_client, "feature_flags", "flags.json", false)
+}
+
+/// Create a HyperCacheReader for team_metadata using the provided Redis client.
+/// Uses token_based=true for token-based lookups.
+/// Returns Arc<HyperCacheReader> to match the production pattern.
+pub async fn setup_team_hypercache_reader(
+    redis_client: Arc<dyn RedisClientTrait + Send + Sync>,
+) -> Arc<HyperCacheReader> {
+    let mut config = HyperCacheConfig::new(
+        "team_metadata".to_string(),
+        "full_metadata.json".to_string(),
+        "us-east-1".to_string(),
+        "posthog".to_string(),
+    );
+    config.token_based = true;
+    Arc::new(
+        HyperCacheReader::new(redis_client, config)
+            .await
+            .expect("Failed to create team HyperCacheReader"),
+    )
+}
+
+/// Create a team_metadata HyperCacheReader with a mock Redis client.
+#[cfg(test)]
+pub fn setup_team_hypercache_reader_with_mock_redis(
+    redis_client: Arc<dyn RedisClientTrait + Send + Sync>,
+) -> Arc<HyperCacheReader> {
+    setup_mock_hypercache_reader(redis_client, "team_metadata", "full_metadata.json", true)
+}
+
+/// Create a HyperCacheReader for remote config (array/config.json).
+/// Uses token_based=true for token-based lookups (api_token).
+/// Returns Arc<HyperCacheReader> to match the production pattern.
+pub async fn setup_config_hypercache_reader(
+    redis_client: Arc<dyn RedisClientTrait + Send + Sync>,
+) -> Arc<HyperCacheReader> {
+    let mut config = HyperCacheConfig::new(
+        "array".to_string(),
+        "config.json".to_string(),
+        "us-east-1".to_string(),
+        "posthog".to_string(),
+    );
+    config.token_based = true;
+    Arc::new(
+        HyperCacheReader::new(redis_client, config)
+            .await
+            .expect("Failed to create config HyperCacheReader"),
+    )
+}
+
+/// Generate the HyperCache key for remote config.
+/// Format: posthog:1:cache/team_tokens/{api_token}/array/config.json
+pub fn config_hypercache_key(api_token: &str) -> String {
+    format!("posthog:1:cache/team_tokens/{api_token}/array/config.json")
+}
+
+/// Insert remote config data in HyperCache for testing.
+/// Use this when testing the config cache reader.
+/// Format: Pickle(JSON string) to match Django's cache format.
+pub async fn insert_config_in_hypercache(
+    client: Arc<dyn RedisClientTrait + Send + Sync>,
+    api_token: &str,
+    config_json: serde_json::Value,
+) -> Result<(), Error> {
+    let json_string = serde_json::to_string(&config_json)?;
+    let pickled_bytes =
+        serde_pickle::to_vec(&json_string, Default::default()).expect("Failed to pickle config");
+    let cache_key = config_hypercache_key(api_token);
+    client.set_bytes(cache_key, pickled_bytes, None).await?;
+    Ok(())
+}
+
+pub fn create_flag_from_json(json_value: Option<String>) -> Vec<FeatureFlag> {
+    let payload = match json_value {
+        Some(value) => value,
+        None => json!([{
+            "id": 1,
+            "key": "flag1",
+            "name": "flag1 description",
+            "active": true,
+            "deleted": false,
+            "team_id": 1,
+            "filters": {
+                "groups": [
+                    {
+                        "properties": [
+                            {
+                                "key": "email",
+                                "value": "a@b.com",
+                                "type": "person",
+                            },
+                        ],
+                        "rollout_percentage": 50,
+                    },
+                ],
+            },
+        }])
+        .to_string(),
+    };
+
+    let flags: Vec<FeatureFlag> =
+        serde_json::from_str(&payload).expect("Failed to parse data to flags list");
+    flags
+}
+
+pub fn setup_pg_reader_client(config: Option<&Config>) -> Arc<dyn Client + Send + Sync> {
+    let config = config.unwrap_or(&DEFAULT_TEST_CONFIG);
+    Arc::new(
+        get_pool(&config.read_database_url, config.max_pg_connections)
+            .expect("Failed to create Postgres client"),
+    )
+}
+
+pub fn setup_pg_writer_client(config: Option<&Config>) -> Arc<dyn Client + Send + Sync> {
+    let config = config.unwrap_or(&DEFAULT_TEST_CONFIG);
+    Arc::new(
+        get_pool(&config.write_database_url, config.max_pg_connections)
+            .expect("Failed to create Postgres client"),
+    )
+}
+
+/// Setup dual database clients for tests that need to work with both persons and non-persons databases.
+/// If persons DB routing is not enabled, returns the same client twice.
+pub fn setup_dual_pg_readers(
+    config: Option<&Config>,
+) -> (Arc<dyn Client + Send + Sync>, Arc<dyn Client + Send + Sync>) {
+    let config = config.unwrap_or(&DEFAULT_TEST_CONFIG);
+
+    if config.is_persons_db_routing_enabled() {
+        // Separate persons and non-persons databases
+        let persons_reader = Arc::new(
+            get_pool(
+                &config.get_persons_read_database_url(),
+                config.max_pg_connections,
+            )
+            .expect("Failed to create Postgres persons reader client"),
+        );
+        let non_persons_reader = Arc::new(
+            get_pool(&config.read_database_url, config.max_pg_connections)
+                .expect("Failed to create Postgres client"),
+        );
+        (persons_reader, non_persons_reader)
+    } else {
+        // Same database for both
+        let client = Arc::new(
+            get_pool(&config.read_database_url, config.max_pg_connections)
+                .expect("Failed to create Postgres client"),
+        );
+        (client.clone(), client)
+    }
+}
+
+/// Setup dual database writers for tests that need to write to both persons and non-persons databases.
+/// If persons DB routing is not enabled, returns the same client twice.
+pub fn setup_dual_pg_writers(
+    config: Option<&Config>,
+) -> (Arc<dyn Client + Send + Sync>, Arc<dyn Client + Send + Sync>) {
+    let config = config.unwrap_or(&DEFAULT_TEST_CONFIG);
+
+    if config.is_persons_db_routing_enabled() {
+        // Separate persons and non-persons databases
+        let persons_writer = Arc::new(
+            get_pool(
+                &config.get_persons_write_database_url(),
+                config.max_pg_connections,
+            )
+            .expect("Failed to create Postgres persons writer client"),
+        );
+        let non_persons_writer = Arc::new(
+            get_pool(&config.write_database_url, config.max_pg_connections)
+                .expect("Failed to create Postgres client"),
+        );
+        (persons_writer, non_persons_writer)
+    } else {
+        // Same database for both
+        let client = Arc::new(
+            get_pool(&config.write_database_url, config.max_pg_connections)
+                .expect("Failed to create Postgres client"),
+        );
+        (client.clone(), client)
+    }
+}
+
+pub struct MockPgClient;
+
+#[async_trait]
+impl Client for MockPgClient {
+    async fn get_connection(&self) -> Result<PoolConnection<Postgres>, CustomDatabaseError> {
+        // Simulate a database connection failure
+        Err(CustomDatabaseError::Other(SqlxError::PoolTimedOut))
+    }
+
+    fn get_pool_stats(&self) -> Option<common_database::PoolStats> {
+        // Return None for mock client
+        None
+    }
+}
+
+pub async fn setup_invalid_pg_client() -> Arc<dyn Client + Send + Sync> {
+    Arc::new(MockPgClient)
+}
+
+/// Inserts an organization if it doesn't exist
+/// If slug is not provided, generates one from the org_id
+async fn insert_organization_if_not_exists(
+    conn: &mut PoolConnection<Postgres>,
+    org_id: &str,
+    slug: Option<&str>,
+) -> Result<(), Error> {
+    let org_slug = match slug {
+        Some(s) => s.to_string(),
+        None => format!("test-org-{}", &org_id[..8]),
+    };
+
+    sqlx::query(
+        r#"INSERT INTO posthog_organization
+        (id, name, slug, created_at, updated_at, plugins_access_level, for_internal_metrics, is_member_join_email_enabled, enforce_2fa, is_hipaa, customer_id, available_product_features, personalization, setup_section_2_completed, domain_whitelist, members_can_use_personal_api_keys, allow_publicly_shared_resources, default_anonymize_ips)
+        VALUES
+        ($1::uuid, 'Test Organization', $2, '2024-06-17 14:40:49.298579+00:00', '2024-06-17 14:40:49.298593+00:00', 9, false, true, NULL, false, NULL, '{}', '{}', true, '{}', true, true, false)
+        ON CONFLICT DO NOTHING"#,
+    )
+    .bind(org_id)
+    .bind(&org_slug)
+    .execute(&mut **conn)
+    .await?;
+
+    Ok(())
+}
+
+/// Inserts group type mappings for a team in the persons database
+async fn insert_team_group_mappings(
+    persons_client: Arc<dyn Client + Send + Sync>,
+    team: &Team,
+) -> Result<(), Error> {
+    let mut persons_conn = persons_client.get_connection().await?;
+    let group_types = vec![
+        ("project", 0),
+        ("organization", 1),
+        ("instance", 2),
+        ("customer", 3),
+        ("team", 4),
+    ];
+
+    for (group_type, group_type_index) in group_types {
+        sqlx::query(
+            r#"INSERT INTO posthog_grouptypemapping
+            (group_type, group_type_index, name_singular, name_plural, team_id, project_id)
+            VALUES
+            ($1, $2, NULL, NULL, $3, $4)
+            ON CONFLICT (project_id, group_type_index) DO NOTHING"#,
+        )
+        .bind(group_type)
+        .bind(group_type_index)
+        .bind(team.id)
+        .bind(team.id)
+        .execute(&mut *persons_conn)
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub async fn insert_new_team_in_pg(
+    persons_client: Arc<dyn Client + Send + Sync>,
+    non_persons_client: Arc<dyn Client + Send + Sync>,
+    team_id: Option<i32>,
+    org_id: Option<&str>,
+) -> Result<Team, Error> {
+    let org_id = org_id.unwrap_or("019026a4be8000005bf3171d00629163");
+
+    // Create team model
+    let id = match team_id {
+        Some(value) => value,
+        None => {
+            let mut non_persons_conn = non_persons_client.get_connection().await?;
+            let row: (i32,) = sqlx::query_as("SELECT nextval('posthog_team_id_seq')::int")
+                .fetch_one(&mut *non_persons_conn)
+                .await?;
+            row.0
+        }
+    };
+    let token = random_string("phc_", 12);
+    let team = Team {
+        id,
+        name: "Test Team".to_string(),
+        api_token: token.clone(),
+        cookieless_server_hash_mode: Some(0),
+        timezone: "UTC".to_string(),
+        ..Default::default()
+    };
+
+    // Insert organization and project
+    let mut non_persons_conn = non_persons_client.get_connection().await?;
+    insert_organization_if_not_exists(&mut non_persons_conn, org_id, None).await?;
+
+    let uuid = Uuid::now_v7();
+    let res = sqlx::query(
+        r#"INSERT INTO posthog_project
+        (id, organization_id, name, created_at) VALUES
+        ($1, $2::uuid, $3, '2024-06-17 14:40:51.332036+00:00')"#,
+    )
+    .bind(team.id)
+    .bind(org_id)
+    .bind(&team.name)
+    .execute(&mut *non_persons_conn)
+    .await?;
+    assert_eq!(res.rows_affected(), 1);
+
+    // Insert team without secret tokens
+    let res = sqlx::query(
+        r#"INSERT INTO posthog_team
+        (id, uuid, organization_id, project_id, api_token, name, created_at, updated_at, app_urls, anonymize_ips, completed_snippet_onboarding, ingested_event, session_recording_opt_in, is_demo, access_control, test_account_filters, timezone, data_attributes, plugins_opt_in, opt_out_capture, event_names, event_names_with_usage, event_properties, event_properties_with_usage, event_properties_numerical, cookieless_server_hash_mode, base_currency, session_recording_retention_period, web_analytics_pre_aggregated_tables_enabled) VALUES
+        ($1, $2, $3::uuid, $4, $5, $6, '2024-06-17 14:40:51.332036+00:00', '2024-06-17', '{}', false, false, false, false, false, false, '{}', 'UTC', '["data-attr"]', false, false, '[]', '[]', '[]', '[]', '[]', $7, 'USD', '30d', false)"#
+    ).bind(team.id).bind(uuid).bind(org_id).bind(team.id).bind(&team.api_token).bind(&team.name).bind(team.cookieless_server_hash_mode.unwrap_or(0)).execute(&mut *non_persons_conn).await?;
+    assert_eq!(res.rows_affected(), 1);
+
+    // Insert group type mappings
+    insert_team_group_mappings(persons_client, &team).await?;
+
+    Ok(team)
+}
+
+pub async fn insert_flag_for_team_in_pg(
+    client: Arc<dyn Client + Send + Sync>,
+    team_id: i32,
+    flag: Option<FeatureFlagRow>,
+) -> Result<FeatureFlagRow, Error> {
+    let mut payload_flag = match flag {
+        Some(value) => value,
+        None => FeatureFlagRow {
+            id: 0, // Placeholder, will be updated after insertion
+            key: "flag1".to_string(),
+            name: Some("flag1 description".to_string()),
+            active: true,
+            deleted: false,
+            ensure_experience_continuity: Some(false),
+            team_id,
+            filters: json!({
+                "groups": [
+                    {
+                        "properties": [
+                            {
+                                "key": "email",
+                                "value": "a@b.com",
+                                "type": "person",
+                            },
+                        ],
+                        "rollout_percentage": 50,
+                    },
+                ],
+            }),
+            version: None,
+            evaluation_runtime: Some("all".to_string()),
+            evaluation_tags: None,
+            bucketing_identifier: None,
+            has_experiment: false,
+        },
+    };
+
+    let mut conn = client.get_connection().await?;
+    let row: (i32,) = sqlx::query_as(
+        r#"INSERT INTO posthog_featureflag
+        (team_id, name, key, filters, deleted, active, ensure_experience_continuity, evaluation_runtime, created_at) VALUES
+        ($1, $2, $3, $4, $5, $6, $7, $8, '2024-06-17')
+        RETURNING id"#
+    ).bind(team_id).bind(&payload_flag.name).bind(&payload_flag.key).bind(&payload_flag.filters).bind(payload_flag.deleted).bind(payload_flag.active).bind(payload_flag.ensure_experience_continuity).bind(&payload_flag.evaluation_runtime).fetch_one(&mut *conn).await?;
+
+    payload_flag.id = row.0;
+
+    Ok(payload_flag)
+}
+
+pub async fn insert_evaluation_tags_for_flag_in_pg(
+    client: Arc<dyn Client + Send + Sync>,
+    flag_id: i32,
+    team_id: i32,
+    tag_names: Vec<&str>,
+) -> Result<(), Error> {
+    let mut conn = client.get_connection().await?;
+
+    for tag_name in tag_names {
+        // Insert the evaluation context if it doesn't exist
+        let ctx_uuid = Uuid::now_v7();
+        let ctx_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO posthog_evaluationcontext (id, name, team_id, created_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (team_id, name) DO UPDATE
+            SET name = EXCLUDED.name
+            RETURNING id
+            "#,
+        )
+        .bind(ctx_uuid)
+        .bind(tag_name)
+        .bind(team_id)
+        .fetch_one(&mut *conn)
+        .await?;
+
+        // Then, create the flag-context association
+        let assoc_uuid = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO posthog_featureflagevaluationcontext (id, feature_flag_id, evaluation_context_id, created_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (feature_flag_id, evaluation_context_id) DO NOTHING
+            "#,
+        )
+        .bind(assoc_uuid)
+        .bind(flag_id)
+        .bind(ctx_id)
+        .execute(&mut *conn)
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub async fn insert_experiment_for_flag_in_pg(
+    client: Arc<dyn Client + Send + Sync>,
+    flag_id: i32,
+    team_id: i32,
+    deleted: bool,
+) -> Result<(), Error> {
+    let mut conn = client.get_connection().await?;
+    sqlx::query(
+        r#"
+        INSERT INTO posthog_experiment
+        (name, filters, feature_flag_id, team_id, deleted, archived,
+         only_count_matured_users, created_at, updated_at)
+        VALUES ('test experiment', '{}'::jsonb, $1, $2, $3, false, false, NOW(), NOW())
+        "#,
+    )
+    .bind(flag_id)
+    .bind(team_id)
+    .bind(deleted)
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn insert_person_for_team_in_pg(
+    client: Arc<dyn Client + Send + Sync>,
+    team_id: i32,
+    distinct_id: String,
+    properties: Option<Value>,
+) -> Result<PersonId, Error> {
+    let payload = match properties {
+        Some(value) => value,
+        None => json!({
+            "email": "a@b.com",
+            "name": "Alice",
+        }),
+    };
+
+    let uuid = Uuid::now_v7();
+
+    let mut conn = client.get_connection().await?;
+    let row = sqlx::query(
+        r#"
+        WITH inserted_person AS (
+            INSERT INTO posthog_person (
+                created_at, properties, properties_last_updated_at,
+                properties_last_operation, team_id, is_user_id, is_identified, uuid, version
+            )
+            VALUES ('2023-04-05', $1, '{}', '{}', $2, NULL, true, $3, 0)
+            RETURNING id
+        )
+        INSERT INTO posthog_persondistinctid (distinct_id, person_id, team_id, version)
+        VALUES ($4, (SELECT id FROM inserted_person), $5, 0)
+        RETURNING person_id
+        "#,
+    )
+    .bind(&payload)
+    .bind(team_id)
+    .bind(uuid)
+    .bind(&distinct_id)
+    .bind(team_id)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    let person_id: PersonId = row.get::<PersonId, _>("person_id");
+    Ok(person_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_cohort_for_team_in_pg(
+    client: Arc<dyn Client + Send + Sync>,
+    team_id: i32,
+    name: Option<String>,
+    filters: serde_json::Value,
+    is_static: bool,
+    cohort_type: Option<CohortType>,
+    last_backfill_person_properties_at: Option<DateTime<Utc>>,
+    last_backfill_events_at: Option<DateTime<Utc>>,
+) -> Result<Cohort, Error> {
+    let cohort = Cohort {
+        id: 0, // Placeholder, will be updated after insertion
+        name,
+        description: Some("Description for cohort".to_string()),
+        team_id,
+        deleted: false,
+        filters: Some(filters),
+        query: None,
+        version: Some(1),
+        pending_version: None,
+        count: None,
+        is_calculating: false,
+        is_static,
+        errors_calculating: 0,
+        groups: serde_json::json!([]),
+        created_by_id: None,
+        cohort_type,
+        last_backfill_person_properties_at,
+        last_backfill_events_at,
+    };
+
+    let mut conn = client.get_connection().await?;
+    let row: (i32,) = sqlx::query_as(
+        r#"INSERT INTO posthog_cohort
+        (name, description, team_id, deleted, filters, query, version, pending_version, count, is_calculating, is_static, errors_calculating, groups, created_by_id, cohort_type, last_backfill_person_properties_at, last_backfill_events_at) VALUES
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        RETURNING id"#,
+    )
+    .bind(&cohort.name)
+    .bind(&cohort.description)
+    .bind(cohort.team_id)
+    .bind(cohort.deleted)
+    .bind(&cohort.filters)
+    .bind(&cohort.query)
+    .bind(cohort.version)
+    .bind(cohort.pending_version)
+    .bind(cohort.count)
+    .bind(cohort.is_calculating)
+    .bind(cohort.is_static)
+    .bind(cohort.errors_calculating)
+    .bind(&cohort.groups)
+    .bind(cohort.created_by_id)
+    .bind(cohort.cohort_type)
+    .bind(cohort.last_backfill_person_properties_at)
+    .bind(cohort.last_backfill_events_at)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    // Update the cohort_row with the actual id generated by sqlx
+    let id = row.0;
+
+    Ok(Cohort { id, ..cohort })
+}
+
+pub async fn get_person_id_by_distinct_id(
+    client: Arc<dyn Client + Send + Sync>,
+    team_id: i32,
+    distinct_id: &str,
+) -> Result<PersonId, Error> {
+    let mut conn = client.get_connection().await?;
+    Person::from_distinct_id(&mut conn, team_id, distinct_id)
+        .await?
+        .map(|p| p.id)
+        .ok_or_else(|| anyhow::anyhow!("Person not found"))
+}
+
+pub async fn add_person_to_cohort(
+    client: Arc<dyn Client + Send + Sync>,
+    person_id: PersonId,
+    cohort_id: CohortId,
+) -> Result<(), Error> {
+    let mut conn = client.get_connection().await?;
+    let res = sqlx::query(
+        r#"INSERT INTO posthog_cohortpeople (cohort_id, person_id)
+           VALUES ($1, $2)
+           ON CONFLICT DO NOTHING"#,
+    )
+    .bind(cohort_id)
+    .bind(person_id)
+    .execute(&mut *conn)
+    .await?;
+
+    assert!(res.rows_affected() > 0, "Failed to add person to cohort");
+
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct Group {
+    pub id: i32,
+    pub team_id: i32,
+    pub group_type_index: i32,
+    pub group_key: String,
+    pub group_properties: Value,
+}
+
+pub async fn create_group_in_pg(
+    client: Arc<dyn Client + Send + Sync>,
+    team_id: i32,
+    group_type: &str,
+    group_key: &str,
+    group_properties: Value,
+) -> Result<Group, Error> {
+    // First, retrieve the group_type_index from grouptypemapping
+    let mut conn = client.get_connection().await?;
+    let row = sqlx::query(
+        r#"SELECT group_type_index FROM posthog_grouptypemapping
+           WHERE team_id = $1 AND group_type = $2"#,
+    )
+    .bind(team_id)
+    .bind(group_type)
+    .fetch_one(&mut *conn)
+    .await?;
+    let group_type_index: i32 = row.get("group_type_index");
+
+    // Insert the group with all non-nullable fields
+    let res = sqlx::query(
+        r#"INSERT INTO posthog_group
+           (team_id, group_type_index, group_key, group_properties, created_at, properties_last_updated_at, properties_last_operation, version)
+           VALUES ($1, $2, $3, $4, '2024-06-17', '{}'::jsonb, '{}'::jsonb, 0)
+           RETURNING id"#,
+    )
+    .bind(team_id)
+    .bind(group_type_index)
+    .bind(group_key)
+    .bind(group_properties.clone())
+    .fetch_one(&mut *conn)
+    .await?;
+    let group_id: i32 = res.get("id");
+
+    Ok(Group {
+        id: group_id,
+        team_id,
+        group_type_index,
+        group_key: group_key.to_string(),
+        group_properties,
+    })
+}
+
+/// Insert a suppression rule for error tracking into the database
+pub async fn insert_suppression_rule_in_pg(
+    client: Arc<dyn Client + Send + Sync>,
+    team_id: i32,
+    filters: serde_json::Value,
+) -> Result<uuid::Uuid, Error> {
+    let mut conn = client.get_connection().await?;
+    let rule_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO posthog_errortrackingsuppressionrule
+           (id, team_id, filters, created_at, updated_at, order_key, sampling_rate)
+           VALUES ($1, $2, $3, NOW(), NOW(), 0, 1.0)"#,
+    )
+    .bind(rule_id)
+    .bind(team_id)
+    .bind(filters)
+    .execute(&mut *conn)
+    .await?;
+    Ok(rule_id)
+}
+
+/// Update autocapture exceptions setting for a team in the database
+pub async fn update_team_autocapture_exceptions(
+    client: Arc<dyn Client + Send + Sync>,
+    team_id: i32,
+    enabled: bool,
+) -> Result<(), Error> {
+    let mut conn = client.get_connection().await?;
+    sqlx::query("UPDATE posthog_team SET autocapture_exceptions_opt_in = $1 WHERE id = $2")
+        .bind(enabled)
+        .bind(team_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+pub async fn update_team_timezone(
+    client: Arc<dyn Client + Send + Sync>,
+    team_id: i32,
+    timezone: &str,
+) -> Result<(), Error> {
+    let mut conn = client.get_connection().await?;
+    sqlx::query("UPDATE posthog_team SET timezone = $1 WHERE id = $2")
+        .bind(timezone)
+        .bind(team_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Build a `FeatureFlagList` with proper `EvaluationMetadata` from a list of flags.
+///
+/// Scans each flag's filters for `PropertyType::Flag` dependencies and produces
+/// topologically sorted `dependency_stages`. Flags with no inter-flag dependencies
+/// land in the first stage; flags that depend on others land in later stages.
+///
+/// Handles cycles (cycle participants go into `flags_with_missing_deps`) and
+/// missing dependencies (deps on flag IDs not in the set).
+pub fn flag_list_with_metadata(flags: Vec<FeatureFlag>) -> FeatureFlagList {
+    flag_list_with_metadata_and_filter(flags, HashSet::new())
+}
+
+/// Like `flag_list_with_metadata` but also sets `filtered_out_flag_ids`.
+pub fn flag_list_with_metadata_and_filter(
+    flags: Vec<FeatureFlag>,
+    filtered_out_flag_ids: HashSet<i32>,
+) -> FeatureFlagList {
+    let flag_ids: HashSet<i32> = flags.iter().map(|f| f.id).collect();
+    debug_assert_eq!(
+        flags.len(),
+        flag_ids.len(),
+        "flag_list_with_metadata called with duplicate flag IDs: {:?}",
+        flags.iter().map(|f| f.id).collect::<Vec<_>>()
+    );
+
+    // Build adjacency: flag_id -> set of flag_ids it depends on (only known flags)
+    // Also track flags with missing deps (deps on IDs not in the flag set)
+    let mut deps: HashMap<i32, HashSet<i32>> = HashMap::new();
+    let mut flags_with_missing_deps_set: HashSet<i32> = HashSet::new();
+    for flag in &flags {
+        let mut flag_deps = HashSet::new();
+        for group in &flag.filters.groups {
+            if let Some(props) = &group.properties {
+                for prop in props {
+                    if prop.prop_type == PropertyType::Flag {
+                        if let Ok(dep_id) = prop.key.parse::<i32>() {
+                            if dep_id == flag.id {
+                                // Self-referencing dependency is a cycle
+                                flags_with_missing_deps_set.insert(flag.id);
+                            } else if flag_ids.contains(&dep_id) {
+                                flag_deps.insert(dep_id);
+                            } else {
+                                flags_with_missing_deps_set.insert(flag.id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        deps.insert(flag.id, flag_deps);
+    }
+
+    // Topological sort (Kahn's algorithm) — cycle participants stay in `remaining`
+    // Build reverse adjacency: dep_id -> set of flag_ids that depend on it
+    let mut reverse_deps: HashMap<i32, Vec<i32>> = HashMap::new();
+    let mut in_degree: HashMap<i32, usize> = flag_ids.iter().map(|&id| (id, 0)).collect();
+    for (&id, flag_deps) in &deps {
+        for &dep in flag_deps {
+            if flag_ids.contains(&dep) && dep != id {
+                *in_degree.entry(id).or_insert(0) += 1;
+                reverse_deps.entry(dep).or_default().push(id);
+            }
+        }
+    }
+
+    let mut stages: Vec<Vec<i32>> = Vec::new();
+    let mut remaining: HashSet<i32> = flag_ids.clone();
+
+    loop {
+        let mut stage: Vec<i32> = remaining
+            .iter()
+            .filter(|&&id| *in_degree.get(&id).unwrap_or(&0) == 0)
+            .copied()
+            .collect();
+        stage.sort();
+
+        if stage.is_empty() {
+            break; // remaining flags are all cycle participants
+        }
+
+        for &id in &stage {
+            remaining.remove(&id);
+        }
+
+        // Decrease in-degree for dependents via reverse adjacency
+        for &resolved_id in &stage {
+            if let Some(dependents) = reverse_deps.get(&resolved_id) {
+                for &dependent_id in dependents {
+                    if remaining.contains(&dependent_id) {
+                        *in_degree.get_mut(&dependent_id).unwrap() -= 1;
+                    }
+                }
+            }
+        }
+
+        stages.push(stage);
+    }
+
+    // Any flags still in `remaining` are cycle participants
+    for &id in &remaining {
+        flags_with_missing_deps_set.insert(id);
+    }
+
+    // Compute transitive deps (only for non-cycle flags)
+    let mut transitive_deps: HashMap<i32, HashSet<i32>> = HashMap::new();
+    for &id in &flag_ids {
+        if remaining.contains(&id) {
+            transitive_deps.insert(id, HashSet::new());
+            continue;
+        }
+        let mut visited = HashSet::new();
+        let mut stack: Vec<i32> = deps
+            .get(&id)
+            .map_or(vec![], |d| d.iter().copied().collect());
+        while let Some(dep) = stack.pop() {
+            if visited.insert(dep) && !remaining.contains(&dep) {
+                if let Some(transitive) = deps.get(&dep) {
+                    for &t in transitive {
+                        if !visited.contains(&t) {
+                            stack.push(t);
+                        }
+                    }
+                }
+            }
+        }
+        transitive_deps.insert(id, visited);
+    }
+
+    let mut flags_with_missing_deps: Vec<i32> = flags_with_missing_deps_set.into_iter().collect();
+    flags_with_missing_deps.sort();
+
+    let evaluation_metadata = Arc::new(EvaluationMetadata {
+        dependency_stages: stages,
+        flags_with_missing_deps,
+        transitive_deps,
+    });
+
+    FeatureFlagList {
+        flags: flags.into(),
+        filtered_out_flag_ids,
+        evaluation_metadata,
+        cohorts: None,
+    }
+}
+
+/// Test context that encapsulates all database connections needed for testing
+/// This struct manages the proper routing of database operations to the correct
+/// database (persons vs non-persons) based on the configuration
+pub struct TestContext {
+    pub persons_reader: Arc<dyn Client + Send + Sync>,
+    pub persons_writer: Arc<dyn Client + Send + Sync>,
+    pub non_persons_reader: Arc<dyn Client + Send + Sync>,
+    pub non_persons_writer: Arc<dyn Client + Send + Sync>,
+    /// Pool for the behavioral cohorts database (cohort_membership table).
+    /// Available when `behavioral_cohorts_read_database_url` is configured in test config.
+    pub behavioral_cohorts_pool: Option<Arc<sqlx::PgPool>>,
+    config: Config,
+}
+
+impl TestContext {
+    pub async fn new(config: Option<&Config>) -> Self {
+        let config = config.unwrap_or(&DEFAULT_TEST_CONFIG).clone();
+
+        let (persons_reader, non_persons_reader) = setup_dual_pg_readers(Some(&config));
+        let (persons_writer, non_persons_writer) = setup_dual_pg_writers(Some(&config));
+
+        let behavioral_cohorts_pool = if config.is_behavioral_cohorts_db_configured() {
+            match sqlx::PgPool::connect(&config.behavioral_cohorts_read_database_url).await {
+                Ok(pool) => Some(Arc::new(pool)),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to connect to behavioral cohorts database ({}), \
+                         cohort membership tests will be skipped: {e}",
+                        config.behavioral_cohorts_read_database_url
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Self {
+            persons_reader,
+            persons_writer,
+            non_persons_reader,
+            non_persons_writer,
+            behavioral_cohorts_pool,
+            config,
+        }
+    }
+
+    pub fn create_postgres_router(&self) -> crate::database::PostgresRouter {
+        crate::database::PostgresRouter::new(
+            self.persons_reader.clone(),
+            self.persons_writer.clone(),
+            self.non_persons_reader.clone(),
+            self.non_persons_writer.clone(),
+        )
+    }
+
+    pub async fn insert_new_team(&self, team_id: Option<i32>) -> Result<Team, Error> {
+        insert_new_team_in_pg(
+            self.persons_writer.clone(),
+            self.non_persons_writer.clone(),
+            team_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn insert_new_team_with_org(
+        &self,
+        team_id: Option<i32>,
+        org_id: &str,
+    ) -> Result<Team, Error> {
+        insert_new_team_in_pg(
+            self.persons_writer.clone(),
+            self.non_persons_writer.clone(),
+            team_id,
+            Some(org_id),
+        )
+        .await
+    }
+
+    pub async fn insert_flag(
+        &self,
+        team_id: i32,
+        flag: Option<FeatureFlagRow>,
+    ) -> Result<FeatureFlagRow, Error> {
+        insert_flag_for_team_in_pg(self.non_persons_writer.clone(), team_id, flag).await
+    }
+
+    pub async fn insert_experiment(
+        &self,
+        flag_id: i32,
+        team_id: i32,
+        deleted: bool,
+    ) -> Result<(), Error> {
+        insert_experiment_for_flag_in_pg(self.non_persons_writer.clone(), flag_id, team_id, deleted)
+            .await
+    }
+
+    pub async fn insert_person(
+        &self,
+        team_id: i32,
+        distinct_id: String,
+        properties: Option<Value>,
+    ) -> Result<PersonId, Error> {
+        insert_person_for_team_in_pg(
+            self.persons_writer.clone(),
+            team_id,
+            distinct_id,
+            properties,
+        )
+        .await
+    }
+
+    pub async fn insert_cohort(
+        &self,
+        team_id: i32,
+        name: Option<String>,
+        filters: serde_json::Value,
+        is_static: bool,
+    ) -> Result<Cohort, Error> {
+        insert_cohort_for_team_in_pg(
+            self.non_persons_writer.clone(),
+            team_id,
+            name,
+            filters,
+            is_static,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_cohort_with_type(
+        &self,
+        team_id: i32,
+        name: Option<String>,
+        filters: serde_json::Value,
+        is_static: bool,
+        cohort_type: Option<CohortType>,
+        last_backfill_person_properties_at: Option<DateTime<Utc>>,
+        last_backfill_events_at: Option<DateTime<Utc>>,
+    ) -> Result<Cohort, Error> {
+        insert_cohort_for_team_in_pg(
+            self.non_persons_writer.clone(),
+            team_id,
+            name,
+            filters,
+            is_static,
+            cohort_type,
+            last_backfill_person_properties_at,
+            last_backfill_events_at,
+        )
+        .await
+    }
+
+    pub async fn insert_evaluation_tags_for_flag(
+        &self,
+        flag_id: i32,
+        team_id: i32,
+        tag_names: Vec<&str>,
+    ) -> Result<(), Error> {
+        insert_evaluation_tags_for_flag_in_pg(
+            self.non_persons_writer.clone(),
+            flag_id,
+            team_id,
+            tag_names,
+        )
+        .await
+    }
+
+    pub async fn add_person_to_cohort(
+        &self,
+        cohort_id: CohortId,
+        person_id: PersonId,
+    ) -> Result<(), Error> {
+        add_person_to_cohort(self.persons_writer.clone(), person_id, cohort_id).await
+    }
+
+    pub async fn get_feature_flag_hash_key_overrides(
+        &self,
+        team_id: i32,
+        distinct_ids: Vec<String>,
+    ) -> Result<std::collections::HashMap<String, String>, super::super::api::errors::FlagError>
+    {
+        super::super::flags::flag_matching_utils::get_feature_flag_hash_key_overrides(
+            self.persons_reader.clone(),
+            team_id,
+            distinct_ids,
+        )
+        .await
+    }
+
+    pub async fn get_persons_connection(
+        &self,
+    ) -> Result<PoolConnection<Postgres>, CustomDatabaseError> {
+        self.persons_writer.get_connection().await
+    }
+
+    pub async fn get_non_persons_connection(
+        &self,
+    ) -> Result<PoolConnection<Postgres>, CustomDatabaseError> {
+        self.non_persons_writer.get_connection().await
+    }
+
+    pub async fn create_group(
+        &self,
+        team_id: i32,
+        group_type: &str,
+        group_key: &str,
+        group_properties: Value,
+    ) -> Result<Group, Error> {
+        create_group_in_pg(
+            self.persons_writer.clone(),
+            team_id,
+            group_type,
+            group_key,
+            group_properties,
+        )
+        .await
+    }
+
+    pub async fn insert_suppression_rule(
+        &self,
+        team_id: i32,
+        filters: serde_json::Value,
+    ) -> Result<uuid::Uuid, Error> {
+        insert_suppression_rule_in_pg(self.non_persons_writer.clone(), team_id, filters).await
+    }
+
+    pub async fn update_team_autocapture_exceptions(
+        &self,
+        team_id: i32,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        update_team_autocapture_exceptions(self.non_persons_writer.clone(), team_id, enabled).await
+    }
+
+    pub async fn update_team_timezone(&self, team_id: i32, timezone: &str) -> Result<(), Error> {
+        update_team_timezone(self.non_persons_writer.clone(), team_id, timezone).await
+    }
+
+    pub async fn get_person_id_by_distinct_id(
+        &self,
+        team_id: i32,
+        distinct_id: &str,
+    ) -> Result<PersonId, Error> {
+        get_person_id_by_distinct_id(self.persons_reader.clone(), team_id, distinct_id).await
+    }
+
+    /// Returns the person UUID for a given distinct_id, needed for cohort_membership inserts.
+    pub async fn get_person_uuid_by_distinct_id(
+        &self,
+        team_id: i32,
+        distinct_id: &str,
+    ) -> Result<Uuid, Error> {
+        let mut conn = self.persons_reader.get_connection().await?;
+        Person::from_distinct_id(&mut conn, team_id, distinct_id)
+            .await?
+            .map(|p| p.uuid)
+            .ok_or_else(|| anyhow::anyhow!("Person not found"))
+    }
+
+    /// Inserts a row into the `cohort_membership` table (behavioral cohorts database).
+    pub async fn insert_cohort_membership(
+        &self,
+        team_id: i32,
+        cohort_id: CohortId,
+        person_uuid: Uuid,
+        in_cohort: bool,
+    ) -> Result<(), Error> {
+        let pool = self
+            .behavioral_cohorts_pool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("behavioral cohorts pool not configured"))?;
+        sqlx::query(
+            r#"INSERT INTO cohort_membership (team_id, cohort_id, person_id, in_cohort)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (team_id, cohort_id, person_id) DO UPDATE SET in_cohort = $4"#,
+        )
+        .bind(i64::from(team_id))
+        .bind(i64::from(cohort_id))
+        .bind(person_uuid)
+        .bind(in_cohort)
+        .execute(pool.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    /// Creates a `CohortMembershipProvider` backed by the behavioral cohorts pool,
+    /// or falls back to `NoOpCohortMembershipProvider` if the pool is not available.
+    pub fn create_cohort_membership_provider(
+        &self,
+    ) -> Arc<dyn crate::cohorts::membership::CohortMembershipProvider> {
+        if let Some(pool) = &self.behavioral_cohorts_pool {
+            Arc::new(
+                crate::cohorts::membership::RealtimeCohortMembershipProvider::new(pool.clone()),
+            )
+        } else {
+            Arc::new(crate::cohorts::membership::NoOpCohortMembershipProvider)
+        }
+    }
+
+    /// Creates a user with configurable options
+    pub async fn create_user_with_options(
+        &self,
+        email: &str,
+        org_id: &uuid::Uuid,
+        team_id: Option<i32>,
+        is_active: bool,
+    ) -> Result<i32, Error> {
+        let mut conn = self.non_persons_writer.get_connection().await?;
+        let user_uuid = uuid::Uuid::new_v4();
+
+        let user_id: i32 = if let Some(team_id) = team_id {
+            sqlx::query(
+                "INSERT INTO posthog_user (
+                    password, last_login, email, first_name, last_name, is_active, is_staff, date_joined,
+                    events_column_config, current_organization_id, current_team_id, uuid
+                 )
+                 VALUES ('', NULL, $1, 'Test', 'User', $2, false, NOW(), '{\"active\": \"DEFAULT\"}'::jsonb, $3, $4, $5)
+                 RETURNING id",
+            )
+            .bind(email)
+            .bind(is_active)
+            .bind(org_id)
+            .bind(team_id)
+            .bind(user_uuid)
+            .fetch_one(&mut *conn)
+            .await?
+            .get(0)
+        } else {
+            sqlx::query(
+                "INSERT INTO posthog_user (
+                    password, last_login, email, first_name, last_name, is_active, is_staff, date_joined,
+                    events_column_config, current_organization_id, current_team_id, uuid
+                 )
+                 VALUES ('', NULL, $1, 'Test', 'User', $2, false, NOW(), '{\"active\": \"DEFAULT\"}'::jsonb, $3, NULL, $4)
+                 RETURNING id",
+            )
+            .bind(email)
+            .bind(is_active)
+            .bind(org_id)
+            .bind(user_uuid)
+            .fetch_one(&mut *conn)
+            .await?
+            .get(0)
+        };
+
+        Ok(user_id)
+    }
+
+    /// Creates an active user with a team (common case)
+    pub async fn create_user(
+        &self,
+        email: &str,
+        org_id: &uuid::Uuid,
+        team_id: i32,
+    ) -> Result<i32, Error> {
+        self.create_user_with_options(email, org_id, Some(team_id), true)
+            .await
+    }
+
+    /// Creates a personal API key with hashed value (SHA256 mode)
+    pub async fn create_personal_api_key(
+        &self,
+        user_id: i32,
+        label: &str,
+        scopes: Vec<&str>,
+        scoped_teams: Option<Vec<i32>>,
+        scoped_organizations: Option<Vec<String>>,
+    ) -> Result<(String, String), Error> {
+        // Generate unique PAK ID and value
+        let pak_id = format!("test_pak_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let api_key_value = format!("phx_{}", &uuid::Uuid::new_v4().to_string()[..12]);
+
+        let secure_value = crate::api::auth::hash_token_value(&api_key_value);
+
+        let mut conn = self.non_persons_writer.get_connection().await?;
+
+        // Convert scopes to Vec<String>
+        let scopes_vec: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+
+        let mut query = sqlx::QueryBuilder::new(
+            "INSERT INTO posthog_personalapikey (id, user_id, label, secure_value, created_at, scopes",
+        );
+
+        if scoped_teams.is_some() {
+            query.push(", scoped_teams");
+        }
+        if scoped_organizations.is_some() {
+            query.push(", scoped_organizations");
+        }
+
+        query.push(") VALUES (");
+        query.push_bind(&pak_id);
+        query.push(", ");
+        query.push_bind(user_id);
+        query.push(", ");
+        query.push_bind(label);
+        query.push(", ");
+        query.push_bind(&secure_value);
+        query.push(", NOW(), ");
+        query.push_bind(&scopes_vec);
+
+        if let Some(teams) = scoped_teams {
+            query.push(", ");
+            query.push_bind(teams);
+        }
+        if let Some(orgs) = scoped_organizations {
+            query.push(", ");
+            query.push_bind(orgs);
+        }
+
+        query.push(")");
+
+        query.build().execute(&mut *conn).await?;
+
+        Ok((pak_id, api_key_value))
+    }
+
+    /// Creates a project secret API key with hashed value (SHA256 mode)
+    pub async fn create_project_secret_api_key(
+        &self,
+        team_id: i32,
+        label: &str,
+        scopes: Option<Vec<&str>>,
+    ) -> Result<String, Error> {
+        let key_id = format!("test_psk_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let raw_key = format!("phs_{}", &uuid::Uuid::new_v4().to_string()[..12]);
+
+        let secure_value = crate::api::auth::hash_token_value(&raw_key);
+        let mask_value = format!("...{}", &raw_key[raw_key.len().saturating_sub(5)..]);
+
+        let mut conn = self.non_persons_writer.get_connection().await?;
+
+        let scopes_vec: Option<Vec<String>> =
+            scopes.map(|s| s.iter().map(|v| v.to_string()).collect());
+
+        sqlx::query(
+            r#"INSERT INTO posthog_projectsecretapikey
+               (id, team_id, label, mask_value, secure_value, scopes, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, NOW())"#,
+        )
+        .bind(&key_id)
+        .bind(team_id)
+        .bind(label)
+        .bind(&mask_value)
+        .bind(&secure_value)
+        .bind(&scopes_vec)
+        .execute(&mut *conn)
+        .await?;
+
+        Ok(raw_key)
+    }
+
+    /// Creates a team with both public token and secret API token
+    /// Optionally accepts a backup secret token
+    pub async fn create_team_with_secret_token(
+        &self,
+        public_token: Option<&str>,
+        secret_token: Option<&str>,
+        backup_secret_token: Option<&str>,
+    ) -> Result<(Team, String, Option<String>), Error> {
+        // Generate unique tokens if not provided
+        let public_token = public_token
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| random_string("phc_", 12));
+        let secret_token = secret_token
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| random_string("phs_", 12));
+        let backup_secret_token = backup_secret_token.map(|s| s.to_string());
+
+        const ORG_ID: &str = "019026a4be8000005bf3171d00629163";
+
+        // Create team model with a sequence-assigned ID
+        let mut conn = self.non_persons_writer.get_connection().await?;
+        let row: (i32,) = sqlx::query_as("SELECT nextval('posthog_team_id_seq')::int")
+            .fetch_one(&mut *conn)
+            .await?;
+        let id = row.0;
+        let team = Team {
+            id,
+            name: "Test Team".to_string(),
+            api_token: public_token.clone(),
+            cookieless_server_hash_mode: Some(0),
+            timezone: "UTC".to_string(),
+            ..Default::default()
+        };
+
+        // Insert organization and project
+        let mut conn = self.non_persons_writer.get_connection().await?;
+        insert_organization_if_not_exists(&mut conn, ORG_ID, None).await?;
+
+        let uuid = Uuid::now_v7();
+        let res = sqlx::query(
+            r#"INSERT INTO posthog_project
+            (id, organization_id, name, created_at) VALUES
+            ($1, $2::uuid, $3, '2024-06-17 14:40:51.332036+00:00')"#,
+        )
+        .bind(team.id)
+        .bind(ORG_ID)
+        .bind(&team.name)
+        .execute(&mut *conn)
+        .await?;
+        assert_eq!(res.rows_affected(), 1);
+
+        // Insert team with secret tokens
+        let mut query_str = String::from(
+            "INSERT INTO posthog_team (id, uuid, organization_id, project_id, api_token, secret_api_token"
+        );
+
+        // Add secret_api_token_backup column if provided
+        if backup_secret_token.is_some() {
+            query_str.push_str(", secret_api_token_backup");
+        }
+
+        query_str.push_str(", name, created_at, updated_at, app_urls, anonymize_ips, completed_snippet_onboarding, ingested_event, session_recording_opt_in, is_demo, access_control, test_account_filters, timezone, data_attributes, plugins_opt_in, opt_out_capture, event_names, event_names_with_usage, event_properties, event_properties_with_usage, event_properties_numerical, cookieless_server_hash_mode, base_currency, session_recording_retention_period, web_analytics_pre_aggregated_tables_enabled) VALUES ($1, $2, $3::uuid, $4, $5, $6");
+
+        // Add backup token parameter placeholder if provided
+        if backup_secret_token.is_some() {
+            query_str.push_str(", $7");
+            query_str.push_str(", $8, '2024-06-17 14:40:51.332036+00:00', '2024-06-17', '{}', false, false, false, false, false, false, '{}', 'UTC', '[\"data-attr\"]', false, false, '[]', '[]', '[]', '[]', '[]', $9, 'USD', '30d', false)");
+        } else {
+            query_str.push_str(", $7, '2024-06-17 14:40:51.332036+00:00', '2024-06-17', '{}', false, false, false, false, false, false, '{}', 'UTC', '[\"data-attr\"]', false, false, '[]', '[]', '[]', '[]', '[]', $8, 'USD', '30d', false)");
+        }
+
+        let mut query = sqlx::query(&query_str)
+            .bind(team.id)
+            .bind(uuid)
+            .bind(ORG_ID)
+            .bind(team.id)
+            .bind(&team.api_token)
+            .bind(&secret_token);
+
+        if let Some(ref backup) = backup_secret_token {
+            query = query.bind(backup);
+        }
+
+        query = query
+            .bind(&team.name)
+            .bind(team.cookieless_server_hash_mode.unwrap_or(0));
+
+        let res = query.execute(&mut *conn).await?;
+        assert_eq!(res.rows_affected(), 1);
+
+        // Insert group type mappings
+        insert_team_group_mappings(self.persons_writer.clone(), &team).await?;
+
+        Ok((team, secret_token, backup_secret_token))
+    }
+
+    /// Populates the HyperCache with flag definitions for flag_definitions endpoint
+    /// Uses the same cache key format that Django's cache warming uses
+    pub async fn populate_flag_definitions_cache(
+        &self,
+        redis: Arc<dyn RedisClientTrait + Send + Sync>,
+        team_id: i32,
+    ) -> Result<(), Error> {
+        // Cache key format: posthog:1:cache/teams/{team_id}/feature_flags/flags_with_cohorts.json
+        let cache_key =
+            format!("posthog:1:cache/teams/{team_id}/feature_flags/flags_with_cohorts.json");
+
+        // Create minimal valid flag definitions response
+        let flags_data = json!({
+            "flags": [],
+            "group_type_mapping": {},
+            "cohorts": {}
+        });
+
+        let payload = serde_json::to_string(&flags_data)?;
+
+        redis
+            .set(cache_key, payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to set cache: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Populate cache for a team with custom flag definitions payload.
+    pub async fn populate_cache_for_team_with_flags(
+        &self,
+        team_id: i32,
+        flags_data: serde_json::Value,
+    ) -> Result<(), Error> {
+        let redis_client = setup_redis_client(Some(self.config.redis_url.clone())).await;
+        let cache_key =
+            format!("posthog:1:cache/teams/{team_id}/feature_flags/flags_with_cohorts.json");
+        let payload = serde_json::to_string(&flags_data)?;
+        redis_client
+            .set(cache_key, payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to set cache: {e}"))?;
+        Ok(())
+    }
+
+    /// Gets the organization_id for a team by querying the project table
+    pub async fn get_organization_id_for_team(&self, team: &Team) -> Result<uuid::Uuid, Error> {
+        let mut conn = self.non_persons_reader.get_connection().await?;
+        let org_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT organization_id FROM posthog_project WHERE id = $1")
+                .bind(team.id)
+                .fetch_one(&mut *conn)
+                .await?;
+        Ok(org_id)
+    }
+
+    /// Simplified helper to populate cache for a team
+    /// Handles Redis client setup internally
+    pub async fn populate_cache_for_team(&self, team_id: i32) -> Result<(), Error> {
+        let redis_client = setup_redis_client(Some(self.config.redis_url.clone())).await;
+        self.populate_flag_definitions_cache(redis_client, team_id)
+            .await
+    }
+
+    /// Populate cache for a team and store an ETag alongside it.
+    /// The ETag is stored at `{cache_key}:etag` using pickle serialization,
+    /// matching Django's HyperCache behavior.
+    pub async fn populate_cache_for_team_with_etag(
+        &self,
+        team_id: i32,
+        etag: &str,
+    ) -> Result<(), Error> {
+        let redis_client = setup_redis_client(Some(self.config.redis_url.clone())).await;
+        self.populate_flag_definitions_cache(redis_client.clone(), team_id)
+            .await?;
+
+        let etag_key =
+            format!("posthog:1:cache/teams/{team_id}/feature_flags/flags_with_cohorts.json:etag");
+        let pickled_etag =
+            serde_pickle::to_vec(&etag, Default::default()).expect("Failed to pickle ETag");
+        redis_client
+            .set_bytes(etag_key, pickled_etag, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to set ETag: {e}"))?;
+        Ok(())
+    }
+
+    /// Generates a unique test email address with an optional prefix
+    pub fn generate_test_email(prefix: &str) -> String {
+        let unique_id = &uuid::Uuid::new_v4().to_string()[..8];
+        format!("{prefix}_{unique_id}@posthog.com")
+    }
+
+    /// Adds a user to an organization with a specified membership level
+    pub async fn add_user_to_organization(
+        &self,
+        user_id: i32,
+        org_id: &uuid::Uuid,
+        level: i16,
+    ) -> Result<(), Error> {
+        let mut conn = self.non_persons_writer.get_connection().await?;
+        sqlx::query(
+            "INSERT INTO posthog_organizationmembership (id, organization_id, user_id, level, joined_at, updated_at)
+             VALUES ($1, $2, $3, $4, NOW(), NOW())",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(org_id)
+        .bind(user_id)
+        .bind(level)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_user_from_organization(
+        &self,
+        user_id: i32,
+        org_id: &uuid::Uuid,
+    ) -> Result<(), Error> {
+        let mut conn = self.non_persons_writer.get_connection().await?;
+        sqlx::query(
+            "DELETE FROM posthog_organizationmembership WHERE user_id = $1 AND organization_id = $2",
+        )
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Sets a value in the posthog_instancesetting table (upsert).
+    /// Uses the constance prefix matching Django's CONSTANCE_DATABASE_PREFIX.
+    pub async fn set_instance_setting(&self, key: &str, value: &str) -> Result<(), Error> {
+        let mut conn = self.non_persons_writer.get_connection().await?;
+        let full_key = format!("constance:posthog:{key}");
+        sqlx::query(
+            "INSERT INTO posthog_instancesetting (key, raw_value)
+             VALUES ($1, $2)
+             ON CONFLICT ON CONSTRAINT \"unique key\"
+             DO UPDATE SET raw_value = $2",
+        )
+        .bind(&full_key)
+        .bind(value)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Deletes a value from the posthog_instancesetting table.
+    pub async fn delete_instance_setting(&self, key: &str) -> Result<(), Error> {
+        let mut conn = self.non_persons_writer.get_connection().await?;
+        let full_key = format!("constance:posthog:{key}");
+        sqlx::query("DELETE FROM posthog_instancesetting WHERE key = $1")
+            .bind(&full_key)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+}
+
+pub struct MockGroupTypeFetcher {
+    pub mapping: GroupTypeMapping,
+}
+
+#[async_trait]
+impl GroupTypeMappingFetcher for MockGroupTypeFetcher {
+    async fn fetch(
+        &self,
+        _team_id: common_types::TeamId,
+    ) -> Result<GroupTypeMapping, GroupTypeFetchError> {
+        Ok(self.mapping.clone())
+    }
+}
+
+pub fn mock_group_type_cache(
+    types_to_indexes: std::collections::HashMap<String, i32>,
+) -> Arc<GroupTypeCacheManager> {
+    let fetcher = MockGroupTypeFetcher {
+        mapping: GroupTypeMapping::new(types_to_indexes),
+    };
+    Arc::new(GroupTypeCacheManager::new_with_fetcher(fetcher, None, None))
+}
+
+/// Delete a single auth token cache entry from Redis.
+///
+/// Both secret API tokens and personal API keys share the same cache namespace
+/// (`posthog:auth_token:{sha256_hash}`). This helper hashes the raw token/key
+/// value and deletes the corresponding Redis key.
+///
+/// NOTE: Rust's in-memory negative cache is not cleared — tests going from
+/// invalid → valid state need a fresh server or must wait for the negative
+/// cache TTL to expire.
+async fn invalidate_auth_cache_entry(
+    redis_client: Arc<dyn RedisClientTrait + Send + Sync>,
+    raw_value: &str,
+) -> Result<(), Error> {
+    let token_hash = crate::api::auth::hash_token_value(raw_value);
+    let cache_key = format!("{}{}", crate::api::auth::TOKEN_CACHE_PREFIX, token_hash);
+    redis_client
+        .del(cache_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to delete auth cache key: {e}"))?;
+    Ok(())
+}
+
+/// Simulate Django signal-based auth cache invalidation for a secret API token.
+///
+/// In production, rotating or deleting a team's secret token fires a Django signal
+/// that deletes the token's Redis cache entry via a Celery task. Tests that modify
+/// secret tokens directly bypass those signals, so they must call this helper to
+/// keep the auth cache consistent.
+pub async fn invalidate_secret_token_auth_cache(
+    redis_client: Arc<dyn RedisClientTrait + Send + Sync>,
+    token_value: &str,
+) -> Result<(), Error> {
+    invalidate_auth_cache_entry(redis_client, token_value).await
+}
+
+/// Simulate Django signal-based auth cache invalidation for a personal API key.
+///
+/// In production, removing a user from an organization fires a Django signal that
+/// asynchronously deletes the token's Redis cache entry via Celery. Tests that
+/// modify org membership directly bypass those signals, so they must call this
+/// helper to keep the auth cache consistent.
+pub async fn invalidate_personal_api_key_auth_cache(
+    redis_client: Arc<dyn RedisClientTrait + Send + Sync>,
+    key_value: &str,
+) -> Result<(), Error> {
+    invalidate_auth_cache_entry(redis_client, key_value).await
+}

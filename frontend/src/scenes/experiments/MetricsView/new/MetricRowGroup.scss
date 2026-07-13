@@ -1,0 +1,23 @@
+.metric-cell {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--color-text-secondary);
+}
+
+.metric-cell-header {
+    font-size: 0.75rem;
+    color: var(--color-text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.03125rem;
+}
+
+// Breakdown section collapse - match parent row background
+.breakdown-collapse {
+    &--alt-row .LemonCollapsePanel__header {
+        background: var(--bg-table) !important;
+    }
+
+    &--normal-row .LemonCollapsePanel__header {
+        background: var(--bg-light) !important;
+    }
+}

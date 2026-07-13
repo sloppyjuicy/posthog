@@ -1,0 +1,272 @@
+import { useActions, useValues } from 'kea'
+import { router } from 'kea-router'
+
+import { IconRefresh } from '@posthog/icons'
+import { LemonButton, LemonDialog } from '@posthog/lemon-ui'
+
+import { AccessControlAction } from 'lib/components/AccessControlAction'
+import { ObjectTags } from 'lib/components/ObjectTags/ObjectTags'
+import { TagSelect } from 'lib/components/TagSelect'
+import { More } from 'lib/lemon-ui/LemonButton/More'
+import { LemonDivider } from 'lib/lemon-ui/LemonDivider'
+import { LemonInput } from 'lib/lemon-ui/LemonInput'
+import { LemonTable, LemonTableColumn, LemonTableColumns } from 'lib/lemon-ui/LemonTable'
+import { atColumn, createdAtColumn, createdByColumn } from 'lib/lemon-ui/LemonTable/columnUtils'
+import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
+import { LemonTag } from 'lib/lemon-ui/LemonTag'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { urls } from 'scenes/urls'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { isHogQLQuery } from '~/queries/utils'
+import { AccessControlLevel, AccessControlResourceType, EndpointType } from '~/types'
+
+import { humanizeQueryKind } from './common'
+import { EndpointFromInsightModal } from './EndpointFromInsightModal'
+import { endpointLogic } from './endpointLogic'
+import { endpointsLogic } from './endpointsLogic'
+
+export function Endpoints(): JSX.Element {
+    return (
+        <>
+            <EndpointsTable />
+        </>
+    )
+}
+
+export const EndpointsTable = (): JSX.Element => {
+    const { setFilters, loadEndpoints } = useActions(endpointsLogic)
+    const { endpoints, allEndpointsLoading, filters } = useValues(endpointsLogic)
+
+    const { deleteEndpoint, confirmToggleActive, setDuplicateEndpoint } = useActions(endpointLogic)
+    const { duplicateEndpoint } = useValues(endpointLogic)
+
+    const handleDelete = (endpointName: string): void => {
+        LemonDialog.open({
+            title: 'Delete endpoint?',
+            content: (
+                <div className="text-sm text-secondary">
+                    Are you sure you want to delete this endpoint? This action cannot be undone.
+                </div>
+            ),
+            primaryButton: {
+                children: 'Delete',
+                type: 'primary',
+                status: 'danger',
+                onClick: () => {
+                    deleteEndpoint(endpointName)
+                },
+                size: 'small',
+            },
+            secondaryButton: {
+                children: 'Cancel',
+                type: 'tertiary',
+                size: 'small',
+            },
+        })
+    }
+
+    const handleEndpointActivation = (endpoint: EndpointType): void => {
+        confirmToggleActive(endpoint)
+    }
+
+    const handleDuplicate = (endpoint: EndpointType): void => {
+        if (isHogQLQuery(endpoint.query)) {
+            router.actions.push(urls.sqlEditor({ query: endpoint.query.query, source: 'endpoint' }))
+        } else {
+            setDuplicateEndpoint(endpoint)
+        }
+    }
+
+    const columns: LemonTableColumns<EndpointType> = [
+        {
+            title: 'Name',
+            key: 'name',
+            dataIndex: 'name',
+            width: '25%',
+            render: function Render(_, record) {
+                return (
+                    <LemonTableLink
+                        to={urls.endpoint(record.name)}
+                        title={
+                            <>
+                                {record.name}
+                                <LemonTag type="option" size="small" className="mr-1">
+                                    {record.query?.kind && humanizeQueryKind(record.query.kind)}
+                                </LemonTag>
+                            </>
+                        }
+                        description={record.description}
+                    />
+                )
+            },
+            sorter: (a: EndpointType, b: EndpointType) => a.name.localeCompare(b.name),
+        },
+        {
+            title: 'Tags',
+            key: 'tags',
+            dataIndex: 'tags',
+            render: function RenderTags(tags: EndpointType['tags']) {
+                return tags && tags.length > 0 ? <ObjectTags tags={[...tags].sort()} staticOnly /> : null
+            },
+        } as LemonTableColumn<EndpointType, keyof EndpointType | undefined>,
+        createdAtColumn<EndpointType>() as LemonTableColumn<EndpointType, keyof EndpointType | undefined>,
+        createdByColumn<EndpointType>() as LemonTableColumn<EndpointType, keyof EndpointType | undefined>,
+        atColumn<EndpointType>('last_executed_at', 'Last executed at') as LemonTableColumn<
+            EndpointType,
+            keyof EndpointType | undefined
+        >,
+        atColumn<EndpointType>(
+            'materialization' as any,
+            'Last materialized at',
+            (record) => record.materialization?.last_materialized_at
+        ) as LemonTableColumn<EndpointType, keyof EndpointType | undefined>,
+        {
+            title: 'Endpoint path',
+            key: 'endpoint_path',
+            dataIndex: 'endpoint_path',
+            render: (_, record) => (
+                <LemonButton
+                    type="secondary"
+                    size="xsmall"
+                    onClick={() => {
+                        navigator.clipboard.writeText(record.endpoint_path)
+                        lemonToast.success('Endpoint URL copied to clipboard')
+                    }}
+                    className="font-mono text-xs"
+                >
+                    {record.endpoint_path}
+                </LemonButton>
+            ),
+        },
+        {
+            title: 'Status',
+            key: 'is_active',
+            dataIndex: 'is_active',
+            align: 'center',
+            render: (_, record) => (
+                <span>
+                    {record.is_active ? (
+                        <LemonTag type="success">Active</LemonTag>
+                    ) : (
+                        <LemonTag type="danger">Inactive</LemonTag>
+                    )}
+                </span>
+            ),
+            sorter: (a: EndpointType, b: EndpointType) => Number(b.is_active) - Number(a.is_active),
+        },
+        {
+            key: 'actions',
+            width: 0,
+            render: (_, record) => (
+                <More
+                    overlay={
+                        <>
+                            <LemonButton
+                                onClick={() => {
+                                    router.actions.push(urls.endpointsUsage({ endpointFilter: [record.name] }))
+                                }}
+                                fullWidth
+                            >
+                                View usage
+                            </LemonButton>
+                            <AccessControlAction
+                                resourceType={AccessControlResourceType.Endpoint}
+                                minAccessLevel={AccessControlLevel.Editor}
+                            >
+                                <LemonButton onClick={() => handleDuplicate(record)} fullWidth>
+                                    Duplicate endpoint
+                                </LemonButton>
+                            </AccessControlAction>
+
+                            <LemonDivider />
+                            <AccessControlAction
+                                resourceType={AccessControlResourceType.Endpoint}
+                                minAccessLevel={AccessControlLevel.Editor}
+                            >
+                                <LemonButton
+                                    onClick={() => {
+                                        handleEndpointActivation(record)
+                                    }}
+                                    fullWidth
+                                    status="alt"
+                                    data-attr="endpoint-activate"
+                                >
+                                    {record.is_active ? 'Deactivate endpoint' : 'Activate endpoint'}
+                                </LemonButton>
+                            </AccessControlAction>
+                            <AccessControlAction
+                                resourceType={AccessControlResourceType.Endpoint}
+                                minAccessLevel={AccessControlLevel.Editor}
+                            >
+                                <LemonButton
+                                    onClick={() => {
+                                        handleDelete(record.name)
+                                    }}
+                                    fullWidth
+                                    status="danger"
+                                >
+                                    Delete endpoint
+                                </LemonButton>
+                            </AccessControlAction>
+                        </>
+                    }
+                />
+            ),
+        },
+    ]
+
+    return (
+        <SceneContent>
+            <div className="flex justify-between gap-2 flex-wrap items-center">
+                <LemonInput
+                    type="search"
+                    placeholder="Search for endpoints"
+                    onChange={(x) => setFilters({ search: x })}
+                    value={filters.search}
+                />
+                <div className="flex items-center gap-2 flex-wrap">
+                    <span className="ml-1">
+                        <b>Tags</b>
+                    </span>
+                    <TagSelect
+                        defaultLabel="Any tags"
+                        value={filters.tags}
+                        onChange={(tags) => setFilters({ tags })}
+                        data-attr="endpoints-tag-filter"
+                    />
+                    <LemonButton
+                        type="secondary"
+                        icon={<IconRefresh />}
+                        onClick={() => loadEndpoints()}
+                        loading={allEndpointsLoading}
+                        size="small"
+                    >
+                        Reload
+                    </LemonButton>
+                </div>
+            </div>
+            <LemonTable
+                data-attr="endpoints-table"
+                pagination={{ pageSize: 20 }}
+                dataSource={endpoints as EndpointType[]}
+                rowKey="id"
+                rowClassName={(record) => (record._highlight ? 'highlighted' : null)}
+                columns={columns}
+                loading={allEndpointsLoading}
+                defaultSorting={{
+                    columnKey: 'last_executed_at',
+                    order: -1,
+                }}
+                emptyState="No endpoints matching your filters!"
+                nouns={['endpoint', 'endpoints']}
+            />
+            {duplicateEndpoint && (
+                <EndpointFromInsightModal
+                    insightQuery={duplicateEndpoint.query}
+                    insightShortId={duplicateEndpoint.derived_from_insight ?? undefined}
+                />
+            )}
+        </SceneContent>
+    )
+}

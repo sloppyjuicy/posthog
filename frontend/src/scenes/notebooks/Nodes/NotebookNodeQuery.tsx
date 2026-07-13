@@ -1,0 +1,442 @@
+import { BindLogic, useActions, useValues } from 'kea'
+import { useEffect, useMemo } from 'react'
+
+import { LemonButton } from '@posthog/lemon-ui'
+
+import { useComponentPanelState } from 'lib/components/MarkdownNotebook/componentPanelContext'
+import { ScrollableShadows } from 'lib/components/ScrollableShadows/ScrollableShadows'
+import { OutputTab } from 'scenes/data-warehouse/editor/outputPaneLogic'
+import { insightDataLogic } from 'scenes/insights/insightDataLogic'
+import { insightLogic } from 'scenes/insights/insightLogic'
+import { useSummarizeInsight } from 'scenes/insights/summarizeInsight'
+import { createPostHogWidgetNode } from 'scenes/notebooks/Nodes/NodeWrapper'
+import { urls } from 'scenes/urls'
+
+import { Query } from '~/queries/Query/Query'
+import { DataTableNode, InsightVizNode, NodeKind, QuerySchema } from '~/queries/schema/schema-general'
+import {
+    containsHogQLQuery,
+    isDataTableNode,
+    isEventsQuery,
+    isHogQLQuery,
+    isInsightVizNode,
+    isNodeWithSource,
+    isSavedInsightNode,
+    isActorsQuery,
+} from '~/queries/utils'
+import { InsightLogicProps, InsightShortId } from '~/types'
+
+import { NotebookNodeAttributeProperties, NotebookNodeProps, NotebookNodeType } from '../types'
+import {
+    getSqlEditorSourceQuery,
+    EMBEDDED_SQL_EDITOR_DEFAULT_HEIGHT,
+    EMBEDDED_SQL_EDITOR_MIN_HEIGHT,
+    NotebookSQLEditorOutput,
+    NotebookSQLEditorSettings,
+} from './components/NotebookSQLEditor'
+import { useRequiredNotebookNode } from './NotebookNodeContext'
+import { UnsupportedNodePlaceholder } from './sharedNodeSupport'
+import { SHORT_CODE_REGEX_MATCH_GROUPS } from './utils'
+
+type NotebookSqlOutputToolbarVisibilityProps = {
+    componentPanelState: ReturnType<typeof useComponentPanelState>
+    expanded: boolean
+    isEditing: boolean
+}
+
+export function getNotebookSqlOutputToolbarVisibility({
+    componentPanelState,
+    expanded,
+    isEditing,
+}: NotebookSqlOutputToolbarVisibilityProps): boolean {
+    const isOutputPaneOpen = componentPanelState?.showViewPanel ?? expanded
+    const isEditorPaneOpen = componentPanelState?.showEditPanel ?? isEditing
+
+    return isOutputPaneOpen && isEditorPaneOpen
+}
+
+export const DEFAULT_QUERY: QuerySchema = {
+    kind: NodeKind.DataTableNode,
+    source: {
+        kind: NodeKind.EventsQuery,
+        select: ['*', 'event', 'person', 'timestamp'],
+        orderBy: ['timestamp DESC'],
+        after: '-24h',
+        limit: 100,
+    },
+}
+
+const Component = ({
+    attributes,
+    updateAttributes,
+}: NotebookNodeProps<NotebookNodeQueryAttributes>): JSX.Element | null => {
+    const { query, nodeId } = attributes
+    const nodeLogic = useRequiredNotebookNode()
+    const { expanded, nodeId: resolvedNodeId, notebookLogic } = useValues(nodeLogic)
+    const {
+        editingNodeIds,
+        isShared,
+        getSharedCachedInsight,
+        getSharedCachedInlineQueryResults,
+        canvasFiltersOverride,
+    } = useValues(notebookLogic)
+    const { setTitlePlaceholder } = useActions(nodeLogic)
+    const componentPanelState = useComponentPanelState()
+    const summarizeInsight = useSummarizeInsight()
+    const sharedCachedInsight = query.kind === NodeKind.SavedInsightNode ? getSharedCachedInsight(query.shortId) : null
+    const sharedCachedInlineResults =
+        query.kind !== NodeKind.SavedInsightNode ? getSharedCachedInlineQueryResults(resolvedNodeId) : null
+
+    const insightLogicProps: InsightLogicProps = sharedCachedInsight
+        ? {
+              dashboardItemId: sharedCachedInsight.short_id,
+              cachedInsight: sharedCachedInsight,
+              doNotLoad: true,
+          }
+        : {
+              dashboardItemId: query.kind === NodeKind.SavedInsightNode ? query.shortId : ('new' as const),
+          }
+    const { insightName } = useValues(insightLogic(insightLogicProps))
+    const isOutputPaneOpen = componentPanelState?.showViewPanel ?? expanded
+    const showSqlOutputToolbar = getNotebookSqlOutputToolbarVisibility({
+        componentPanelState,
+        expanded,
+        isEditing: !!editingNodeIds[resolvedNodeId],
+    })
+
+    useEffect(() => {
+        let title = 'Query'
+
+        if (query.kind === NodeKind.DataTableNode) {
+            if (query.source.kind === 'HogQLQuery') {
+                title = 'SQL'
+            } else if (query.source.kind) {
+                title = query.source.kind.replace('Node', '').replace('Query', '')
+            } else {
+                title = 'Data exploration'
+            }
+        }
+        if (query.kind === NodeKind.InsightVizNode) {
+            title = summarizeInsight(query)
+
+            if (!title) {
+                if (query.source.kind) {
+                    title = query.source.kind.replace('Node', '').replace('Query', '')
+                } else {
+                    title = 'Insight'
+                }
+            }
+        }
+
+        if (query.kind === NodeKind.SavedInsightNode) {
+            title = insightName ?? 'Saved Insight'
+        }
+
+        setTitlePlaceholder(title)
+        // oxlint-disable-next-line exhaustive-deps
+    }, [query, insightName])
+
+    const modifiedQuery = useMemo(() => {
+        let modifiedQuery = { ...query, full: false }
+
+        if (isDataTableNode(modifiedQuery) || isSavedInsightNode(modifiedQuery)) {
+            modifiedQuery.showOpenEditorButton = false
+            modifiedQuery.full = false
+            modifiedQuery.showHogQLEditor = false
+            modifiedQuery.embedded = true
+            modifiedQuery.showTimings = false
+        }
+
+        if (isInsightVizNode(modifiedQuery) || isSavedInsightNode(modifiedQuery)) {
+            modifiedQuery.showFilters = false
+            modifiedQuery.showHeader = false
+            modifiedQuery.showTable = false
+            modifiedQuery.showCorrelationTable = false
+            modifiedQuery.embedded = true
+        }
+
+        if (isDataTableNode(modifiedQuery) && isEventsQuery(modifiedQuery.source)) {
+            modifiedQuery.source.fixedProperties = canvasFiltersOverride
+            updateAttributes({ isDefaultFilterApplied: true })
+        }
+
+        return modifiedQuery
+        // oxlint-disable-next-line react-hooks/exhaustive-deps
+    }, [query])
+
+    if (!isOutputPaneOpen) {
+        return null
+    }
+
+    // Shared notebook fast paths. The render order below is deliberate:
+    //   1. Saved insight with a pre-computed result → render via insightLogic + cachedResults.
+    //   2. Inline query with a pre-computed result → render the original query with cachedResults.
+    //   3. Otherwise (no cached result for this node, e.g. backend execution failed) → placeholder.
+    // We never fall through to the live `<Query>` path in shared mode because `dataNodeLogic`
+    // would issue a POST that the sharing token can't authenticate.
+    if (isShared) {
+        if (sharedCachedInsight) {
+            return (
+                <div className="flex flex-1 flex-col h-full" data-attr="notebook-node-query">
+                    <BindLogic logic={insightLogic} props={insightLogicProps}>
+                        <Query
+                            uniqueKey={nodeId + '-shared'}
+                            query={sharedCachedInsight.query as QuerySchema}
+                            cachedResults={sharedCachedInsight}
+                            embedded
+                            readOnly
+                            inSharedMode
+                        />
+                    </BindLogic>
+                </div>
+            )
+        }
+        if (sharedCachedInlineResults) {
+            return (
+                <div className="flex flex-1 flex-col h-full" data-attr="notebook-node-query">
+                    <Query
+                        uniqueKey={nodeId + '-shared-inline'}
+                        query={query}
+                        cachedResults={sharedCachedInlineResults}
+                        embedded
+                        readOnly
+                        inSharedMode
+                    />
+                </div>
+            )
+        }
+        return <UnsupportedNodePlaceholder />
+    }
+
+    if (getSqlEditorSourceQuery(query)) {
+        return (
+            <div className="flex flex-1 flex-col h-full" data-attr="notebook-node-query">
+                <NotebookSQLEditorOutput
+                    attributes={attributes}
+                    updateAttributes={updateAttributes}
+                    showOutputToolbar={showSqlOutputToolbar}
+                />
+            </div>
+        )
+    }
+
+    const isInsightViz = isInsightVizNode(modifiedQuery) || isSavedInsightNode(modifiedQuery)
+
+    const queryComponent = (
+        <Query
+            uniqueKey={nodeId + '-component'}
+            query={modifiedQuery}
+            attachTo={notebookLogic}
+            setQuery={(t) => {
+                updateAttributes({
+                    query: {
+                        ...attributes.query,
+                        source: (t as DataTableNode | InsightVizNode).source,
+                    } as QuerySchema,
+                })
+            }}
+            embedded
+            readOnly
+        />
+    )
+
+    return (
+        <div className="flex flex-1 flex-col h-full" data-attr="notebook-node-query">
+            <BindLogic logic={insightLogic} props={insightLogicProps}>
+                {isInsightViz ? (
+                    <div className="flex flex-1 flex-col overflow-hidden">{queryComponent}</div>
+                ) : (
+                    <ScrollableShadows direction="vertical" className="flex-1">
+                        {queryComponent}
+                    </ScrollableShadows>
+                )}
+            </BindLogic>
+        </div>
+    )
+}
+
+type NotebookNodeQueryAttributes = {
+    query: QuerySchema
+    /* Whether canvasFiltersOverride is applied, as we should apply it only once  */
+    isDefaultFilterApplied: boolean
+    showSettings?: boolean
+    outputTab?: OutputTab | null
+}
+
+export const Settings = ({
+    attributes,
+    updateAttributes,
+}: NotebookNodeAttributeProperties<NotebookNodeQueryAttributes>): JSX.Element => {
+    const { query, isDefaultFilterApplied } = attributes
+    const nodeLogic = useRequiredNotebookNode()
+    const { notebookLogic } = useValues(nodeLogic)
+    const { canvasFiltersOverride } = useValues(notebookLogic)
+
+    const modifiedQuery = useMemo(() => {
+        const modifiedQuery = { ...query, full: false }
+
+        if (isDataTableNode(modifiedQuery) || isSavedInsightNode(modifiedQuery)) {
+            modifiedQuery.showOpenEditorButton = false
+            modifiedQuery.showHogQLEditor = true
+            modifiedQuery.showResultsTable = false
+
+            modifiedQuery.showReload = true
+            modifiedQuery.showExport = true
+            modifiedQuery.showElapsedTime = false
+            modifiedQuery.showTimings = false
+
+            modifiedQuery.embedded = true
+            modifiedQuery.showActions = true
+
+            modifiedQuery.showDateRange = true
+            modifiedQuery.showEventFilter = true
+            modifiedQuery.showSearch = true
+            modifiedQuery.showPropertyFilter = true
+            modifiedQuery.showColumnConfigurator = true
+        }
+
+        if (isInsightVizNode(modifiedQuery) || isSavedInsightNode(modifiedQuery)) {
+            modifiedQuery.showFilters = true
+            modifiedQuery.showHeader = true
+            modifiedQuery.showResults = false
+            modifiedQuery.embedded = true
+        }
+
+        if (
+            isInsightVizNode(modifiedQuery) &&
+            !isHogQLQuery(modifiedQuery.source) &&
+            !isActorsQuery(modifiedQuery.source) &&
+            !isDefaultFilterApplied
+        ) {
+            modifiedQuery.source.properties = canvasFiltersOverride
+            updateAttributes({ isDefaultFilterApplied: true })
+        }
+
+        if (isDataTableNode(modifiedQuery) && isEventsQuery(modifiedQuery.source) && !isDefaultFilterApplied) {
+            modifiedQuery.source.fixedProperties = canvasFiltersOverride
+            updateAttributes({ isDefaultFilterApplied: true })
+        }
+
+        return modifiedQuery
+    }, [query, canvasFiltersOverride, isDefaultFilterApplied, attributes, updateAttributes])
+
+    const detachSavedInsight = (): void => {
+        if (isSavedInsightNode(attributes.query)) {
+            const insightProps: InsightLogicProps = { dashboardItemId: attributes.query.shortId }
+            const dataLogic = insightDataLogic.findMounted(insightProps)
+
+            if (dataLogic) {
+                updateAttributes({ query: dataLogic.values.query as QuerySchema })
+            }
+        }
+    }
+
+    const isSqlEditorQuery = !!getSqlEditorSourceQuery(query)
+
+    return isSavedInsightNode(attributes.query) ? (
+        <div className="p-3 deprecated-space-y-2">
+            <div className="text-lg font-semibold">Insight created outside of this notebook</div>
+            <div>
+                Changes made to the original insight will be reflected in the notebook. Or you can detach from the
+                insight to make changes independently in the notebook.
+            </div>
+
+            <div className="deprecated-space-y-2">
+                <LemonButton
+                    center={true}
+                    type="secondary"
+                    fullWidth
+                    className="flex flex-1"
+                    to={urls.insightEdit(attributes.query.shortId)}
+                >
+                    Edit the insight
+                </LemonButton>
+                <LemonButton
+                    center={true}
+                    fullWidth
+                    type="secondary"
+                    className="flex flex-1"
+                    onClick={detachSavedInsight}
+                >
+                    Detach from insight
+                </LemonButton>
+            </div>
+        </div>
+    ) : isSqlEditorQuery ? (
+        <NotebookSQLEditorSettings attributes={attributes} updateAttributes={updateAttributes} />
+    ) : (
+        <div className="p-3">
+            <Query
+                // use separate keys for the settings and visualization to avoid conflicts with insightProps
+                uniqueKey={attributes.nodeId + '-settings'}
+                attachTo={notebookLogic}
+                query={modifiedQuery}
+                setQuery={(t) => {
+                    updateAttributes({
+                        query: {
+                            ...attributes.query,
+                            source: (t as DataTableNode | InsightVizNode).source,
+                        } as QuerySchema,
+                    })
+                }}
+            />
+        </div>
+    )
+}
+
+export const NotebookNodeQuery = createPostHogWidgetNode<NotebookNodeQueryAttributes>({
+    nodeType: NotebookNodeType.Query,
+    titlePlaceholder: 'Query',
+    Component,
+    heightEstimate: EMBEDDED_SQL_EDITOR_DEFAULT_HEIGHT,
+    minHeight: EMBEDDED_SQL_EDITOR_MIN_HEIGHT,
+    resizeable: true,
+    startExpanded: true,
+    attributes: {
+        query: {
+            default: DEFAULT_QUERY,
+        },
+        isDefaultFilterApplied: {
+            default: false,
+        },
+        showSettings: {
+            default: false,
+        },
+        outputTab: {
+            default: OutputTab.Results,
+        },
+    },
+    href: ({ query }) =>
+        isSavedInsightNode(query)
+            ? urls.insightView(query.shortId)
+            : isInsightVizNode(query)
+              ? urls.insightNew({ query })
+              : undefined,
+    Settings,
+    settingsPlacement: 'inline',
+    pasteOptions: {
+        find: urls.insightView(SHORT_CODE_REGEX_MATCH_GROUPS as InsightShortId),
+        getAttributes: async (match) => {
+            return {
+                query: {
+                    kind: NodeKind.SavedInsightNode,
+                    shortId: match[1] as InsightShortId,
+                },
+                isDefaultFilterApplied: false,
+            }
+        },
+    },
+    serializedText: (attrs) => {
+        let text = ''
+        const q = attrs.query
+        if (containsHogQLQuery(q)) {
+            if (isHogQLQuery(q)) {
+                text = q.query
+            }
+            if (isNodeWithSource(q)) {
+                text = isHogQLQuery(q.source) ? q.source.query : ''
+            }
+        }
+        return text
+    },
+})

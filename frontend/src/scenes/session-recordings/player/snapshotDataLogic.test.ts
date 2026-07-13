@@ -1,0 +1,204 @@
+import { expectLogic } from 'kea-test-utils'
+import { EventType, IncrementalSource, NodeType, mutationData } from 'posthog-js/rrweb-types'
+
+import { chunkMutationSnapshot, MUTATION_CHUNK_SIZE } from '@posthog/replay-shared'
+
+import { RecordingDeletedError } from 'lib/api'
+import { encodedWebSnapshotData } from 'scenes/session-recordings/player/__mocks__/encoded-snapshot-data'
+import { parseEncodedSnapshots } from 'scenes/session-recordings/player/snapshot-processing/process-all-snapshots'
+
+import { RecordingSnapshot, SessionRecordingSnapshotSource } from '~/types'
+
+import { setupSessionRecordingTest } from './__mocks__/test-setup'
+import { snapshotDataLogic } from './snapshotDataLogic'
+
+const BLOB_SOURCE: SessionRecordingSnapshotSource = {
+    source: 'blob_v2',
+    start_timestamp: '2023-08-11T12:03:36.097000Z',
+    end_timestamp: '2023-08-11T12:04:52.268000Z',
+    blob_key: '0',
+}
+const BLOB_SOURCE_TWO: SessionRecordingSnapshotSource = {
+    source: 'blob_v2',
+    start_timestamp: '2023-08-11T12:04:53.097000Z',
+    end_timestamp: '2023-08-11T12:04:56.268000Z',
+    blob_key: '1',
+}
+
+describe('snapshotDataLogic', () => {
+    let logic: ReturnType<typeof snapshotDataLogic.build>
+
+    beforeEach(() => {
+        setupSessionRecordingTest({
+            snapshotSources: [BLOB_SOURCE, BLOB_SOURCE_TWO],
+        })
+        logic = snapshotDataLogic({
+            sessionRecordingId: '2',
+            blobV2PollingDisabled: true,
+        })
+        logic.mount()
+    })
+
+    describe('recording deleted selectors', () => {
+        it('isRecordingDeleted is false when no error', () => {
+            expect(logic.values.isRecordingDeleted).toBe(false)
+            expect(logic.values.recordingDeletedAt).toBe(null)
+            expect(logic.values.recordingDeletedBy).toBe(null)
+        })
+
+        it('isRecordingDeleted is true when snapshotLoadError is RecordingDeletedError', () => {
+            const error = new RecordingDeletedError(1700000000, 'admin@example.com')
+            logic.actions.loadSnapshotsForSourceFailure('Recording deleted', error)
+
+            expect(logic.values.isRecordingDeleted).toBe(true)
+            expect(logic.values.recordingDeletedAt).toBe(1700000000)
+            expect(logic.values.recordingDeletedBy).toBe('admin@example.com')
+        })
+
+        it('isRecordingDeleted is false for non-deleted errors', () => {
+            logic.actions.loadSnapshotsForSourceFailure('some error', new Error('some other error'))
+
+            expect(logic.values.isRecordingDeleted).toBe(false)
+            expect(logic.values.recordingDeletedAt).toBe(null)
+            expect(logic.values.recordingDeletedBy).toBe(null)
+        })
+
+        it('recordingDeletedAt is null when deleted_at is not provided', () => {
+            const error = new RecordingDeletedError(null, null)
+            logic.actions.loadSnapshotsForSourceFailure('Recording deleted', error)
+
+            expect(logic.values.isRecordingDeleted).toBe(true)
+            expect(logic.values.recordingDeletedAt).toBe(null)
+            expect(logic.values.recordingDeletedBy).toBe(null)
+        })
+    })
+
+    describe('source load give-up', () => {
+        it('dispatches snapshotSourceLoadExhausted once retries are exhausted', async () => {
+            const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {})
+            await expectLogic(logic, () => {
+                logic.actions.loadSnapshotsForSourceFailure('load failed', new Error('load failed'))
+                logic.actions.loadSnapshotsForSourceFailure('load failed', new Error('load failed'))
+                logic.actions.loadSnapshotsForSourceFailure('load failed', new Error('load failed'))
+                logic.actions.loadSnapshotsForSourceFailure('load failed', new Error('load failed'))
+            }).toDispatchActions(['snapshotSourceLoadExhausted'])
+            consoleError.mockRestore()
+        })
+    })
+
+    describe('snapshot parsing', () => {
+        const sessionId = '12345'
+        const numberOfParsedLinesInData = 8
+        it('handles normal web data', async () => {
+            const parsed = await parseEncodedSnapshots(encodedWebSnapshotData, sessionId)
+            expect(parsed.length).toEqual(numberOfParsedLinesInData)
+            expect(parsed).toMatchSnapshot()
+        })
+
+        it('handles data with unparseable lines', async () => {
+            const parsed = await parseEncodedSnapshots(
+                encodedWebSnapshotData.map((line, index) => {
+                    return index == 0 ? line.substring(0, line.length / 2) : line
+                }),
+                sessionId
+            )
+
+            // unparseable lines are not returned
+            expect(encodedWebSnapshotData.length).toEqual(2)
+            expect(parsed.length).toEqual(numberOfParsedLinesInData / 2)
+
+            expect(parsed).toMatchSnapshot()
+        })
+    })
+
+    describe('mutation chunking', () => {
+        const createMutationSnapshot = (addsCount: number): RecordingSnapshot =>
+            ({
+                type: EventType.IncrementalSnapshot,
+                timestamp: 1000,
+                data: {
+                    source: IncrementalSource.Mutation,
+                    adds: Array(addsCount).fill({ parentId: 1, nextId: null, node: { type: 1, tagName: 'div' } }),
+                    removes: [{ parentId: 1, id: 2 }],
+                    texts: [{ id: 3, value: 'text' }],
+                    attributes: [{ id: 4, attributes: { class: 'test' } }],
+                },
+                windowId: 1,
+            }) as RecordingSnapshot
+
+        it('does not chunk snapshots with adds below chunk size', () => {
+            const snapshot = createMutationSnapshot(100)
+            const chunks = chunkMutationSnapshot(snapshot)
+            expect(chunks).toEqual([snapshot])
+        })
+
+        it('chunks large mutation snapshots correctly', () => {
+            const addsCount = MUTATION_CHUNK_SIZE * 2 + 500 // Will create 3 chunks
+            const snapshot = createMutationSnapshot(addsCount)
+            const chunks = chunkMutationSnapshot(snapshot)
+
+            expect(chunks.length).toBe(3)
+
+            // First chunk
+            expect(chunks[0]).toMatchObject({
+                timestamp: 1000,
+                data: {
+                    adds: expect.arrayContaining([expect.any(Object)]),
+                    removes: (snapshot.data as mutationData).removes,
+                    texts: [],
+                    attributes: [],
+                },
+            })
+            expect((chunks[0].data as mutationData).adds.length).toBe(MUTATION_CHUNK_SIZE)
+
+            // Middle chunk
+            expect(chunks[1]).toMatchObject({
+                timestamp: 1000,
+                data: {
+                    adds: expect.arrayContaining([expect.any(Object)]),
+                    removes: [],
+                    texts: [],
+                    attributes: [],
+                },
+            })
+            expect((chunks[1].data as mutationData).adds.length).toBe(MUTATION_CHUNK_SIZE)
+
+            // Last chunk
+            expect(chunks[2]).toMatchObject({
+                timestamp: 1000,
+                data: {
+                    adds: expect.arrayContaining([expect.any(Object)]),
+                    removes: [],
+                    texts: (snapshot.data as mutationData).texts,
+                    attributes: (snapshot.data as mutationData).attributes,
+                },
+            })
+            expect((chunks[2].data as mutationData).adds.length).toBe(500)
+        })
+
+        it('handles delay correctly when chunking', () => {
+            const snapshot = createMutationSnapshot(MUTATION_CHUNK_SIZE * 2)
+            snapshot.delay = 100
+
+            const chunks = chunkMutationSnapshot(snapshot)
+
+            expect(chunks.length).toBe(2)
+            expect(chunks[0].delay).toBe(100)
+            expect(chunks[1].delay).toBe(100)
+        })
+
+        it('does not chunk non-mutation snapshots', () => {
+            const snapshot: RecordingSnapshot = {
+                type: EventType.FullSnapshot,
+                timestamp: 1000,
+                data: {
+                    node: { type: NodeType.Document, id: 1, childNodes: [] },
+                    initialOffset: { top: 0, left: 0 },
+                },
+                windowId: 1,
+            }
+            const chunks = chunkMutationSnapshot(snapshot)
+            expect(chunks).toEqual([snapshot])
+        })
+    })
+})

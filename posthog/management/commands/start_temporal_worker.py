@@ -1,0 +1,766 @@
+import os
+import signal
+import typing
+import asyncio
+import datetime as dt
+import functools
+import threading
+import faulthandler
+import collections.abc
+from collections import defaultdict
+
+import structlog
+from temporalio import workflow
+
+from posthog.temporal.common.base import PostHogWorkflow
+from posthog.temporal.common.open_telemetry import initialize_otel
+
+with workflow.unsafe.imports_passed_through():
+    from django.conf import settings
+    from django.core.management.base import BaseCommand
+
+from posthog.clickhouse.query_tagging import tag_queries
+from posthog.temporal.ai import AI_ACTIVITIES, AI_WORKFLOWS, POSTHOG_CODE_SLACK_ACTIVITIES, POSTHOG_CODE_SLACK_WORKFLOWS
+from posthog.temporal.ai_observability import (
+    ACTIVITIES as LLM_ANALYTICS_ACTIVITIES,
+    EVAL_ACTIVITIES as LLM_ANALYTICS_EVAL_ACTIVITIES,
+    EVAL_WORKFLOWS as LLM_ANALYTICS_EVAL_WORKFLOWS,
+    TAGGER_ACTIVITIES as LLM_ANALYTICS_TAGGER_ACTIVITIES,
+    TAGGER_WORKFLOWS as LLM_ANALYTICS_TAGGER_WORKFLOWS,
+    WORKFLOWS as LLM_ANALYTICS_WORKFLOWS,
+)
+from posthog.temporal.alerts import (
+    ACTIVITIES as ALERT_ACTIVITIES,
+    WORKFLOWS as ALERT_WORKFLOWS,
+)
+from posthog.temporal.backfill_group_type_created_at import (
+    ACTIVITIES as BACKFILL_GROUP_TYPE_CREATED_AT_ACTIVITIES,
+    WORKFLOWS as BACKFILL_GROUP_TYPE_CREATED_AT_WORKFLOWS,
+)
+from posthog.temporal.cleanup_property_definitions import (
+    ACTIVITIES as CLEANUP_PROPDEFS_ACTIVITIES,
+    WORKFLOWS as CLEANUP_PROPDEFS_WORKFLOWS,
+)
+from posthog.temporal.common.health_server import HealthCheckServer
+from posthog.temporal.common.liveness_tracker import get_liveness_tracker
+from posthog.temporal.common.logger import configure_logger, get_logger
+from posthog.temporal.common.worker import ManagedWorker, create_worker
+from posthog.temporal.data_modeling import (
+    ACTIVITIES as DATA_MODELING_ACTIVITIES,
+    SEMANTIC_ENRICHMENT_ACTIVITIES,
+    SEMANTIC_ENRICHMENT_WORKFLOWS,
+    WORKFLOWS as DATA_MODELING_WORKFLOWS,
+)
+from posthog.temporal.delete_persons import (
+    ACTIVITIES as DELETE_PERSONS_ACTIVITIES,
+    WORKFLOWS as DELETE_PERSONS_WORKFLOWS,
+)
+from posthog.temporal.delete_teams import (
+    ACTIVITIES as DELETE_TEAMS_ACTIVITIES,
+    WORKFLOWS as DELETE_TEAMS_WORKFLOWS,
+)
+from posthog.temporal.dlq_replay import (
+    ACTIVITIES as DLQ_REPLAY_ACTIVITIES,
+    WORKFLOWS as DLQ_REPLAY_WORKFLOWS,
+)
+from posthog.temporal.ducklake import (
+    ACTIVITIES as DUCKLAKE_COPY_ACTIVITIES,
+    WORKFLOWS as DUCKLAKE_COPY_WORKFLOWS,
+)
+from posthog.temporal.event_screenshots import (
+    ACTIVITIES as EVENT_SCREENSHOTS_ACTIVITIES,
+    WORKFLOWS as EVENT_SCREENSHOTS_WORKFLOWS,
+)
+from posthog.temporal.experiments import (
+    ACTIVITIES as EXPERIMENTS_ACTIVITIES,
+    WORKFLOWS as EXPERIMENTS_WORKFLOWS,
+)
+from posthog.temporal.exports import (
+    ACTIVITIES as EXPORT_ACTIVITIES,
+    WORKFLOWS as EXPORT_WORKFLOWS,
+)
+from posthog.temporal.health_checks import (
+    ACTIVITIES as HEALTH_CHECK_ACTIVITIES,
+    WORKFLOWS as HEALTH_CHECK_WORKFLOWS,
+)
+from posthog.temporal.ingestion_acceptance_test import (
+    ACTIVITIES as INGESTION_ACCEPTANCE_TEST_ACTIVITIES,
+    WORKFLOWS as INGESTION_ACCEPTANCE_TEST_WORKFLOWS,
+)
+from posthog.temporal.mcp_analytics.intent_clustering import (
+    MCP_ANALYTICS_INTENT_CLUSTERING_ACTIVITIES,
+    MCP_ANALYTICS_INTENT_CLUSTERING_WORKFLOWS,
+)
+from posthog.temporal.messaging import (
+    ACTIVITIES as MESSAGING_ACTIVITIES,
+    WORKFLOWS as MESSAGING_WORKFLOWS,
+)
+from posthog.temporal.product_analytics import (
+    ACTIVITIES as PRODUCT_ANALYTICS_ACTIVITIES,
+    WORKFLOWS as PRODUCT_ANALYTICS_WORKFLOWS,
+)
+from posthog.temporal.proxy_service import (
+    ACTIVITIES as PROXY_SERVICE_ACTIVITIES,
+    WORKFLOWS as PROXY_SERVICE_WORKFLOWS,
+)
+from posthog.temporal.quota_limiting import (
+    ACTIVITIES as QUOTA_LIMITING_ACTIVITIES,
+    WORKFLOWS as QUOTA_LIMITING_WORKFLOWS,
+)
+from posthog.temporal.salesforce_enrichment import (
+    ACTIVITIES as SALESFORCE_ENRICHMENT_ACTIVITIES,
+    WORKFLOWS as SALESFORCE_ENRICHMENT_WORKFLOWS,
+)
+from posthog.temporal.session_replay.count_playlist_items import (
+    COUNT_PLAYLIST_ITEMS_ACTIVITIES,
+    COUNT_PLAYLIST_ITEMS_WORKFLOWS,
+)
+from posthog.temporal.session_replay.delete_recordings import DELETE_RECORDINGS_ACTIVITIES, DELETE_RECORDINGS_WORKFLOWS
+from posthog.temporal.session_replay.enforce_max_replay_retention import (
+    ENFORCE_MAX_REPLAY_RETENTION_ACTIVITIES,
+    ENFORCE_MAX_REPLAY_RETENTION_WORKFLOWS,
+)
+from posthog.temporal.session_replay.gemini_cleanup_sweep import (
+    GEMINI_CLEANUP_SWEEP_ACTIVITIES,
+    GEMINI_CLEANUP_SWEEP_WORKFLOWS,
+)
+from posthog.temporal.session_replay.rasterize_recording import (
+    RASTERIZE_RECORDING_ACTIVITIES,
+    RASTERIZE_RECORDING_WORKFLOWS,
+)
+from posthog.temporal.session_replay.replay_count_metrics import (
+    REPLAY_COUNT_METRICS_ACTIVITIES,
+    REPLAY_COUNT_METRICS_WORKFLOWS,
+)
+from posthog.temporal.session_replay.session_summary import SESSION_SUMMARY_ACTIVITIES, SESSION_SUMMARY_WORKFLOWS
+from posthog.temporal.session_replay.session_summary_group import (
+    SESSION_SUMMARY_GROUP_ACTIVITIES,
+    SESSION_SUMMARY_GROUP_WORKFLOWS,
+)
+from posthog.temporal.session_replay.summarization_sweep import (
+    SUMMARIZATION_SWEEP_ACTIVITIES,
+    SUMMARIZATION_SWEEP_WORKFLOWS,
+)
+from posthog.temporal.session_replay.surfacing_score_export_sweep import (
+    SURFACING_SCORE_EXPORT_SWEEP_ACTIVITIES,
+    SURFACING_SCORE_EXPORT_SWEEP_WORKFLOWS,
+)
+from posthog.temporal.session_replay.surfacing_scoring_sweep import (
+    SURFACING_SCORING_SWEEP_ACTIVITIES,
+    SURFACING_SCORING_SWEEP_WORKFLOWS,
+)
+from posthog.temporal.sync_events_retention import SYNC_EVENTS_RETENTION_ACTIVITIES, SYNC_EVENTS_RETENTION_WORKFLOWS
+from posthog.temporal.sync_person_distinct_ids import (
+    ACTIVITIES as SYNC_PERSON_DISTINCT_IDS_ACTIVITIES,
+    WORKFLOWS as SYNC_PERSON_DISTINCT_IDS_WORKFLOWS,
+)
+from posthog.temporal.tests.utils.workflow import (
+    ACTIVITIES as TEST_ACTIVITIES,
+    WORKFLOWS as TEST_WORKFLOWS,
+)
+from posthog.temporal.usage_report import (
+    ACTIVITIES as USAGE_REPORTS_ACTIVITIES,
+    WORKFLOWS as USAGE_REPORTS_WORKFLOWS,
+)
+from posthog.temporal.warehouse_sources_queue_partition_management import (
+    ACTIVITIES as WAREHOUSE_SOURCES_QUEUE_PARTITION_ACTIVITIES,
+    WORKFLOWS as WAREHOUSE_SOURCES_QUEUE_PARTITION_WORKFLOWS,
+)
+from posthog.temporal.weekly_digest import (
+    ACTIVITIES as WEEKLY_DIGEST_ACTIVITIES,
+    WORKFLOWS as WEEKLY_DIGEST_WORKFLOWS,
+)
+
+from products.batch_exports.backend.temporal import (
+    ACTIVITIES as BATCH_EXPORTS_ACTIVITIES,
+    WORKFLOWS as BATCH_EXPORTS_WORKFLOWS,
+)
+from products.business_knowledge.backend.temporal import (
+    ACTIVITIES as BUSINESS_KNOWLEDGE_ACTIVITIES,
+    WORKFLOWS as BUSINESS_KNOWLEDGE_WORKFLOWS,
+)
+from products.conversations.backend.temporal import (
+    ACTIVITIES as CONVERSATIONS_ACTIVITIES,
+    WORKFLOWS as CONVERSATIONS_WORKFLOWS,
+)
+from products.engineering_analytics.backend.facade.temporal import JOB_LOGS_ACTIVITIES, JOB_LOGS_WORKFLOWS
+from products.error_tracking.backend.facade.temporal import (
+    ACTIVITIES as ERROR_TRACKING_ACTIVITIES,
+    WORKFLOWS as ERROR_TRACKING_WORKFLOWS,
+)
+from products.experiments.backend.temporal import (
+    ACTIVITIES as EXPERIMENTS_RECALCULATION_ACTIVITIES,
+    EXPERIMENT_CANARY_ACTIVITIES,
+    EXPERIMENT_CANARY_WORKFLOWS,
+    WORKFLOWS as EXPERIMENTS_RECALCULATION_WORKFLOWS,
+)
+from products.exports.backend.temporal.subscriptions import (
+    ACTIVITIES as SUBSCRIPTION_ACTIVITIES,
+    WORKFLOWS as SUBSCRIPTION_WORKFLOWS,
+)
+from products.logs.backend.facade.temporal import (
+    ACTIVITIES as LOGS_ALERTING_ACTIVITIES,
+    WORKFLOWS as LOGS_ALERTING_WORKFLOWS,
+)
+from products.notebooks.backend.facade.temporal import (
+    ACTIVITIES as NOTEBOOKS_ACTIVITIES,
+    WORKFLOWS as NOTEBOOKS_WORKFLOWS,
+)
+from products.replay_vision.backend.temporal import (
+    ACTIVITIES as REPLAY_VISION_ACTIVITIES,
+    WORKFLOWS as REPLAY_VISION_WORKFLOWS,
+)
+from products.signals.backend.emission.temporal_settings import (
+    EMIT_SIGNALS_ACTIVITIES as DATA_IMPORT_EMIT_SIGNALS_ACTIVITIES,
+    EMIT_SIGNALS_WORKFLOWS as DATA_IMPORT_EMIT_SIGNALS_WORKFLOWS,
+)
+from products.signals.backend.temporal import (
+    ACTIVITIES as SIGNALS_PRODUCT_ACTIVITIES,
+    WORKFLOWS as SIGNALS_PRODUCT_WORKFLOWS,
+)
+from products.tasks.backend.facade.temporal import (
+    ACTIVITIES as TASKS_ACTIVITIES,
+    WORKFLOWS as TASKS_WORKFLOWS,
+)
+from products.warehouse_sources.backend.facade.temporal import (
+    ACTIVITIES as DATA_SYNC_ACTIVITIES,
+    METADATA_ACTIVITIES as DATA_WAREHOUSE_METADATA_ACTIVITIES,
+    METADATA_WORKFLOWS as DATA_WAREHOUSE_METADATA_WORKFLOWS,
+    WORKFLOWS as DATA_SYNC_WORKFLOWS,
+    load_all_sources,
+)
+from products.web_analytics.backend.temporal import (
+    ACTIVITIES as WA_DIGEST_ACTIVITIES,
+    WORKFLOWS as WA_DIGEST_WORKFLOWS,
+)
+
+# When adding modules to a queue, also update the corresponding CI trigger
+# in .github/workflows/container-images-cd.yml (check_changes_*_temporal_worker)
+_task_queue_specs = [
+    (
+        settings.SYNC_BATCH_EXPORTS_TASK_QUEUE,
+        BATCH_EXPORTS_WORKFLOWS,
+        BATCH_EXPORTS_ACTIVITIES,
+    ),
+    (
+        settings.BATCH_EXPORTS_TASK_QUEUE,
+        BATCH_EXPORTS_WORKFLOWS,
+        BATCH_EXPORTS_ACTIVITIES,
+    ),
+    (
+        settings.DATA_WAREHOUSE_TASK_QUEUE,
+        DATA_SYNC_WORKFLOWS + DATA_MODELING_WORKFLOWS,
+        DATA_SYNC_ACTIVITIES + DATA_MODELING_ACTIVITIES,
+    ),
+    (
+        settings.DATA_WAREHOUSE_CDP_PRODUCER_TASK_QUEUE,
+        DATA_SYNC_WORKFLOWS,
+        DATA_SYNC_ACTIVITIES,
+    ),
+    (
+        settings.DATA_WAREHOUSE_METADATA_TASK_QUEUE,
+        DATA_WAREHOUSE_METADATA_WORKFLOWS + SEMANTIC_ENRICHMENT_WORKFLOWS,
+        DATA_WAREHOUSE_METADATA_ACTIVITIES + SEMANTIC_ENRICHMENT_ACTIVITIES,
+    ),
+    (
+        settings.DATA_MODELING_TASK_QUEUE,
+        DATA_MODELING_WORKFLOWS,
+        DATA_MODELING_ACTIVITIES,
+    ),
+    (
+        settings.GENERAL_PURPOSE_TASK_QUEUE,
+        PROXY_SERVICE_WORKFLOWS
+        + DELETE_PERSONS_WORKFLOWS
+        + DELETE_TEAMS_WORKFLOWS
+        + SALESFORCE_ENRICHMENT_WORKFLOWS
+        + PRODUCT_ANALYTICS_WORKFLOWS
+        + LLM_ANALYTICS_WORKFLOWS
+        + DLQ_REPLAY_WORKFLOWS
+        + SYNC_PERSON_DISTINCT_IDS_WORKFLOWS
+        + EXPERIMENTS_WORKFLOWS
+        + EXPERIMENT_CANARY_WORKFLOWS
+        + CLEANUP_PROPDEFS_WORKFLOWS
+        + BACKFILL_GROUP_TYPE_CREATED_AT_WORKFLOWS
+        + INGESTION_ACCEPTANCE_TEST_WORKFLOWS
+        + WAREHOUSE_SOURCES_QUEUE_PARTITION_WORKFLOWS
+        + SYNC_EVENTS_RETENTION_WORKFLOWS
+        + JOB_LOGS_WORKFLOWS
+        + NOTEBOOKS_WORKFLOWS,
+        PROXY_SERVICE_ACTIVITIES
+        + DELETE_PERSONS_ACTIVITIES
+        + DELETE_TEAMS_ACTIVITIES
+        + QUOTA_LIMITING_ACTIVITIES
+        + SALESFORCE_ENRICHMENT_ACTIVITIES
+        + PRODUCT_ANALYTICS_ACTIVITIES
+        + LLM_ANALYTICS_ACTIVITIES
+        + DLQ_REPLAY_ACTIVITIES
+        + SYNC_PERSON_DISTINCT_IDS_ACTIVITIES
+        + EXPERIMENTS_ACTIVITIES
+        + EXPERIMENT_CANARY_ACTIVITIES
+        + CLEANUP_PROPDEFS_ACTIVITIES
+        + BACKFILL_GROUP_TYPE_CREATED_AT_ACTIVITIES
+        + INGESTION_ACCEPTANCE_TEST_ACTIVITIES
+        + WAREHOUSE_SOURCES_QUEUE_PARTITION_ACTIVITIES
+        + SYNC_EVENTS_RETENTION_ACTIVITIES
+        + JOB_LOGS_ACTIVITIES
+        + NOTEBOOKS_ACTIVITIES,
+    ),
+    (
+        settings.EXPERIMENTS_RECALCULATION_TASK_QUEUE,
+        EXPERIMENTS_RECALCULATION_WORKFLOWS,
+        EXPERIMENTS_RECALCULATION_ACTIVITIES,
+    ),
+    (
+        settings.HEALTH_CHECK_TASK_QUEUE,
+        HEALTH_CHECK_WORKFLOWS,
+        HEALTH_CHECK_ACTIVITIES,
+    ),
+    (
+        settings.DUCKLAKE_TASK_QUEUE,
+        DUCKLAKE_COPY_WORKFLOWS,
+        DUCKLAKE_COPY_ACTIVITIES,
+    ),
+    (
+        settings.ANALYTICS_PLATFORM_TASK_QUEUE,
+        EXPORT_WORKFLOWS + SUBSCRIPTION_WORKFLOWS + ALERT_WORKFLOWS,
+        EXPORT_ACTIVITIES + SUBSCRIPTION_ACTIVITIES + ALERT_ACTIVITIES,
+    ),
+    (
+        settings.TASKS_TASK_QUEUE,
+        # PostHog Code Slack workflows are also registered on MAX_AI_TASK_QUEUE.
+        # First step of merging them onto this queue — once master traffic has
+        # cut over and any in-flight runs have drained, drop them from
+        # AI_WORKFLOWS / AI_ACTIVITIES and flip the start_workflow callers in
+        # products/slack_app to settings.TASKS_TASK_QUEUE.
+        TASKS_WORKFLOWS + POSTHOG_CODE_SLACK_WORKFLOWS,
+        TASKS_ACTIVITIES + POSTHOG_CODE_SLACK_ACTIVITIES,
+    ),
+    (
+        settings.MAX_AI_TASK_QUEUE,
+        AI_WORKFLOWS,
+        AI_ACTIVITIES,
+    ),
+    (
+        settings.TEST_TASK_QUEUE,
+        TEST_WORKFLOWS,
+        TEST_ACTIVITIES,
+    ),
+    (
+        settings.BILLING_TASK_QUEUE,
+        QUOTA_LIMITING_WORKFLOWS + SALESFORCE_ENRICHMENT_WORKFLOWS + USAGE_REPORTS_WORKFLOWS,
+        QUOTA_LIMITING_ACTIVITIES + SALESFORCE_ENRICHMENT_ACTIVITIES + USAGE_REPORTS_ACTIVITIES,
+    ),
+    (
+        settings.VIDEO_EXPORT_TASK_QUEUE,
+        SIGNALS_PRODUCT_WORKFLOWS
+        + DATA_IMPORT_EMIT_SIGNALS_WORKFLOWS
+        + BUSINESS_KNOWLEDGE_WORKFLOWS
+        + CONVERSATIONS_WORKFLOWS,
+        SIGNALS_PRODUCT_ACTIVITIES
+        + DATA_IMPORT_EMIT_SIGNALS_ACTIVITIES
+        + BUSINESS_KNOWLEDGE_ACTIVITIES
+        + CONVERSATIONS_ACTIVITIES,
+    ),
+    (
+        settings.SESSION_REPLAY_TASK_QUEUE,
+        GEMINI_CLEANUP_SWEEP_WORKFLOWS
+        + COUNT_PLAYLIST_ITEMS_WORKFLOWS
+        + DELETE_RECORDINGS_WORKFLOWS
+        + ENFORCE_MAX_REPLAY_RETENTION_WORKFLOWS
+        + RASTERIZE_RECORDING_WORKFLOWS
+        + REPLAY_COUNT_METRICS_WORKFLOWS
+        + SESSION_SUMMARY_WORKFLOWS
+        + SESSION_SUMMARY_GROUP_WORKFLOWS
+        + SUMMARIZATION_SWEEP_WORKFLOWS
+        + SURFACING_SCORE_EXPORT_SWEEP_WORKFLOWS
+        + SURFACING_SCORING_SWEEP_WORKFLOWS,
+        GEMINI_CLEANUP_SWEEP_ACTIVITIES
+        + COUNT_PLAYLIST_ITEMS_ACTIVITIES
+        + DELETE_RECORDINGS_ACTIVITIES
+        + ENFORCE_MAX_REPLAY_RETENTION_ACTIVITIES
+        + RASTERIZE_RECORDING_ACTIVITIES
+        + REPLAY_COUNT_METRICS_ACTIVITIES
+        + SESSION_SUMMARY_ACTIVITIES
+        + SESSION_SUMMARY_GROUP_ACTIVITIES
+        + SUMMARIZATION_SWEEP_ACTIVITIES
+        + SURFACING_SCORE_EXPORT_SWEEP_ACTIVITIES
+        + SURFACING_SCORING_SWEEP_ACTIVITIES,
+    ),
+    (
+        settings.REPLAY_VISION_TASK_QUEUE,
+        REPLAY_VISION_WORKFLOWS,
+        REPLAY_VISION_ACTIVITIES,
+    ),
+    (
+        settings.MESSAGING_TASK_QUEUE,
+        MESSAGING_WORKFLOWS + WA_DIGEST_WORKFLOWS,
+        MESSAGING_ACTIVITIES + WA_DIGEST_ACTIVITIES,
+    ),
+    (
+        settings.WEEKLY_DIGEST_TASK_QUEUE,
+        WEEKLY_DIGEST_WORKFLOWS,
+        WEEKLY_DIGEST_ACTIVITIES,
+    ),
+    (
+        settings.LLMA_EVALS_TASK_QUEUE,
+        LLM_ANALYTICS_EVAL_WORKFLOWS + LLM_ANALYTICS_TAGGER_WORKFLOWS,
+        LLM_ANALYTICS_EVAL_ACTIVITIES + LLM_ANALYTICS_TAGGER_ACTIVITIES,
+    ),
+    (
+        settings.LLMA_TASK_QUEUE,
+        LLM_ANALYTICS_WORKFLOWS,
+        LLM_ANALYTICS_ACTIVITIES,
+    ),
+    (
+        # Dedicated queue for MCP analytics clustering — isolates the CPU
+        # burst (cluster compute) and external embedding worker calls from
+        # the general-purpose queue that hosts the rest of mcp_analytics.
+        # Workflow + activity lists are populated as the stack lands; an
+        # empty queue is harmless — the worker registers and idles.
+        settings.MCPA_TASK_QUEUE,
+        MCP_ANALYTICS_INTENT_CLUSTERING_WORKFLOWS,
+        MCP_ANALYTICS_INTENT_CLUSTERING_ACTIVITIES,
+    ),
+    (
+        settings.ERROR_TRACKING_TASK_QUEUE,
+        ERROR_TRACKING_WORKFLOWS,
+        ERROR_TRACKING_ACTIVITIES,
+    ),
+    (
+        settings.EVENT_SCREENSHOTS_TASK_QUEUE,
+        EVENT_SCREENSHOTS_WORKFLOWS,
+        EVENT_SCREENSHOTS_ACTIVITIES,
+    ),
+    (
+        settings.LOGS_ALERTING_TASK_QUEUE,
+        LOGS_ALERTING_WORKFLOWS,
+        LOGS_ALERTING_ACTIVITIES,
+    ),
+]
+
+# Note: When running locally, many task queues resolve to the same queue name.
+# If we used plain dict literals, later entries would overwrite earlier ones for
+# the same queue. We aggregate with defaultdict(set) so all workflows/activities
+# registered for a shared queue name are combined, ensuring the worker registers
+# everything it should.
+_workflows: defaultdict[str, set[type[PostHogWorkflow]]] = defaultdict(set)
+_activities: defaultdict[str, set[typing.Callable[..., typing.Any]]] = defaultdict(set)
+for task_queue_name, workflows_for_queue, activities_for_queue in _task_queue_specs:
+    _workflows[task_queue_name].update(workflows_for_queue)  # type: ignore
+    _activities[task_queue_name].update(activities_for_queue)
+
+WORKFLOWS_DICT = _workflows
+ACTIVITIES_DICT = _activities
+
+
+def workflows_include_data_import_syncs(workflows: collections.abc.Iterable[type]) -> bool:
+    """True when this worker runs data-warehouse source syncs and must eagerly load the sources."""
+    return any(wf in DATA_SYNC_WORKFLOWS for wf in workflows)
+
+
+if settings.DEBUG:
+    TASK_QUEUE_METRIC_PREFIXES = {}
+else:
+    TASK_QUEUE_METRIC_PREFIXES = {
+        settings.BATCH_EXPORTS_TASK_QUEUE: "batch_exports_",
+    }
+
+LOGGER = get_logger(__name__)
+
+
+class Command(BaseCommand):
+    help = "Start Temporal Python Django-aware Worker"
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--temporal-host",
+            default=settings.TEMPORAL_HOST,
+            help="Hostname for Temporal Scheduler",
+        )
+        parser.add_argument(
+            "--temporal-port",
+            default=settings.TEMPORAL_PORT,
+            help="Port for Temporal Scheduler",
+        )
+        parser.add_argument(
+            "--namespace",
+            default=settings.TEMPORAL_NAMESPACE,
+            help="Namespace to connect to",
+        )
+        parser.add_argument(
+            "--task-queue",
+            default=settings.TEMPORAL_TASK_QUEUE,
+            help="Task queue to service",
+        )
+        parser.add_argument(
+            "--server-root-ca-cert",
+            default=None,
+            help="Optional root server CA cert",
+        )
+        parser.add_argument(
+            "--client-cert",
+            default=settings.TEMPORAL_CLIENT_CERT,
+            help="Optional client cert",
+        )
+        parser.add_argument(
+            "--client-key",
+            default=settings.TEMPORAL_CLIENT_KEY,
+            help="Optional client key",
+        )
+        parser.add_argument(
+            "--metrics-port",
+            default=settings.PROMETHEUS_METRICS_EXPORT_PORT,
+            help="Port to export Prometheus metrics on",
+        )
+        parser.add_argument(
+            "--graceful-shutdown-timeout-seconds",
+            type=int,
+            default=settings.GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+            help="Time that the worker will wait after shutdown before canceling activities, in seconds",
+        )
+        parser.add_argument(
+            "--max-concurrent-workflow-tasks",
+            type=int,
+            default=settings.MAX_CONCURRENT_WORKFLOW_TASKS,
+            help="Maximum number of concurrent workflow tasks for this worker",
+        )
+        parser.add_argument(
+            "--max-concurrent-activities",
+            type=int,
+            default=settings.MAX_CONCURRENT_ACTIVITIES,
+            help="Maximum number of concurrent activity tasks for this worker",
+        )
+        parser.add_argument(
+            "--use-pydantic-converter",
+            action="store_true",
+            default=settings.TEMPORAL_USE_PYDANTIC_CONVERTER,
+            help="Use Pydantic data converter for this worker",
+        )
+        parser.add_argument(
+            "--target-memory-usage",
+            type=float,
+            default=settings.TARGET_MEMORY_USAGE,
+            help="Fraction of available memory to use",
+        )
+        parser.add_argument(
+            "--target-cpu-usage",
+            type=float,
+            default=settings.TARGET_CPU_USAGE,
+            help="Fraction of available CPU to use",
+        )
+        parser.add_argument(
+            "--health-port",
+            type=int,
+            default=settings.TEMPORAL_HEALTH_PORT,
+            help="Port for health check endpoints (/healthz, /readyz)",
+        )
+        parser.add_argument(
+            "--health-max-idle-seconds",
+            type=float,
+            default=settings.TEMPORAL_HEALTH_MAX_IDLE_SECONDS,
+            help="Maximum seconds without workflow/activity execution before unhealthy",
+        )
+        parser.add_argument(
+            "--disable-combined-metrics-server",
+            action="store_true",
+            default=not settings.TEMPORAL_COMBINED_METRICS_SERVER_ENABLED,
+            help="Disable the combined metrics server (useful for workers with GIL contention issues)",
+        )
+
+    def handle(self, *args, **options):
+        temporal_host = options["temporal_host"]
+        temporal_port = options["temporal_port"]
+        namespace = options["namespace"]
+        task_queue = options["task_queue"]
+        server_root_ca_cert = options.get("server_root_ca_cert", None)
+        client_cert = options.get("client_cert", None)
+        client_key = options.get("client_key", None)
+        graceful_shutdown_timeout_seconds = options.get("graceful_shutdown_timeout_seconds", None)
+        max_concurrent_workflow_tasks = options.get("max_concurrent_workflow_tasks", None)
+        max_concurrent_activities = options.get("max_concurrent_activities", None)
+        use_pydantic_converter = options["use_pydantic_converter"]
+        target_memory_usage = options.get("target_memory_usage", None)
+        target_cpu_usage = options.get("target_cpu_usage", None)
+        health_port = options.get("health_port", None)
+        health_max_idle_seconds = options.get("health_max_idle_seconds", None)
+        disable_combined_metrics_server = options.get("disable_combined_metrics_server", False)
+
+        try:
+            workflows = list(WORKFLOWS_DICT[task_queue])
+            activities = list(ACTIVITIES_DICT[task_queue])
+        except KeyError:
+            raise ValueError(f'Task queue "{task_queue}" not found in WORKFLOWS_DICT or ACTIVITIES_DICT')
+
+        # Data-import source modules import vendor SDKs (google-ads, etc.) at module scope, and those
+        # SDKs register protobuf descriptors into a process-global pool that rejects a second
+        # registration of the same symbol. They must be imported exactly once per process. Do it here
+        # — synchronously, at worker boot, on the main thread — for any queue that runs data syncs.
+        # Deferring to the first SourceRegistry.get_source() at runtime (the lazy path) let the
+        # registration recur and broke unrelated syncs with "duplicate symbol". Other workers never
+        # import the vendor SDKs, so they keep their fast startup.
+        if workflows_include_data_import_syncs(workflows):
+            load_all_sources()
+
+        if options["client_key"]:
+            options["client_key"] = "--SECRET--"
+
+        structlog.reset_defaults()
+
+        # enable faulthandler to print stack traces on segfaults
+        faulthandler.enable()
+
+        metrics_port = int(options["metrics_port"])
+
+        shutdown_task = None
+        health_server: HealthCheckServer | None = None
+
+        tag_queries(kind="temporal")
+
+        # Max AI and tasks-agent traces span the Django request and the Temporal activity that runs
+        # the agent loop. Without the OTel plugin on the worker, every span emitted from an activity
+        # is a root span and the conversation trace splits across disconnected pieces. Force-enable
+        # for both queues so investigations don't depend on an operator flipping
+        # TEMPORAL_OTEL_PLUGIN_ENABLED.
+        enable_otel = (
+            settings.TEMPORAL_OTEL_PLUGIN_ENABLED is True
+            or task_queue in (settings.MAX_AI_TASK_QUEUE, settings.TASKS_TASK_QUEUE)
+        ) and settings.OTEL_SERVICE_NAME is not None
+        if enable_otel is True:
+            # Mypy doesn't understand we have already checked settings.OTEL_SERVICE_NAME
+            initialize_otel(settings.OTEL_SERVICE_NAME, settings.TEMPORAL_OTEL_LIBRARIES_TO_INSTRUMENT)  # type: ignore
+
+        async def shutdown_all(
+            worker: ManagedWorker, health_srv: HealthCheckServer | None, sig: signal.Signals
+        ) -> None:
+            """Shutdown worker and health server."""
+            nonlocal shutdown_task
+
+            logger.info("Signal %s received", sig)
+
+            if worker.is_shutdown():
+                logger.info("Temporal worker already shut down")
+                return
+
+            logger.info("Initiating shutdown")
+
+            # Shutdown health server first so k8s stops sending traffic
+            if health_srv:
+                await health_srv.stop()
+
+            # Then shutdown the worker
+            await worker.shutdown()
+
+        def shutdown_on_signal(
+            worker: ManagedWorker,
+            health_srv: HealthCheckServer | None,
+            sig: signal.Signals,
+            loop: asyncio.AbstractEventLoop,
+        ):
+            """Signal handler that initiates shutdown."""
+            nonlocal shutdown_task
+
+            if shutdown_task is None:
+                shutdown_task = loop.create_task(shutdown_all(worker, health_srv, sig))
+
+        with asyncio.Runner() as runner:
+            loop = runner.get_loop()
+            configure_logger(loop=loop)
+
+            logger = LOGGER.bind(
+                host=temporal_host,
+                port=temporal_port,
+                namespace=namespace,
+                task_queue=task_queue,
+                graceful_shutdown_timeout_seconds=graceful_shutdown_timeout_seconds,
+                max_concurrent_workflow_tasks=max_concurrent_workflow_tasks,
+                max_concurrent_activities=max_concurrent_activities,
+                target_memory_usage=target_memory_usage,
+                target_cpu_usage=target_cpu_usage,
+                health_port=health_port,
+                health_max_idle_seconds=health_max_idle_seconds,
+                combined_metrics_server_enabled=not disable_combined_metrics_server,
+            )
+            logger.info("Starting Temporal Worker")
+
+            if task_queue == settings.SURFACING_SCORING_SWEEP_TASK_QUEUE:
+                from posthog.temporal.session_replay.surfacing_scoring_sweep.scorer import warmup_best_effort
+
+                # Best-effort: surfacing shares this queue with the rest of the
+                # session-replay worker, so a model problem must not crash the
+                # pod. It logs and continues; scoring activities retry until the
+                # model is fixed.
+                warmup_best_effort()
+
+            worker = runner.run(
+                create_worker(
+                    temporal_host,
+                    temporal_port,
+                    metrics_port=metrics_port,
+                    namespace=namespace,
+                    task_queue=task_queue,
+                    server_root_ca_cert=server_root_ca_cert,
+                    client_cert=client_cert,
+                    client_key=client_key,
+                    workflows=workflows,
+                    activities=activities,
+                    graceful_shutdown_timeout=(
+                        dt.timedelta(seconds=graceful_shutdown_timeout_seconds)
+                        if graceful_shutdown_timeout_seconds is not None
+                        else None
+                    ),
+                    max_concurrent_workflow_tasks=max_concurrent_workflow_tasks,
+                    max_concurrent_activities=max_concurrent_activities,
+                    metric_prefix=TASK_QUEUE_METRIC_PREFIXES.get(task_queue, None),
+                    use_pydantic_converter=use_pydantic_converter,
+                    target_memory_usage=target_memory_usage,
+                    target_cpu_usage=target_cpu_usage,
+                    enable_combined_metrics_server=not disable_combined_metrics_server,
+                    enable_open_telemetry_plugin=enable_otel,
+                )
+            )
+
+            # Create and start health check server
+            if health_port and health_max_idle_seconds:
+                health_server = HealthCheckServer(
+                    port=health_port,
+                    liveness_tracker=get_liveness_tracker(),
+                    max_idle_seconds=health_max_idle_seconds,
+                )
+                runner.run(health_server.start())
+            else:
+                logger.warning(
+                    f"No healthcheck server due to health_port={health_port} and health_max_idle_seconds={health_max_idle_seconds}"
+                )
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(
+                    sig,
+                    functools.partial(shutdown_on_signal, worker=worker, health_srv=health_server, sig=sig, loop=loop),
+                )
+
+            runner.run(worker.run())
+
+            if shutdown_task:
+                logger.info("Waiting on shutdown_task")
+                _ = runner.run(asyncio.wait([shutdown_task]))
+                logger.info("Finished Temporal worker shutdown")
+
+                logger.info("Listing active threads at shutdown:")
+                for t in threading.enumerate():
+                    logger.info(
+                        "Thread still alive at shutdown",
+                        thread_name=t.name,
+                        daemon=t.daemon,
+                        ident=t.ident,
+                    )
+
+                # _something_ is preventing clean exit after worker shutdown
+                logger.info("Temporal Worker has shut down, starting hard exit timer of 5 mins")
+
+                def hard_exit():
+                    logger.info("Hard exiting")
+                    os._exit(0)
+
+                timer = threading.Timer(60 * 5, hard_exit)
+                timer.daemon = True
+                timer.start()

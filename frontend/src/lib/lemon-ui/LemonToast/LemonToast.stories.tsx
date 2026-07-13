@@ -1,0 +1,176 @@
+import { Meta, StoryObj } from '@storybook/react'
+import { useMountedLogic, useValues } from 'kea'
+import { useEffect } from 'react'
+import { Slide, ToastContainer } from 'react-toastify'
+
+import { STATUS_PAGE_BASE } from 'lib/components/HelpMenu/incidentStatusLogic'
+import { incidentStatusLogic } from 'lib/components/HelpMenu/incidentStatusLogic'
+
+import { useStorybookMocks } from '~/mocks/browser'
+import * as statusPageCritical from '~/mocks/fixtures/_status_page_critical.json'
+
+import { ToastCloseButton, ToastContent, ToastContentProps, lemonToast } from './LemonToast'
+
+const meta: Meta<ToastContentProps> = {
+    title: 'Lemon UI/Lemon Toast',
+    component: ToastContent,
+    parameters: {
+        testOptions: {
+            waitForLoadersToDisappear: false,
+            snapshotTargetSelector: '.Toastify__toast-container',
+        },
+    },
+}
+
+type ToastStory = {
+    toasts: ToastContentProps[]
+}
+
+export default meta
+type Story = StoryObj<ToastStory>
+
+export const ToastTypes: Story = {
+    args: {
+        toasts: [
+            {
+                type: 'info',
+                message: 'An info toast',
+            },
+            {
+                type: 'success',
+                message: 'A success toast',
+            },
+            {
+                type: 'warning',
+                message: 'A warning toast',
+            },
+            {
+                type: 'error',
+                message: 'An error toast',
+            },
+        ],
+    },
+    render: (args, { globals }) => {
+        const isDarkModeOn = globals.theme === 'dark'
+
+        // eslint-disable-next-line react-hooks/rules-of-hooks
+        useEffect(() => {
+            lemonToast.dismiss()
+            args.toasts.forEach((toast) => {
+                const { type, message, ...rest } = toast
+                lemonToast[type](message, rest)
+            })
+        }, [isDarkModeOn]) // oxlint-disable-line react-hooks/exhaustive-deps
+
+        return (
+            <ToastContainer
+                position="top-left" // different from app
+                autoClose={false} // different from app
+                transition={Slide}
+                closeButton={<ToastCloseButton />}
+                theme={isDarkModeOn ? 'dark' : 'light'}
+            />
+        )
+    },
+}
+
+export const BillingError: Story = {
+    ...ToastTypes,
+    args: {
+        toasts: [
+            {
+                type: 'error',
+                message:
+                    'Load experiment failed: This feature is part of the premium PostHog offering. To use it, subscribe to PostHog Cloud with a generous free tier: https://app.posthog.com/organization/billing',
+            },
+        ],
+    },
+}
+
+export const WithButton: Story = {
+    ...ToastTypes,
+    args: {
+        toasts: [
+            {
+                type: 'success',
+                message: 'Insight added to dashboard',
+                button: {
+                    label: 'View dashboard',
+                    action: (): void => {},
+                },
+            },
+        ],
+    },
+}
+
+export const WithProgress: Story = {
+    ...ToastTypes,
+    args: {
+        toasts: [
+            {
+                type: 'info',
+                message: 'An info toast with progress',
+                progress: 0.4,
+            } as ToastContentProps,
+            {
+                type: 'success',
+                message: 'A success toast with progress',
+                progress: 0.4,
+            } as ToastContentProps,
+            {
+                type: 'warning',
+                message: 'A warning toast with progress',
+                progress: 0.4,
+            } as ToastContentProps,
+            {
+                type: 'error',
+                message: 'An error toast with progress',
+                progress: 0.4,
+            } as ToastContentProps,
+        ],
+    },
+}
+
+export const ErrorWithIncidentNote: Story = {
+    args: {
+        toasts: [
+            {
+                type: 'error',
+                message: 'An error toast during an incident',
+            },
+        ],
+    },
+    render: (_args, { globals }) => {
+        const isDarkModeOn = globals.theme === 'dark'
+
+        // eslint-disable-next-line react-hooks/rules-of-hooks
+        useStorybookMocks({
+            get: {
+                [`${STATUS_PAGE_BASE}/api/v1/summary`]: statusPageCritical,
+            },
+        })
+
+        // eslint-disable-next-line react-hooks/rules-of-hooks
+        useMountedLogic(incidentStatusLogic)
+        // eslint-disable-next-line react-hooks/rules-of-hooks
+        const { status } = useValues(incidentStatusLogic)
+
+        // eslint-disable-next-line react-hooks/rules-of-hooks
+        useEffect(() => {
+            if (status !== 'operational') {
+                lemonToast.dismiss()
+                lemonToast.error('An error toast during an incident')
+            }
+        }, [status, isDarkModeOn]) // oxlint-disable-line react-hooks/exhaustive-deps
+
+        return (
+            <ToastContainer
+                position="top-left"
+                autoClose={false}
+                transition={Slide}
+                closeButton={<ToastCloseButton />}
+                theme={isDarkModeOn ? 'dark' : 'light'}
+            />
+        )
+    },
+}

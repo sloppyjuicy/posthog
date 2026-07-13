@@ -1,0 +1,226 @@
+import { actions, kea, listeners, path, reducers, selectors } from 'kea'
+import { actionToUrl, router, urlToAction } from 'kea-router'
+import { subscriptions } from 'kea-subscriptions'
+import posthog from 'posthog-js'
+
+import { AutoplayDirection, SessionRecordingSidebarStacking } from '~/types'
+
+import type { playerSettingsLogicType } from './playerSettingsLogicType'
+
+export enum TimestampFormat {
+    Relative = 'relative',
+    UTC = 'utc',
+    Device = 'device',
+}
+
+export type HideViewedRecordingsOptions = 'current-user' | 'any-user' | false
+
+// This logic contains player settings that should persist across players
+// If key is not specified, it is global so it does not reset when recordings change in the main recordings page
+export const playerSettingsLogic = kea<playerSettingsLogicType>([
+    path(['scenes', 'session-recordings', 'player', 'playerSettingsLogic']),
+    actions({
+        setSkipInactivitySetting: (skipInactivitySetting: boolean) => ({ skipInactivitySetting }),
+        setSpeed: (speed: number) => ({ speed }),
+        setHideViewedRecordings: (hideViewedRecordings: HideViewedRecordingsOptions) => ({
+            hideViewedRecordings,
+        }),
+        setAutoplayDirection: (autoplayDirection: AutoplayDirection) => ({ autoplayDirection }),
+        setShowFilters: (showFilters: boolean) => ({ showFilters }),
+        setTimestampFormat: (format: TimestampFormat) => ({ format }),
+        setPlaylistTimestampFormat: (format: TimestampFormat) => ({ format }),
+        setPreferredSidebarStacking: (stacking: SessionRecordingSidebarStacking) => ({ stacking }),
+        setSidebarOpen: (open: boolean) => ({ open }),
+        setPlaylistOpen: (open: boolean) => ({ open }),
+        setURLOverrideSidebarOpen: (open: boolean) => ({ open }),
+        setPlaylistCollapsed: (collapsed: boolean) => ({ collapsed }),
+        setShowMetadataFooter: (showMetadataFooter: boolean) => ({ showMetadataFooter }),
+        setPlayerControlsOverlay: (playerControlsOverlay: boolean) => ({ playerControlsOverlay }),
+    }),
+    reducers(() => ({
+        showFilters: [true, { persist: true }, { setShowFilters: (_, { showFilters }) => showFilters }],
+        userPreferenceSidebarOpen: [false, { persist: true }, { setSidebarOpen: (_, { open }) => open }],
+        urlOverrideSidebarOpen: [
+            null as boolean | null,
+            { persist: false },
+            { setURLOverrideSidebarOpen: (_, { open }) => open },
+        ],
+        playlistOpen: [true, { setPlaylistOpen: (_, { open }) => open }],
+        preferredSidebarStacking: [
+            SessionRecordingSidebarStacking.Horizontal as SessionRecordingSidebarStacking,
+            { persist: true },
+            {
+                setPreferredSidebarStacking: (_, { stacking }) => stacking,
+            },
+        ],
+        speed: [
+            1,
+            { persist: true },
+            {
+                setSpeed: (_, { speed }) => speed,
+            },
+        ],
+        timestampFormat: [
+            TimestampFormat.Relative as TimestampFormat,
+            { persist: true },
+            {
+                setTimestampFormat: (_, { format }) => format,
+            },
+        ],
+        playlistTimestampFormat: [
+            TimestampFormat.Relative as TimestampFormat,
+            { persist: true },
+            {
+                setPlaylistTimestampFormat: (_, { format }) => format,
+            },
+        ],
+        skipInactivitySetting: [
+            true,
+            { persist: true },
+            {
+                setSkipInactivitySetting: (_, { skipInactivitySetting }) => skipInactivitySetting,
+            },
+        ],
+        autoplayDirection: [
+            'older' as AutoplayDirection,
+            { persist: true },
+            {
+                setAutoplayDirection: (_, { autoplayDirection }) => autoplayDirection,
+            },
+        ],
+        hideViewedRecordings: [
+            false as HideViewedRecordingsOptions,
+            { persist: true },
+            {
+                setHideViewedRecordings: (_, { hideViewedRecordings }) => hideViewedRecordings,
+            },
+        ],
+        isPlaylistCollapsed: [
+            false,
+            { persist: true },
+            {
+                setPlaylistCollapsed: (_, { collapsed }) => collapsed,
+            },
+        ],
+        showMetadataFooter: [
+            false,
+            // Don't persist this setting as required for export only
+            {
+                setShowMetadataFooter: (_, { showMetadataFooter }) => showMetadataFooter,
+            },
+        ],
+        // Whether the seekbar + transport controls float on top of the recording or sit pinned below it in normal flow.
+        playerControlsOverlay: [
+            true,
+            { persist: true },
+            {
+                setPlayerControlsOverlay: (_, { playerControlsOverlay }) => playerControlsOverlay,
+            },
+        ],
+    })),
+
+    selectors({
+        sidebarOpen: [
+            (s) => [s.userPreferenceSidebarOpen, s.urlOverrideSidebarOpen],
+            (userPreferenceSidebarOpen, urlOverrideSidebarOpen): boolean => {
+                if (urlOverrideSidebarOpen !== null) {
+                    return urlOverrideSidebarOpen
+                }
+                return userPreferenceSidebarOpen
+            },
+        ],
+        isVerticallyStacked: [
+            (s) => [s.preferredSidebarStacking],
+            (preferredSidebarStacking) => preferredSidebarStacking === SessionRecordingSidebarStacking.Vertical,
+        ],
+        hideRecordingsMenuLabelFor: [
+            () => [],
+            () => {
+                return (option: HideViewedRecordingsOptions) => {
+                    switch (option) {
+                        case 'current-user':
+                            return 'Hide my viewed recordings'
+                        case 'any-user':
+                            return 'Hide all viewed recordings'
+                        default:
+                            return 'Viewed and unviewed recordings'
+                    }
+                }
+            },
+        ],
+    }),
+
+    listeners({
+        setSpeed: ({ speed }) => {
+            posthog.capture('recording player speed changed', { new_speed: speed })
+        },
+        setSkipInactivitySetting: ({ skipInactivitySetting }) => {
+            posthog.capture('recording player skip inactivity toggled', { skip_inactivity: skipInactivitySetting })
+        },
+        setPlayerControlsOverlay: ({ playerControlsOverlay }) => {
+            posthog.capture('recording player controls overlay toggled', {
+                player_controls_overlay: playerControlsOverlay,
+            })
+        },
+    }),
+
+    subscriptions(({ actions }) => ({
+        hideViewedRecordings: ({ hideViewedRecordings }) => {
+            // hideViewRecordings used to be flat boolean
+            // if someone has it set to true, we should set it to 'current-user'
+            // to upgrade them to the new behavior
+            // this can be deleted after a few weeks
+            if (hideViewedRecordings === true) {
+                actions.setHideViewedRecordings('current-user')
+            }
+        },
+    })),
+
+    urlToAction(({ actions, values }) => ({
+        ['**/shared/*']: (_, searchParams) => {
+            // when sharing a recording, you can specify whether the inspector should be open.
+            // we should obey that regardless of the preference stored here.
+            // the sharing URLs historically added showInspector with no value.
+            // so we need to check for the presence of the key.
+            // if the key is present but "null", that is equivalent to true
+            const inspectorSideBarOpen = 'showInspector' in searchParams && (searchParams.showInspector ?? true)
+            if (inspectorSideBarOpen && inspectorSideBarOpen !== values.sidebarOpen) {
+                actions.setURLOverrideSidebarOpen(inspectorSideBarOpen)
+            }
+        },
+        ['**/exporter']: (_, searchParams) => {
+            const playerSpeed = Number(searchParams.playerSpeed ?? 1)
+            if (values.speed !== playerSpeed) {
+                actions.setSpeed(playerSpeed)
+            }
+            const showMetadataFooter =
+                'showMetadataFooter' in searchParams && (searchParams.showMetadataFooter ?? false)
+            if (values.showMetadataFooter !== showMetadataFooter) {
+                actions.setShowMetadataFooter(showMetadataFooter)
+                // If we display metadata footer (for analysis purposes), we also want to skip inactivity to speed up rendering
+                actions.setSkipInactivitySetting(showMetadataFooter)
+            }
+        },
+        // Putting `*` last to match it only if more specific routes don't match, as the matching seems to be exclusive
+        '*': (_, searchParams, hashParams) => {
+            const inspectorSideBarOpen = searchParams.inspectorSideBar === true || hashParams.inspectorSideBar === true
+            if (inspectorSideBarOpen && inspectorSideBarOpen !== values.sidebarOpen) {
+                actions.setSidebarOpen(inspectorSideBarOpen)
+            }
+        },
+    })),
+
+    actionToUrl(() => ({
+        setSidebarOpen: ({ open }) => {
+            const { currentLocation } = router.values
+            return [
+                currentLocation.pathname,
+                {
+                    ...currentLocation.searchParams,
+                    inspectorSideBar: open,
+                },
+                currentLocation.hashParams,
+            ]
+        },
+    })),
+])

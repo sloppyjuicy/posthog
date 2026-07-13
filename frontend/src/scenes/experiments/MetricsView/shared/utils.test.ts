@@ -1,0 +1,356 @@
+import type { ExperimentFunnelsQuery, ExperimentMetric, ExperimentTrendsQuery } from '~/queries/schema/schema-general'
+import { ExperimentMetricType, NodeKind } from '~/queries/schema/schema-general'
+import { ExperimentMetricGoal, ExperimentMetricMathType, FunnelConversionWindowTimeUnit } from '~/types'
+
+import {
+    type ExperimentVariantResult,
+    formatChanceToWinForGoal,
+    formatMetricValue,
+    formatPValue,
+    formatTickValue,
+    getChanceToWin,
+    getDefaultMetricTitle,
+    getMetricColors,
+    getMetricTag,
+    isProportionMetric,
+    isWinning,
+} from './utils'
+
+describe('getMetricTag', () => {
+    it('handles different metric types correctly', () => {
+        const experimentMetric: ExperimentMetric = {
+            kind: NodeKind.ExperimentMetric,
+            metric_type: ExperimentMetricType.MEAN,
+            source: {
+                kind: NodeKind.EventsNode,
+                event: 'purchase',
+                math: ExperimentMetricMathType.TotalCount,
+            },
+        }
+
+        const funnelMetric: ExperimentFunnelsQuery = {
+            kind: NodeKind.ExperimentFunnelsQuery,
+            funnels_query: {
+                kind: NodeKind.FunnelsQuery,
+                series: [],
+            },
+        }
+
+        const trendMetric: ExperimentTrendsQuery = {
+            kind: NodeKind.ExperimentTrendsQuery,
+            count_query: {
+                kind: NodeKind.TrendsQuery,
+                series: [],
+            },
+        }
+
+        expect(getMetricTag(experimentMetric)).toBe('Mean')
+        expect(getMetricTag(funnelMetric)).toBe('Funnel')
+        expect(getMetricTag(trendMetric)).toBe('Trend')
+    })
+})
+
+describe('getDefaultMetricTitle', () => {
+    it('handles ExperimentEventMetricConfig with math and math_property', () => {
+        const metric: ExperimentMetric = {
+            kind: NodeKind.ExperimentMetric,
+            metric_type: ExperimentMetricType.MEAN,
+            source: {
+                kind: NodeKind.EventsNode,
+                event: 'purchase completed',
+            },
+        }
+        expect(getDefaultMetricTitle(metric)).toBe('purchase completed')
+    })
+
+    it('returns action name for ExperimentActionMetricConfig', () => {
+        const metric: ExperimentMetric = {
+            kind: NodeKind.ExperimentMetric,
+            metric_type: ExperimentMetricType.MEAN,
+            source: {
+                kind: NodeKind.ActionsNode,
+                id: 1,
+                name: 'purchase',
+            },
+        }
+
+        expect(getDefaultMetricTitle(metric)).toBe('purchase')
+    })
+
+    it('returns table name for ExperimentDataWarehouseMetricConfig', () => {
+        const metric: ExperimentMetric = {
+            kind: NodeKind.ExperimentMetric,
+            metric_type: ExperimentMetricType.MEAN,
+            source: {
+                kind: NodeKind.ExperimentDataWarehouseNode,
+                table_name: 'purchase_events',
+                timestamp_field: 'timestamp',
+                events_join_key: 'person_id',
+                data_warehouse_join_key: 'person_id',
+            },
+        }
+        expect(getDefaultMetricTitle(metric)).toBe('purchase_events')
+    })
+})
+
+describe('isWinning', () => {
+    const createResult = (credible_interval: [number, number] | undefined): ExperimentVariantResult => ({
+        key: 'test',
+        sum: 100,
+        number_of_samples: 100,
+        sum_squares: 100,
+        significant: true,
+        method: 'bayesian',
+        credible_interval,
+        chance_to_win: 0.75,
+    })
+
+    it('returns true for positive delta with increase goal', () => {
+        const result = createResult([0.05, 0.15])
+        expect(isWinning(result, ExperimentMetricGoal.Increase)).toBe(true)
+    })
+
+    it('returns false for positive delta with decrease goal', () => {
+        const result = createResult([0.05, 0.15])
+        expect(isWinning(result, ExperimentMetricGoal.Decrease)).toBe(false)
+    })
+
+    it('returns false for negative delta with increase goal', () => {
+        const result = createResult([-0.15, -0.05])
+        expect(isWinning(result, ExperimentMetricGoal.Increase)).toBe(false)
+    })
+
+    it('returns true for negative delta with decrease goal', () => {
+        const result = createResult([-0.15, -0.05])
+        expect(isWinning(result, ExperimentMetricGoal.Decrease)).toBe(true)
+    })
+
+    it('returns undefined when no interval is present', () => {
+        const result = createResult(undefined)
+        expect(isWinning(result, ExperimentMetricGoal.Increase)).toBeUndefined()
+        expect(isWinning(result, ExperimentMetricGoal.Decrease)).toBeUndefined()
+    })
+})
+
+describe('getChanceToWin', () => {
+    const createBayesianResult = (chance_to_win: number | undefined): ExperimentVariantResult => ({
+        key: 'test',
+        sum: 100,
+        number_of_samples: 100,
+        sum_squares: 100,
+        significant: true,
+        method: 'bayesian',
+        credible_interval: [0.05, 0.15],
+        chance_to_win,
+    })
+
+    const createFrequentistResult = (): ExperimentVariantResult => ({
+        key: 'test',
+        sum: 100,
+        number_of_samples: 100,
+        sum_squares: 100,
+        significant: true,
+        method: 'frequentist',
+        confidence_interval: [0.05, 0.15],
+        p_value: 0.03,
+    })
+
+    it('returns chance to win as-is for increase goal', () => {
+        const result = createBayesianResult(0.75)
+        expect(getChanceToWin(result, ExperimentMetricGoal.Increase)).toBe(0.75)
+    })
+
+    it('inverts chance to win for decrease goal', () => {
+        const result = createBayesianResult(0.75)
+        expect(getChanceToWin(result, ExperimentMetricGoal.Decrease)).toBe(0.25)
+    })
+
+    it('handles null chance to win', () => {
+        const result = createBayesianResult(undefined)
+        expect(getChanceToWin(result, ExperimentMetricGoal.Increase)).toBeUndefined()
+        expect(getChanceToWin(result, ExperimentMetricGoal.Decrease)).toBeUndefined()
+    })
+
+    it('returns undefined for frequentist results', () => {
+        const result = createFrequentistResult()
+        expect(getChanceToWin(result, ExperimentMetricGoal.Increase)).toBeUndefined()
+        expect(getChanceToWin(result, ExperimentMetricGoal.Decrease)).toBeUndefined()
+    })
+})
+
+describe('formatChanceToWinForGoal', () => {
+    const createResult = (chance_to_win: number): ExperimentVariantResult => ({
+        key: 'test',
+        sum: 100,
+        number_of_samples: 100,
+        sum_squares: 100,
+        significant: true,
+        method: 'bayesian',
+        credible_interval: [0.05, 0.15],
+        chance_to_win,
+    })
+
+    it('formats chance to win for increase goal', () => {
+        const result = createResult(0.756)
+        expect(formatChanceToWinForGoal(result, ExperimentMetricGoal.Increase)).toBe('75.6%')
+    })
+
+    it('formats inverted chance to win for decrease goal', () => {
+        const result = createResult(0.756)
+        expect(formatChanceToWinForGoal(result, ExperimentMetricGoal.Decrease)).toBe('24.4%')
+    })
+
+    it('handles very high chances', () => {
+        const result = createResult(0.9995)
+        expect(formatChanceToWinForGoal(result, ExperimentMetricGoal.Increase)).toBe('> 99.9%')
+        expect(formatChanceToWinForGoal(result, ExperimentMetricGoal.Decrease)).toBe('< 0.1%')
+    })
+
+    it('handles very low chances', () => {
+        const result = createResult(0.0005)
+        expect(formatChanceToWinForGoal(result, ExperimentMetricGoal.Increase)).toBe('< 0.1%')
+        expect(formatChanceToWinForGoal(result, ExperimentMetricGoal.Decrease)).toBe('> 99.9%')
+    })
+})
+
+describe('getMetricColors', () => {
+    const colors = {
+        BAR_POSITIVE: '#00FF00',
+        BAR_NEGATIVE: '#FF0000',
+    }
+
+    it('returns normal colors for increase goal', () => {
+        const result = getMetricColors(colors, ExperimentMetricGoal.Increase)
+        expect(result.positive).toBe('#00FF00')
+        expect(result.negative).toBe('#FF0000')
+    })
+
+    it('swaps colors for decrease goal', () => {
+        const result = getMetricColors(colors, ExperimentMetricGoal.Decrease)
+        expect(result.positive).toBe('#FF0000')
+        expect(result.negative).toBe('#00FF00')
+    })
+})
+
+describe('formatPValue', () => {
+    it.each([
+        [null, '—'],
+        [undefined, '—'],
+    ])('returns "—" for %p', (input, expected) => {
+        expect(formatPValue(input)).toBe(expected)
+    })
+
+    it.each([
+        [0, '< 0.001'],
+        [0.0001, '< 0.001'],
+        [0.00001, '< 0.001'],
+        [4.196532010780629e-11, '< 0.001'],
+        [1e-100, '< 0.001'],
+        [Number.MIN_VALUE, '< 0.001'],
+    ])('returns "< 0.001" for very small p-value %p', (input, expected) => {
+        expect(formatPValue(input)).toBe(expected)
+    })
+
+    it.each([
+        [0.001, '0.0010'],
+        [0.005, '0.0050'],
+        [0.009, '0.0090'],
+        [0.00999, '0.0100'],
+    ])('returns 4 decimal places for p-value %p between 0.001 and 0.01', (input, expected) => {
+        expect(formatPValue(input)).toBe(expected)
+    })
+
+    it.each([
+        [0.01, '0.010'],
+        [0.05, '0.050'],
+        [0.1, '0.100'],
+        [0.5, '0.500'],
+        [0.999, '0.999'],
+        [1, '1.000'],
+    ])('returns 3 decimal places for p-value %p >= 0.01', (input, expected) => {
+        expect(formatPValue(input)).toBe(expected)
+    })
+})
+
+describe('formatTickValue', () => {
+    it.each([
+        [0, '0%'],
+        [0.5, '50%'],
+        [-0.15, '-15%'],
+        [0.055, '5.50%'],
+        [0.005, '0.500%'],
+        [1.5, '150%'],
+    ])('formatTickValue(%p) === %p', (input, expected) => {
+        expect(formatTickValue(input)).toBe(expected)
+    })
+})
+
+const meanMetric = (threshold?: number): ExperimentMetric => ({
+    kind: NodeKind.ExperimentMetric,
+    metric_type: ExperimentMetricType.MEAN,
+    source: { kind: NodeKind.EventsNode, event: 'purchase', math: ExperimentMetricMathType.Sum },
+    ...(threshold != null ? { threshold } : {}),
+})
+
+const funnelMetric: ExperimentMetric = {
+    kind: NodeKind.ExperimentMetric,
+    metric_type: ExperimentMetricType.FUNNEL,
+    series: [{ kind: NodeKind.EventsNode, event: 'signup' }],
+}
+
+const retentionMetric: ExperimentMetric = {
+    kind: NodeKind.ExperimentMetric,
+    metric_type: ExperimentMetricType.RETENTION,
+    start_event: { kind: NodeKind.EventsNode, event: 'signup' },
+    completion_event: { kind: NodeKind.EventsNode, event: 'return' },
+    retention_window_start: 0,
+    retention_window_end: 7,
+    retention_window_unit: FunnelConversionWindowTimeUnit.Day,
+    start_handling: 'first_seen',
+}
+
+const ratioMetric: ExperimentMetric = {
+    kind: NodeKind.ExperimentMetric,
+    metric_type: ExperimentMetricType.RATIO,
+    numerator: { kind: NodeKind.EventsNode, event: 'revenue' },
+    denominator: { kind: NodeKind.EventsNode, event: 'sessions' },
+}
+
+describe('isProportionMetric', () => {
+    const cases: { label: string; metric: ExperimentMetric; expected: boolean }[] = [
+        { label: 'threshold mean', metric: meanMetric(5), expected: true },
+        { label: 'plain mean', metric: meanMetric(), expected: false },
+        { label: 'funnel', metric: funnelMetric, expected: true },
+        { label: 'retention', metric: retentionMetric, expected: true },
+        { label: 'ratio', metric: ratioMetric, expected: false },
+    ]
+    it.each(cases)('classifies $label metric', ({ metric, expected }) => {
+        expect(isProportionMetric(metric)).toBe(expected)
+    })
+})
+
+describe('formatMetricValue', () => {
+    it('formats a plain mean metric as a raw number', () => {
+        expect(formatMetricValue({ sum: 4, number_of_samples: 100 }, meanMetric())).toBe('0.04')
+    })
+
+    it('formats a threshold mean metric as a percentage', () => {
+        expect(formatMetricValue({ sum: 40, number_of_samples: 100 }, meanMetric(5))).toBe('40.00%')
+    })
+
+    it('formats a funnel metric as a percentage', () => {
+        expect(formatMetricValue({ sum: 25, number_of_samples: 100 }, funnelMetric)).toBe('25.00%')
+    })
+
+    it('formats a retention metric as a percentage', () => {
+        expect(formatMetricValue({ sum: 60, number_of_samples: 100 }, retentionMetric)).toBe('60.00%')
+    })
+
+    it('formats a ratio metric as a quotient', () => {
+        expect(formatMetricValue({ sum: 50, denominator_sum: 200 }, ratioMetric)).toBe('0.25')
+    })
+
+    it('returns "—" when the value is not a number', () => {
+        expect(formatMetricValue({ sum: 0, number_of_samples: 0 }, meanMetric())).toBe('—')
+    })
+})

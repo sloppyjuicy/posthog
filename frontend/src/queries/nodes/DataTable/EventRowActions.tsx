@@ -1,0 +1,123 @@
+import React from 'react'
+
+import { IconLlmAnalytics, IconWarning } from '@posthog/icons'
+
+import ViewRecordingButton, { RecordingPlayerType } from 'lib/components/ViewRecordingButton/ViewRecordingButton'
+import { IconLink } from 'lib/lemon-ui/icons'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { More } from 'lib/lemon-ui/LemonButton/More'
+import { copyToClipboard } from 'lib/utils/copyToClipboard'
+import { getCurrentTeamId } from 'lib/utils/getAppContext'
+import { insightUrlForEvent } from 'scenes/insights/utils'
+import { ArchiveSurveyButton } from 'scenes/surveys/components/ArchiveSurveyButton'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { saveActionFromEvent } from '~/models/saveAsActionDialog'
+import { EventType, SurveyEventName } from '~/types'
+
+export function EventRowActions({
+    event,
+    hideRecordingButton,
+}: {
+    event: EventType
+    hideRecordingButton?: boolean
+}): JSX.Element {
+    return (
+        <div className="flex items-center justify-end gap-1">
+            {!hideRecordingButton && (
+                <ViewRecordingButton
+                    iconOnly
+                    sessionId={event.properties.$session_id}
+                    recordingStatus={event.properties.$recording_status}
+                    timestamp={event.timestamp}
+                    hasRecording={event.properties.$has_recording as boolean | undefined}
+                    openPlayerIn={RecordingPlayerType.NewTab}
+                    size="xsmall"
+                    type="secondary"
+                    data-attr="events-table-inline-recording-button"
+                />
+            )}
+            <More overlay={<EventRowActionsDropdown event={event} />} />
+        </div>
+    )
+}
+
+function EventRowActionsDropdown({ event }: { event: EventType }): JSX.Element {
+    const insightUrl = insightUrlForEvent(event)
+
+    return (
+        <>
+            {getCurrentTeamId() && (
+                <LemonButton
+                    onClick={() =>
+                        saveActionFromEvent(event, teamLogic.findMounted()?.values.currentTeam?.data_attributes || [])
+                    }
+                    fullWidth
+                    data-attr="events-table-create-action"
+                >
+                    Create action from event
+                </LemonButton>
+            )}
+            {event.event === SurveyEventName.SENT && event.uuid && event.properties.$survey_id ? (
+                <ArchiveSurveyButton surveyId={event.properties.$survey_id} responseUuid={event.uuid} />
+            ) : null}
+            {event.uuid && event.timestamp && <EventCopyLinkButton event={event} />}
+            {event.event === '$exception' && '$exception_issue_id' in event.properties ? (
+                <LemonButton
+                    fullWidth
+                    sideIcon={<IconWarning />}
+                    data-attr="events-table-issue-link"
+                    to={urls.errorTrackingIssue(
+                        event.properties.$exception_issue_id,
+                        event.properties.$exception_fingerprint
+                    )}
+                >
+                    Visit issue
+                </LemonButton>
+            ) : null}
+            {'$ai_trace_id' in event.properties ? (
+                <LemonButton
+                    fullWidth
+                    sideIcon={<IconLlmAnalytics />}
+                    data-attr="events-table-trace-link"
+                    to={urls.aiObservabilityTrace(
+                        event.properties.$ai_trace_id,
+                        event.event === '$ai_trace'
+                            ? { event: event.id, exception_ts: event.timestamp }
+                            : { event: event.id }
+                    )}
+                >
+                    View LLM trace
+                </LemonButton>
+            ) : null}
+            {insightUrl && (
+                <LemonButton to={insightUrl} fullWidth data-attr="events-table-usage" targetBlank>
+                    Try out in Insights
+                </LemonButton>
+            )}
+        </>
+    )
+}
+
+export const EventCopyLinkButton = React.forwardRef<
+    HTMLButtonElement,
+    { event: Pick<EventType, 'uuid' | 'timestamp'> }
+>(function EventCopyLinkButton({ event }, ref) {
+    return (
+        <LemonButton
+            ref={ref}
+            fullWidth
+            sideIcon={<IconLink />}
+            data-attr="events-table-event-link"
+            onClick={() =>
+                void copyToClipboard(
+                    urls.absolute(urls.currentProject(urls.event(String(event.uuid), event.timestamp))),
+                    'link to event'
+                )
+            }
+        >
+            Copy link to event
+        </LemonButton>
+    )
+})

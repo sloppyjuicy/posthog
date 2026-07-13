@@ -1,0 +1,335 @@
+import equal from 'fast-deep-equal'
+import { actions, connect, events, kea, listeners, path, props, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+
+import api from 'lib/api'
+import { getSingularType } from 'lib/components/DefinitionPopover/utils'
+import { resolvePropertyDefinitionId } from 'lib/components/PropertyFilters/utils'
+import { getDataWarehouseItemWithFieldDefaults } from 'lib/components/TaxonomicFilter/dataWarehouseItemUtils'
+import { TaxonomicDefinitionTypes, TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { capitalizeFirstLetter } from 'lib/utils/strings'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { actionsModel } from '~/models/actionsModel'
+import { cohortsModel } from '~/models/cohortsModel'
+import { propertyDefinitionsModel, updatePropertyDefinitions } from '~/models/propertyDefinitionsModel'
+import { ActionType, CohortType, EventDefinition, PropertyDefinition } from '~/types'
+
+import { DataWarehouseTableForInsight } from 'products/data_warehouse/frontend/types'
+
+import type { definitionPopoverLogicType } from './definitionPopoverLogicType'
+
+const IS_TEST_MODE = process.env.NODE_ENV === 'test'
+
+export enum DefinitionPopoverState {
+    Edit = 'edit',
+    View = 'view',
+}
+
+export interface DefinitionPopoverLogicProps {
+    /* String type accounts for types with `TaxonomicFilterGroupType.GroupsPrefix` prefix */
+    type: TaxonomicFilterGroupType | string
+    selectedItemMeta?: Record<string, any> | null
+    /* Callback to update specific item in in-memory list */
+    updateRemoteItem?: (item: TaxonomicDefinitionTypes) => void
+    onCancel?: () => void
+    onSave?: () => void
+    hideView?: boolean
+    hideEdit?: boolean
+    openDetailInNewTab?: boolean
+}
+
+export const definitionPopoverLogic = kea<definitionPopoverLogicType>([
+    props({} as DefinitionPopoverLogicProps),
+    path(['lib', 'components', 'DefinitionPanel', 'definitionPopoverLogic']),
+    connect(() => ({
+        values: [teamLogic, ['currentProjectId'], propertyDefinitionsModel, ['getPropertyDefinition']],
+    })),
+    actions(({ values, props }) => ({
+        setDefinition: (item: Partial<TaxonomicDefinitionTypes>) => ({
+            item,
+            isDataWarehouse: values.isDataWarehouse,
+            selectedItemMeta: props.selectedItemMeta,
+        }),
+        setLocalDefinition: (item: Partial<TaxonomicDefinitionTypes>) => ({ item }),
+        setPopoverState: (state: DefinitionPopoverState) => ({ state }),
+        handleCancel: true,
+        recordHoverActivity: true,
+    })),
+    loaders(({ values, props, cache }) => ({
+        definition: [
+            {} as Partial<TaxonomicDefinitionTypes>,
+            {
+                setDefinition: ({ item }) => item as TaxonomicDefinitionTypes,
+                handleSave: async (_, breakpoint) => {
+                    if (!values.definition) {
+                        return {}
+                    }
+
+                    // resolvedDefinition carries the recovered id for name-only pinned/default
+                    // property items, so Save PATCHes the real definition instead of /undefined.
+                    let definition = {
+                        ...values.resolvedDefinition,
+                        ...values.localDefinition,
+                    } as TaxonomicDefinitionTypes
+                    cache.startTime = performance.now()
+                    try {
+                        if (values.isAction) {
+                            // Action Definitions
+                            const _action = definition as ActionType
+                            definition = await api.update(
+                                `api/projects/${values.currentProjectId}/actions/${_action.id}`,
+                                _action
+                            )
+                            actionsModel.findMounted()?.actions.updateAction(definition as ActionType)
+                        } else if (values.isEvent) {
+                            // Event Definitions
+                            const _event = definition as EventDefinition
+                            definition = await api.update(
+                                `api/projects/${values.currentProjectId}/event_definitions/${_event.id}`,
+                                {
+                                    ..._event,
+                                    owner: _event.owner?.id ?? null,
+                                    verified: !!_event.verified,
+                                }
+                            )
+                        } else if (
+                            values.type === TaxonomicFilterGroupType.EventProperties ||
+                            values.type === TaxonomicFilterGroupType.EventFeatureFlags
+                        ) {
+                            // Event Property Definitions
+                            const _eventProperty = definition as PropertyDefinition
+                            definition = await api.update(
+                                `api/projects/${values.currentProjectId}/property_definitions/${_eventProperty.id}`,
+                                _eventProperty
+                            )
+                            updatePropertyDefinitions({
+                                [`event/${definition.name}`]: definition as PropertyDefinition,
+                            })
+                        } else if (values.type === TaxonomicFilterGroupType.Cohorts) {
+                            // Cohort
+                            const _cohort = definition as CohortType
+                            definition = await api.update(
+                                `api/projects/${values.currentProjectId}/cohorts/${_cohort.id}`,
+                                _cohort
+                            )
+                            cohortsModel.findMounted()?.actions.updateCohort(definition as CohortType)
+                        }
+                    } catch (error: any) {
+                        lemonToast.error(error.message)
+                    }
+                    breakpoint()
+                    // Disregard save attempts for any other types of taxonomy groups
+                    lemonToast.success(`${capitalizeFirstLetter(values.singularType)} definition saved`)
+                    // Update item in infinite list
+                    props.updateRemoteItem?.(definition)
+                    return definition
+                },
+            },
+        ],
+    })),
+    reducers(() => ({
+        state: [
+            DefinitionPopoverState.View as DefinitionPopoverState,
+            {
+                setPopoverState: (_, { state }) => state,
+            },
+        ],
+        localDefinition: [
+            {} as Partial<TaxonomicDefinitionTypes>,
+            {
+                setDefinition: (_, { item, isDataWarehouse, selectedItemMeta }) => {
+                    if (isDataWarehouse && 'fields' in item) {
+                        return getDataWarehouseItemWithFieldDefaults(
+                            item as DataWarehouseTableForInsight,
+                            selectedItemMeta
+                        )
+                    }
+
+                    return item
+                },
+                setLocalDefinition: (state, { item }) =>
+                    ({
+                        ...state,
+                        ...item,
+                    }) as Partial<TaxonomicDefinitionTypes>,
+            },
+        ],
+    })),
+    selectors({
+        type: [() => [(_, props) => props.type], (type) => type],
+        hideView: [() => [(_, props) => props.hideView], (hideView) => hideView ?? false],
+        hideEdit: [() => [(_, props) => props.hideEdit], (hideEdit) => hideEdit ?? false],
+        openDetailInNewTab: [
+            () => [(_, props) => props.openDetailInNewTab],
+            (openDetailInNewTab) => openDetailInNewTab ?? true,
+        ],
+        singularType: [(s) => [s.type], (type) => getSingularType(type)],
+        mediaPreviews: [
+            (s) => [s.definition],
+            (definition): string[] => (definition as EventDefinition)?.media_preview_urls ?? [],
+        ],
+        dirty: [
+            (s) => [s.state, s.definition, s.localDefinition],
+            (state, definition, localDefinition) =>
+                state === DefinitionPopoverState.Edit && !equal(definition, localDefinition),
+        ],
+        isViewable: [
+            (s) => [s.type],
+            (type) => {
+                if (
+                    type === TaxonomicFilterGroupType.PersonProperties ||
+                    type.startsWith(TaxonomicFilterGroupType.GroupsPrefix)
+                ) {
+                    return true
+                }
+
+                return [
+                    TaxonomicFilterGroupType.Actions,
+                    TaxonomicFilterGroupType.Events,
+                    TaxonomicFilterGroupType.CustomEvents,
+                    TaxonomicFilterGroupType.Cohorts,
+                    TaxonomicFilterGroupType.EventProperties,
+                    TaxonomicFilterGroupType.EventFeatureFlags,
+                ].includes(type)
+            },
+        ],
+        isAction: [(s) => [s.type], (type) => type === TaxonomicFilterGroupType.Actions],
+        isEvent: [
+            (s) => [s.type],
+            (type) => [TaxonomicFilterGroupType.Events, TaxonomicFilterGroupType.CustomEvents].includes(type),
+        ],
+        isProperty: [
+            (s) => [s.type],
+            (type) =>
+                [
+                    TaxonomicFilterGroupType.PersonProperties,
+                    TaxonomicFilterGroupType.EventProperties,
+                    TaxonomicFilterGroupType.SessionProperties,
+                    TaxonomicFilterGroupType.EventFeatureFlags,
+                    TaxonomicFilterGroupType.NumericalEventProperties,
+                    TaxonomicFilterGroupType.Metadata,
+                    TaxonomicFilterGroupType.DataWarehousePersonProperties,
+                    TaxonomicFilterGroupType.RevenueAnalyticsProperties,
+                    TaxonomicFilterGroupType.ErrorTrackingProperties,
+                ].includes(type) || type.startsWith(TaxonomicFilterGroupType.GroupsPrefix),
+        ],
+        isVirtual: [
+            (s) => [s.definition],
+            (definition) => {
+                return 'virtual' in definition && definition.virtual
+            },
+        ],
+        hasSentAs: [
+            (s) => [s.type, s.isProperty, s.isEvent, s.isVirtual],
+            (type, isProperty, isEvent, isVirtual) =>
+                isEvent || (isProperty && !isVirtual && type !== TaxonomicFilterGroupType.SessionProperties),
+        ],
+        isCohort: [(s) => [s.type], (type) => type === TaxonomicFilterGroupType.Cohorts],
+        isDataWarehouse: [(s) => [s.type], (type) => type === TaxonomicFilterGroupType.DataWarehouse],
+        isDataWarehousePersonProperty: [
+            (s) => [s.type],
+            (type) => type === TaxonomicFilterGroupType.DataWarehousePersonProperties,
+        ],
+        resolvedDefinition: [
+            (s) => [s.definition, s.isProperty, s.type, s.getPropertyDefinition],
+            (definition, isProperty, type, getPropertyDefinition): Partial<TaxonomicDefinitionTypes> => {
+                // Pinned/default property items are stored as { name } only. Hydrate them with the
+                // saved definition id recovered from propertyDefinitionsModel so View, Edit and Save
+                // all operate on a complete definition (and self-heal as the model loads) rather
+                // than hitting /data-management/properties/undefined.
+                if (isProperty && definition && !(definition as PropertyDefinition).id) {
+                    const id = resolvePropertyDefinitionId(
+                        definition as PropertyDefinition,
+                        type as TaxonomicFilterGroupType,
+                        getPropertyDefinition
+                    )
+                    if (id) {
+                        // Cast because the union has numeric-id members (ActionType/CohortType);
+                        // this branch only runs for property definitions (string id).
+                        return { ...definition, id } as Partial<TaxonomicDefinitionTypes>
+                    }
+                }
+                return definition
+            },
+        ],
+        viewFullDetailUrl: [
+            (s) => [s.resolvedDefinition, s.isAction, s.isEvent, s.isProperty, s.isCohort],
+            (resolvedDefinition, isAction, isEvent, isProperty, isCohort) => {
+                if (isAction) {
+                    const id = (resolvedDefinition as ActionType).id
+                    return id != null ? urls.action(id) : undefined
+                } else if (isEvent) {
+                    const id = (resolvedDefinition as EventDefinition).id
+                    return id ? urls.eventDefinition(id) : undefined
+                } else if (isProperty) {
+                    const id = (resolvedDefinition as PropertyDefinition).id
+                    return id ? urls.propertyDefinition(id) : undefined
+                } else if (isCohort) {
+                    const id = (resolvedDefinition as CohortType).id
+                    return id != null ? urls.cohort(id) : undefined
+                }
+                return undefined
+            },
+        ],
+    }),
+    listeners(({ actions, selectors, values, props, cache }) => ({
+        setDefinition: (_, __, ___, previousState) => {
+            // Reset definition popover to view mode if context is switched
+            if (
+                selectors.definition(previousState)?.name &&
+                values.definition?.name !== selectors.definition(previousState).name
+            ) {
+                actions.setPopoverState(DefinitionPopoverState.View)
+                actions.recordHoverActivity()
+            }
+        },
+        handleSave: () => {
+            actions.setPopoverState(DefinitionPopoverState.View)
+            props?.onSave?.()
+        },
+        handleSaveSuccess: () => {
+            if (cache.startTime !== undefined) {
+                eventUsageLogic
+                    .findMounted()
+                    ?.actions?.reportDataManagementDefinitionSaveSucceeded(
+                        values.type,
+                        performance.now() - cache.startTime
+                    )
+                cache.startTime = undefined
+            }
+        },
+        handleSaveFailure: ({ error }) => {
+            if (cache.startTime !== undefined) {
+                eventUsageLogic
+                    .findMounted()
+                    ?.actions?.reportDataManagementDefinitionSaveFailed(
+                        values.type,
+                        performance.now() - cache.startTime,
+                        error
+                    )
+                cache.startTime = undefined
+            }
+        },
+        handleCancel: () => {
+            actions.setPopoverState(DefinitionPopoverState.View)
+            actions.setLocalDefinition(values.definition)
+            props?.onCancel?.()
+            eventUsageLogic.findMounted()?.actions?.reportDataManagementDefinitionCancel(values.type)
+        },
+        recordHoverActivity: async (_, breakpoint) => {
+            await breakpoint(IS_TEST_MODE ? 1 : 1000) // Tests will wait for all breakpoints to finish
+            eventUsageLogic
+                .findMounted()
+                ?.actions?.reportDataManagementDefinitionHovered(values.type, values.mediaPreviews.length)
+        },
+    })),
+    events(({ actions }) => ({
+        afterMount: () => {
+            actions.recordHoverActivity()
+        },
+    })),
+])

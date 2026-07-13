@@ -1,115 +1,157 @@
-import { kea } from 'kea'
-import api from 'lib/api'
-import { toParams } from 'lib/utils'
-import { insightLogic } from 'scenes/insights/insightLogic'
-import { retentionTableLogicType } from './retentionTableLogicType'
-import { ACTIONS_LINE_GRAPH_LINEAR, ACTIONS_TABLE, RETENTION_FIRST_TIME, RETENTION_RECURRING } from 'lib/constants'
-import { actionsModel } from '~/models/actionsModel'
-import { ActionType, InsightLogicProps, FilterType, ViewType } from '~/types'
-import {
-    RetentionTablePayload,
-    RetentionTrendPayload,
-    RetentionTablePeoplePayload,
-    RetentionTrendPeoplePayload,
-} from 'scenes/retention/types'
+import { actions, afterMount, connect, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+
+import { capitalizeFirstLetter } from 'lib/utils/strings'
+import { insightVizDataLogic } from 'scenes/insights/insightVizDataLogic'
 import { keyForInsightLogicProps } from 'scenes/insights/sharedUtils'
-import { cleanFilters } from 'scenes/insights/utils/cleanFilters'
 
-export const dateOptions = ['Hour', 'Day', 'Week', 'Month']
+import { InsightQueryNode } from '~/queries/schema/schema-general'
+import { isRetentionQuery } from '~/queries/utils'
+import { InsightLogicProps, InsightType } from '~/types'
 
-export const retentionOptions = {
-    [`${RETENTION_FIRST_TIME}`]: 'First Time',
-    [`${RETENTION_RECURRING}`]: 'Recurring',
-}
-
-export const retentionOptionDescriptions = {
-    [`${RETENTION_RECURRING}`]: 'A user will belong to any cohort where they have performed the event in its Period 0.',
-    [`${RETENTION_FIRST_TIME}`]:
-        'A user will only belong to the cohort for which they performed the event for the first time.',
-}
+import { dateOptionPlurals } from './constants'
+import { retentionLogic } from './retentionLogic'
+import type { retentionTableLogicType } from './retentionTableLogicType'
+import { NO_BREAKDOWN_VALUE, ProcessedRetentionPayload, RetentionTableRow } from './types'
+import { formatRetentionCohortLabel } from './utils'
 
 const DEFAULT_RETENTION_LOGIC_KEY = 'default_retention_key'
 
-export const retentionTableLogic = kea<retentionTableLogicType>({
-    props: {} as InsightLogicProps,
-    key: keyForInsightLogicProps(DEFAULT_RETENTION_LOGIC_KEY),
-    connect: (props: InsightLogicProps) => ({
-        values: [insightLogic(props), ['filters', 'insight', 'insightLoading'], actionsModel, ['actions']],
-        actions: [insightLogic(props), ['loadResultsSuccess']],
+export const retentionTableLogic = kea<retentionTableLogicType>([
+    props({} as InsightLogicProps),
+    key(keyForInsightLogicProps(DEFAULT_RETENTION_LOGIC_KEY)),
+    path((key) => ['scenes', 'retention', 'retentionTableLogic', key]),
+    connect((props: InsightLogicProps) => ({
+        values: [
+            insightVizDataLogic(props),
+            ['dateRange', 'retentionFilter', 'vizSpecificOptions', 'theme', 'insightQuery'],
+            retentionLogic(props),
+            [
+                'results',
+                'filteredResults',
+                'selectedBreakdownValue',
+                'retentionMeans',
+                'breakdownDisplayNames',
+                'isPropertyValueAggregation',
+            ],
+        ],
+        actions: [retentionLogic(props), ['setSelectedBreakdownValue']],
+    })),
+
+    actions({
+        toggleBreakdown: (breakdownValue: string) => ({ breakdownValue }),
+        setExpandedBreakdowns: (expandedBreakdowns: Record<string, boolean>) => ({ expandedBreakdowns }),
+        setHoveredColumn: (columnIndex: number | null) => ({ columnIndex }),
     }),
-    actions: () => ({
-        setFilters: (filters: Partial<FilterType>) => ({ filters }),
-        loadMorePeople: true,
-        updatePeople: (people) => ({ people }),
-        clearPeople: true,
-    }),
-    loaders: ({ values }) => ({
-        people: {
-            __default: {} as RetentionTablePeoplePayload | RetentionTrendPeoplePayload,
-            loadPeople: async (rowIndex: number) => {
-                const urlParams = toParams({ ...values.filters, selected_interval: rowIndex })
-                const res = await api.get(`api/person/retention/?${urlParams}`)
-                return res
-            },
-        },
-    }),
-    reducers: {
-        people: {
-            clearPeople: () => ({}),
-            updatePeople: (_, { people }) => people,
-        },
-        loadingMore: [
-            false,
+
+    reducers({
+        expandedBreakdowns: [
+            {} as Record<string, boolean>,
             {
-                loadMorePeople: () => true,
-                updatePeople: () => false,
+                toggleBreakdown: (state, { breakdownValue }) => ({
+                    ...state,
+                    [breakdownValue]: !state[breakdownValue],
+                }),
+                setExpandedBreakdowns: (_, { expandedBreakdowns }) => expandedBreakdowns,
             },
         ],
-    },
-    selectors: {
-        loadedFilters: [
-            (s) => [s.insight],
-            ({ filters }): Partial<FilterType> => (filters?.insight === ViewType.RETENTION ? filters ?? {} : {}),
-        ],
-        results: [
-            (s) => [s.insight],
-            ({ filters, result }): RetentionTablePayload[] | RetentionTrendPayload[] => {
-                return filters?.insight === ViewType.RETENTION &&
-                    result &&
-                    (result.length === 0 ||
-                        (!result[0].values && filters.display === ACTIONS_LINE_GRAPH_LINEAR) ||
-                        (result[0].values && filters.display === ACTIONS_TABLE))
-                    ? result
-                    : []
+        hoveredColumn: [
+            null as number | null,
+            {
+                setHoveredColumn: (_, { columnIndex }) => columnIndex,
             },
         ],
-        resultsLoading: [(s) => [s.insightLoading], (insightLoading) => insightLoading],
-        actionsLookup: [
-            (s) => [s.actions],
-            (actions: ActionType[]) => Object.assign({}, ...actions.map((action) => ({ [action.id]: action.name }))),
-        ],
-        actionFilterTargetEntity: [(s) => [s.filters], (filters) => ({ events: [filters.target_entity] })],
-        actionFilterReturningEntity: [(s) => [s.filters], (filters) => ({ events: [filters.returning_entity] })],
-    },
-    listeners: ({ actions, values, props }) => ({
-        setProperties: ({ properties }) => {
-            insightLogic(props).actions.setFilters(cleanFilters({ ...values.filters, properties }, values.filters))
-        },
-        setFilters: ({ filters }) => {
-            insightLogic(props).actions.setFilters(cleanFilters({ ...values.filters, ...filters }, values.filters))
-        },
-        loadResultsSuccess: async () => {
-            actions.clearPeople()
-        },
-        loadMorePeople: async () => {
-            if (values.people.next) {
-                const peopleResult = await api.get(values.people.next)
-                const newPeople = {
-                    result: [...(values.people.result as Record<string, any>[]), ...peopleResult['result']],
-                    next: peopleResult['next'],
-                }
-                actions.updatePeople(newPeople)
-            }
-        },
     }),
-})
+
+    afterMount(({ actions, values }) => {
+        autoExpandSingleBreakdown(values.tableRowsSplitByBreakdownValue, actions.setExpandedBreakdowns)
+    }),
+
+    listeners(({ actions, values }) => ({
+        setSelectedBreakdownValue: () => {
+            autoExpandSingleBreakdown(values.tableRowsSplitByBreakdownValue, actions.setExpandedBreakdowns)
+        },
+    })),
+
+    selectors({
+        retentionVizOptions: [
+            (s) => [s.vizSpecificOptions],
+            (vizSpecificOptions) => vizSpecificOptions?.[InsightType.RETENTION],
+        ],
+        hideSizeColumn: [(s) => [s.retentionVizOptions], (retentionVizOptions) => retentionVizOptions?.hideSizeColumn],
+
+        tableRows: [
+            (s) => [s.filteredResults, s.retentionFilter],
+            (filteredResults, retentionFilter): RetentionTableRow[] => {
+                const { period } = retentionFilter || {}
+
+                return filteredResults.map((currentResult: ProcessedRetentionPayload) => {
+                    const cohortSize = currentResult.values?.[0] ? currentResult.values[0].count : 0
+
+                    return {
+                        label: formatRetentionCohortLabel(currentResult, period),
+                        cohortSize,
+                        values: currentResult.values,
+                        breakdown_value: currentResult.breakdown_value,
+                    }
+                })
+            },
+        ],
+
+        tableHeaders: [
+            (s) => [s.results, s.insightQuery],
+            (results: ProcessedRetentionPayload[], insightQuery: InsightQueryNode | null): string[] => {
+                if (results.length > 0 && results[0].values.length > 0) {
+                    if (isRetentionQuery(insightQuery) && insightQuery.retentionFilter?.retentionCustomBrackets) {
+                        const { period, retentionCustomBrackets, cohortLabelStartIndex } = insightQuery.retentionFilter
+                        const offset = cohortLabelStartIndex ?? 0
+                        const unit = capitalizeFirstLetter(dateOptionPlurals[period || 'Day'])
+                        const labels = [`${period || 'Day'} ${offset}`]
+                        let cumulativeTotal = 1
+                        for (const bracketSize of retentionCustomBrackets) {
+                            const start = cumulativeTotal + offset
+                            const end = cumulativeTotal + bracketSize - 1 + offset
+                            if (start === end) {
+                                labels.push(`${unit} ${start}`)
+                            } else {
+                                labels.push(`${unit} ${start}-${end}`)
+                            }
+                            cumulativeTotal += bracketSize
+                        }
+                        return labels
+                    }
+                    if (isRetentionQuery(insightQuery)) {
+                        const offset = insightQuery.retentionFilter?.cohortLabelStartIndex ?? 0
+                        return results[0].values.map(
+                            (_, i) => `${insightQuery.retentionFilter?.period || 'Day'} ${i + offset}`
+                        )
+                    }
+                }
+                return []
+            },
+        ],
+        tableRowsSplitByBreakdownValue: [
+            (s) => [s.tableRows],
+            (tableRows) => {
+                return tableRows.reduce(
+                    (acc, row) => {
+                        const breakdownValue = row.breakdown_value ?? NO_BREAKDOWN_VALUE
+                        acc[breakdownValue] = [...(acc[breakdownValue] || []), row]
+                        return acc
+                    },
+                    {} as Record<string, RetentionTableRow[]>
+                )
+            },
+        ],
+    }),
+])
+// Helper function to auto-expand a single breakdown
+function autoExpandSingleBreakdown(
+    tableRowsSplitByBreakdownValue: Record<string, RetentionTableRow[]>,
+    setExpandedBreakdownsAction: (expandedBreakdowns: Record<string, boolean>) => void
+): void {
+    const breakdownKeys = Object.keys(tableRowsSplitByBreakdownValue)
+    if (breakdownKeys.length === 1) {
+        const singleBreakdownValue = breakdownKeys[0]
+        setExpandedBreakdownsAction({ [singleBreakdownValue]: true })
+    }
+}

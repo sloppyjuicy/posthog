@@ -1,0 +1,374 @@
+import { Meta, StoryObj } from '@storybook/react'
+import { useState } from 'react'
+
+import { capitalizeFirstLetter } from 'lib/utils/strings'
+
+import { ProfilePicture } from '../ProfilePicture'
+import { LemonInputSelect, LemonInputSelectProps } from './LemonInputSelect'
+
+const names = [
+    'ben',
+    'marius',
+    'paul',
+    'tiina',
+    'tim',
+    'james',
+    'neil',
+    'tom',
+    'annika',
+    'thomas',
+    'eric',
+    'yakko',
+    'manoel',
+    'leon',
+    'lottie',
+    'charles',
+]
+
+type Story = StoryObj<LemonInputSelectProps<string>>
+const meta: Meta<LemonInputSelectProps<string>> = {
+    title: 'Lemon UI/Lemon Input Select',
+    component: LemonInputSelect as any,
+    args: {
+        options: names.map((x, i) => ({
+            key: `user-${i}`,
+            labelComponent: (
+                <span className="flex gap-2 items-center">
+                    <ProfilePicture
+                        user={{
+                            first_name: x,
+                            email: `${x}@posthog.com`,
+                        }}
+                        size="sm"
+                    />
+                    <span>
+                        {capitalizeFirstLetter(x)} <b>{`<${x}@posthog.com>`}</b>
+                    </span>
+                </span>
+            ),
+            label: `${capitalizeFirstLetter(x)} <${x}@posthog.com>`,
+        })),
+    },
+    tags: ['autodocs'],
+}
+export default meta
+
+export const Default: Story = {
+    args: {
+        placeholder: 'Pick one email',
+        mode: 'single',
+    },
+}
+
+// Single-select where the option keys are opaque ids (e.g. UUIDs) distinct from their labels.
+// Focusing with a value selected must still show every option — not just the selected one.
+// This is the OAuth organization picker shape, where the bug was first seen.
+export const SingleSelectWithIdKeys: Story = {
+    render: (args) => {
+        const [value, setValue] = useState<string[]>(['019cd764-55e6-0000-67dc-7f9cb756d36e'])
+        return <LemonInputSelect {...args} value={value} onChange={setValue} />
+    },
+    args: {
+        mode: 'single',
+        placeholder: 'Select an organization',
+        options: [
+            { key: '019cd764-55e6-0000-67dc-7f9cb756d36e', label: 'Testbench' },
+            { key: '4dc8564d-bd82-1065-2f40-97f7c50f67cf', label: 'PostHog Inc.' },
+            { key: '018e6669-be95-0000-a135-08054c5d99b4', label: 'Acme Corp' },
+        ],
+    },
+}
+
+export const MultipleSelect: Story = {
+    args: {
+        placeholder: 'Pick email addresses',
+        mode: 'multiple',
+    },
+}
+
+export const MultipleSelectWithCustom: Story = {
+    args: {
+        placeholder: 'Enter URLs',
+        mode: 'multiple',
+        allowCustomValues: true,
+        options: [
+            {
+                key: 'http://posthog.com/docs',
+                label: 'http://posthog.com/docs',
+            },
+            {
+                key: 'http://posthog.com/pricing',
+                label: 'http://posthog.com/pricing',
+            },
+
+            {
+                key: 'http://posthog.com/products',
+                label: 'http://posthog.com/products',
+            },
+        ],
+    },
+}
+
+export const Autocomplete: Story = {
+    args: {
+        placeholder: 'Enter a new URL or select existing (Single Select With Custom)',
+        mode: 'single',
+        allowCustomValues: true,
+        formatCreateLabel: (input) => (
+            <>
+                {input} <i>(new entry)</i>
+            </>
+        ),
+        options: [
+            {
+                key: 'http://posthog.com/docs',
+                label: 'http://posthog.com/docs',
+            },
+            {
+                key: 'http://posthog.com/pricing',
+                label: 'http://posthog.com/pricing',
+            },
+            {
+                key: 'http://posthog.com/products',
+                label: 'http://posthog.com/products',
+            },
+        ],
+    },
+}
+
+export const WithInputNormalization: Story = {
+    args: {
+        placeholder: 'Enter a URL (spaces to dashes, lowercase)',
+        mode: 'single',
+        allowCustomValues: true,
+        inputTransform: (input) => input.toLowerCase().replace(/\s+/g, '-'),
+        formatCreateLabel: (input) => (
+            <>
+                {input} <i>(new entry)</i>
+            </>
+        ),
+        options: [
+            {
+                key: 'http://posthog.com/docs',
+                label: 'http://posthog.com/docs',
+            },
+        ],
+    },
+}
+
+export const Disabled: Story = {
+    args: {
+        mode: 'single',
+        placeholder: 'Disabled...',
+        disabled: true,
+    },
+}
+
+export const Loading: Story = {
+    args: {
+        mode: 'single',
+        placeholder: 'Loading with options...',
+        loading: true,
+    },
+    parameters: {
+        testOptions: {
+            waitForLoadersToDisappear: false,
+        },
+    },
+}
+
+export const EmptyLoading: Story = {
+    args: {
+        mode: 'single',
+        placeholder: 'Loading without options...',
+        options: [],
+        loading: true,
+    },
+    parameters: {
+        testOptions: {
+            waitForLoadersToDisappear: false,
+        },
+    },
+}
+
+export const NoOptions: Story = {
+    args: {
+        mode: 'multiple',
+        allowCustomValues: true,
+        placeholder: 'No options...',
+        options: [],
+    },
+}
+
+export const SingleOptionWithCustom: Story = {
+    args: {
+        mode: 'single',
+        allowCustomValues: true,
+        placeholder: 'Only one option allowed but can be custom',
+    },
+}
+
+export const PrefilledManyValues: Story = {
+    args: {
+        mode: 'multiple',
+        allowCustomValues: true,
+        value: names.map((_, i) => `user-${i}`),
+    },
+}
+
+export const WithSelectAllAndClear: Story = {
+    args: {
+        mode: 'multiple',
+        bulkActions: 'select-and-clear-all',
+    },
+}
+
+export const WithClearOnly: Story = {
+    args: {
+        mode: 'multiple',
+        bulkActions: 'clear-all',
+    },
+}
+
+export const CountModeAllSelected: Story = {
+    args: {
+        mode: 'multiple',
+        displayMode: 'count',
+        value: names.map((_, i) => `user-${i}`),
+    },
+}
+
+export const CountModePartiallySelected: Story = {
+    args: {
+        mode: 'multiple',
+        displayMode: 'count',
+        value: names.slice(0, 10).map((_, i) => `user-${i}`),
+    },
+}
+
+export const CountModeNoneSelected: Story = {
+    args: {
+        mode: 'multiple',
+        displayMode: 'count',
+        value: [],
+    },
+}
+
+export const CountModeWithSelectClear: Story = {
+    args: {
+        mode: 'multiple',
+        displayMode: 'count',
+        bulkActions: 'select-and-clear-all',
+        value: names.slice(0, 5).map((_, i) => `user-${i}`),
+    },
+}
+
+export const SnacksModeWithSortable: Story = {
+    args: {
+        mode: 'multiple',
+        displayMode: 'snacks',
+        value: names.slice(0, 5).map((_, i) => `user-${i}`),
+        sortable: true,
+    },
+}
+
+export const PrefilledSingleValue: Story = {
+    args: {
+        mode: 'single',
+        allowCustomValues: true,
+        placeholder: 'Pick one email',
+        value: ['user-0'],
+    },
+}
+
+export const PrefilledSingleValueAsSnack: Story = {
+    args: {
+        mode: 'single',
+        singleValueAsSnack: true,
+        allowCustomValues: true,
+        placeholder: 'Pick one email',
+        value: ['user-0'],
+    },
+}
+
+// New stories showcasing typed values support
+export const TypedValuesBooleanExample: StoryObj = {
+    render: () => {
+        const [value, setValue] = useState<(boolean | string)[]>([])
+
+        const handleChange = (newValue: (boolean | string)[]): void => {
+            setValue(newValue)
+        }
+
+        return (
+            <div className="space-y-4">
+                <LemonInputSelect<boolean | string>
+                    mode="multiple"
+                    placeholder="Select boolean or string values"
+                    options={[
+                        { key: 'bool-true', label: 'Boolean True', value: true },
+                        { key: 'bool-false', label: 'Boolean False', value: false },
+                        { key: 'some-variant', label: 'String Variant', value: 'some-variant' },
+                        { key: 'string-true', label: 'String "true"', value: 'true' },
+                    ]}
+                    value={value}
+                    onChange={handleChange}
+                    className="w-140"
+                />
+                <div className="bg-accent-highlight-secondary p-3 rounded">
+                    <strong>Selected values:</strong> {JSON.stringify(value)} <br />
+                    <strong>Types:</strong> [{value.map((v) => typeof v).join(', ')}]
+                    <br />
+                    <em>Check browser console for onChange logs!</em>
+                </div>
+            </div>
+        )
+    },
+    parameters: {
+        docs: {
+            description: {
+                story: 'Demonstrates typed values support with boolean and string types. Notice how the onChange callback receives the original typed values (true, false, "some-variant") rather than just strings. Check the browser console and the display below to see the typed values!',
+            },
+        },
+    },
+}
+
+export const TypedValuesBackwardsCompatibility: StoryObj = {
+    render: () => {
+        const [value, setValue] = useState<string[]>([])
+
+        const handleChange = (newValue: string[]): void => {
+            setValue(newValue)
+        }
+
+        return (
+            <div className="space-y-4">
+                <LemonInputSelect
+                    mode="multiple"
+                    placeholder="Select string options (backwards compatible)"
+                    options={[
+                        { key: 'option1', label: 'Option 1' },
+                        { key: 'option2', label: 'Option 2' },
+                        { key: 'option3', label: 'Option 3' },
+                    ]}
+                    value={value}
+                    onChange={handleChange}
+                    className="w-140"
+                />
+                <div className="bg-accent-highlight-secondary p-3 rounded">
+                    <strong>Selected values:</strong> {JSON.stringify(value)} <br />
+                    <strong>Types:</strong> [{value.map((v) => typeof v).join(', ')}]
+                    <br />
+                    <em>Works exactly as before - no breaking changes! Check browser console for onChange logs!</em>
+                </div>
+            </div>
+        )
+    },
+    parameters: {
+        docs: {
+            description: {
+                story: 'Shows backwards compatibility - existing string-only usage continues to work exactly as before. All values are strings and the component behaves identically to the previous version.',
+            },
+        },
+    },
+}

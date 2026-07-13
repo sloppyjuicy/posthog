@@ -1,0 +1,289 @@
+import { BindLogic, useActions, useValues } from 'kea'
+import React from 'react'
+
+import {
+    IconArrowLeft,
+    IconChevronLeft,
+    IconExpand45,
+    IconOpenSidebar,
+    IconPlus,
+    IconShare,
+    IconSidePanel,
+} from '@posthog/icons'
+import { LemonBanner, Link, Tooltip } from '@posthog/lemon-ui'
+
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { ButtonPrimitive } from 'lib/ui/Button/ButtonPrimitives'
+import { copyToClipboard } from 'lib/utils/copyToClipboard'
+import { cn } from 'lib/utils/css-classes'
+import { maxGlobalLogic } from 'scenes/max/maxGlobalLogic'
+import { SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { SidePanelPaneHeader } from '~/layout/navigation-3000/sidepanel/components/SidePanelPaneHeader'
+import { SidePanelContentContainer } from '~/layout/navigation-3000/sidepanel/SidePanelContentContainer'
+import { sidePanelLogic } from '~/layout/navigation-3000/sidepanel/sidePanelLogic'
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import { SidePanelTab } from '~/types'
+
+import { runnerPanelLogic } from 'products/posthog_ai/frontend/api/logics'
+
+import { AiFirstMaxInstance } from './components/AiFirstMaxInstance'
+import { AnimatedBackButton } from './components/AnimatedBackButton'
+import { MaxNotConfigured } from './components/MaxNotConfigured'
+import { MAX_SIDE_PANEL_ID, PhaiSidePanelChat } from './components/PhaiSidePanelChat'
+import { PhaiViewToggle } from './components/PhaiViewToggle'
+import { SidebarQuestionInput } from './components/SidebarQuestionInput'
+import { SidebarQuestionInputWithSuggestions } from './components/SidebarQuestionInputWithSuggestions'
+import { ThreadAutoScroller } from './components/ThreadAutoScroller'
+import { ConversationHistory } from './ConversationHistory'
+import { HistoryPreview } from './HistoryPreview'
+import { Intro } from './Intro'
+import { MaxLogicProps, SIDE_PANEL_PANEL_ID, maxLogic } from './maxLogic'
+import { MaxThreadLogicProps, maxThreadLogic } from './maxThreadLogic'
+import { SandboxComposerSurfaces, Thread } from './Thread'
+
+export const scene: SceneExport = {
+    component: Max,
+    logic: maxLogic,
+}
+
+export function Max({ tabId }: { tabId?: string }): JSX.Element {
+    const { sidePanelOpen, selectedTab } = useValues(sidePanelLogic)
+    const { closeSidePanel } = useActions(sidePanelLogic)
+    const { conversationId: tabConversationId } = useValues(maxLogic({ panelId: tabId }))
+    const { conversationId: sidepanelConversationId } = useValues(maxLogic({ panelId: SIDE_PANEL_PANEL_ID }))
+    if (sidePanelOpen && selectedTab === SidePanelTab.Max && sidepanelConversationId === tabConversationId) {
+        return (
+            <SceneContent className="px-4 py-4 min-h-[calc(100vh-var(--scene-layout-header-height)-120px)]">
+                <SceneTitleSection name={null} resourceType={{ type: 'chat' }} />
+                <div className="flex flex-col items-center justify-center w-full grow">
+                    <IconSidePanel className="text-3xl text-muted mb-2" />
+                    <h3 className="text-xl font-bold mb-1">The chat is currently in the context panel</h3>
+                    <p className="text-sm text-muted mb-2">You can navigate freely around the app with it, or…</p>
+                    <LemonButton
+                        type="secondary"
+                        size="xsmall"
+                        onClick={() => closeSidePanel()}
+                        sideIcon={<IconArrowLeft />}
+                    >
+                        Move it here
+                    </LemonButton>
+                </div>
+            </SceneContent>
+        )
+    }
+
+    return <AiFirstMaxInstance tabId={tabId ?? ''} />
+}
+
+export interface MaxInstanceProps {
+    sidePanel?: boolean
+    tabId?: string
+}
+
+export const MaxInstance = React.memo(function MaxInstance({ sidePanel, tabId }: MaxInstanceProps): JSX.Element {
+    // `sidePanel` here is presentational (side panel chrome/layout) and is independent of the logic
+    // identity we bind: a tabId identifies a scene tab (or a Storybook instance rendered with side
+    // panel chrome), while the real side panel — which has no tabId — binds the side panel panelId.
+    // Folding the presentational flag into the key would hijack tabbed instances.
+    const logicProps: MaxLogicProps = { panelId: tabId ?? SIDE_PANEL_PANEL_ID }
+    const {
+        threadVisible,
+        conversationHistoryVisible,
+        chatTitle,
+        backButtonDisabled,
+        threadLogicKey,
+        conversation,
+        conversationId,
+    } = useValues(maxLogic(logicProps))
+    const { startNewConversation, goBack } = useActions(maxLogic(logicProps))
+    const { openSidePanelMax } = useActions(maxGlobalLogic)
+    const { isMaxAvailable, effectivePhaiView } = useValues(maxGlobalLogic)
+    // The new posthog_ai view's back button walks its own panel view state (run -> history -> composer)
+    // rather than legacy Max's conversation stack — mounting this tiny headless logic in legacy view is
+    // harmless (unconditional hooks).
+    const { canGoBack: panelCanGoBack } = useValues(runnerPanelLogic({ panelId: MAX_SIDE_PANEL_ID }))
+    const { goBack: panelGoBack } = useActions(runnerPanelLogic({ panelId: MAX_SIDE_PANEL_ID }))
+
+    const threadProps: MaxThreadLogicProps = {
+        ...logicProps,
+        conversationId: threadLogicKey,
+        conversation,
+    }
+
+    const { closeSidePanel } = useActions(sidePanelLogic)
+
+    const isNewView = effectivePhaiView === 'new'
+    const headerBackDisabled = isNewView ? !panelCanGoBack : backButtonDisabled
+
+    const content = !isMaxAvailable ? (
+        <MaxNotConfigured />
+    ) : (
+        <BindLogic logic={maxLogic} props={logicProps}>
+            <BindLogic logic={maxThreadLogic} props={threadProps}>
+                {effectivePhaiView === 'new' ? (
+                    // Side panel only shows the new composer + thread viewer — the tasks list lives on /ai.
+                    <PhaiSidePanelChat />
+                ) : conversationHistoryVisible ? (
+                    <ConversationHistory sidePanel={sidePanel} />
+                ) : !threadVisible ? (
+                    // pb-7 below is intentionally specific - it's chosen so that the bottom-most chat's title
+                    // is at the same viewport height as the QuestionInput text that appear after going into a thread.
+                    // This makes the transition from one view into another just that bit smoother visually.
+                    <div
+                        className={cn(
+                            '@container/max-welcome relative flex flex-col gap-4 px-4 pb-7 grow',
+                            !sidePanel && 'min-h-[calc(100vh-var(--scene-layout-header-height)-120px)]',
+                            sidePanel && 'px-0'
+                        )}
+                    >
+                        <div className="grow items-center justify-center flex flex-col gap-3 relative z-50">
+                            <Intro />
+                            <SidebarQuestionInputWithSuggestions />
+                        </div>
+
+                        <HistoryPreview sidePanel={sidePanel} />
+                    </div>
+                ) : (
+                    /** Must be the last child and be a direct descendant of the scrollable element */
+                    <ThreadAutoScroller>
+                        {conversation?.has_unsupported_content && (
+                            <div className="px-4 pt-4">
+                                <LemonBanner type="warning">
+                                    <div className="flex items-center justify-between gap-4">
+                                        <span>This thread contains content that is no longer supported.</span>
+                                        <LemonButton type="primary" onClick={() => startNewConversation()}>
+                                            Start a new thread
+                                        </LemonButton>
+                                    </div>
+                                </LemonBanner>
+                            </div>
+                        )}
+                        <Thread className={cn('p-3', sidePanel && 'p-1')} />
+                        <SandboxComposerSurfaces />
+                        {!conversation?.has_unsupported_content && (
+                            <SidebarQuestionInput isSticky sidePanel={sidePanel} />
+                        )}
+                    </ThreadAutoScroller>
+                )}
+            </BindLogic>
+        </BindLogic>
+    )
+    const header = (
+        <SidePanelPaneHeader className="transition-all duration-200" showCloseButton={false}>
+            <div className="flex flex-1 min-w-0 overflow-hidden">
+                <div className="flex items-center flex-1 min-w-0">
+                    <AnimatedBackButton in={isNewView ? panelCanGoBack : !backButtonDisabled}>
+                        <ButtonPrimitive
+                            iconOnly
+                            onClick={() => (isNewView ? panelGoBack() : goBack())}
+                            tooltip="Go back"
+                            tooltipPlacement="bottom-end"
+                            disabledReasons={headerBackDisabled ? { 'You are already at home': true } : undefined}
+                        >
+                            <IconChevronLeft className="text-tertiary size-3 group-hover:text-primary z-10" />
+                        </ButtonPrimitive>
+                    </AnimatedBackButton>
+
+                    <Tooltip title={chatTitle || undefined} placement="bottom">
+                        <h3 className="flex-1 font-semibold mb-0 truncate text-sm ml-2">{chatTitle || 'PostHog AI'}</h3>
+                    </Tooltip>
+                </div>
+                {conversationId && !conversationHistoryVisible && !threadVisible && (
+                    <LemonButton
+                        size="small"
+                        icon={<IconPlus />}
+                        onClick={() => startNewConversation()}
+                        data-attr="max-new-chat"
+                        tooltip="Start a new chat"
+                        tooltipPlacement="bottom"
+                    />
+                )}
+                {conversationId && (
+                    <ButtonPrimitive
+                        onClick={() => {
+                            copyToClipboard(
+                                urls.absolute(urls.currentProject(urls.ai(conversationId))),
+                                'conversation sharing link'
+                            )
+                        }}
+                        tooltip="Copy link to chat"
+                        tooltipPlacement="bottom-end"
+                        iconOnly
+                    >
+                        <IconShare className="text-tertiary size-3 group-hover:text-primary z-10" />
+                    </ButtonPrimitive>
+                )}
+                <PhaiViewToggle variant="primitive" />
+                <Link
+                    buttonProps={{
+                        iconOnly: true,
+                    }}
+                    to={urls.ai(conversationId ?? undefined)}
+                    onClick={() => {
+                        closeSidePanel()
+                    }}
+                    target="_blank"
+                    tooltip="Open as main focus"
+                    tooltipPlacement="bottom-end"
+                >
+                    <IconExpand45 className="text-tertiary size-3 group-hover:text-primary z-10" />
+                </Link>
+            </div>
+        </SidePanelPaneHeader>
+    )
+
+    return sidePanel ? (
+        <>
+            {/* The new view scrolls internally (virtualized thread, history list), so the ScrollArea
+            content must stay clamped to the panel height — without `min-h-0` its `min-height: auto`
+            grows it to fit the whole thread and no scroller ever engages. The legacy view is the
+            opposite: it relies on this container growing so the outer viewport scrolls it. */}
+            <SidePanelContentContainer contentClassName={cn('flex flex-col flex-1', isNewView && 'min-h-0')}>
+                {header}
+                {content}
+            </SidePanelContentContainer>
+        </>
+    ) : (
+        <SceneContent className="pt-4 px-4 min-h-[calc(100vh-var(--scene-layout-header-height))]">
+            <SceneTitleSection
+                name={null}
+                resourceType={{ type: 'chat' }}
+                actions={
+                    <>
+                        {tabId && conversationId ? (
+                            <LemonButton
+                                size="small"
+                                type="secondary"
+                                sideIcon={<IconShare />}
+                                onClick={() => {
+                                    copyToClipboard(
+                                        urls.absolute(urls.currentProject(urls.ai(conversationId ?? undefined))),
+                                        'conversation sharing link'
+                                    )
+                                }}
+                            >
+                                Copy link to chat
+                            </LemonButton>
+                        ) : undefined}
+                        {tabId ? (
+                            <LemonButton
+                                size="small"
+                                type="secondary"
+                                sideIcon={<IconOpenSidebar />}
+                                onClick={() => {
+                                    openSidePanelMax(conversationId ?? undefined)
+                                }}
+                            >
+                                Open in context panel
+                            </LemonButton>
+                        ) : undefined}
+                    </>
+                }
+            />
+            <div className="grow flex flex-col">{content}</div>
+        </SceneContent>
+    )
+})

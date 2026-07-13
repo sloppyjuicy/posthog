@@ -1,0 +1,845 @@
+import json
+import asyncio
+import importlib
+from types import SimpleNamespace
+from typing import cast
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import httpx_sse
+from parameterized import parameterized
+from temporalio.exceptions import ApplicationError
+
+from products.tasks.backend.models import TaskRun
+from products.tasks.backend.temporal.process_task import workflow as process_task_workflow_module
+from products.tasks.backend.temporal.process_task.activities.get_task_processing_context import TaskProcessingContext
+from products.tasks.backend.temporal.process_task.activities.relay_sandbox_events import (
+    RelaySandboxEventsInput,
+    TaskRunRedisStream,
+    _is_active_agent_update,
+    _is_end_of_turn,
+    _is_keepalive_event,
+    _is_session_update,
+    _mark_error_unless_run_is_terminal,
+    _relay_loop,
+    relay_sandbox_events,
+)
+from products.tasks.backend.temporal.process_task.activities.start_agent_server import StartAgentServerOutput
+from products.tasks.backend.temporal.process_task.workflow import (
+    RELAY_SANDBOX_EVENTS_START_TO_CLOSE_TIMEOUT,
+    ProcessTaskWorkflow,
+)
+
+from ee.hogai.sandbox import TURN_COMPLETE_METHOD
+
+relay_sandbox_events_module = importlib.import_module(
+    "products.tasks.backend.temporal.process_task.activities.relay_sandbox_events"
+)
+
+
+class TestIsEndOfTurn:
+    @parameterized.expand(
+        [
+            (
+                "raw_acp_end_turn",
+                {"type": "notification", "notification": {"result": {"stopReason": "end_turn"}}},
+                True,
+            ),
+            (
+                "raw_acp_non_terminal",
+                {"type": "notification", "notification": {"result": {"stopReason": "max_tokens"}}},
+                False,
+            ),
+            (
+                "synthetic_turn_complete",
+                {"type": "notification", "notification": {"method": TURN_COMPLETE_METHOD}},
+                True,
+            ),
+            (
+                "non_notification",
+                {"type": "event", "notification": {"result": {"stopReason": "end_turn"}}},
+                False,
+            ),
+        ]
+    )
+    def test_is_end_of_turn(self, _name: str, event_data: dict, expected: bool):
+        assert _is_end_of_turn(event_data) == expected
+
+
+class TestIsSessionUpdate:
+    @parameterized.expand(
+        [
+            (
+                "session_update",
+                {"type": "notification", "notification": {"method": "session/update"}},
+                True,
+            ),
+            (
+                "console_notification",
+                {"type": "notification", "notification": {"method": "_posthog/console"}},
+                False,
+            ),
+            (
+                "sandbox_output_notification",
+                {"type": "notification", "notification": {"method": "_posthog/sandbox_output"}},
+                False,
+            ),
+            (
+                "terminal_task_complete",
+                {"type": "notification", "notification": {"method": "_posthog/task_complete"}},
+                False,
+            ),
+            (
+                "terminal_error",
+                {"type": "notification", "notification": {"method": "_posthog/error"}},
+                False,
+            ),
+            (
+                "non_notification_type",
+                {"type": "event", "notification": {"method": "session/update"}},
+                False,
+            ),
+            (
+                "missing_notification",
+                {"type": "notification"},
+                False,
+            ),
+            (
+                "empty_dict",
+                {},
+                False,
+            ),
+        ],
+    )
+    def test_is_session_update(self, _name: str, event_data: dict, expected: bool):
+        assert _is_session_update(event_data) == expected
+
+
+class TestIsActiveAgentUpdate:
+    @staticmethod
+    def _su(sub_type: str) -> dict:
+        return {
+            "type": "notification",
+            "notification": {"method": "session/update", "params": {"update": {"sessionUpdate": sub_type}}},
+        }
+
+    @parameterized.expand(
+        [
+            # Generation updates -> active.
+            ("agent_message", "agent_message", True),
+            ("agent_message_chunk", "agent_message_chunk", True),
+            ("agent_thought_chunk", "agent_thought_chunk", True),
+            ("tool_call", "tool_call", True),
+            ("tool_call_update", "tool_call_update", True),
+            ("plan", "plan", True),
+            ("user_message_chunk", "user_message_chunk", True),
+            # Lifecycle updates -> not active.
+            ("available_commands_update", "available_commands_update", False),
+            ("current_mode_update", "current_mode_update", False),
+            ("config_option_update", "config_option_update", False),
+            ("usage_update", "usage_update", False),
+            # Allowlist fails safe: an unknown/future sub-type is not active.
+            ("unknown_future_subtype", "some_new_lifecycle_event", False),
+        ],
+    )
+    def test_session_update_sub_types(self, _name: str, sub_type: str, expected: bool) -> None:
+        assert _is_active_agent_update(self._su(sub_type)) is expected
+
+    @parameterized.expand(
+        [
+            ("missing_session_update_key", {"update": {}}),
+            ("missing_update_key", {}),
+            ("null_params", None),
+        ],
+    )
+    def test_missing_session_update_is_not_active(self, _name: str, params: dict | None) -> None:
+        # A session/update with no sessionUpdate sub-type must not mark the agent active.
+        event = {"type": "notification", "notification": {"method": "session/update", "params": params}}
+        assert _is_active_agent_update(event) is False
+
+    def test_non_session_update_is_not_active(self) -> None:
+        assert (
+            _is_active_agent_update({"type": "notification", "notification": {"method": "_posthog/console"}}) is False
+        )
+
+
+class TestIsKeepaliveEvent:
+    @parameterized.expand(
+        [
+            ("keepalive", {"type": "keepalive"}, True),
+            ("notification", {"type": "notification"}, False),
+            ("missing_type", {}, False),
+        ],
+    )
+    def test_is_keepalive_event(self, _name: str, event_data: dict, expected: bool) -> None:
+        assert _is_keepalive_event(event_data) == expected
+
+
+class TestAgentActiveReactivation:
+    """Verify that agent_active is only re-activated by session/update events.
+
+    This tests the logic from lines 231-232 of relay_sandbox_events.py:
+        elif not agent_active[0] and _is_session_update(event_data):
+            agent_active[0] = True
+    """
+
+    @staticmethod
+    def _simulate_reactivation(event_data: dict, agent_active: bool) -> bool:
+        """Replicate the inline re-activation logic from _relay_loop."""
+        active = [agent_active]
+        if _is_end_of_turn(event_data):
+            active[0] = False
+        elif not active[0] and _is_session_update(event_data):
+            active[0] = True
+        return active[0]
+
+    def test_session_update_reactivates_after_end_turn(self):
+        event = {"type": "notification", "notification": {"method": "session/update"}}
+        assert self._simulate_reactivation(event, agent_active=False) is True
+
+    def test_console_event_does_not_reactivate(self):
+        event = {"type": "notification", "notification": {"method": "_posthog/console"}}
+        assert self._simulate_reactivation(event, agent_active=False) is False
+
+    def test_sandbox_output_does_not_reactivate(self):
+        event = {"type": "notification", "notification": {"method": "_posthog/sandbox_output"}}
+        assert self._simulate_reactivation(event, agent_active=False) is False
+
+    def test_end_turn_deactivates(self):
+        end_turn = {
+            "type": "notification",
+            "notification": {"result": {"stopReason": "end_turn"}},
+        }
+        assert self._simulate_reactivation(end_turn, agent_active=True) is False
+
+    def test_full_lifecycle_turn_then_idle_then_resume(self):
+        """Simulate: agent active → end_turn → console noise → session/update resumes."""
+        active = [True]
+
+        # Agent finishes turn
+        end_turn = {"type": "notification", "notification": {"result": {"stopReason": "end_turn"}}}
+        if _is_end_of_turn(end_turn):
+            active[0] = False
+        assert active[0] is False
+
+        # Console events should NOT re-activate
+        for method in ("_posthog/console", "_posthog/sandbox_output"):
+            event = {"type": "notification", "notification": {"method": method}}
+            if not active[0] and _is_session_update(event):
+                active[0] = True
+            assert active[0] is False, f"{method} should not re-activate agent"
+
+        # session/update from new user message SHOULD re-activate
+        session_event = {"type": "notification", "notification": {"method": "session/update"}}
+        if not active[0] and _is_session_update(session_event):
+            active[0] = True
+        assert active[0] is True
+
+
+class TestRelaySandboxEventsCancellation:
+    async def test_cancelled_relay_marks_stream_complete_without_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        redis_stream = SimpleNamespace(
+            initialize=AsyncMock(),
+            mark_complete=AsyncMock(),
+            mark_error=AsyncMock(),
+        )
+
+        class StubTaskRunRedisStream:
+            def __init__(self, stream_key: str, use_dedicated: bool = False) -> None:
+                self.stream_key = stream_key
+
+            async def initialize(self) -> None:
+                await redis_stream.initialize()
+
+            async def mark_complete(self) -> None:
+                await redis_stream.mark_complete()
+
+            async def mark_error(self, error: str) -> None:
+                await redis_stream.mark_error(error)
+
+        class StubTaskRunQuerySet:
+            def select_related(self, *_args: str) -> "StubTaskRunQuerySet":
+                return self
+
+            async def aget(self, id: str) -> SimpleNamespace:
+                return SimpleNamespace(
+                    task=SimpleNamespace(created_by=SimpleNamespace(id=123), origin_product=None), state={}
+                )
+
+        async def fake_relay_loop(**_kwargs: object) -> None:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(relay_sandbox_events_module, "TaskRunRedisStream", StubTaskRunRedisStream)
+        monkeypatch.setattr(
+            relay_sandbox_events_module,
+            "TaskRunModel",
+            SimpleNamespace(objects=StubTaskRunQuerySet()),
+        )
+        monkeypatch.setattr(relay_sandbox_events_module, "create_sandbox_connection_token", lambda **_kwargs: "token")
+        monkeypatch.setattr(relay_sandbox_events_module, "validate_sandbox_url", lambda _url: None)
+        monkeypatch.setattr(relay_sandbox_events_module, "_relay_loop", fake_relay_loop)
+
+        with pytest.raises(asyncio.CancelledError):
+            await relay_sandbox_events(
+                RelaySandboxEventsInput(
+                    run_id="run-id",
+                    task_id="task-id",
+                    sandbox_url="https://sandbox.example",
+                    sandbox_connect_token=None,
+                    team_id=1,
+                    distinct_id="distinct-id",
+                )
+            )
+
+        redis_stream.mark_complete.assert_awaited_once()
+        redis_stream.mark_error.assert_not_awaited()
+
+
+class TestRelaySandboxEventsMissingActor:
+    @pytest.mark.django_db
+    async def test_missing_slack_actor_fails_non_retryable_with_stream_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        redis_stream = SimpleNamespace(
+            initialize=AsyncMock(),
+            mark_complete=AsyncMock(),
+            mark_error=AsyncMock(),
+        )
+
+        class StubTaskRunRedisStream:
+            def __init__(self, stream_key: str, use_dedicated: bool = False) -> None:
+                self.stream_key = stream_key
+
+            async def initialize(self) -> None:
+                await redis_stream.initialize()
+
+            async def mark_complete(self) -> None:
+                await redis_stream.mark_complete()
+
+            async def mark_error(self, error: str) -> None:
+                await redis_stream.mark_error(error)
+
+        class StubTaskRunQuerySet:
+            def select_related(self, *_args: str) -> "StubTaskRunQuerySet":
+                return self
+
+            async def aget(self, id: str) -> SimpleNamespace:
+                return SimpleNamespace(
+                    task=SimpleNamespace(id="task-id", created_by=None, origin_product=None),
+                    # A recorded actor that no longer resolves — deterministic, so the
+                    # activity must fail for good instead of retrying forever.
+                    state={"interaction_origin": "slack", "slack_actor_user_id": 424_242},
+                )
+
+        relay_loop_mock = AsyncMock()
+        monkeypatch.setattr(relay_sandbox_events_module, "TaskRunRedisStream", StubTaskRunRedisStream)
+        monkeypatch.setattr(
+            relay_sandbox_events_module,
+            "TaskRunModel",
+            SimpleNamespace(objects=StubTaskRunQuerySet()),
+        )
+        monkeypatch.setattr(relay_sandbox_events_module, "validate_sandbox_url", lambda _url: None)
+        monkeypatch.setattr(relay_sandbox_events_module, "_relay_loop", relay_loop_mock)
+
+        with pytest.raises(ApplicationError) as exc_info:
+            await relay_sandbox_events(
+                RelaySandboxEventsInput(
+                    run_id="run-id",
+                    task_id="task-id",
+                    sandbox_url="https://sandbox.example",
+                    sandbox_connect_token=None,
+                    team_id=1,
+                    distinct_id="distinct-id",
+                )
+            )
+
+        assert exc_info.value.non_retryable is True
+        redis_stream.mark_error.assert_awaited_once()
+        relay_loop_mock.assert_not_awaited()
+
+
+class TestBrokerPermissionRequestStateRefresh:
+    @pytest.mark.django_db
+    def test_mode_downgrade_after_relay_start_escalates_instead_of_auto_approving(self) -> None:
+        from posthog.models import Organization, Team
+        from posthog.models.user import User
+
+        from products.tasks.backend.models import Task
+
+        organization = Organization.objects.create(name="broker-refresh-org")
+        team = Team.objects.create(organization=organization, name="broker-refresh-team")
+        creator = User.objects.create(email="broker-refresh@example.com")
+        task = Task.objects.create(
+            team=team,
+            title="Create a PDF",
+            created_by=creator,
+            origin_product=Task.OriginProduct.SLACK,
+        )
+        task_run = TaskRun.objects.create(
+            task=task,
+            team=team,
+            status=TaskRun.Status.IN_PROGRESS,
+            state={"sandbox_url": "https://sandbox.example.com", "slack_permission_mode": "full_auto"},
+        )
+        # The object the relay holds from its start; the user downgrades the mode mid-run.
+        stale_task_run = TaskRun.objects.select_related("task__created_by").get(id=task_run.id)
+        TaskRun.objects.filter(id=task_run.id).update(
+            state={"sandbox_url": "https://sandbox.example.com", "slack_permission_mode": "ask_before_write"}
+        )
+
+        permission_request = {
+            "request_id": "perm-1",
+            "tool_call": {"title": "Run tool", "rawInput": {"toolName": "Bash", "command": "rm -rf report.xlsx"}},
+            "options": [
+                {"optionId": "allow", "kind": "allow_once", "name": "Yes"},
+                {"optionId": "reject", "kind": "reject_once", "name": "No"},
+            ],
+        }
+
+        with (
+            patch(
+                "products.tasks.backend.logic.services.permission_broker.create_sandbox_connection_token",
+                return_value="sandbox-token",
+            ),
+            patch("products.tasks.backend.logic.services.permission_broker.send_agent_command") as mock_send,
+            patch(
+                "products.slack_app.backend.services.agent_permissions.post_slack_permission_request_for_task_run"
+            ) as mock_prompt,
+        ):
+            relay_sandbox_events_module._broker_permission_request(stale_task_run, permission_request)
+
+        mock_send.assert_not_called()
+        mock_prompt.assert_called_once()
+
+
+class TestRelaySandboxEventsErrorHandling:
+    @parameterized.expand(
+        [
+            ("read_error", httpx.ReadError),
+            ("connect_error", httpx.ConnectError),
+            ("remote_protocol_error", httpx.RemoteProtocolError),
+            ("sse_error", httpx_sse.SSEError),
+        ],
+    )
+    async def test_relay_loop_retries_retryable_stream_errors(
+        self,
+        _name: str,
+        exception_class: type[Exception],
+    ) -> None:
+        redis_stream = SimpleNamespace(
+            write_event=AsyncMock(),
+            mark_complete=AsyncMock(),
+            mark_error=AsyncMock(),
+        )
+        sleep_mock = AsyncMock()
+        connect_attempts = 0
+        terminal_event = SimpleNamespace(
+            data='{"type":"notification","notification":{"method":"_posthog/task_complete"}}'
+        )
+
+        class FailingEventSource:
+            async def __aenter__(self) -> "FailingEventSource":
+                raise exception_class("terminated")
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+        class SuccessfulEventSource:
+            response = SimpleNamespace(raise_for_status=lambda: None)
+
+            async def __aenter__(self) -> "SuccessfulEventSource":
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def aiter_sse(self):
+                yield terminal_event
+
+        def fake_connect_sse(*_args: object, **_kwargs: object):
+            nonlocal connect_attempts
+            connect_attempts += 1
+            if connect_attempts == 1:
+                return FailingEventSource()
+            return SuccessfulEventSource()
+
+        async def fake_background_heartbeat(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(relay_sandbox_events_module.httpx_sse, "aconnect_sse", fake_connect_sse)
+            monkeypatch.setattr(relay_sandbox_events_module.asyncio, "sleep", sleep_mock)
+            monkeypatch.setattr(relay_sandbox_events_module, "_background_heartbeat", fake_background_heartbeat)
+
+            await _relay_loop(
+                events_url="https://sandbox.example/events",
+                headers={"Authorization": "Bearer token"},
+                params={},
+                redis_stream=cast(TaskRunRedisStream, redis_stream),
+                run_id="run-id",
+                task_id="task-id",
+            )
+
+        assert connect_attempts == 2
+        sleep_mock.assert_awaited_once_with(2)
+        redis_stream.write_event.assert_awaited_once()
+        redis_stream.mark_complete.assert_awaited_once()
+        redis_stream.mark_error.assert_not_awaited()
+
+    async def test_keepalive_events_are_transport_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        redis_stream = SimpleNamespace(
+            write_event=AsyncMock(),
+            mark_complete=AsyncMock(),
+            mark_error=AsyncMock(),
+        )
+        terminal_event = {
+            "type": "notification",
+            "notification": {"method": "_posthog/task_complete"},
+        }
+
+        class SuccessfulEventSource:
+            response = SimpleNamespace(raise_for_status=lambda: None)
+
+            async def __aenter__(self) -> "SuccessfulEventSource":
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def aiter_sse(self):
+                yield SimpleNamespace(data='{"type":"keepalive"}')
+                yield SimpleNamespace(data=json.dumps(terminal_event))
+
+        def fake_connect_sse(*_args: object, **_kwargs: object) -> SuccessfulEventSource:
+            return SuccessfulEventSource()
+
+        async def fake_background_heartbeat(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(relay_sandbox_events_module.httpx_sse, "aconnect_sse", fake_connect_sse)
+        monkeypatch.setattr(relay_sandbox_events_module, "_background_heartbeat", fake_background_heartbeat)
+
+        await _relay_loop(
+            events_url="https://sandbox.example/events",
+            headers={"Authorization": "Bearer token"},
+            params={},
+            redis_stream=cast(TaskRunRedisStream, redis_stream),
+            run_id="run-id",
+            task_id="task-id",
+        )
+
+        redis_stream.write_event.assert_awaited_once_with(terminal_event)
+        redis_stream.mark_complete.assert_awaited_once()
+        redis_stream.mark_error.assert_not_awaited()
+
+    async def test_permission_request_dispatches_to_broker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        redis_stream = SimpleNamespace(
+            write_event=AsyncMock(),
+            mark_complete=AsyncMock(),
+            mark_error=AsyncMock(),
+        )
+        permission_event = {
+            "type": "notification",
+            "notification": {
+                "method": "_posthog/permission_request",
+                "params": {
+                    "requestId": "perm-1",
+                    "options": [{"kind": "allow_once", "optionId": "allow"}],
+                    "toolCall": {"_meta": {"claudeCode": {"toolName": "Bash"}}, "rawInput": {"command": "ls"}},
+                },
+            },
+        }
+        terminal_event = {
+            "type": "notification",
+            "notification": {"method": "_posthog/task_complete"},
+        }
+        task_run = SimpleNamespace(id="run-id")
+        dispatch_mock = MagicMock()
+
+        class SuccessfulEventSource:
+            response = SimpleNamespace(raise_for_status=lambda: None)
+
+            async def __aenter__(self) -> "SuccessfulEventSource":
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def aiter_sse(self):
+                yield SimpleNamespace(data=json.dumps(permission_event))
+                yield SimpleNamespace(data=json.dumps(terminal_event))
+
+        def fake_connect_sse(*_args: object, **_kwargs: object) -> SuccessfulEventSource:
+            return SuccessfulEventSource()
+
+        async def fake_background_heartbeat(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def fake_to_thread(func, *args):
+            func(*args)
+
+        monkeypatch.setattr(relay_sandbox_events_module.httpx_sse, "aconnect_sse", fake_connect_sse)
+        monkeypatch.setattr(relay_sandbox_events_module, "_background_heartbeat", fake_background_heartbeat)
+        monkeypatch.setattr(relay_sandbox_events_module.asyncio, "to_thread", fake_to_thread)
+        monkeypatch.setattr(relay_sandbox_events_module, "_broker_permission_request", dispatch_mock)
+
+        await _relay_loop(
+            events_url="https://sandbox.example/events",
+            headers={"Authorization": "Bearer token"},
+            params={},
+            redis_stream=cast(TaskRunRedisStream, redis_stream),
+            run_id="run-id",
+            task_id="task-id",
+            task_run=cast(TaskRun, task_run),
+        )
+
+        redis_stream.write_event.assert_any_await(permission_event)
+        dispatch_mock.assert_called_once_with(
+            task_run,
+            {
+                "request_id": "perm-1",
+                "tool_call": {"_meta": {"claudeCode": {"toolName": "Bash"}}, "rawInput": {"command": "ls"}},
+                "tool_name": "Bash",
+                "options": [{"optionId": "allow", "kind": "allow_once", "name": ""}],
+            },
+        )
+        redis_stream.mark_complete.assert_awaited_once()
+        redis_stream.mark_error.assert_not_awaited()
+
+    async def test_terminal_run_marks_stream_complete_on_late_relay_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        redis_stream_mock = SimpleNamespace(mark_complete=AsyncMock(), mark_error=AsyncMock())
+        redis_stream = cast(TaskRunRedisStream, redis_stream_mock)
+
+        class StubTaskRunQuerySet:
+            def only(self, *_fields: str) -> "StubTaskRunQuerySet":
+                return self
+
+            async def aget(self, id: str) -> SimpleNamespace:
+                return SimpleNamespace(status="cancelled")
+
+        monkeypatch.setattr(
+            relay_sandbox_events_module,
+            "TaskRunModel",
+            SimpleNamespace(
+                Status=SimpleNamespace(COMPLETED="completed", FAILED="failed", CANCELLED="cancelled"),
+                DoesNotExist=Exception,
+                objects=StubTaskRunQuerySet(),
+            ),
+        )
+
+        marked_complete = await _mark_error_unless_run_is_terminal(redis_stream, "run-id", "late relay error")
+
+        assert marked_complete is True
+        redis_stream_mock.mark_complete.assert_awaited_once()
+        redis_stream_mock.mark_error.assert_not_awaited()
+
+    async def test_normal_stream_close_marks_stream_complete(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        redis_stream = SimpleNamespace(
+            write_event=AsyncMock(),
+            mark_complete=AsyncMock(),
+            mark_error=AsyncMock(),
+        )
+        sleep_mock = AsyncMock()
+        connect_attempts = 0
+
+        class EmptyEventSource:
+            response = SimpleNamespace(raise_for_status=lambda: None)
+
+            async def __aenter__(self) -> "EmptyEventSource":
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def aiter_sse(self):
+                events: list[SimpleNamespace] = []
+                for event in events:
+                    yield event
+
+        def fake_connect_sse(*_args: object, **_kwargs: object) -> EmptyEventSource:
+            nonlocal connect_attempts
+            connect_attempts += 1
+            return EmptyEventSource()
+
+        async def fake_background_heartbeat(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(relay_sandbox_events_module.httpx_sse, "aconnect_sse", fake_connect_sse)
+        monkeypatch.setattr(relay_sandbox_events_module.asyncio, "sleep", sleep_mock)
+        monkeypatch.setattr(relay_sandbox_events_module, "_background_heartbeat", fake_background_heartbeat)
+
+        await _relay_loop(
+            events_url="https://sandbox.example/events",
+            headers={"Authorization": "Bearer token"},
+            params={},
+            redis_stream=cast(TaskRunRedisStream, redis_stream),
+            run_id="run-id",
+            task_id="task-id",
+        )
+
+        assert connect_attempts == 1
+        sleep_mock.assert_not_awaited()
+        redis_stream.write_event.assert_not_awaited()
+        redis_stream.mark_complete.assert_awaited_once()
+        redis_stream.mark_error.assert_not_awaited()
+
+    async def test_in_progress_run_marks_stream_error_on_relay_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        redis_stream_mock = SimpleNamespace(mark_complete=AsyncMock(), mark_error=AsyncMock())
+        redis_stream = cast(TaskRunRedisStream, redis_stream_mock)
+
+        class StubTaskRunQuerySet:
+            def only(self, *_fields: str) -> "StubTaskRunQuerySet":
+                return self
+
+            async def aget(self, id: str) -> SimpleNamespace:
+                return SimpleNamespace(status="in_progress")
+
+        monkeypatch.setattr(
+            relay_sandbox_events_module,
+            "TaskRunModel",
+            SimpleNamespace(
+                Status=SimpleNamespace(COMPLETED="completed", FAILED="failed", CANCELLED="cancelled"),
+                DoesNotExist=Exception,
+                objects=StubTaskRunQuerySet(),
+            ),
+        )
+
+        marked_complete = await _mark_error_unless_run_is_terminal(redis_stream, "run-id", "relay error")
+
+        assert marked_complete is False
+        redis_stream_mock.mark_complete.assert_not_awaited()
+        redis_stream_mock.mark_error.assert_awaited_once_with("relay error")
+
+    async def test_missing_run_marks_stream_error_on_relay_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        redis_stream_mock = SimpleNamespace(mark_complete=AsyncMock(), mark_error=AsyncMock())
+        redis_stream = cast(TaskRunRedisStream, redis_stream_mock)
+
+        class DoesNotExist(Exception):
+            pass
+
+        class StubTaskRunQuerySet:
+            def only(self, *_fields: str) -> "StubTaskRunQuerySet":
+                return self
+
+            async def aget(self, id: str) -> SimpleNamespace:
+                raise DoesNotExist
+
+        monkeypatch.setattr(
+            relay_sandbox_events_module,
+            "TaskRunModel",
+            SimpleNamespace(
+                Status=SimpleNamespace(COMPLETED="completed", FAILED="failed", CANCELLED="cancelled"),
+                DoesNotExist=DoesNotExist,
+                objects=StubTaskRunQuerySet(),
+            ),
+        )
+
+        marked_complete = await _mark_error_unless_run_is_terminal(redis_stream, "run-id", "relay error")
+
+        assert marked_complete is False
+        redis_stream_mock.mark_complete.assert_not_awaited()
+        redis_stream_mock.mark_error.assert_awaited_once_with("relay error")
+
+    async def test_terminal_status_check_failure_reraises_original_relay_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        redis_stream = SimpleNamespace(
+            initialize=AsyncMock(),
+            mark_complete=AsyncMock(),
+            mark_error=AsyncMock(),
+        )
+
+        class StubTaskRunRedisStream:
+            def __init__(self, stream_key: str, use_dedicated: bool = False) -> None:
+                self.stream_key = stream_key
+
+            async def initialize(self) -> None:
+                await redis_stream.initialize()
+
+            async def mark_complete(self) -> None:
+                await redis_stream.mark_complete()
+
+            async def mark_error(self, error: str) -> None:
+                await redis_stream.mark_error(error)
+
+        class StubTaskRunQuerySet:
+            def select_related(self, *_args: str) -> "StubTaskRunQuerySet":
+                return self
+
+            async def aget(self, id: str) -> SimpleNamespace:
+                return SimpleNamespace(
+                    task=SimpleNamespace(created_by=SimpleNamespace(id=123), origin_product=None), state={}
+                )
+
+        async def fake_relay_loop(**_kwargs: object) -> None:
+            raise RuntimeError("relay error")
+
+        async def fake_mark_error_unless_run_is_terminal(_redis_stream: object, _run_id: str, _error: str) -> bool:
+            raise RuntimeError("status check failed")
+
+        monkeypatch.setattr(relay_sandbox_events_module, "TaskRunRedisStream", StubTaskRunRedisStream)
+        monkeypatch.setattr(
+            relay_sandbox_events_module,
+            "TaskRunModel",
+            SimpleNamespace(objects=StubTaskRunQuerySet()),
+        )
+        monkeypatch.setattr(relay_sandbox_events_module, "create_sandbox_connection_token", lambda **_kwargs: "token")
+        monkeypatch.setattr(relay_sandbox_events_module, "validate_sandbox_url", lambda _url: None)
+        monkeypatch.setattr(relay_sandbox_events_module, "_relay_loop", fake_relay_loop)
+        monkeypatch.setattr(
+            relay_sandbox_events_module,
+            "_mark_error_unless_run_is_terminal",
+            fake_mark_error_unless_run_is_terminal,
+        )
+
+        with pytest.raises(ApplicationError, match="relay error") as exc_info:
+            await relay_sandbox_events(
+                RelaySandboxEventsInput(
+                    run_id="run-id",
+                    task_id="task-id",
+                    sandbox_url="https://sandbox.example",
+                    sandbox_connect_token=None,
+                    team_id=1,
+                    distinct_id="distinct-id",
+                )
+            )
+
+        # An error sentinel was written to the stream, so the failure must be
+        # non-retryable — a retried attempt would append events past the
+        # sentinel that disconnected consumers never see.
+        assert exc_info.value.non_retryable is True
+        redis_stream.mark_complete.assert_not_awaited()
+        redis_stream.mark_error.assert_awaited_once_with("relay error")
+
+
+class TestRelaySandboxEventsWorkflowOptions:
+    async def test_relay_sandbox_events_uses_extended_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        workflow = ProcessTaskWorkflow()
+        workflow._context = TaskProcessingContext(
+            task_id="task-id",
+            run_id="run-id",
+            team_id=1,
+            team_uuid="team-uuid",
+            organization_id="organization-id",
+            github_integration_id=123,
+            repository="posthog/posthog-js",
+            distinct_id="distinct-id",
+            create_pr=True,
+            state={},
+            _branch="feature-branch",
+        )
+        execute_activity_mock = AsyncMock()
+        monkeypatch.setattr(process_task_workflow_module.workflow, "execute_activity", execute_activity_mock)
+
+        await workflow._relay_sandbox_events(
+            StartAgentServerOutput(sandbox_url="https://sandbox.example", connect_token="connect-token"),
+            sandbox_id="sandbox-123",
+        )
+
+        assert execute_activity_mock.await_args is not None
+        _, kwargs = execute_activity_mock.await_args
+        assert kwargs["start_to_close_timeout"] == RELAY_SANDBOX_EVENTS_START_TO_CLOSE_TIMEOUT

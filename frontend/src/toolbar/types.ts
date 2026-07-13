@@ -1,27 +1,77 @@
-import { ActionStepType, ActionType, ElementType } from '~/types'
-import { NamePath, StoreValue } from 'rc-field-form/es/interface'
+import { ActionStepType, ActionType, ElementType, Experiment } from '~/types'
+
+import { FragileSelectorResult } from './utils/selectorQuality'
 
 export type ElementsEventType = {
     count: number
     elements: ElementType[]
-    hash: string
+    hash: string | null
+    type: '$autocapture' | '$rageclick'
+}
+
+export type HeatmapResponseType = {
+    results: (
+        | {
+              count: number
+              pointer_relative_x: number
+              pointer_target_fixed: boolean
+              pointer_y: number
+          }
+        | {
+              scroll_depth_bucket: number
+              bucket_count: number
+              cumulative_count: number
+          }
+    )[]
+}
+
+export type HeatmapElement = {
+    count: number
+    xPercentage: number
+    targetFixed: boolean
+    y: number
 }
 
 export interface CountedHTMLElement {
-    count: number
+    count: number // total of types of clicks
+    clickCount: number // autocapture clicks
+    rageclickCount: number
+    deadclickCount: number
     element: HTMLElement
-    hash: string
+    hash: string | null
     selector: string
     position?: number
     actionStep?: ActionStepType
+    type: '$autocapture' | '$rageclick' | '$dead_click'
+    // whether the browser reports this element as visible
+    visible?: boolean
+    rect?: ElementRect
 }
 
+export interface ElementRect {
+    bottom: number
+    height: number
+    left: number
+    right: number
+    top: number
+    width: number
+    x: number
+    y: number
+}
 export interface ElementWithMetadata {
     element: HTMLElement
-    rect?: DOMRect
+    rect?: ElementRect
     index?: number
     count?: number
+    clickCount?: number
+    rageclickCount?: number
+    deadclickCount?: number
     position?: number
+    apparentZIndex?: number
+    visible?: boolean
+    actionStep?: ActionStepType
+    selectorQuality?: FragileSelectorResult | null
+    actions?: ActionElementWithMetadata[]
 }
 
 export interface ActionElementWithMetadata extends ElementWithMetadata {
@@ -29,13 +79,31 @@ export interface ActionElementWithMetadata extends ElementWithMetadata {
     step?: ActionStepType
 }
 
-export type BoxColor = {
-    backgroundBlendMode: string
-    background: string
-    boxShadow: string
-}
-
 export type ActionDraftType = Omit<ActionType, 'id' | 'created_at' | 'created_by'>
+
+export type WebExperimentDraftType = Omit<
+    Experiment,
+    | 'id'
+    | 'created_at'
+    | 'created_by'
+    | 'feature_flag_key'
+    | 'filters'
+    | 'metrics'
+    | 'metrics_secondary'
+    | 'primary_metrics_ordered_uuids'
+    | 'secondary_metrics_ordered_uuids'
+    | 'saved_metrics_ids'
+    | 'saved_metrics'
+    | 'parameters'
+    | 'secondary_metrics'
+    | 'updated_at'
+    | 'user_access_level'
+>
+
+export interface WebExperimentForm extends WebExperimentDraftType {
+    variants: Record<string, WebExperimentVariant>
+    original_html_state?: Record<string, any>
+}
 
 export interface ActionStepForm extends ActionStepType {
     href_selected?: boolean
@@ -48,10 +116,36 @@ export interface ActionForm extends ActionDraftType {
     steps?: ActionStepForm[]
 }
 
-export interface AntdFieldData {
-    touched?: boolean
-    validating?: boolean
-    errors?: string[]
-    value?: StoreValue
-    name: NamePath
+export type WebExperimentUrlMatchType = 'regex' | 'not_regex' | 'exact' | 'is_not' | 'icontains' | 'not_icontains'
+
+export interface WebExperiment extends Experiment {
+    variants: Record<string, WebExperimentVariant>
+}
+
+export interface WebExperimentVariant {
+    is_new?: boolean
+    conditions?: {
+        url?: string
+        urlMatchType?: WebExperimentUrlMatchType
+        utm: {
+            utm_source?: string
+            utm_medium?: string
+            utm_campaign?: string
+            utm_term?: string
+        }
+    } | null
+    transforms: WebExperimentTransform[]
+    rollout_percentage?: number
+}
+
+export interface WebExperimentTransform {
+    selector?: string
+    attributes?: {
+        attribute_name: string
+        attribute_value: string
+    }[]
+    text?: string
+    html?: string
+    imgUrl?: string
+    css?: string | null
 }

@@ -1,0 +1,27 @@
+.SidePanel3000 {
+    z-index: var(--z-main-nav);
+    flex-shrink: 0;
+
+    &--open {
+        min-width: var(--side-panel-min-width);
+
+        @media (max-width: 1200px) {
+            position: fixed;
+            top: 0;
+            right: 0;
+
+            // As a fixed overlay the panel escapes the content column and must sit above the
+            // left nav (--z-layout-panel: 761) instead of behind it at --z-main-nav (750).
+            z-index: calc(var(--z-layout-panel) + 1);
+            box-shadow: 0 0 30px rgb(0 0 0 / 20%);
+
+            [theme='dark'] & {
+                box-shadow: none;
+            }
+        }
+    }
+
+    &--resizing {
+        pointer-events: none;
+    }
+}

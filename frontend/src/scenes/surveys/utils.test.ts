@@ -1,0 +1,1467 @@
+import { getAppContext } from 'lib/utils/getAppContext'
+import { SurveyRatingResults } from 'scenes/surveys/surveyLogic'
+
+import {
+    EventPropertyFilter,
+    FeatureFlagFilters,
+    PropertyOperator,
+    PropertyFilterType,
+    Survey,
+    SurveyAppearance,
+    SurveyDisplayConditions,
+    SurveyEventName,
+    SurveyEventProperties,
+    SurveyQuestion,
+    SurveyQuestionType,
+    SurveyType,
+    SurveyWidgetType,
+} from '~/types'
+
+import {
+    buildSurveyExampleInvocationGlobals,
+    buildPartialResponsesFilter,
+    buildSurveyOptionalBooleanPropertyFilter,
+    buildSurveyTimestampFilter,
+    calculateNpsBreakdown,
+    createAnswerFilterHogQLExpression,
+    doesSurveyRepeatOnEveryEvent,
+    getSurveyNotificationFilters,
+    getResolvedSurveyDateRange,
+    getSurveyAudienceSummaryValue,
+    getSurveyDisplayConditionsSummary,
+    getSurveyEndDateForQuery,
+    getSurveyResponse,
+    getSurveyStartDateForQuery,
+    isSimpleSurveyAudienceTargeting,
+    sanitizeColor,
+    sanitizeSurvey,
+    sanitizeSurveyAppearance,
+    sanitizeSurveyDisplayConditions,
+    splitChoicesOnPaste,
+    validateCSSProperty,
+    validateSurveyAppearance,
+} from './utils'
+
+jest.mock('lib/utils/getAppContext', () => ({
+    getAppContext: jest.fn(() => undefined),
+}))
+
+const mockedGetAppContext = getAppContext as jest.MockedFunction<typeof getAppContext>
+
+afterEach(() => {
+    mockedGetAppContext.mockReturnValue(undefined)
+})
+
+describe('survey utils', () => {
+    beforeAll(() => {
+        // Mock CSS.supports
+        global.CSS = {
+            supports: (property: string, value: string): boolean => {
+                // Basic color validation - this is a simplified version
+                if (property === 'color') {
+                    // Helper to validate RGB/HSL number ranges
+                    const isValidRGBNumber = (n: string): boolean => {
+                        const num = parseInt(n)
+                        return !isNaN(num) && num >= 0 && num <= 255
+                    }
+
+                    const isValidAlpha = (n: string): boolean => {
+                        const num = parseFloat(n)
+                        return !isNaN(num) && num >= 0 && num <= 1
+                    }
+
+                    // Hex colors (3, 4, 6 or 8 digits)
+                    if (value.match(/^#([0-9A-Fa-f]{3}){1,2}$/) || value.match(/^#([0-9A-Fa-f]{4}){1,2}$/)) {
+                        return true
+                    }
+
+                    // RGB colors
+                    const rgbMatch = value.match(/^rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$/)
+                    if (rgbMatch) {
+                        return (
+                            isValidRGBNumber(rgbMatch[1]) &&
+                            isValidRGBNumber(rgbMatch[2]) &&
+                            isValidRGBNumber(rgbMatch[3])
+                        )
+                    }
+
+                    // RGBA colors
+                    const rgbaMatch = value.match(/^rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\d.]+)\s*\)$/)
+                    if (rgbaMatch) {
+                        return (
+                            isValidRGBNumber(rgbaMatch[1]) &&
+                            isValidRGBNumber(rgbaMatch[2]) &&
+                            isValidRGBNumber(rgbaMatch[3]) &&
+                            isValidAlpha(rgbaMatch[4])
+                        )
+                    }
+
+                    // HSL colors
+                    if (value.match(/^hsl\(\s*\d+\s*,\s*\d+%\s*,\s*\d+%\s*\)$/)) {
+                        return true
+                    }
+
+                    // HSLA colors
+                    if (value.match(/^hsla\(\s*\d+\s*,\s*\d+%\s*,\s*\d+%\s*,\s*[\d.]+\s*\)$/)) {
+                        return true
+                    }
+
+                    // Named colors - extend the list with more common colors
+                    return ['red', 'blue', 'green', 'transparent', 'black', 'white'].includes(value)
+                }
+                return false
+            },
+        } as unknown as typeof CSS
+    })
+
+    describe('validateColor', () => {
+        it('returns undefined for valid colors in different formats', () => {
+            // Hex colors
+            expect(validateCSSProperty('color', '#ff0000')).toBeUndefined()
+            expect(validateCSSProperty('color', '#f00')).toBeUndefined()
+            expect(validateCSSProperty('color', '#ff000080')).toBeUndefined() // With alpha
+
+            // RGB/RGBA colors
+            expect(validateCSSProperty('color', 'rgb(255, 0, 0)')).toBeUndefined()
+            expect(validateCSSProperty('color', 'rgba(255, 0, 0, 0.5)')).toBeUndefined()
+
+            // HSL/HSLA colors
+            expect(validateCSSProperty('color', 'hsl(0, 100%, 50%)')).toBeUndefined()
+            expect(validateCSSProperty('color', 'hsla(0, 100%, 50%, 0.5)')).toBeUndefined()
+
+            // Named colors
+            expect(validateCSSProperty('color', 'red')).toBeUndefined()
+            expect(validateCSSProperty('color', 'transparent')).toBeUndefined()
+        })
+
+        it('returns error message for invalid colors', () => {
+            expect(validateCSSProperty('color', 'not-a-color')).toBe('not-a-color is not a valid property for color.')
+        })
+
+        it('returns undefined for undefined input', () => {
+            expect(validateCSSProperty('color', undefined)).toBeUndefined()
+        })
+    })
+
+    describe('sanitizeColor', () => {
+        it('returns undefined for falsy values', () => {
+            expect(sanitizeColor(undefined)).toBeUndefined()
+            expect(sanitizeColor('')).toBeUndefined()
+        })
+
+        it('adds # prefix to valid hex colors without it', () => {
+            expect(sanitizeColor('ff0000')).toBe('#ff0000')
+            expect(sanitizeColor('123456')).toBe('#123456')
+        })
+
+        it('returns original value for already valid colors', () => {
+            expect(sanitizeColor('#ff0000')).toBe('#ff0000')
+            expect(sanitizeColor('rgb(255, 0, 0)')).toBe('rgb(255, 0, 0)')
+            expect(sanitizeColor('red')).toBe('red')
+        })
+    })
+
+    describe('validateSurveyAppearance', () => {
+        const invalidAppearance: SurveyAppearance = {
+            backgroundColor: 'not-a-color',
+            borderColor: 'also-not-a-color',
+            maxWidth: 'definitely-not-a-width',
+        }
+
+        it('skips all appearance validation for API surveys', () => {
+            // API surveys are rendered by the customer, so PostHog's appearance CSS is not applied
+            // and the Customization section is hidden in the editor — flagging errors here would
+            // route submitSurveyFailure to a non-existent section and silently block saves.
+            expect(validateSurveyAppearance(invalidAppearance, false, SurveyType.API)).toEqual({})
+        })
+
+        it('validates appearance CSS for Popover surveys', () => {
+            const result = validateSurveyAppearance(invalidAppearance, false, SurveyType.Popover)
+            expect(result.backgroundColor).toBe('not-a-color is not a valid property for background-color.')
+            expect(result.borderColor).toBe('also-not-a-color is not a valid property for border-color.')
+            expect(result.maxWidth).toBe('definitely-not-a-width is not a valid property for width.')
+        })
+    })
+
+    describe('getSurveyNotificationFilters', () => {
+        it('builds survey-specific notification filters', () => {
+            expect(getSurveyNotificationFilters('survey-123')).toEqual({
+                events: [
+                    {
+                        id: SurveyEventName.SENT,
+                        type: 'events',
+                        properties: [
+                            {
+                                key: SurveyEventProperties.SURVEY_ID,
+                                type: PropertyFilterType.Event,
+                                value: 'survey-123',
+                                operator: PropertyOperator.Exact,
+                            },
+                            {
+                                key: SurveyEventProperties.SURVEY_COMPLETED,
+                                type: PropertyFilterType.Event,
+                                value: true,
+                                operator: PropertyOperator.Exact,
+                            },
+                        ],
+                    },
+                    {
+                        id: SurveyEventName.DISMISSED,
+                        type: 'events',
+                        properties: [
+                            {
+                                key: SurveyEventProperties.SURVEY_ID,
+                                type: PropertyFilterType.Event,
+                                value: 'survey-123',
+                                operator: PropertyOperator.Exact,
+                            },
+                            {
+                                key: SurveyEventProperties.SURVEY_PARTIALLY_COMPLETED,
+                                type: PropertyFilterType.Event,
+                                value: true,
+                                operator: PropertyOperator.Exact,
+                            },
+                        ],
+                    },
+                ],
+            })
+        })
+    })
+
+    describe('buildSurveyExampleInvocationGlobals', () => {
+        it('builds a survey sent example payload with question response properties', () => {
+            const globals = buildSurveyExampleInvocationGlobals({
+                survey: {
+                    id: 'survey-123',
+                    name: 'Onboarding survey',
+                    questions: [
+                        { id: 'q1', type: SurveyQuestionType.Open, question: 'Tell us more' },
+                        {
+                            id: 'q2',
+                            type: SurveyQuestionType.SingleChoice,
+                            question: 'How did you hear about us?',
+                            choices: ['Twitter', 'Word of mouth'],
+                        },
+                        {
+                            id: 'q3',
+                            type: SurveyQuestionType.MultipleChoice,
+                            question: 'What do you use most?',
+                            choices: ['Funnels', 'Session replay', 'Feature flags'],
+                        },
+                        {
+                            id: 'q4',
+                            type: SurveyQuestionType.Rating,
+                            question: 'How satisfied are you?',
+                            scale: 10,
+                            display: 'number',
+                            lowerBoundLabel: 'Low',
+                            upperBoundLabel: 'High',
+                        },
+                    ],
+                } as Survey,
+                projectId: 1,
+                projectName: 'Project',
+                projectUrl: 'https://app.posthog.com/project/1',
+                timestamp: '2026-04-13T12:00:00.000Z',
+                eventUuid: 'event-uuid',
+                distinctId: 'person-distinct-id',
+            })
+
+            expect(globals.event.event).toEqual(SurveyEventName.SENT)
+            expect(globals.event.properties).toEqual({
+                $survey_id: 'survey-123',
+                $survey_name: 'Onboarding survey',
+                $survey_completed: true,
+                $survey_submission_id: 'survey-submission-id',
+                $survey_response_q1: 'Tell us more',
+                $survey_response_q2: 'Twitter',
+                $survey_response_q3: ['Funnels', 'Session replay'],
+                $survey_response_q4: '9',
+            })
+        })
+    })
+
+    describe('getSurveyResponse', () => {
+        it('uses the backend HogQL helper for single-value questions', () => {
+            const question = {
+                id: 'question-123',
+                type: SurveyQuestionType.Rating,
+                question: 'How satisfied are you?',
+                scale: 10,
+                display: 'number',
+                lowerBoundLabel: 'Low',
+                upperBoundLabel: 'High',
+            } as SurveyQuestion
+
+            expect(getSurveyResponse(question, 0)).toBe("getSurveyResponse(0, 'question-123')")
+        })
+
+        it('uses the backend HogQL helper for multiple choice questions', () => {
+            const question = {
+                id: 'question-456',
+                type: SurveyQuestionType.MultipleChoice,
+                question: 'Which features do you use?',
+                choices: ['Insights', 'Session replay'],
+            } as SurveyQuestion
+
+            expect(getSurveyResponse(question, 1)).toBe("getSurveyResponse(1, 'question-456', true)")
+        })
+    })
+
+    describe('sanitizeSurveyAppearance', () => {
+        it('returns null for null input', () => {
+            expect(sanitizeSurveyAppearance(null)).toBeNull()
+        })
+
+        it('sanitizes all color fields in the appearance object', () => {
+            const input: SurveyAppearance = {
+                backgroundColor: 'ff0000',
+                borderColor: '00ff00',
+                ratingButtonActiveColor: '0000ff',
+                ratingButtonColor: 'ffffff',
+                submitButtonColor: '000000',
+                submitButtonTextColor: 'cccccc',
+                // Add other required fields from SurveyAppearance type as needed
+            }
+
+            const result = sanitizeSurveyAppearance(input)
+
+            expect(result?.backgroundColor).toBe('#ff0000')
+            expect(result?.borderColor).toBe('#00ff00')
+            expect(result?.ratingButtonActiveColor).toBe('#0000ff')
+            expect(result?.ratingButtonColor).toBe('#ffffff')
+            expect(result?.submitButtonColor).toBe('#000000')
+            expect(result?.submitButtonTextColor).toBe('#cccccc')
+        })
+
+        it('removes surveyPopupDelaySeconds for external surveys', () => {
+            const input: SurveyAppearance = {
+                backgroundColor: '#ffffff',
+                surveyPopupDelaySeconds: 5,
+                submitButtonColor: '#000000',
+            }
+
+            const result = sanitizeSurveyAppearance(input, false, SurveyType.ExternalSurvey)
+
+            expect(result?.backgroundColor).toBe('#ffffff')
+            expect(result?.submitButtonColor).toBe('#000000')
+            expect(result?.surveyPopupDelaySeconds).toBeUndefined()
+        })
+
+        it('preserves surveyPopupDelaySeconds for non-external surveys', () => {
+            const input: SurveyAppearance = {
+                backgroundColor: '#ffffff',
+                surveyPopupDelaySeconds: 5,
+                submitButtonColor: '#000000',
+            }
+
+            const result = sanitizeSurveyAppearance(input, false, SurveyType.Popover)
+
+            expect(result?.backgroundColor).toBe('#ffffff')
+            expect(result?.submitButtonColor).toBe('#000000')
+            expect(result?.surveyPopupDelaySeconds).toBe(5)
+        })
+    })
+
+    describe('sanitizeSurveyDisplayConditions', () => {
+        it('returns null for null input with non-external survey', () => {
+            expect(sanitizeSurveyDisplayConditions(null, SurveyType.Popover)).toBeNull()
+        })
+
+        it('returns empty conditions object for external surveys with populated input', () => {
+            const input: SurveyDisplayConditions = {
+                url: 'https://example.com',
+                actions: { values: [{ id: 123, name: 'test' }] },
+                deviceTypes: ['mobile'],
+                seenSurveyWaitPeriodInDays: 7,
+                events: { values: [{ name: 'test' }] },
+            }
+
+            const result = sanitizeSurveyDisplayConditions(input, SurveyType.ExternalSurvey)
+
+            expect(result).toEqual({
+                actions: { values: [] },
+                events: { values: [] },
+                deviceTypes: undefined,
+                deviceTypesMatchType: undefined,
+                linkedFlagVariant: undefined,
+                seenSurveyWaitPeriodInDays: undefined,
+                url: undefined,
+                urlMatchType: undefined,
+            })
+        })
+
+        it('preserves conditions for non-external surveys', () => {
+            const input: SurveyDisplayConditions = {
+                url: 'https://example.com',
+                actions: { values: [{ id: 123, name: 'test' }] },
+                events: { values: [{ name: 'test' }] },
+                deviceTypes: ['mobile'],
+            }
+
+            const result = sanitizeSurveyDisplayConditions(input, SurveyType.Popover)
+
+            expect(result?.url).toBe('https://example.com')
+            expect(result?.actions).toEqual({ values: [{ id: 123, name: 'test' }] })
+            expect(result?.events).toEqual({ values: [{ name: 'test' }] })
+            expect(result?.deviceTypes).toEqual(['mobile'])
+        })
+    })
+
+    describe('sanitizeSurvey', () => {
+        it('sanitizes external survey by removing prohibited fields', () => {
+            const inputSurvey = {
+                type: SurveyType.ExternalSurvey,
+                name: 'Test External Survey',
+                questions: [],
+                linked_flag_id: 123,
+                targeting_flag_filters: { groups: [{ rollout_percentage: 50 }] },
+                conditions: {
+                    url: 'https://example.com',
+                    actions: { values: [{ id: 123, name: 'test' }] },
+                    events: { values: [{ name: 'test' }] },
+                },
+                appearance: {
+                    backgroundColor: '#ffffff',
+                    surveyPopupDelaySeconds: 5,
+                    submitButtonColor: '#000000',
+                },
+            }
+
+            const result = sanitizeSurvey(inputSurvey)
+
+            // Should remove prohibited fields
+            expect(result.linked_flag_id).toBeNull()
+            expect(result.targeting_flag_filters).toBeUndefined()
+            expect(result.remove_targeting_flag).toBe(true)
+
+            // Should sanitize conditions to empty values
+            expect(result.conditions).toEqual({
+                actions: { values: [] },
+                events: { values: [] },
+                deviceTypes: undefined,
+                deviceTypesMatchType: undefined,
+                linkedFlagVariant: undefined,
+                seenSurveyWaitPeriodInDays: undefined,
+                url: undefined,
+                urlMatchType: undefined,
+            })
+
+            // Should remove surveyPopupDelaySeconds from appearance
+            expect(result.appearance?.surveyPopupDelaySeconds).toBeUndefined()
+            expect(result.appearance?.backgroundColor).toBe('#ffffff')
+            expect(result.appearance?.submitButtonColor).toBe('#000000')
+        })
+
+        it('preserves fields for non-external surveys', () => {
+            const inputSurvey = {
+                type: SurveyType.Popover,
+                name: 'Test Popover Survey',
+                questions: [],
+                linked_flag_id: 123,
+                targeting_flag_filters: { groups: [{ rollout_percentage: 50 }] },
+                conditions: {
+                    url: 'https://example.com',
+                    actions: { values: [{ id: 123, name: 'test' }] },
+                    events: { values: [{ name: 'test' }] },
+                },
+                appearance: {
+                    backgroundColor: '#ffffff',
+                    surveyPopupDelaySeconds: 5,
+                    submitButtonColor: '#000000',
+                },
+            }
+
+            const result = sanitizeSurvey(inputSurvey)
+
+            // Should preserve all fields for non-external surveys
+            expect(result.linked_flag_id).toBe(123)
+            expect(result.targeting_flag_filters).toEqual({ groups: [{ rollout_percentage: 50 }] })
+            expect(result.remove_targeting_flag).toBeUndefined()
+
+            // Should preserve conditions
+            expect(result.conditions?.url).toBe('https://example.com')
+            expect(result.conditions?.actions).toEqual({ values: [{ id: 123, name: 'test' }] })
+            expect(result.conditions?.events).toEqual({ values: [{ name: 'test' }] })
+
+            // Should preserve surveyPopupDelaySeconds
+            expect(result.appearance?.surveyPopupDelaySeconds).toBe(5)
+            expect(result.appearance?.backgroundColor).toBe('#ffffff')
+            expect(result.appearance?.submitButtonColor).toBe('#000000')
+        })
+
+        it('removes widget-specific fields for non-widget surveys', () => {
+            const inputSurvey: Partial<Survey> = {
+                type: SurveyType.Popover,
+                name: 'Test Survey',
+                questions: [],
+                appearance: {
+                    backgroundColor: '#ffffff',
+                    widgetType: SurveyWidgetType.Tab,
+                    widgetLabel: 'Feedback',
+                    widgetColor: '#ff0000',
+                },
+            }
+
+            const result = sanitizeSurvey(inputSurvey)
+
+            // Should remove widget-specific fields for non-widget surveys
+            expect(result.appearance?.backgroundColor).toBe('#ffffff')
+            expect(result.appearance).not.toHaveProperty('widgetType')
+            expect(result.appearance).not.toHaveProperty('widgetLabel')
+            expect(result.appearance).not.toHaveProperty('widgetColor')
+        })
+
+        it('removing conditions object makes it go back to the empty conditions object', () => {
+            const inputSurvey = {
+                type: SurveyType.ExternalSurvey,
+                name: 'Test Survey',
+                questions: [],
+                conditions: {
+                    actions: { values: [] },
+                    events: { values: [] },
+                },
+            }
+
+            const result = sanitizeSurvey(inputSurvey)
+
+            // Should remove empty conditions object
+            expect(result.conditions).toEqual({
+                actions: {
+                    values: [],
+                },
+                events: {
+                    values: [],
+                },
+                deviceTypes: undefined,
+                deviceTypesMatchType: undefined,
+                linkedFlagVariant: undefined,
+                seenSurveyWaitPeriodInDays: undefined,
+                url: undefined,
+                urlMatchType: undefined,
+            })
+        })
+
+        it('Remove conditions key if its value is null', () => {
+            const inputSurvey = {
+                type: SurveyType.ExternalSurvey,
+                name: 'Test Survey',
+                questions: [],
+                conditions: null,
+            }
+
+            const result = sanitizeSurvey(inputSurvey)
+
+            expect(result.conditions).toBeUndefined()
+        })
+
+        it('Keep conditions key even if its value is null when option is present', () => {
+            const inputSurvey = {
+                type: SurveyType.ExternalSurvey,
+                name: 'Test Survey',
+                questions: [],
+                conditions: null,
+            }
+
+            const result = sanitizeSurvey(inputSurvey, { keepEmptyConditions: true })
+
+            expect(result.conditions).toBeNull()
+        })
+    })
+
+    describe('audience targeting summaries', () => {
+        const baseSurvey = {
+            id: 'survey-id',
+            created_at: '2024-01-01T00:00:00Z',
+            end_date: null,
+            conditions: null,
+            linked_flag: null,
+            linked_flag_id: null,
+            targeting_flag: null,
+            targeting_flag_filters: undefined,
+        } as unknown as Survey
+
+        it('summarizes simple person-property audience rules', () => {
+            const survey = {
+                ...baseSurvey,
+                targeting_flag_filters: {
+                    groups: [
+                        {
+                            properties: [
+                                {
+                                    key: 'email',
+                                    value: ['@posthog.com'],
+                                    operator: 'icontains',
+                                    type: PropertyFilterType.Person,
+                                },
+                                {
+                                    key: 'plan',
+                                    value: ['paid'],
+                                    operator: 'exact',
+                                    type: PropertyFilterType.Person,
+                                },
+                            ],
+                            rollout_percentage: 100,
+                            variant: null,
+                        },
+                    ],
+                },
+            } as Survey
+
+            expect(getSurveyAudienceSummaryValue(survey)).toBe('2 audience rules')
+            expect(getSurveyDisplayConditionsSummary(survey)).toContainEqual({
+                type: 'targeting',
+                label: 'Targeting',
+                value: '2 audience rules',
+            })
+        })
+
+        it('supports simple cohort targeting with rollout', () => {
+            const survey = {
+                ...baseSurvey,
+                targeting_flag_filters: {
+                    groups: [
+                        {
+                            properties: [
+                                {
+                                    key: 'id',
+                                    value: 17,
+                                    type: PropertyFilterType.Cohort,
+                                },
+                            ],
+                            rollout_percentage: 50,
+                            variant: null,
+                        },
+                    ],
+                },
+            } as Survey
+
+            expect(getSurveyAudienceSummaryValue(survey)).toBe('1 audience rule · 50% shown')
+            expect(isSimpleSurveyAudienceTargeting(survey.targeting_flag_filters)).toBe(true)
+        })
+
+        it('summarizes rollout-only targeting', () => {
+            const survey = {
+                ...baseSurvey,
+                targeting_flag_filters: {
+                    groups: [
+                        {
+                            properties: [],
+                            rollout_percentage: 50,
+                            variant: null,
+                        },
+                    ],
+                },
+            } as Survey
+
+            expect(getSurveyAudienceSummaryValue(survey)).toBe('50% of matching users')
+        })
+
+        it('detects advanced audience targeting', () => {
+            const filters: FeatureFlagFilters = {
+                groups: [
+                    {
+                        properties: [
+                            {
+                                key: 'email',
+                                value: ['@posthog.com'],
+                                operator: PropertyOperator.IContains,
+                                type: PropertyFilterType.Person,
+                            },
+                        ],
+                        rollout_percentage: 100,
+                    },
+                    {
+                        properties: [],
+                        rollout_percentage: 100,
+                    },
+                ],
+            }
+
+            expect(isSimpleSurveyAudienceTargeting(filters)).toBe(false)
+            expect(
+                getSurveyAudienceSummaryValue({
+                    ...baseSurvey,
+                    targeting_flag_filters: filters,
+                } as Survey)
+            ).toBe('Advanced audience targeting')
+        })
+    })
+
+    describe('calculateNpsBreakdown', () => {
+        it('returns all zeros when surveyRatingResults is empty', () => {
+            const surveyResults: SurveyRatingResults[number] = {
+                data: [],
+                total: 0,
+            }
+
+            const result = calculateNpsBreakdown(surveyResults)
+
+            expect(result).toBeNull()
+        })
+
+        it('returns all zeros when data array is missing', () => {
+            const surveyResults: SurveyRatingResults[number] = {
+                data: [],
+                total: 0,
+            }
+
+            const result = calculateNpsBreakdown(surveyResults)
+
+            expect(result).toBeNull()
+        })
+
+        it('returns all zeros when data array has incorrect length', () => {
+            const surveyResults: SurveyRatingResults[number] = {
+                data: [1, 2, 3], // Less than 11 elements
+                total: 6,
+            }
+
+            const result = calculateNpsBreakdown(surveyResults)
+
+            expect(result).toBeNull()
+        })
+
+        it('returns early with all zeros when total is 0', () => {
+            const surveyResults: SurveyRatingResults[number] = {
+                data: [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0], // despite having some counts in data
+                total: 0, // total is explicitly 0
+            }
+
+            const result = calculateNpsBreakdown(surveyResults)
+
+            expect(result).toEqual({
+                detractors: 0,
+                passives: 0,
+                promoters: 0,
+                score: '0.0',
+                total: 0,
+            })
+        })
+
+        it('correctly calculates NPS breakdown with all categories present', () => {
+            const surveyResults: SurveyRatingResults[number] = {
+                data: [
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1, // 7 detractors (0-6)
+                    2,
+                    2, // 4 passives (7-8)
+                    3,
+                    3,
+                ], // 6 promoters (9-10)
+                total: 17,
+            }
+
+            const result = calculateNpsBreakdown(surveyResults)
+
+            expect(result).toEqual({
+                detractors: 7,
+                passives: 4,
+                promoters: 6,
+                score: '-5.9',
+                total: 17,
+            })
+        })
+
+        it('handles all zeros', () => {
+            const surveyResults: SurveyRatingResults[number] = {
+                data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                total: 0,
+            }
+
+            const result = calculateNpsBreakdown(surveyResults)
+
+            expect(result).toEqual({
+                detractors: 0,
+                passives: 0,
+                promoters: 0,
+                score: '0.0',
+                total: 0,
+            })
+        })
+
+        it('handles only promoters', () => {
+            const surveyResults: SurveyRatingResults[number] = {
+                data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 5], // only 9s and 10s
+                total: 10,
+            }
+
+            const result = calculateNpsBreakdown(surveyResults)
+
+            expect(result).toEqual({
+                detractors: 0,
+                passives: 0,
+                promoters: 10,
+                score: '100.0',
+                total: 10,
+            })
+        })
+
+        it('handles only passives', () => {
+            const surveyResults: SurveyRatingResults[number] = {
+                data: [0, 0, 0, 0, 0, 0, 0, 5, 5, 0, 0], // only 7s and 8s
+                total: 10,
+            }
+
+            const result = calculateNpsBreakdown(surveyResults)
+
+            expect(result).toEqual({
+                detractors: 0,
+                passives: 10,
+                promoters: 0,
+                score: '0.0',
+                total: 10,
+            })
+        })
+
+        it('handles only detractors', () => {
+            const surveyResults: SurveyRatingResults[number] = {
+                data: [2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0], // only 0-6
+                total: 14,
+            }
+
+            const result = calculateNpsBreakdown(surveyResults)
+
+            expect(result).toEqual({
+                detractors: 14,
+                passives: 0,
+                promoters: 0,
+                score: '-100.0',
+                total: 14,
+            })
+        })
+    })
+
+    describe('buildSurveyTimestampFilter', () => {
+        it('uses survey default dates when no date range provided', () => {
+            const survey = { created_at: '2024-08-27T15:30:00Z', end_date: '2024-08-30T10:00:00Z' }
+            const result = buildSurveyTimestampFilter(survey)
+
+            expect(result).toBe(`AND timestamp >= '2024-08-27T00:00:00'
+    AND timestamp <= '2024-08-30T23:59:59'`)
+        })
+
+        it('respects user date range when provided', () => {
+            const survey = { created_at: '2024-08-27T15:30:00Z', end_date: '2024-08-30T10:00:00Z' }
+            const dateRange = { date_from: '2024-08-28', date_to: '2024-08-29' }
+            const result = buildSurveyTimestampFilter(survey, dateRange)
+
+            expect(result).toBe(`AND timestamp >= '2024-08-28T00:00:00'
+    AND timestamp <= '2024-08-29T23:59:59'`)
+        })
+
+        it('uses user dates even when before survey creation (no clamping)', () => {
+            const survey = { created_at: '2024-08-27T15:30:00Z', end_date: null }
+            const dateRange = { date_from: '2024-08-25', date_to: '2024-08-29' } // Earlier than survey creation
+            const result = buildSurveyTimestampFilter(survey, dateRange)
+
+            // User's dates are used directly - query will return empty results if no data exists
+            expect(result).toContain(`timestamp >= '2024-08-25T00:00:00'`)
+            expect(result).toContain(`timestamp <= '2024-08-29T23:59:59'`)
+        })
+
+        it('uses team timezone for date boundaries', () => {
+            mockedGetAppContext.mockReturnValue({
+                current_team: { timezone: 'America/New_York' },
+            } as any)
+
+            const survey = { created_at: '2024-08-27T15:30:00Z', end_date: '2024-08-30T10:00:00Z' }
+            const dateRange = { date_from: '2024-08-28T12:00:00Z', date_to: '2024-08-29T12:00:00Z' }
+            const result = buildSurveyTimestampFilter(survey, dateRange)
+
+            expect(result).toBe(`AND timestamp >= '2024-08-28T00:00:00'
+    AND timestamp <= '2024-08-29T23:59:59'`)
+        })
+
+        it('defaults to UTC when no team timezone is set', () => {
+            mockedGetAppContext.mockReturnValue(undefined)
+
+            const survey = { created_at: '2024-08-27T15:30:00Z', end_date: '2024-08-30T10:00:00Z' }
+            const result = buildSurveyTimestampFilter(survey)
+
+            expect(result).toBe(`AND timestamp >= '2024-08-27T00:00:00'
+    AND timestamp <= '2024-08-30T23:59:59'`)
+        })
+
+        it('handles date_to with time component from date picker', () => {
+            const survey = { created_at: '2024-08-27T15:30:00Z', end_date: '2024-08-30T10:00:00Z' }
+            // Date picker provides date_to with T23:59:59
+            const dateRange = { date_from: '2024-08-28', date_to: '2024-08-28T23:59:59' }
+            const result = buildSurveyTimestampFilter(survey, dateRange)
+
+            expect(result).toContain(`timestamp >= '2024-08-28T00:00:00'`)
+            expect(result).toContain(`timestamp <= '2024-08-28T23:59:59'`)
+        })
+
+        it('uses survey defaults when only date_from provided', () => {
+            const survey = { created_at: '2024-08-27T15:30:00Z', end_date: '2024-08-30T10:00:00Z' }
+            const dateRange = { date_from: '2024-08-28', date_to: null }
+            const result = buildSurveyTimestampFilter(survey, dateRange)
+
+            expect(result).toContain(`timestamp >= '2024-08-28T00:00:00'`)
+            expect(result).toContain(`timestamp <= '2024-08-30T23:59:59'`) // Survey end date
+        })
+
+        it('ignores date_to when date_from not provided (avoids impossible ranges)', () => {
+            const survey = { created_at: '2024-08-27T15:30:00Z', end_date: '2024-08-30T10:00:00Z' }
+            const dateRange = { date_from: null, date_to: '2024-08-29' }
+            const result = buildSurveyTimestampFilter(survey, dateRange)
+
+            // Uses survey defaults since date_to only could create impossible range
+            expect(result).toContain(`timestamp >= '2024-08-27T00:00:00'`) // Survey start date
+            expect(result).toContain(`timestamp <= '2024-08-30T23:59:59'`) // Survey end date
+        })
+
+        it('prefers survey start_date over created_at for the lower bound', () => {
+            const survey = {
+                created_at: '2024-08-20T15:30:00Z',
+                start_date: '2024-08-27T09:00:00Z',
+                end_date: '2024-08-30T10:00:00Z',
+            }
+            const result = buildSurveyTimestampFilter(survey)
+
+            expect(result).toContain(`timestamp >= '2024-08-27T00:00:00'`)
+        })
+    })
+
+    describe('getResolvedSurveyDateRange', () => {
+        it('does not shift dates due to timezone conversion', () => {
+            const survey = { created_at: '2024-11-19T00:00:00Z', end_date: '2024-11-25T00:00:00Z' }
+            // This datetime should NOT be shifted to Nov 21 due to local timezone conversion
+            const dateRange = { date_from: '2024-11-20', date_to: '2024-11-20T23:59:59' }
+
+            const result = getResolvedSurveyDateRange(survey, dateRange)
+
+            expect(result.fromDate).toBe('2024-11-20T00:00:00')
+            expect(result.toDate).toBe('2024-11-20T23:59:59')
+        })
+    })
+
+    describe('buildPartialResponsesFilter', () => {
+        it('keeps missing survey_completed values eligible for complete-response queries', () => {
+            const survey = {
+                id: 'test-survey-id',
+                created_at: '2024-11-19T00:00:00Z',
+                end_date: null,
+                enable_partial_responses: false,
+            } as Survey
+
+            expect(buildPartialResponsesFilter(survey)).toBe(
+                `AND ${buildSurveyOptionalBooleanPropertyFilter(SurveyEventProperties.SURVEY_COMPLETED, 'false')}`
+            )
+        })
+
+        it('uses same date bounds as buildSurveyTimestampFilter', () => {
+            const survey = {
+                id: 'test-survey-id',
+                created_at: '2024-11-19T00:00:00Z',
+                end_date: '2024-11-25T00:00:00Z',
+                enable_partial_responses: true,
+            } as Survey
+            const dateRange = { date_from: '2024-11-20', date_to: '2024-11-22' }
+
+            const timestampFilter = buildSurveyTimestampFilter(survey, dateRange)
+            const partialFilter = buildPartialResponsesFilter(survey, dateRange)
+
+            const fromMatch = timestampFilter.match(/timestamp >= '([^']+)'/)
+            const toMatch = timestampFilter.match(/timestamp <= '([^']+)'/)
+
+            expect(partialFilter).toContain(`greaterOrEquals(timestamp, '${fromMatch?.[1]}')`)
+            expect(partialFilter).toContain(`lessOrEquals(timestamp, '${toMatch?.[1]}')`)
+        })
+
+        it('uses direct property access for fixed survey properties', () => {
+            const survey = {
+                id: 'test-survey-id',
+                created_at: '2024-11-19T00:00:00Z',
+                end_date: null,
+                enable_partial_responses: true,
+            } as Survey
+
+            const partialFilter = buildPartialResponsesFilter(survey)
+
+            expect(partialFilter).toContain('properties.`$survey_id`')
+            expect(partialFilter).toContain('properties.`$survey_submission_id`')
+            expect(partialFilter).not.toContain('JSONExtractString')
+        })
+    })
+
+    describe('buildSurveyOptionalBooleanPropertyFilter', () => {
+        it('builds a null-safe comparison for optional survey booleans', () => {
+            expect(
+                buildSurveyOptionalBooleanPropertyFilter(SurveyEventProperties.SURVEY_PARTIALLY_COMPLETED, 'true')
+            ).toBe(`coalesce(JSONExtractString(properties, '$survey_partially_completed'), '') != 'true'`)
+        })
+    })
+})
+
+describe('createAnswerFilterHogQLExpression', () => {
+    const mockSurvey = {
+        questions: [{ id: 'q1' }, { id: 'q2' }, { id: 'q3' }],
+    } as any as Survey
+
+    it('returns empty string for empty filters array', () => {
+        expect(createAnswerFilterHogQLExpression([], mockSurvey)).toBe('')
+    })
+
+    it('returns empty string for null or undefined filters', () => {
+        expect(createAnswerFilterHogQLExpression(null as any, mockSurvey)).toBe('')
+        expect(createAnswerFilterHogQLExpression(undefined as any, mockSurvey)).toBe('')
+    })
+
+    it('handles single exact filter', () => {
+        const filters = [
+            { key: '$survey_response_q1', value: 'yes', operator: 'exact', type: PropertyFilterType.Event },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (${getSurveyResponse(mockSurvey.questions[0], 0)} = 'yes')`)
+    })
+
+    it('handles filter for a different question', () => {
+        const filters = [
+            { key: '$survey_response_q2', value: 'no', operator: 'exact', type: PropertyFilterType.Event },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (${getSurveyResponse(mockSurvey.questions[1], 1)} = 'no')`)
+    })
+
+    it('skips filters with empty values', () => {
+        const filters = [
+            { key: '$survey_response_q1', value: '', operator: 'exact', type: PropertyFilterType.Event },
+            { key: '$survey_response_q2', value: null, operator: 'exact', type: PropertyFilterType.Event },
+            { key: '$survey_response_q3', value: undefined, operator: 'exact', type: PropertyFilterType.Event },
+        ] as EventPropertyFilter[]
+
+        expect(createAnswerFilterHogQLExpression(filters, mockSurvey)).toBe('')
+    })
+
+    it('skips filters with empty arrays', () => {
+        const filters = [
+            { key: '$survey_response_q1', value: [], operator: 'exact', type: PropertyFilterType.Event },
+        ] as EventPropertyFilter[]
+
+        expect(createAnswerFilterHogQLExpression(filters, mockSurvey)).toBe('')
+    })
+
+    it('skips icontains filters with empty search patterns', () => {
+        const filters = [
+            { key: '$survey_response_q1', value: '%', operator: 'icontains', type: PropertyFilterType.Event },
+            { key: '$survey_response_q2', value: '%%', operator: 'icontains', type: PropertyFilterType.Event },
+            { key: '$survey_response_q3', value: '   ', operator: 'icontains', type: PropertyFilterType.Event },
+        ] as EventPropertyFilter[]
+
+        expect(createAnswerFilterHogQLExpression(filters, mockSurvey)).toBe('')
+    })
+
+    it('handles exact operator with single value', () => {
+        const filters = [
+            { key: '$survey_response_q1', value: 'test', operator: 'exact', type: PropertyFilterType.Event },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (${getSurveyResponse(mockSurvey.questions[0], 0)} = 'test')`)
+    })
+
+    it('handles exact operator with array values', () => {
+        const filters = [
+            {
+                key: '$survey_response_q1',
+                value: ['option1', 'option2'],
+                operator: 'exact',
+                type: PropertyFilterType.Event,
+            },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (${getSurveyResponse(mockSurvey.questions[0], 0)} IN ('option1', 'option2'))`)
+    })
+
+    it('handles is_not operator with single value', () => {
+        const filters = [
+            { key: '$survey_response_q1', value: 'test', operator: 'is_not', type: PropertyFilterType.Event },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (${getSurveyResponse(mockSurvey.questions[0], 0)} != 'test')`)
+    })
+
+    it('handles is_not operator with array values', () => {
+        const filters = [
+            {
+                key: '$survey_response_q1',
+                value: ['option1', 'option2'],
+                operator: 'is_not',
+                type: PropertyFilterType.Event,
+            },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (${getSurveyResponse(mockSurvey.questions[0], 0)} NOT IN ('option1', 'option2'))`)
+    })
+
+    it('handles icontains operator', () => {
+        const filters = [
+            { key: '$survey_response_q1', value: 'search', operator: 'icontains', type: PropertyFilterType.Event },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (${getSurveyResponse(mockSurvey.questions[0], 0)} ILIKE '%search%')`)
+    })
+
+    it('handles not_icontains operator', () => {
+        const filters = [
+            { key: '$survey_response_q1', value: 'search', operator: 'not_icontains', type: PropertyFilterType.Event },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (NOT ${getSurveyResponse(mockSurvey.questions[0], 0)} ILIKE '%search%')`)
+    })
+
+    it('handles regex operator', () => {
+        const filters = [
+            { key: '$survey_response_q1', value: '.*test.*', operator: 'regex', type: PropertyFilterType.Event },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (match(${getSurveyResponse(mockSurvey.questions[0], 0)}, '.*test.*'))`)
+    })
+
+    it('handles not_regex operator', () => {
+        const filters = [
+            { key: '$survey_response_q1', value: '.*test.*', operator: 'not_regex', type: PropertyFilterType.Event },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (NOT match(${getSurveyResponse(mockSurvey.questions[0], 0)}, '.*test.*'))`)
+    })
+
+    it('combines multiple filters with AND', () => {
+        const filters = [
+            { key: '$survey_response_q1', value: 'yes', operator: 'exact', type: PropertyFilterType.Event },
+            { key: '$survey_response_q2', value: 'no', operator: 'exact', type: PropertyFilterType.Event },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(
+            `AND (${getSurveyResponse(mockSurvey.questions[0], 0)} = 'yes') AND (${getSurveyResponse(
+                mockSurvey.questions[1],
+                1
+            )} = 'no')`
+        )
+    })
+
+    it('skips filters with invalid question keys', () => {
+        const filters = [
+            { key: '$survey_response_invalid', value: 'test', operator: 'exact', type: PropertyFilterType.Event },
+            { key: '$survey_response_q4', value: 'test2', operator: 'exact', type: PropertyFilterType.Event }, // q4 doesn't exist in mockSurvey
+        ] as EventPropertyFilter[]
+
+        expect(createAnswerFilterHogQLExpression(filters, mockSurvey)).toBe('')
+    })
+
+    it('handles array values for regex and not_regex operators', () => {
+        const filters = [
+            { key: '$survey_response_q1', value: ['.*pattern.*'], operator: 'regex', type: PropertyFilterType.Event },
+            {
+                key: '$survey_response_q2',
+                value: ['.*pattern.*'],
+                operator: 'not_regex',
+                type: PropertyFilterType.Event,
+            },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(
+            `AND (match(${getSurveyResponse(
+                mockSurvey.questions[0],
+                0
+            )}, '.*pattern.*')) AND (NOT match(${getSurveyResponse(mockSurvey.questions[1], 1)}, '.*pattern.*'))`
+        )
+    })
+
+    it('handles array values for icontains operator', () => {
+        const filters = [
+            {
+                key: '$survey_response_q1',
+                value: ['searchterm'],
+                operator: 'icontains',
+                type: PropertyFilterType.Event,
+            },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (${getSurveyResponse(mockSurvey.questions[0], 0)} ILIKE '%searchterm%')`)
+    })
+
+    it('handles unsupported operators', () => {
+        const filters = [
+            {
+                key: '$survey_response_q1',
+                value: "O'Reilly",
+                operator: 'exact',
+                type: PropertyFilterType.Event,
+            },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (${getSurveyResponse(mockSurvey.questions[0], 0)} = 'O\\'Reilly')`)
+    })
+
+    it('escapes backslashes in values', () => {
+        const filters = [
+            {
+                key: '$survey_response_q1',
+                value: 'C:\\\\path\\\\to\\\\file',
+                operator: 'exact',
+                type: PropertyFilterType.Event,
+            },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(
+            `AND (${getSurveyResponse(mockSurvey.questions[0], 0)} = 'C:\\\\\\\\path\\\\\\\\to\\\\\\\\file')`
+        )
+    })
+
+    it('escapes SQL injection attempts in array values', () => {
+        const filters = [
+            {
+                key: '$survey_response_q1',
+                value: ['normal', "'; DROP TABLE users; --", "Robert'); DROP TABLE students; --"],
+                operator: 'exact',
+                type: PropertyFilterType.Event,
+            },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(
+            `AND (${getSurveyResponse(
+                mockSurvey.questions[0],
+                0
+            )} IN ('normal', '\\'; DROP TABLE users; --', 'Robert\\'); DROP TABLE students; --'))`
+        )
+    })
+
+    it('escapes complex SQL injection patterns', () => {
+        const filters = [
+            {
+                key: '$survey_response_q1',
+                value: "' UNION SELECT * FROM users; --",
+                operator: 'exact',
+                type: PropertyFilterType.Event,
+            },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(
+            `AND (${getSurveyResponse(mockSurvey.questions[0], 0)} = '\\' UNION SELECT * FROM users; --')`
+        )
+    })
+
+    it('handles regex patterns with special characters', () => {
+        const filters = [
+            {
+                key: '$survey_response_q1',
+                value: ".*'; DROP TABLE.*",
+                operator: 'regex',
+                type: PropertyFilterType.Event,
+            },
+        ] as EventPropertyFilter[]
+
+        const result = createAnswerFilterHogQLExpression(filters, mockSurvey)
+        expect(result).toBe(`AND (match(${getSurveyResponse(mockSurvey.questions[0], 0)}, '.*\\'; DROP TABLE.*'))`)
+    })
+
+    describe('multiple choice questions', () => {
+        const surveyWithMultipleChoiceQuestion = {
+            ...mockSurvey,
+            questions: [
+                {
+                    ...mockSurvey.questions[0],
+                    type: SurveyQuestionType.MultipleChoice,
+                    choices: [
+                        { id: 'c1', label: 'test' },
+                        { id: 'c2', label: 'test2' },
+                    ],
+                },
+            ],
+        } as any as Survey
+
+        it('handles icontains operator', () => {
+            const filters = [
+                { key: '$survey_response_q1', value: 'test', operator: 'icontains', type: PropertyFilterType.Event },
+            ] as EventPropertyFilter[]
+
+            const result = createAnswerFilterHogQLExpression(filters, surveyWithMultipleChoiceQuestion)
+            expect(result).toBe(
+                `AND (arrayExists(x -> x ilike '%test%', ${getSurveyResponse(surveyWithMultipleChoiceQuestion.questions[0], 0)}))`
+            )
+        })
+
+        it('handles not_icontains operator for multiple choice question', () => {
+            const filters = [
+                {
+                    key: '$survey_response_q1',
+                    value: 'test',
+                    operator: 'not_icontains',
+                    type: PropertyFilterType.Event,
+                },
+            ] as EventPropertyFilter[]
+
+            const result = createAnswerFilterHogQLExpression(filters, surveyWithMultipleChoiceQuestion)
+            expect(result).toBe(
+                `AND (NOT arrayExists(x -> x ilike '%test%', ${getSurveyResponse(surveyWithMultipleChoiceQuestion.questions[0], 0)}))`
+            )
+        })
+
+        it('handles regex operator', () => {
+            const filters = [
+                { key: '$survey_response_q1', value: '.*test.*', operator: 'regex', type: PropertyFilterType.Event },
+            ] as EventPropertyFilter[]
+
+            const result = createAnswerFilterHogQLExpression(filters, surveyWithMultipleChoiceQuestion)
+            expect(result).toBe(
+                `AND (arrayExists(x -> match(x, '.*test.*'), ${getSurveyResponse(surveyWithMultipleChoiceQuestion.questions[0], 0)}))`
+            )
+        })
+
+        it('handles not_regex operator', () => {
+            const filters = [
+                {
+                    key: '$survey_response_q1',
+                    value: '.*test.*',
+                    operator: 'not_regex',
+                    type: PropertyFilterType.Event,
+                },
+            ] as EventPropertyFilter[]
+
+            const result = createAnswerFilterHogQLExpression(filters, surveyWithMultipleChoiceQuestion)
+            expect(result).toBe(
+                `AND (NOT arrayExists(x -> match(x, '.*test.*'), ${getSurveyResponse(surveyWithMultipleChoiceQuestion.questions[0], 0)}))`
+            )
+        })
+    })
+})
+
+describe('timezone handling in survey date queries', () => {
+    const createMockSurvey = (
+        createdAt: string,
+        endDate?: string,
+        startDate?: string
+    ): Pick<Survey, 'created_at' | 'end_date'> & Partial<Pick<Survey, 'start_date'>> => ({
+        created_at: createdAt,
+        end_date: endDate || null,
+        start_date: startDate,
+    })
+
+    afterEach(() => {
+        mockedGetAppContext.mockReset()
+    })
+
+    it('uses team timezone to compute date boundaries', () => {
+        mockedGetAppContext.mockReturnValue({
+            current_team: { timezone: 'Asia/Tokyo' },
+        } as any)
+
+        // 2024-08-27T15:30:00Z = 2024-08-28T00:30:00 JST
+        const survey = createMockSurvey('2024-08-27T15:30:00Z', '2024-08-30T10:00:00Z')
+
+        const startDate = getSurveyStartDateForQuery(survey)
+        const endDate = getSurveyEndDateForQuery(survey)
+
+        // In JST (UTC+9), the created_at falls on Aug 28, not Aug 27
+        expect(startDate).toBe('2024-08-28T00:00:00')
+        expect(endDate).toBe('2024-08-30T23:59:59')
+    })
+
+    it('defaults to UTC when no team context', () => {
+        mockedGetAppContext.mockReturnValue(undefined)
+
+        const survey = createMockSurvey('2024-08-27T15:30:00Z', '2024-08-30T10:00:00Z')
+
+        const startDate = getSurveyStartDateForQuery(survey)
+        const endDate = getSurveyEndDateForQuery(survey)
+
+        expect(startDate).toBe('2024-08-27T00:00:00')
+        expect(endDate).toBe('2024-08-30T23:59:59')
+    })
+
+    it('handles null end_date correctly', () => {
+        mockedGetAppContext.mockReturnValue({
+            current_team: { timezone: 'America/Chicago' },
+        } as any)
+
+        const survey = createMockSurvey('2024-08-27T15:30:00Z')
+        const result = getSurveyEndDateForQuery(survey)
+
+        expect(result).toMatch(/^\d{4}-\d{2}-\d{2}T23:59:59$/)
+    })
+})
+
+describe('splitChoicesOnPaste', () => {
+    it('returns null when only one segment is pasted', () => {
+        expect(splitChoicesOnPaste('single value', [''], 0, false)).toBeNull()
+        expect(splitChoicesOnPaste('Yes, sometimes', [''], 0, false)).toBeNull()
+    })
+
+    it('splits newline-separated values into the choices array', () => {
+        expect(splitChoicesOnPaste('one\ntwo\nthree', [''], 0, false)).toEqual(['one', 'two', 'three'])
+    })
+
+    it('splits tab-separated values (spreadsheet rows)', () => {
+        expect(splitChoicesOnPaste('one\ttwo\tthree', [''], 0, false)).toEqual(['one', 'two', 'three'])
+    })
+
+    it('trims and drops empty segments', () => {
+        expect(splitChoicesOnPaste('  one  \n\n  two  \n', [''], 0, false)).toEqual(['one', 'two'])
+    })
+
+    it('inserts segments in place of the target choice and keeps surrounding choices', () => {
+        expect(splitChoicesOnPaste('two\nthree', ['one', 'placeholder', 'four'], 1, false)).toEqual([
+            'one',
+            'two',
+            'three',
+            'four',
+        ])
+    })
+
+    it('preserves the open-ended "Other" entry when pasting into a regular slot', () => {
+        expect(splitChoicesOnPaste('two\nthree', ['one', '', 'Other'], 1, true)).toEqual([
+            'one',
+            'two',
+            'three',
+            'Other',
+        ])
+    })
+
+    it('preserves the open-ended "Other" entry when pasting into the open-ended slot itself', () => {
+        expect(splitChoicesOnPaste('two\nthree', ['one', 'Other'], 1, true)).toEqual(['one', 'two', 'three', 'Other'])
+    })
+})
+
+describe('doesSurveyRepeatOnEveryEvent', () => {
+    it.each([
+        [
+            'repeated activation with a trigger event',
+            true,
+            { values: [{ name: 'purchase' }], repeatedActivation: true },
+        ],
+        ['repeated activation without trigger events', false, { values: [], repeatedActivation: true }],
+        [
+            'trigger events without repeated activation',
+            false,
+            { values: [{ name: 'purchase' }], repeatedActivation: false },
+        ],
+        ['no events object', false, null],
+    ])('%s -> %s', (_name, expected, events) => {
+        const survey = { conditions: events ? { events } : null } as Pick<Survey, 'conditions'>
+        expect(doesSurveyRepeatOnEveryEvent(survey)).toBe(expected)
+    })
+})

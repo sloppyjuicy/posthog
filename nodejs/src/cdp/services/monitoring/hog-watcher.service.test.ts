@@ -1,0 +1,635 @@
+import { deleteKeysWithPrefix } from '~/common/redis/_tests/redis'
+import { RedisV2, createRedisV2PoolFromConfig } from '~/common/redis/redis-v2'
+import { closeHub, createHub } from '~/common/utils/db/hub'
+import { logger } from '~/common/utils/logger'
+
+import { Hub, ProjectId, Team } from '../../../types'
+import { createExampleInvocation, createHogFunction } from '../../_tests/fixtures'
+import { CyclotronJobInvocationHogFunction, CyclotronJobInvocationResult, HogFunctionType } from '../../types'
+import { createInvocationResult } from '../../utils/invocation-utils'
+import { BASE_REDIS_KEY, HogWatcherConfig, HogWatcherService, HogWatcherState } from './hog-watcher.service'
+
+jest.mock('~/common/utils/posthog', () => ({ captureTeamEvent: jest.fn() }))
+
+const mockNow: jest.SpyInstance = jest.spyOn(Date, 'now')
+const mockCaptureTeamEvent: jest.Mock = require('~/common/utils/posthog').captureTeamEvent as any
+
+const DEFAULT_WATCHER_CONFIG: HogWatcherConfig = {
+    hogCostTimingLowerMs: 50,
+    hogCostTimingUpperMs: 550,
+    hogCostTiming: 100,
+    asyncCostTimingLowerMs: 100,
+    asyncCostTimingUpperMs: 5000,
+    asyncCostTiming: 20,
+    sendEvents: true,
+    bucketSize: 10000,
+    refillRate: 10,
+    ttl: 86400,
+    automaticallyDisableFunctions: true,
+    thresholdDegraded: 0.8,
+    stateLockTtl: 60,
+    observeResultsBufferTimeMs: 500,
+    observeResultsBufferMaxResults: 500,
+}
+
+describe('HogWatcher', () => {
+    let now: number
+    let hub: Hub
+    let watcher: HogWatcherService
+    let watcherConfig: HogWatcherConfig
+    let onStateChangeSpy: jest.SpyInstance
+    let redis: RedisV2
+    const hogFunctionId: string = 'hog-function-id'
+    let hogFunction: HogFunctionType
+
+    let team: Team
+
+    beforeAll(async () => {
+        team = {
+            id: 2,
+            project_id: 1 as ProjectId,
+            uuid: 'test-uuid',
+            organization_id: 'organization-id',
+            name: 'testTeam',
+        } as Team
+        hub = await createHub()
+        jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue(team)
+        redis = createRedisV2PoolFromConfig({
+            connection: hub.CDP_REDIS_HOST
+                ? { url: hub.CDP_REDIS_HOST, options: { port: hub.CDP_REDIS_PORT, password: hub.CDP_REDIS_PASSWORD } }
+                : { url: hub.REDIS_URL },
+            poolMinSize: hub.REDIS_POOL_MIN_SIZE,
+            poolMaxSize: hub.REDIS_POOL_MAX_SIZE,
+        })
+        process.env.CDP_HOG_WATCHER_2_ENABLED = 'true'
+        process.env.CDP_HOG_WATCHER_2_CAPTURE_ENABLED = 'true'
+    })
+
+    beforeEach(async () => {
+        now = 1720000000000
+        mockNow.mockReturnValue(now)
+        await deleteKeysWithPrefix(redis, BASE_REDIS_KEY)
+        watcherConfig = { ...DEFAULT_WATCHER_CONFIG }
+
+        watcher = new HogWatcherService(hub.teamManager, watcherConfig, redis)
+        onStateChangeSpy = jest.spyOn(watcher as any, 'onStateChange') as jest.SpyInstance
+        hogFunction = createHogFunction({ id: hogFunctionId, team_id: 2 })
+    })
+
+    afterAll(async () => {
+        await closeHub(hub)
+    })
+
+    const createResult = (options: {
+        id?: string
+        duration?: number
+        finished?: boolean
+        error?: string
+        kind?: 'hog' | 'async_function'
+    }): CyclotronJobInvocationResult<CyclotronJobInvocationHogFunction> => {
+        const invocation = createExampleInvocation({ id: options.id ?? hogFunctionId, team_id: 2 })
+        invocation.state.timings = [
+            {
+                kind: options.kind ?? 'hog',
+                duration_ms: options.duration ?? 0,
+            },
+        ]
+
+        return createInvocationResult(
+            invocation,
+            {},
+            {
+                finished: options.finished ?? true,
+                error: options.error,
+            }
+        )
+    }
+
+    const advanceTime = (ms: number) => {
+        now += ms
+        mockNow.mockReturnValue(now)
+    }
+
+    describe('constructor', () => {
+        it('should validate the bounds configuration', () => {
+            expect(() => {
+                const _badWatcher = new HogWatcherService(
+                    hub.teamManager,
+                    {
+                        ...DEFAULT_WATCHER_CONFIG,
+                        hogCostTimingLowerMs: 100,
+                        hogCostTimingUpperMs: 100,
+                        hogCostTiming: 1,
+                        asyncCostTimingLowerMs: 100,
+                        asyncCostTimingUpperMs: 100,
+                        asyncCostTiming: 1,
+                    },
+                    redis
+                )
+            }).toThrow(
+                'Lower bound for kind hog of 100ms must be lower than upper bound of 100ms. This is a configuration error.'
+            )
+        })
+    })
+
+    describe('observeResults', () => {
+        const cases: [
+            { name: string; cost: number; state: number },
+            CyclotronJobInvocationResult<CyclotronJobInvocationHogFunction>[],
+        ][] = [
+            [
+                { name: 'should calculate cost and state for single default result', cost: 0, state: 1 },
+                [createResult({})],
+            ],
+            [
+                { name: 'should calculate cost and state for multiple default results', cost: 0, state: 1 },
+                [createResult({}), createResult({}), createResult({})],
+            ],
+            [
+                { name: 'should calculate cost and state for small durations', cost: 0, state: 1 },
+                [createResult({ duration: 10 }), createResult({ duration: 20 }), createResult({ duration: 30 })],
+            ],
+            [
+                { name: 'should calculate cost and state for medium durations', cost: 12, state: 1 },
+                [
+                    createResult({ duration: 1000, kind: 'async_function' }),
+                    createResult({ duration: 1000, kind: 'async_function' }),
+                    createResult({ duration: 1000, kind: 'async_function' }),
+                ],
+            ],
+            [
+                { name: 'should calculate cost and state for single large duration', cost: 20, state: 1 },
+                [createResult({ duration: 5000, kind: 'async_function' })],
+            ],
+            [
+                { name: 'should calculate cost and state for single very large duration', cost: 40, state: 1 },
+                [createResult({ duration: 10000, kind: 'async_function' })],
+            ],
+            [
+                {
+                    name: 'should calculate cumulative cost and state for multiple large durations',
+                    cost: 141,
+                    state: 1,
+                },
+                [
+                    createResult({ duration: 5000, kind: 'async_function' }),
+                    createResult({ duration: 10000, kind: 'async_function' }),
+                    createResult({ duration: 20000, kind: 'async_function' }),
+                ],
+            ],
+        ]
+
+        it.each(cases.map(([meta, results]) => [meta.name, meta, results]))(
+            '%s',
+            async (name, expectedScore, results) => {
+                await watcher.observeResults(results)
+                const result = await watcher.getPersistedState(hogFunctionId)
+                expect(hub.CDP_WATCHER_BUCKET_SIZE - result.tokens).toEqual(expectedScore.cost)
+                expect(result.state).toEqual(expectedScore.state)
+            }
+        )
+
+        it('should calculate costs per individual timing not based on total duration', async () => {
+            // Create a result with multiple timings that would have different costs
+            // if calculated individually vs. summed together
+            const result = createResult({
+                id: 'id1',
+                finished: true,
+                kind: 'async_function',
+            }) as CyclotronJobInvocationResult<CyclotronJobInvocationHogFunction>
+
+            // Replace the default timing with multiple timings
+            result.invocation.state.timings = [
+                { kind: 'async_function', duration_ms: 90 }, // Below threshold, should have minimal cost
+                { kind: 'async_function', duration_ms: 90 }, // Below threshold, should have minimal cost
+                { kind: 'async_function', duration_ms: 90 }, // Below threshold, should have minimal cost
+            ]
+
+            // If using individual timings (correct): each timing has a small cost
+            // If using total duration (incorrect): 300ms total would have a higher cost
+
+            await watcher.observeResults([result])
+            const state = await watcher.getPersistedState(hogFunctionId)
+
+            // Expected: each 100ms timing has minimal cost since it's below the lower threshold
+            // This is checking that we're not summing them into a 300ms duration
+            const expectedIndividualCost = 0 // Three 100ms timings each have minimal/zero cost
+            const totalCost = hub.CDP_WATCHER_BUCKET_SIZE - state.tokens
+
+            expect(totalCost).toEqual(expectedIndividualCost)
+        })
+
+        it('should max out scores', async () => {
+            let lotsOfResults = Array(10000).fill(createResult({ duration: 25000, kind: 'async_function' }))
+
+            await watcher.observeResults(lotsOfResults)
+
+            // V3 lua floor-drains on overdraft, so the persisted pool lands at 0.
+            // The state machine is driven by the rate-limiter return (tokens=-1 on the
+            // denied per-input results inside observeResults), so `state: 3` (disabled).
+            expect(await watcher.getPersistedState(hogFunctionId)).toMatchInlineSnapshot(`
+                {
+                  "state": 3,
+                  "tokens": 0,
+                }
+            `)
+
+            lotsOfResults = Array(10000).fill(createResult({ id: 'id2', kind: 'async_function' }))
+
+            await watcher.observeResults(lotsOfResults)
+
+            expect(await watcher.getPersistedState('id2')).toMatchInlineSnapshot(`
+                {
+                  "state": 1,
+                  "tokens": 10000,
+                }
+            `)
+        })
+
+        it('should refill over time', async () => {
+            hub.CDP_WATCHER_REFILL_RATE = 10
+            await watcher.observeResults([
+                createResult({ duration: 10000, kind: 'async_function' }),
+                createResult({ duration: 10000, kind: 'async_function' }),
+                createResult({ duration: 10000, kind: 'async_function' }),
+            ])
+
+            expect((await watcher.getPersistedState(hogFunctionId)).tokens).toMatchInlineSnapshot(`9880`)
+            advanceTime(1000)
+            expect((await watcher.getPersistedState(hogFunctionId)).tokens).toMatchInlineSnapshot(`9890`)
+            advanceTime(10000)
+            expect((await watcher.getPersistedState(hogFunctionId)).tokens).toMatchInlineSnapshot(`9990`)
+        })
+
+        describe('onStateChange', () => {
+            it('should trigger state change events', async () => {
+                await watcher.clearLock(hogFunctionId) // For testing the logic
+                await watcher.observeResults(Array(10).fill(createResult({ duration: 1000, kind: 'hog' })))
+                expect(await watcher.getPersistedState(hogFunctionId)).toMatchInlineSnapshot(`
+                    {
+                      "state": 1,
+                      "tokens": 8100,
+                    }
+                `)
+                expect(onStateChangeSpy).toHaveBeenCalledTimes(0)
+
+                await watcher.clearLock(hogFunctionId) // For testing the logic
+                await watcher.observeResults(Array(10).fill(createResult({ duration: 1000, kind: 'hog' })))
+                expect(await watcher.getPersistedState(hogFunctionId)).toMatchInlineSnapshot(`
+                    {
+                      "state": 2,
+                      "tokens": 6200,
+                    }
+                `)
+                expect(onStateChangeSpy).toHaveBeenCalledTimes(1) // New state change
+                expect(onStateChangeSpy).toHaveBeenLastCalledWith({
+                    hogFunction,
+                    state: HogWatcherState.degraded,
+                    previousState: HogWatcherState.healthy,
+                })
+
+                await watcher.clearLock(hogFunctionId) // For testing the logic
+                await watcher.observeResults(Array(10).fill(createResult({ duration: 1000, kind: 'hog' })))
+                expect(await watcher.getPersistedState(hogFunctionId)).toMatchInlineSnapshot(`
+                    {
+                      "state": 2,
+                      "tokens": 4300,
+                    }
+                `)
+                expect(onStateChangeSpy).toHaveBeenCalledTimes(1) // NO New state change
+
+                await watcher.clearLock(hogFunctionId) // For testing the logic
+                await watcher.observeResults(Array(100).fill(createResult({ duration: 1000, kind: 'hog' })))
+                // Final batch overdraws; V3 lua floor-drains the available tokens, so the
+                // stored pool lands at 0. State transition fires from the rate limiter
+                // return (tokens=-1 on the denied per-input tail).
+                expect(await watcher.getPersistedState(hogFunctionId)).toMatchInlineSnapshot(`
+                    {
+                      "state": 3,
+                      "tokens": 0,
+                    }
+                `)
+                expect(onStateChangeSpy).toHaveBeenCalledTimes(2) // New state change
+                expect(onStateChangeSpy).toHaveBeenLastCalledWith({
+                    hogFunction,
+                    state: HogWatcherState.disabled,
+                    previousState: HogWatcherState.degraded,
+                })
+            })
+
+            it('should not transition to disabled if not enabled', async () => {
+                watcherConfig.automaticallyDisableFunctions = false
+                watcher = new HogWatcherService(hub.teamManager, watcherConfig, redis)
+                onStateChangeSpy = jest.spyOn(watcher as any, 'onStateChange') as jest.SpyInstance
+                await watcher.observeResults(Array(1000).fill(createResult({ duration: 1000, kind: 'hog' })))
+                // Cold-start denial: V3 lua floor-drains to 0. State transition fires
+                // from the rate-limiter return (tokens=-1 on denied per-input results).
+                expect(await watcher.getPersistedState(hogFunctionId)).toMatchInlineSnapshot(`
+                    {
+                      "state": 2,
+                      "tokens": 0,
+                    }
+                `)
+                expect(onStateChangeSpy).toHaveBeenCalledTimes(1)
+                expect(onStateChangeSpy).toHaveBeenLastCalledWith({
+                    hogFunction,
+                    state: HogWatcherState.degraded,
+                    previousState: HogWatcherState.healthy,
+                })
+
+                await watcher.observeResults(Array(1000).fill(createResult({ duration: 1000, kind: 'hog' })))
+                expect(onStateChangeSpy).toHaveBeenCalledTimes(1)
+            })
+
+            it('should not automatically transition out of disabled', async () => {
+                await watcher.observeResults(Array(1000).fill(createResult({ duration: 1000, kind: 'hog' })))
+                // V3 lua floor-drains on overdraft → pool=0. State persists at 3
+                // (disabled) because state writes are independent of pool writes.
+                expect(await watcher.getPersistedState(hogFunctionId)).toMatchInlineSnapshot(`
+                    {
+                      "state": 3,
+                      "tokens": 0,
+                    }
+                `)
+                advanceTime(1000)
+                // Refill from 0 at refillRate=10 over 1s.
+                expect(await watcher.getPersistedState(hogFunctionId)).toMatchInlineSnapshot(`
+                    {
+                      "state": 3,
+                      "tokens": 10,
+                    }
+                `)
+
+                advanceTime(1000)
+                await watcher.observeResults(Array(1).fill(createResult({ duration: 10, kind: 'hog' })))
+                expect(await watcher.getPersistedState(hogFunctionId)).toMatchInlineSnapshot(`
+                    {
+                      "state": 3,
+                      "tokens": 20,
+                    }
+                `)
+                expect(onStateChangeSpy).toHaveBeenCalledTimes(1)
+            })
+
+            it('should not change states if recently changed', async () => {
+                await watcher.doStageChanges([[hogFunction, HogWatcherState.healthy]])
+                await watcher.observeResults(Array(1000).fill(createResult({ duration: 1000, kind: 'hog' })))
+                expect((await watcher.getPersistedState(hogFunctionId)).state).toEqual(HogWatcherState.healthy)
+                const res = await redis.usePipeline({ name: 'getLock' }, (pipeline) => {
+                    pipeline.get(`@posthog-test/hog-watcher-2/state-lock/${hogFunctionId}`)
+                    pipeline.ttl(`@posthog-test/hog-watcher-2/state-lock/${hogFunctionId}`)
+                })
+                expect(res?.[0]?.[1]).toEqual('1') // The value
+                expect(res?.[1]?.[1]).toBeGreaterThan(hub.CDP_WATCHER_STATE_LOCK_TTL - 5) // The ttl
+                expect(res?.[1]?.[1]).toBeLessThan(hub.CDP_WATCHER_STATE_LOCK_TTL + 5) // The ttl
+            })
+
+            it('should not transition to a different state if forcefully set', async () => {
+                await watcher.doStageChanges([[hogFunction, HogWatcherState.forcefully_degraded]], true)
+                await watcher.clearLock(hogFunctionId)
+                expect(await watcher.getPersistedState(hogFunctionId)).toMatchInlineSnapshot(`
+                    {
+                      "state": 11,
+                      "tokens": 0,
+                    }
+                `)
+                await watcher.observeResults(Array(1000).fill(createResult({ duration: 1, kind: 'hog' })))
+
+                expect(await watcher.getPersistedState(hogFunctionId)).toMatchInlineSnapshot(`
+                    {
+                      "state": 11,
+                      "tokens": 0,
+                    }
+                `)
+            })
+        })
+    })
+
+    describe('getPersistedStates', () => {
+        it('should return healthy with full bucket for unknown function', async () => {
+            const state = await watcher.getPersistedState('totally-unknown-function-id')
+            expect(state).toEqual({
+                state: HogWatcherState.healthy,
+                tokens: 10000,
+            })
+        })
+
+        it('should not create Redis keys on read-only access', async () => {
+            const unknownId = 'never-executed-function'
+            await watcher.getPersistedState(unknownId)
+            await watcher.getPersistedState(unknownId)
+
+            // Verify no key was created — reads should be side-effect-free
+            const exists = await redis.useClient({ name: 'test-check' }, async (client) => {
+                return await client.exists(`${BASE_REDIS_KEY}/tokens/${unknownId}`)
+            })
+            expect(exists).toEqual(0)
+        })
+
+        it('should cap refill at bucketSize after large time gap', async () => {
+            await watcher.observeResults([createResult({ duration: 10000, kind: 'async_function' })])
+            expect((await watcher.getPersistedState(hogFunctionId)).tokens).toBeLessThan(10000)
+
+            // Advance time by a very large amount — tokens should cap at bucketSize, not overflow
+            advanceTime(1_000_000_000)
+            const state = await watcher.getPersistedState(hogFunctionId)
+            expect(state.tokens).toEqual(watcherConfig.bucketSize)
+        })
+
+        it('should handle pool existing without ts in Redis', async () => {
+            // Write pool directly without ts to simulate corrupted state
+            await redis.useClient({ name: 'test-setup' }, async (client) => {
+                await client.hset(`${BASE_REDIS_KEY}/tokens/${hogFunctionId}`, 'pool', '5000')
+            })
+
+            const state = await watcher.getPersistedState(hogFunctionId)
+            // With no ts, timeDiff is 0, so no refill — tokens should be the raw pool value
+            expect(state.tokens).toEqual(5000)
+        })
+
+        it('should handle ts existing without pool in Redis', async () => {
+            // Write ts directly without pool to simulate corrupted state
+            await redis.useClient({ name: 'test-setup' }, async (client) => {
+                await client.hset(`${BASE_REDIS_KEY}/tokens/${hogFunctionId}`, 'ts', Math.round(now / 1000))
+            })
+
+            const state = await watcher.getPersistedState(hogFunctionId)
+            // With no pool, should return bucketSize (healthy default)
+            expect(state.tokens).toEqual(watcherConfig.bucketSize)
+        })
+
+        it('should return consistent results between write and read paths', async () => {
+            // Write costs via observeResults (uses evalsha Lua script)
+            await watcher.observeResults([
+                createResult({ duration: 5000, kind: 'async_function' }),
+                createResult({ duration: 5000, kind: 'async_function' }),
+            ])
+
+            // Read immediately via getPersistedState (uses hget)
+            const state = await watcher.getPersistedState(hogFunctionId)
+
+            // Tokens should be reduced but function still healthy
+            expect(state.tokens).toBeLessThan(watcherConfig.bucketSize)
+            expect(state.tokens).toBeGreaterThan(0)
+            expect(state.state).toEqual(HogWatcherState.healthy)
+        })
+    })
+
+    describe('doStateChanges - with resetPool', () => {
+        const expectMockCaptureTeamEvent = (state: string, previousState: string) => {
+            expect(mockCaptureTeamEvent).toHaveBeenCalledWith(team, 'hog_function_state_change', {
+                hog_function_id: hogFunction.id,
+                hog_function_type: hogFunction.type,
+                hog_function_name: hogFunction.name,
+                hog_function_template_id: hogFunction.template_id,
+                state,
+                previous_state: previousState,
+            })
+        }
+
+        it('should change the state of a hog function', async () => {
+            expect(await watcher.getPersistedState(hogFunction.id)).toEqual({
+                state: HogWatcherState.healthy,
+                tokens: 10000,
+            })
+            await watcher.doStageChanges([[hogFunction, HogWatcherState.degraded]], true)
+            expect(await watcher.getPersistedState(hogFunction.id)).toEqual({
+                state: HogWatcherState.degraded,
+                tokens: 8000,
+            })
+
+            expect(onStateChangeSpy).toHaveBeenCalledWith({
+                hogFunction,
+                state: HogWatcherState.degraded,
+                previousState: HogWatcherState.healthy,
+            })
+        })
+
+        it('should only trigger state change events if the state actually changed', async () => {
+            await watcher.doStageChanges([[hogFunction, HogWatcherState.degraded]], true)
+            expect(onStateChangeSpy).toHaveBeenCalledTimes(1)
+            expect(onStateChangeSpy).toHaveBeenLastCalledWith({
+                hogFunction,
+                state: HogWatcherState.degraded,
+                previousState: HogWatcherState.healthy,
+            })
+            expectMockCaptureTeamEvent('degraded', 'healthy')
+
+            await watcher.doStageChanges([[hogFunction, HogWatcherState.degraded]], true)
+            expect(onStateChangeSpy).toHaveBeenCalledTimes(1)
+            await watcher.doStageChanges([[hogFunction, HogWatcherState.disabled]], true)
+            expect(onStateChangeSpy).toHaveBeenCalledTimes(2)
+            expect(onStateChangeSpy).toHaveBeenLastCalledWith({
+                hogFunction,
+                state: HogWatcherState.disabled,
+                previousState: HogWatcherState.degraded,
+            })
+            expectMockCaptureTeamEvent('disabled', 'degraded')
+            await watcher.doStageChanges([[hogFunction, HogWatcherState.disabled]], true)
+            expect(onStateChangeSpy).toHaveBeenCalledTimes(2)
+        })
+    })
+
+    describe('observeResultsBuffered', () => {
+        let observeResultsSpy: jest.SpyInstance
+        beforeEach(() => {
+            observeResultsSpy = jest.spyOn(watcher, 'observeResults')
+            watcherConfig.observeResultsBufferMaxResults = 3
+        })
+
+        it('should buffer results and observe them', async () => {
+            const result1 = createResult({})
+            const result2 = createResult({})
+            const result3 = createResult({})
+
+            await Promise.all([
+                watcher.observeResultsBuffered(result1),
+                watcher.observeResultsBuffered(result2),
+                watcher.observeResultsBuffered(result3),
+            ])
+            expect(observeResultsSpy).toHaveBeenCalledTimes(1)
+            expect(observeResultsSpy).toHaveBeenCalledWith([result1, result2, result3])
+        })
+
+        it('should buffer results and flush them when the buffer is full', async () => {
+            const results = [createResult({}), createResult({}), createResult({}), createResult({})]
+            await Promise.all([
+                watcher.observeResultsBuffered(results[0]),
+                watcher.observeResultsBuffered(results[1]),
+                watcher.observeResultsBuffered(results[2]),
+                watcher.observeResultsBuffered(results[3]),
+            ])
+            expect(observeResultsSpy).toHaveBeenCalledTimes(2)
+            expect(observeResultsSpy).toHaveBeenCalledWith([results[0], results[1], results[2]])
+            expect(observeResultsSpy).toHaveBeenCalledWith([results[3]])
+        })
+    })
+
+    describe('reader fallback', () => {
+        let loggerWarnSpy: jest.SpyInstance
+
+        const makeFailingReader = (err: Error): RedisV2 => ({
+            useClient: jest.fn(() => Promise.reject(err)),
+            usePipeline: jest.fn(() => Promise.reject(err)),
+        })
+
+        beforeEach(() => {
+            loggerWarnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined)
+        })
+
+        afterEach(() => {
+            loggerWarnSpy.mockRestore()
+        })
+
+        it('should fall back to the writer when the reader throws on getPersistedStates', async () => {
+            const failingReader = makeFailingReader(new Error('reader unavailable'))
+            const watcherWithFailingReader = new HogWatcherService(hub.teamManager, watcherConfig, redis, failingReader)
+
+            // Seed state on the writer so a successful fallback returns real data
+            await watcherWithFailingReader.observeResults([createResult({ duration: 1000, kind: 'hog' })])
+
+            const state = await watcherWithFailingReader.getPersistedState(hogFunctionId)
+
+            // observeResults uses useClient (mget), getPersistedState uses usePipeline
+            expect(failingReader.useClient).toHaveBeenCalledTimes(1)
+            expect(failingReader.usePipeline).toHaveBeenCalledTimes(1)
+            expect(state.tokens).toBeLessThan(watcherConfig.bucketSize)
+            expect(loggerWarnSpy).toHaveBeenCalledWith(
+                '🔀',
+                expect.stringContaining('reader getStates failed'),
+                expect.any(Object)
+            )
+        })
+
+        it('should fall back to the writer when the reader throws on getAllFunctionStates', async () => {
+            // Seed enough cost to trigger a state transition - that's what writes the
+            // state key that getAllFunctionStates SCANs for.
+            await watcher.observeResults(Array(10000).fill(createResult({ duration: 25000, kind: 'async_function' })))
+
+            const failingReader = makeFailingReader(new Error('reader unavailable'))
+            const watcherWithFailingReader = new HogWatcherService(hub.teamManager, watcherConfig, redis, failingReader)
+
+            const states = await watcherWithFailingReader.getAllFunctionStates()
+
+            expect(failingReader.useClient).toHaveBeenCalledTimes(1)
+            expect(Object.keys(states)).toContain(hogFunctionId)
+            expect(loggerWarnSpy).toHaveBeenCalledWith(
+                '🔀',
+                expect.stringContaining('reader scanStates failed'),
+                expect.any(Object)
+            )
+        })
+
+        it('should not log a fallback when the reader is healthy', async () => {
+            const healthyWatcher = new HogWatcherService(hub.teamManager, watcherConfig, redis, redis)
+
+            await healthyWatcher.getPersistedState(hogFunctionId)
+
+            expect(loggerWarnSpy).not.toHaveBeenCalledWith(
+                '🔀',
+                expect.stringContaining('reader getStates failed'),
+                expect.any(Object)
+            )
+        })
+    })
+})

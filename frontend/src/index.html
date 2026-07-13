@@ -1,16 +1,66 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+{# boot_theme mirrors themeLogic.isDarkModeOn (posthog/utils.py): "dark", "system", or "light" #}
+<html lang="en" data-boot-theme="{{ boot_theme|default:'light' }}">
     <head>
+        {# head.html first: it carries <meta charset>, which must stay within the first 1024 bytes #}
+        {# so the browser's encoding prescan finds it #}
         {% include "head.html" %}
+        {# Critical CSS for the pre-React shell (background, spinner, boot-failure message), so the #}
+        {# page doesn't flash white. Everything visual is scoped to #root:empty and .Preloader — the #}
+        {# app never styles <body> background itself, so an unscoped rule here would persist after #}
+        {# boot and bleed through the themed app. These selectors stop matching once React renders #}
+        {# real content. #}
+        <style>
+            html,body,#root{height:100%;margin:0;padding:0}
+            *,:after,:before{box-sizing:border-box}
+            #root:empty,.Preloader{background:#f3f4ef;color:#111;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,sans-serif;font-size:14px;line-height:1.4}
+            [data-boot-theme=dark] #root:empty,[data-boot-theme=dark] .Preloader{background:#1d1f27;color:#fff}
+            @media (prefers-color-scheme:dark){[data-boot-theme=system] #root:empty,[data-boot-theme=system] .Preloader{background:#1d1f27;color:#fff}}
+            .Preloader{display:flex;align-items:center;justify-content:center;height:100%;min-height:200px;width:100%}
+            .Preloader__inner{width:25px;height:25px;border:5px solid rgba(245,78,0,.333);border-top-color:#f54e00;border-radius:50%;animation:preloader-spin 1s linear infinite}
+            .Preloader button{border:0;padding:0;background:none;font:inherit;color:inherit;text-decoration:underline;cursor:pointer}
+            @keyframes preloader-spin{to{transform:rotate(360deg)}}
+        </style>
+        {# Resource hints so the boot chain (font, CSS, entry -> App chunks) is fetched in parallel #}
+        {# instead of discovered as a waterfall. Empty in dev mode and when no build manifest exists. #}
+        {% if js_url %}
+            <link rel="preconnect" href="{{ js_url }}" crossorigin>
+        {% endif %}
+        {% if preload_font_url %}
+            <link rel="preload" href="{{ js_url }}/{{ preload_font_url }}" as="font" type="font/woff2" crossorigin>
+        {% endif %}
+        {% if preload_css_url %}
+            {# Preload only — the loader script injected at the end of <head> appends the actual #}
+            {# stylesheet link (with its hashless fallback). Applying the stylesheet there keeps a #}
+            {# slow CSS fetch from blocking the parser-inserted boot scripts, and keeps the CSSOM #}
+            {# to a single copy. crossorigin matches the loader's fetch mode so one response is reused. #}
+            <link rel="preload" href="{{ js_url }}/{{ preload_css_url }}" as="style" crossorigin="anonymous">
+        {% endif %}
+        {% for url in preload_js_urls %}
+            <link rel="modulepreload" href="{{ js_url }}/{{ url }}">
+        {% endfor %}
     </head>
     <body>
         {% include "overlays.html" %}
-        <script>
-            if (
-                typeof Object.entries === 'undefined' ||
-                typeof Object.fromEntries === 'undefined' ||
-                typeof Array.prototype.flatMap === 'undefined'
-            ) {
+        <script nonce="{{ request.csp_nonce }}">
+            const tags = [
+                '{% if debug %}DEBUG mode{% elif region %}Region: {{ region }}{% else %}Hobby deployment{% endif %}',
+                '{% if debug %}Branch: {{ git_branch|default:"unknown" }}{% else %}Commit: {{ git_rev|default:"unknown" }}{% endif %}',
+                'Join us! https://posthog.com/careers',
+            ]
+            console.info(
+                `%c %cPostHog %c— %cIn data we trust\n%c${tags.join('%c %c')}`,
+                `padding-left: 2.5em; line-height: 4em; background-size: 2.5em; background-repeat: no-repeat; background-position: left center; background-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20viewBox%3D'0%200%2052%2028'%20width%3D'52'%3E%3Cg%20data-logo-part%3D'blue'%3E%3Cpath%20fill%3D'%230054ff'%20d%3D'M.87%2019.13a.5.5%200%200%200-.87.34v5.94a2.6%202.6%200%200%200%202.59%202.58H7.8a.5.5%200%200%200%20.37-.84zM.86%208.4c-.3-.32-.86-.1-.86.36v6.73q0%20.2.13.34l8.81%209.68%201.8%202.06v-8.82zM4.59.82A2.67%202.67%200%200%200%200%202.68v1.93q0%20.4.27.69l10.47%2010.95v-9.1z'%2F%3E%3C%2Fg%3E%3Cg%20data-logo-part%3D'red'%3E%3Cpath%20fill%3D'%23ff5506'%20d%3D'M11.36%2028h7.08a.5.5%200%200%200%20.36-.85l-8.05-8.4v8.8l.23.28q.16.17.38.17m-.61-11.76%208.84%209.25%202.1%202.33q.1.11.27.14V18.7L10.75%207.15zm0-13.7v1.41a2%202%200%200%200%20.55%201.28L21.96%2016.2V7.65L15.32.8a2.67%202.67%200%200%200-4.57%201.71z'%2F%3E%3C%2Fg%3E%3Cg%20data-logo-part%3D'yellow'%3E%3Cpath%20fill%3D'%23ffb70f'%20d%3D'M22.06%2028h7.76a.5.5%200%200%200%20.36-.86l-8.22-8.45v9.27l.09.02zM31%2025.49l1.13%201.14c.32.31.85.09.85-.35v-7.3l-.49-.51L21.96%207.64v8.55zM22.52%205.73l9.62%209.89c.3.32.86.1.86-.35V7.46L26.56.82a2.67%202.67%200%200%200-4.59%201.84v1.7c0%20.51.2%201%20.57%201.37z'%2F%3E%3C%2Fg%3E%3Cg%20data-logo-part%3D'head'%3E%3Cpath%20fill%3D'%23111'%20d%3D'm50%2023.34-.35-.05A4.5%204.5%200%200%201%2047%2021.97L35.56%2010.1c-.3-.33-.86-.1-.86.35V27.5c0%20.27.22.5.5.5h13.78c1.48%200%202.67-1.2%202.67-2.67v-.1a1.9%201.9%200%200%200-1.67-1.89zm-10.81.2a1.8%201.8%200%201%201%200-3.58%201.8%201.8%200%200%201%200%203.58'%2F%3E%3C%2Fg%3E%3C%2Fsvg%3E");`,
+                'font-weight: bold;',
+                '',
+                'font-style: italic;',
+                'padding: 0.2em 0.4em; border-radius: 0.5em; background: #1d4aff; color: white;',
+                'padding-bottom: 0.4em;',
+                'padding: 0.2em 0.4em; border-radius: 0.5em; background: #f54e00; color: white;',
+                '',
+                'padding: 0.2em 0.4em; border-radius: 0.5em; background: #f9bd2b; color: black;'
+            )
+            if (!('entries' in Object) || !('fromEntries' in Object) || !('flatMap' in Array.prototype)) {
                 var div = document.createElement('div')
                 div.style.color = '#fef6f6'
                 div.style.background = '#920c0c'

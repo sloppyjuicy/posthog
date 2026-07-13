@@ -1,0 +1,1169 @@
+import uuid
+import datetime
+import concurrent.futures
+
+import pytest
+from freezegun import config, configure, freeze_time
+from posthog.test.base import (
+    APIBaseTest,
+    BaseTest,
+    ClickhouseTestMixin,
+    QueryMatchingTest,
+    _create_event,
+    flush_persons_and_events,
+    snapshot_postgres_queries_context,
+)
+from unittest.mock import MagicMock, patch
+
+from django.core.cache import cache
+
+from posthog import redis
+from posthog.constants import FlagRequestType
+from posthog.models.team.team import Team
+
+from products.feature_flags.backend.api.feature_flag import _create_usage_dashboard
+from products.feature_flags.backend.flag_analytics import (
+    SDK_LIBRARIES,
+    _enriched_flag_key_expr_sql,
+    _extract_sdk_breakdown_from_redis,
+    _flag_key_filter_sql,
+    capture_team_decide_usage,
+    capture_usage_for_all_teams,
+    find_flags_with_enriched_analytics,
+    get_cached_evaluations_7d_by_team,
+    get_evaluations_7d_by_team,
+    get_team_request_library_key,
+    increment_request_count,
+)
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+
+
+class TestFeatureFlagAnalytics(BaseTest, QueryMatchingTest):
+    maxDiff = None
+
+    def tearDown(self):
+        configure(default_ignore_list=config.DEFAULT_IGNORE_LIST)
+        return super().tearDown()
+
+    def setUp(self):
+        # delete all keys in redis
+        r = redis.get_client()
+        for key in r.scan_iter("*"):
+            r.delete(key)
+        return super().setUp()
+
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_increment_request_count_adds_requests_to_appropriate_buckets(self):
+        team_id = 3
+        other_team_id = 1243
+
+        with freeze_time("2022-05-07 12:23:07") as frozen_datetime:
+            for _ in range(10):
+                # 10 requests in first bucket
+                increment_request_count(team_id)
+            for _ in range(7):
+                # 7 requests for other team
+                increment_request_count(other_team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=5))
+
+            for _ in range(5):
+                # 5 requests in second bucket
+                increment_request_count(team_id)
+            for _ in range(3):
+                # 3 requests for other team
+                increment_request_count(other_team_id)
+
+            client = redis.get_client()
+
+            # redis returns encoded bytes
+            self.assertEqual(
+                client.hgetall(f"posthog:decide_requests:{team_id}"),
+                {b"165192618": b"10", b"165192619": b"5"},
+            )
+            self.assertEqual(
+                client.hgetall(f"posthog:decide_requests:{other_team_id}"),
+                {b"165192618": b"7", b"165192619": b"3"},
+            )
+            self.assertEqual(client.hgetall(f"posthog:decide_requests:other"), {})
+
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_increment_request_count_remote_config_uses_own_bucket(self):
+        team_id = 3
+
+        with freeze_time("2022-05-07 12:23:07"):
+            for _ in range(4):
+                increment_request_count(team_id)
+            for _ in range(6):
+                increment_request_count(team_id, 1, FlagRequestType.REMOTE_CONFIG)
+
+            client = redis.get_client()
+
+            # Remote config fetches are telemetry-only, so they must never leak into the
+            # decide bucket that billing consumes.
+            self.assertEqual(
+                client.hgetall(f"posthog:decide_requests:{team_id}"),
+                {b"165192618": b"4"},
+            )
+            self.assertEqual(
+                client.hgetall(f"posthog:remote_config_requests:{team_id}"),
+                {b"165192618": b"6"},
+            )
+
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_capture_team_decide_usage(self):
+        mock_capture = MagicMock()
+        team_id = 3
+        other_team_id = 1243
+        team_uuid = "team-uuid"
+        other_team_uuid = "other-team-uuid"
+
+        with (
+            freeze_time("2022-05-07 12:23:07") as frozen_datetime,
+            self.settings(DECIDE_BILLING_ANALYTICS_TOKEN="token"),
+        ):
+            for _ in range(10):
+                # 10 requests in first bucket
+                increment_request_count(team_id)
+                increment_request_count(team_id, 1, FlagRequestType.LOCAL_EVALUATION)
+                increment_request_count(team_id, 1, FlagRequestType.REMOTE_CONFIG)
+            for _ in range(7):
+                # 7 requests for other team
+                increment_request_count(other_team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=5))
+
+            for _ in range(5):
+                # 5 requests in second bucket
+                increment_request_count(team_id)
+                increment_request_count(team_id, 1, FlagRequestType.LOCAL_EVALUATION)
+                increment_request_count(team_id, 1, FlagRequestType.REMOTE_CONFIG)
+            for _ in range(3):
+                # 3 requests for other team
+                increment_request_count(other_team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=10))
+
+            for _ in range(5):
+                # 5 requests in third bucket
+                increment_request_count(team_id)
+                increment_request_count(team_id, 1, FlagRequestType.LOCAL_EVALUATION)
+                increment_request_count(team_id, 1, FlagRequestType.REMOTE_CONFIG)
+                increment_request_count(other_team_id)
+
+            capture_team_decide_usage(mock_capture, team_id, team_uuid)
+            # these other requests should not add duplicate counts
+            capture_team_decide_usage(mock_capture, team_id, team_uuid)
+            capture_team_decide_usage(mock_capture, team_id, team_uuid)
+            assert mock_capture.capture.call_count == 3
+            mock_capture.capture.assert_any_call(
+                distinct_id=team_id,
+                event="decide usage",
+                properties={
+                    "count": 15,
+                    "team_id": team_id,
+                    "team_uuid": team_uuid,
+                    "max_time": 1651926190,
+                    "min_time": 1651926180,
+                    "token": "token",
+                },
+            )
+            mock_capture.capture.assert_any_call(
+                distinct_id=team_id,
+                event="local evaluation usage",
+                properties={
+                    "count": 15,
+                    "team_id": team_id,
+                    "team_uuid": team_uuid,
+                    "max_time": 1651926190,
+                    "min_time": 1651926180,
+                    "token": "token",
+                },
+            )
+            mock_capture.capture.assert_any_call(
+                distinct_id=team_id,
+                event="remote config usage",
+                properties={
+                    "count": 15,
+                    "team_id": team_id,
+                    "team_uuid": team_uuid,
+                    "max_time": 1651926190,
+                    "min_time": 1651926180,
+                    "token": "token",
+                },
+            )
+
+            mock_capture.reset_mock()
+            capture_team_decide_usage(mock_capture, other_team_id, other_team_uuid)
+            capture_team_decide_usage(mock_capture, other_team_id, other_team_uuid)
+            mock_capture.capture.assert_called_once_with(
+                distinct_id=other_team_id,
+                event="decide usage",
+                properties={
+                    "count": 10,
+                    "team_id": other_team_id,
+                    "team_uuid": other_team_uuid,
+                    "max_time": 1651926190,
+                    "min_time": 1651926180,
+                    "token": "token",
+                },
+            )
+
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_no_token_loses_capture_team_decide_usage_data(self):
+        mock_capture = MagicMock()
+        team_id = 3
+        other_team_id = 1243
+        team_uuid = "team-uuid"
+        other_team_uuid = "other-team-uuid"
+
+        with freeze_time("2022-05-07 12:23:07") as frozen_datetime:
+            for _ in range(10):
+                # 10 requests in first bucket
+                increment_request_count(team_id)
+            for _ in range(7):
+                # 7 requests for other team
+                increment_request_count(other_team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=5))
+
+            for _ in range(5):
+                # 5 requests in second bucket
+                increment_request_count(team_id)
+            for _ in range(3):
+                # 3 requests for other team
+                increment_request_count(other_team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=10))
+
+            for _ in range(5):
+                # 5 requests in third bucket
+                increment_request_count(team_id)
+                increment_request_count(other_team_id)
+
+            capture_team_decide_usage(mock_capture, team_id, team_uuid)
+            capture_team_decide_usage(mock_capture, team_id, team_uuid)
+            mock_capture.capture.assert_not_called()
+
+            client = redis.get_client()
+            self.assertEqual(
+                client.hgetall(f"posthog:decide_requests:{team_id}"),
+                {b"165192620": b"5"},
+            )
+
+            with self.settings(DECIDE_BILLING_ANALYTICS_TOKEN="token"):
+                capture_team_decide_usage(mock_capture, team_id, team_uuid)
+                # no data anymore to capture
+                mock_capture.capture.assert_not_called()
+
+                mock_capture.reset_mock()
+
+                capture_team_decide_usage(mock_capture, other_team_id, other_team_uuid)
+                mock_capture.capture.assert_called_once_with(
+                    distinct_id=other_team_id,
+                    event="decide usage",
+                    properties={
+                        "count": 10,
+                        "team_id": other_team_id,
+                        "team_uuid": other_team_uuid,
+                        "max_time": 1651926190,
+                        "min_time": 1651926180,
+                        "token": "token",
+                    },
+                )
+
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_efficient_querying_of_team_decide_usage_data(self):
+        mock_capture = MagicMock()
+        team_id = 3901
+        other_team_id = 1243
+        # generate uuid
+        team_uuid = uuid.uuid4()
+        other_team_uuid = uuid.uuid4()
+
+        # make sure the teams exist to query them
+        Team.objects.create(id=team_id, organization=self.organization, api_token=f"token:::{team_id}", uuid=team_uuid)
+
+        Team.objects.create(
+            id=other_team_id, organization=self.organization, api_token=f"token:::{other_team_id}", uuid=other_team_uuid
+        )
+
+        with freeze_time("2022-05-07 12:23:07") as frozen_datetime:
+            for _ in range(10):
+                # 10 requests in first bucket
+                increment_request_count(team_id)
+            for _ in range(7):
+                # 7 requests for other team
+                increment_request_count(other_team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=5))
+
+            for _ in range(5):
+                # 5 requests in second bucket
+                increment_request_count(team_id)
+            for _ in range(3):
+                # 3 requests for other team
+                increment_request_count(other_team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=10))
+
+            for _ in range(5):
+                # 5 requests in third bucket
+                increment_request_count(team_id)
+                increment_request_count(other_team_id)
+
+            with self.settings(DECIDE_BILLING_ANALYTICS_TOKEN="token"), snapshot_postgres_queries_context(self):
+                capture_usage_for_all_teams(mock_capture)
+
+                mock_capture.capture.assert_any_call(
+                    distinct_id=team_id,
+                    event="decide usage",
+                    properties={
+                        "count": 15,
+                        "team_id": team_id,
+                        "team_uuid": team_uuid,
+                        "max_time": 1651926190,
+                        "min_time": 1651926180,
+                        "token": "token",
+                    },
+                )
+
+                mock_capture.capture.assert_any_call(
+                    distinct_id=other_team_id,
+                    event="decide usage",
+                    properties={
+                        "count": 10,
+                        "team_id": other_team_id,
+                        "team_uuid": other_team_uuid,
+                        "max_time": 1651926190,
+                        "min_time": 1651926180,
+                        "token": "token",
+                    },
+                )
+                assert mock_capture.capture.call_count == 2
+
+    @pytest.mark.skip(
+        reason="This works locally, but causes issues in CI because the freeze_time applies to threads as well in unrelated tests, causing timeouts."
+    )
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_no_interference_between_different_types_of_new_incoming_increments(self):
+        # we want freezetime to apply to threads too.
+        # However, the list can't be empty, so we need to add something.
+        configure(default_ignore_list=["tensorflow"])
+
+        mock_capture = MagicMock()
+        team_id = 3
+        other_team_id = 1243
+        team_uuid = "team-uuid"
+
+        with (
+            freeze_time("2022-05-07 12:23:07") as frozen_datetime,
+            self.settings(DECIDE_BILLING_ANALYTICS_TOKEN="token"),
+        ):
+            for _ in range(10):
+                # 10 requests in first bucket
+                increment_request_count(team_id)
+                increment_request_count(team_id, 1, FlagRequestType.LOCAL_EVALUATION)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=5))
+
+            for _ in range(5):
+                # 5 requests in second bucket
+                increment_request_count(team_id)
+                increment_request_count(team_id, 1, FlagRequestType.LOCAL_EVALUATION)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=10))
+
+            for _ in range(3):
+                # 3 requests in third bucket
+                increment_request_count(team_id)
+                increment_request_count(team_id, 1, FlagRequestType.LOCAL_EVALUATION)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=2))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                future_to_index = {executor.submit(increment_request_count, team_id): index for index in range(5, 10)}
+                future_to_index = {
+                    executor.submit(capture_team_decide_usage, mock_capture, team_id, team_uuid): index
+                    for index in range(5)
+                }
+                future_to_index = {
+                    executor.submit(
+                        increment_request_count,
+                        team_id,
+                        1,
+                        FlagRequestType.LOCAL_EVALUATION,
+                    ): index
+                    for index in range(10, 15)
+                }
+
+            for future in concurrent.futures.as_completed(future_to_index):
+                result = future.result()
+                assert result is None
+                assert future.exception() is None
+
+            mock_capture.capture.assert_any_call(
+                distinct_id=team_id,
+                event="decide usage",
+                properties={
+                    "count": 15,
+                    "team_id": team_id,
+                    "team_uuid": team_uuid,
+                    "max_time": 1651926190,
+                    "min_time": 1651926180,
+                    "token": "token",
+                },
+            )
+            mock_capture.capture.assert_any_call(
+                distinct_id=team_id,
+                event="local evaluation usage",
+                properties={
+                    "count": 15,
+                    "team_id": team_id,
+                    "team_uuid": team_uuid,
+                    "max_time": 1651926190,
+                    "min_time": 1651926180,
+                    "token": "token",
+                },
+            )
+            assert mock_capture.capture.call_count == 2
+
+            client = redis.get_client()
+
+            # check that the increments made it through
+            # and no extra requests were counted
+            self.assertEqual(
+                client.hgetall(f"posthog:decide_requests:{team_id}"),
+                {b"165192620": b"8"},
+            )
+            self.assertEqual(
+                client.hgetall(f"posthog:local_evaluation_requests:{team_id}"),
+                {b"165192620": b"8"},
+            )
+            self.assertEqual(client.hgetall(f"posthog:decide_requests:{other_team_id}"), {})
+            self.assertEqual(client.hgetall(f"posthog:local_evaluation_requests:{other_team_id}"), {})
+
+    @pytest.mark.skip(
+        reason="This works locally, but causes issues in CI because the freeze_time applies to threads as well in unrelated tests, causing timeouts."
+    )
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_locking_works_for_capture_team_decide_usage(self):
+        # we want freezetime to apply to threads too.
+        # However, the list can't be empty, so we need to add something.
+        configure(default_ignore_list=["tensorflow"])
+
+        mock_capture = MagicMock()
+        team_id = 3
+        other_team_id = 1243
+        team_uuid = "team-uuid"
+        other_team_uuid = "other-team-uuid"
+
+        with (
+            freeze_time("2022-05-07 12:23:07") as frozen_datetime,
+            self.settings(DECIDE_BILLING_ANALYTICS_TOKEN="token"),
+        ):
+            for _ in range(10):
+                # 10 requests in first bucket
+                increment_request_count(team_id)
+            for _ in range(7):
+                # 7 requests for other team
+                increment_request_count(other_team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=5))
+
+            for _ in range(5):
+                # 5 requests in second bucket
+                increment_request_count(team_id)
+            for _ in range(3):
+                # 3 requests for other team
+                increment_request_count(other_team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=10))
+
+            for _ in range(5):
+                # 5 requests in third bucket
+                increment_request_count(team_id)
+                increment_request_count(other_team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=10))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_index = {
+                    executor.submit(capture_team_decide_usage, mock_capture, team_id, team_uuid): index
+                    for index in range(5)
+                }
+                future_to_index = {
+                    executor.submit(
+                        capture_team_decide_usage,
+                        mock_capture,
+                        other_team_id,
+                        other_team_uuid,
+                    ): index
+                    for index in range(5, 10)
+                }
+
+            for future in concurrent.futures.as_completed(future_to_index):
+                result = future.result()
+                assert result is None
+                assert future.exception() is None
+
+            mock_capture.capture.assert_any_call(
+                distinct_id=team_id,
+                event="decide usage",
+                properties={
+                    "count": 15,
+                    "team_id": team_id,
+                    "team_uuid": team_uuid,
+                    "max_time": 1651926190,
+                    "min_time": 1651926180,
+                    "token": "token",
+                },
+            )
+            mock_capture.capture.assert_any_call(
+                distinct_id=other_team_id,
+                event="decide usage",
+                properties={
+                    "count": 10,
+                    "team_id": other_team_id,
+                    "team_uuid": other_team_uuid,
+                    "max_time": 1651926190,
+                    "min_time": 1651926180,
+                    "token": "token",
+                },
+            )
+            assert mock_capture.capture.call_count == 2
+
+    # TODO: Figure out a way to run these tests in CI
+    @pytest.mark.skip(
+        reason="This works locally, but causes issues in CI because the freeze_time applies to threads as well in unrelated tests, causing timeouts."
+    )
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_locking_in_redis_doesnt_block_new_incoming_increments(self):
+        # we want freezetime to apply to threads too.
+        # However, the list can't be empty, so we need to add something.
+        configure(default_ignore_list=["tensorflow"])
+
+        mock_capture = MagicMock()
+        team_id = 3
+        other_team_id = 1243
+        team_uuid = "team-uuid"
+
+        with (
+            freeze_time("2022-05-07 12:23:07") as frozen_datetime,
+            self.settings(DECIDE_BILLING_ANALYTICS_TOKEN="token"),
+        ):
+            for _ in range(10):
+                # 10 requests in first bucket
+                increment_request_count(team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=5))
+
+            for _ in range(5):
+                # 5 requests in second bucket
+                increment_request_count(team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=10))
+
+            for _ in range(3):
+                # 3 requests in third bucket
+                increment_request_count(team_id)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=2))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_index = {
+                    executor.submit(capture_team_decide_usage, mock_capture, team_id, team_uuid): index
+                    for index in range(5)
+                }
+                future_to_index = {executor.submit(increment_request_count, team_id): index for index in range(5, 10)}
+
+            for future in concurrent.futures.as_completed(future_to_index):
+                result = future.result()
+                assert result is None
+                assert future.exception() is None
+
+            mock_capture.capture.assert_any_call(
+                distinct_id=team_id,
+                event="decide usage",
+                properties={
+                    "count": 15,
+                    "team_id": team_id,
+                    "team_uuid": team_uuid,
+                    "max_time": 1651926190,
+                    "min_time": 1651926180,
+                    "token": "token",
+                },
+            )
+            assert mock_capture.capture.call_count == 1
+
+            client = redis.get_client()
+
+            # check that the increments made it through
+            # and no extra requests were counted
+            self.assertEqual(
+                client.hgetall(f"posthog:decide_requests:{team_id}"),
+                {b"165192620": b"8"},
+            )
+            self.assertEqual(client.hgetall(f"posthog:decide_requests:{other_team_id}"), {})
+
+
+class TestSdkBreakdown(BaseTest):
+    def setUp(self):
+        r = redis.get_client()
+        for key in r.scan_iter("*"):
+            r.delete(key)
+        return super().setUp()
+
+    def test_get_team_request_library_key_decide(self):
+        self.assertEqual(
+            get_team_request_library_key(123, FlagRequestType.DECIDE, "posthog-js"),
+            "posthog:decide_requests:sdk:123:posthog-js",
+        )
+        self.assertEqual(
+            get_team_request_library_key(456, FlagRequestType.DECIDE, "posthog-node"),
+            "posthog:decide_requests:sdk:456:posthog-node",
+        )
+
+    def test_get_team_request_library_key_local_evaluation(self):
+        self.assertEqual(
+            get_team_request_library_key(123, FlagRequestType.LOCAL_EVALUATION, "posthog-python"),
+            "posthog:local_evaluation_requests:sdk:123:posthog-python",
+        )
+
+    def test_sdk_libraries_matches_rust_library_enum(self):
+        """
+        Verify SDK_LIBRARIES matches Rust Library::as_str() values.
+
+        IMPORTANT: These values must match the Rust Library enum in:
+        rust/feature-flags/src/handler/types.rs
+
+        If this test fails after adding a new SDK to Rust, update SDK_LIBRARIES
+        in posthog/models/feature_flag/flag_analytics.py to match.
+        """
+        expected_libraries = [
+            "posthog-js",
+            "posthog-node",
+            "posthog-python",
+            "posthog-php",
+            "posthog-ruby",
+            "posthog-go",
+            "posthog-java",
+            "posthog-dotnet",
+            "posthog-elixir",
+            "posthog-rs",
+            "posthog-android",
+            "posthog-ios",
+            "posthog-react-native",
+            "posthog-flutter",
+            "other",
+        ]
+        self.assertEqual(SDK_LIBRARIES, expected_libraries)
+
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_extract_sdk_breakdown_from_redis_empty(self):
+        client = redis.get_client()
+        team_id = 999
+
+        with freeze_time("2022-05-07 12:23:07"):
+            result = _extract_sdk_breakdown_from_redis(client, team_id, FlagRequestType.DECIDE)
+            self.assertEqual(result, {})
+
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_extract_sdk_breakdown_from_redis_with_data(self):
+        client = redis.get_client()
+        team_id = 888
+
+        with freeze_time("2022-05-07 12:23:07") as frozen_datetime:
+            # Set up SDK-specific data in Redis in first bucket
+            time_bucket_1 = "165192618"
+            client.hincrby(f"posthog:decide_requests:sdk:{team_id}:posthog-js", time_bucket_1, 100)
+            client.hincrby(f"posthog:decide_requests:sdk:{team_id}:posthog-node", time_bucket_1, 50)
+
+            # Move to second bucket - each SDK key needs 2+ buckets for extraction
+            frozen_datetime.tick(datetime.timedelta(seconds=10))
+            time_bucket_2 = "165192619"
+            client.hincrby(f"posthog:decide_requests:sdk:{team_id}:posthog-js", time_bucket_2, 10)
+            client.hincrby(f"posthog:decide_requests:sdk:{team_id}:posthog-node", time_bucket_2, 5)
+
+            # Move time forward so bucket 2 is no longer "current"
+            frozen_datetime.tick(datetime.timedelta(seconds=15))
+
+            result = _extract_sdk_breakdown_from_redis(client, team_id, FlagRequestType.DECIDE)
+            # Only bucket 1 should be extracted (bucket 2 is skipped as it's most recent)
+            self.assertEqual(result, {"posthog-js": 100, "posthog-node": 50})
+
+            # Bucket 1 should be consumed, bucket 2 should still exist
+            self.assertEqual(
+                client.hgetall(f"posthog:decide_requests:sdk:{team_id}:posthog-js"),
+                {b"165192619": b"10"},
+            )
+            self.assertEqual(
+                client.hgetall(f"posthog:decide_requests:sdk:{team_id}:posthog-node"),
+                {b"165192619": b"5"},
+            )
+
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_capture_team_decide_usage_includes_sdk_breakdown(self):
+        mock_capture = MagicMock()
+        team_id = 777
+        team_uuid = "team-uuid-777"
+
+        with (
+            freeze_time("2022-05-07 12:23:07") as frozen_datetime,
+            self.settings(DECIDE_BILLING_ANALYTICS_TOKEN="token"),
+        ):
+            client = redis.get_client()
+
+            # Set up aggregate counts in first bucket
+            time_bucket_1 = "165192618"
+            client.hincrby(f"posthog:decide_requests:{team_id}", time_bucket_1, 150)
+
+            # Set up SDK-specific counts (simulating what Rust would write)
+            client.hincrby(f"posthog:decide_requests:sdk:{team_id}:posthog-js", time_bucket_1, 100)
+            client.hincrby(f"posthog:decide_requests:sdk:{team_id}:posthog-node", time_bucket_1, 50)
+
+            # Move to second bucket - each key needs 2+ buckets for extraction
+            frozen_datetime.tick(datetime.timedelta(seconds=10))
+            time_bucket_2 = "165192619"
+            client.hincrby(f"posthog:decide_requests:{team_id}", time_bucket_2, 1)
+            client.hincrby(f"posthog:decide_requests:sdk:{team_id}:posthog-js", time_bucket_2, 1)
+            client.hincrby(f"posthog:decide_requests:sdk:{team_id}:posthog-node", time_bucket_2, 1)
+
+            # Move time forward so bucket 2 is no longer "current"
+            frozen_datetime.tick(datetime.timedelta(seconds=15))
+
+            capture_team_decide_usage(mock_capture, team_id, team_uuid)
+
+            mock_capture.capture.assert_called_once_with(
+                distinct_id=team_id,
+                event="decide usage",
+                properties={
+                    "count": 150,
+                    "team_id": team_id,
+                    "team_uuid": team_uuid,
+                    "min_time": 1651926180,
+                    "max_time": 1651926180,
+                    "token": "token",
+                    "sdk_breakdown": {"posthog-js": 100, "posthog-node": 50},
+                },
+            )
+
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_capture_team_decide_usage_without_sdk_breakdown(self):
+        mock_capture = MagicMock()
+        team_id = 666
+        team_uuid = "team-uuid-666"
+
+        with (
+            freeze_time("2022-05-07 12:23:07") as frozen_datetime,
+            self.settings(DECIDE_BILLING_ANALYTICS_TOKEN="token"),
+        ):
+            client = redis.get_client()
+
+            # Set up only aggregate counts in first bucket (no SDK-specific data)
+            time_bucket_1 = "165192618"
+            client.hincrby(f"posthog:decide_requests:{team_id}", time_bucket_1, 100)
+
+            # Move to second bucket (extraction requires 2+ buckets)
+            frozen_datetime.tick(datetime.timedelta(seconds=10))
+            time_bucket_2 = "165192619"
+            client.hincrby(f"posthog:decide_requests:{team_id}", time_bucket_2, 1)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=15))
+
+            capture_team_decide_usage(mock_capture, team_id, team_uuid)
+
+            # Should NOT include sdk_breakdown when there's no SDK data
+            mock_capture.capture.assert_called_once_with(
+                distinct_id=team_id,
+                event="decide usage",
+                properties={
+                    "count": 100,
+                    "team_id": team_id,
+                    "team_uuid": team_uuid,
+                    "min_time": 1651926180,
+                    "max_time": 1651926180,
+                    "token": "token",
+                },
+            )
+
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_capture_local_evaluation_usage_includes_sdk_breakdown(self):
+        mock_capture = MagicMock()
+        team_id = 555
+        team_uuid = "team-uuid-555"
+
+        with (
+            freeze_time("2022-05-07 12:23:07") as frozen_datetime,
+            self.settings(DECIDE_BILLING_ANALYTICS_TOKEN="token"),
+        ):
+            client = redis.get_client()
+
+            # Set up data in first bucket
+            time_bucket_1 = "165192618"
+            client.hincrby(f"posthog:local_evaluation_requests:{team_id}", time_bucket_1, 80)
+            client.hincrby(f"posthog:local_evaluation_requests:sdk:{team_id}:posthog-python", time_bucket_1, 50)
+            client.hincrby(f"posthog:local_evaluation_requests:sdk:{team_id}:posthog-node", time_bucket_1, 30)
+
+            # Move to second bucket - each key needs 2+ buckets for extraction
+            frozen_datetime.tick(datetime.timedelta(seconds=10))
+            time_bucket_2 = "165192619"
+            client.hincrby(f"posthog:local_evaluation_requests:{team_id}", time_bucket_2, 1)
+            client.hincrby(f"posthog:local_evaluation_requests:sdk:{team_id}:posthog-python", time_bucket_2, 1)
+            client.hincrby(f"posthog:local_evaluation_requests:sdk:{team_id}:posthog-node", time_bucket_2, 1)
+
+            frozen_datetime.tick(datetime.timedelta(seconds=15))
+
+            capture_team_decide_usage(mock_capture, team_id, team_uuid)
+
+            mock_capture.capture.assert_called_once_with(
+                distinct_id=team_id,
+                event="local evaluation usage",
+                properties={
+                    "count": 80,
+                    "team_id": team_id,
+                    "team_uuid": team_uuid,
+                    "min_time": 1651926180,
+                    "max_time": 1651926180,
+                    "token": "token",
+                    "sdk_breakdown": {"posthog-python": 50, "posthog-node": 30},
+                },
+            )
+
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_extract_sdk_breakdown_uses_pipelining_for_all_sdks(self):
+        """
+        Verify that SDK breakdown extraction works correctly with many SDKs.
+
+        This test exercises the pipelining path by setting up data for multiple
+        SDKs and verifying all are extracted and consumed correctly.
+        """
+        client = redis.get_client()
+        team_id = 444
+
+        with freeze_time("2022-05-07 12:23:07") as frozen_datetime:
+            time_bucket_1 = "165192618"
+
+            # Set up data for multiple SDKs (simulating real-world usage)
+            test_sdks = {
+                "posthog-js": 1000,
+                "posthog-node": 500,
+                "posthog-python": 300,
+                "posthog-android": 200,
+                "posthog-ios": 150,
+                "other": 50,
+            }
+
+            for sdk, count in test_sdks.items():
+                client.hincrby(f"posthog:decide_requests:sdk:{team_id}:{sdk}", time_bucket_1, count)
+
+            # Move to second bucket - extraction requires 2+ buckets
+            frozen_datetime.tick(datetime.timedelta(seconds=10))
+            time_bucket_2 = "165192619"
+
+            for sdk in test_sdks:
+                client.hincrby(f"posthog:decide_requests:sdk:{team_id}:{sdk}", time_bucket_2, 1)
+
+            # Move time forward so bucket 2 is no longer "current"
+            frozen_datetime.tick(datetime.timedelta(seconds=15))
+
+            result = _extract_sdk_breakdown_from_redis(client, team_id, FlagRequestType.DECIDE)
+
+            # Verify all SDKs were extracted with correct counts from bucket 1
+            self.assertEqual(result, test_sdks)
+
+            # Verify bucket 1 was consumed for all SDKs, bucket 2 remains
+            for sdk in test_sdks:
+                remaining = client.hgetall(f"posthog:decide_requests:sdk:{team_id}:{sdk}")
+                self.assertEqual(remaining, {b"165192619": b"1"}, f"SDK {sdk} should only have bucket 2 remaining")
+
+    @patch("products.feature_flags.backend.flag_analytics.CACHE_BUCKET_SIZE", 10)
+    def test_extract_sdk_breakdown_handles_single_bucket_gracefully(self):
+        """
+        Verify that SDKs with only one bucket (still being filled) are not extracted.
+        """
+        client = redis.get_client()
+        team_id = 333
+
+        with freeze_time("2022-05-07 12:23:07"):
+            time_bucket = "165192618"
+
+            # Set up data with only one bucket per SDK
+            client.hincrby(f"posthog:decide_requests:sdk:{team_id}:posthog-js", time_bucket, 100)
+            client.hincrby(f"posthog:decide_requests:sdk:{team_id}:posthog-node", time_bucket, 50)
+
+            result = _extract_sdk_breakdown_from_redis(client, team_id, FlagRequestType.DECIDE)
+
+            # Should return empty dict since there's only one bucket (still being filled)
+            self.assertEqual(result, {})
+
+            # Data should still be in Redis (not consumed)
+            self.assertEqual(
+                client.hgetall(f"posthog:decide_requests:sdk:{team_id}:posthog-js"),
+                {b"165192618": b"100"},
+            )
+
+
+class TestEnrichedAnalytics(BaseTest):
+    def test_find_flags_with_enriched_analytics(self):
+        f1 = FeatureFlag.objects.create(
+            team=self.team,
+            name="Beta feature",
+            key="test_flag",
+            created_by=self.user,
+            ensure_experience_continuity=False,
+        )
+        f2 = FeatureFlag.objects.create(
+            team=self.team,
+            name="Beta feature",
+            key="beta-feature",
+            created_by=self.user,
+            ensure_experience_continuity=True,
+        )
+        f3 = FeatureFlag.objects.create(
+            team=self.team,
+            name="Beta feature",
+            key="beta-feature2",
+            created_by=self.user,
+        )
+        f4 = FeatureFlag.objects.create(
+            team=self.team,
+            name="Beta feature",
+            key="beta-feature3",
+            created_by=self.user,
+        )
+
+        # create usage dashboard for f1 and f3
+        _create_usage_dashboard(f1, self.user)
+        _create_usage_dashboard(f3, self.user)
+
+        # create some enriched analytics events
+        _create_event(
+            team=self.team,
+            distinct_id="test",
+            event="$feature_view",
+            properties={"feature_flag": "test_flag"},
+            timestamp="2021-01-01T12:00:00Z",
+        )
+        _create_event(
+            team=self.team,
+            distinct_id="test2",
+            event="$feature_view",
+            properties={"feature_flag": "test_flag"},
+            timestamp="2021-01-01T22:05:00Z",
+        )
+        # out of bounds
+        _create_event(
+            team=self.team,
+            distinct_id="test3",
+            event="$feature_view",
+            properties={"feature_flag": "test_flag"},
+            timestamp="2021-01-12T12:00:10Z",
+        )
+        # different flag
+        _create_event(
+            team=self.team,
+            distinct_id="test4",
+            event="$feature_view",
+            properties={"feature_flag": "beta-feature"},
+            timestamp="2021-01-01T12:00:00Z",
+        )
+        # non-existing flag
+        _create_event(
+            team=self.team,
+            distinct_id="test5",
+            event="$feature_view",
+            properties={"feature_flag": "non-existing-flag"},
+            timestamp="2021-01-01T12:10:00Z",
+        )
+        # incorrect event
+        _create_event(
+            team=self.team,
+            distinct_id="test6",
+            event="$pageview",
+            properties={"feature_flag": "beta-feature2"},
+            timestamp="2021-01-01T12:20:00Z",
+        )
+        # incorrect property
+        _create_event(
+            team=self.team,
+            distinct_id="test7",
+            event="$feature_view",
+            properties={"$$feature_flag": "beta-feature3"},
+            timestamp="2021-01-01T12:30:00Z",
+        )
+
+        flush_persons_and_events()
+
+        start = datetime.datetime(2021, 1, 1, 0, 0, 0)
+        end = datetime.datetime(2021, 1, 2, 0, 0, 0)
+
+        find_flags_with_enriched_analytics(start, end)
+
+        f1.refresh_from_db()
+        f2.refresh_from_db()
+        f3.refresh_from_db()
+        f4.refresh_from_db()
+
+        self.assertEqual(f1.has_enriched_analytics, True)
+        self.assertEqual(f2.has_enriched_analytics, True)
+        self.assertEqual(f3.has_enriched_analytics, False)
+        self.assertEqual(f4.has_enriched_analytics, False)
+
+        # now try deleting a usage dashboard. It should not delete the feature flag
+        assert f1.usage_dashboard is not None
+        self.assertEqual(f1.usage_dashboard.name, "Generated Dashboard: test_flag Usage")
+        self.assertEqual(f2.usage_dashboard, None)
+        assert f3.usage_dashboard is not None
+        self.assertEqual(f3.usage_dashboard.name, "Generated Dashboard: beta-feature2 Usage")
+        self.assertEqual(f4.usage_dashboard, None)
+
+        # 1 should have enriched analytics, but nothing else
+        self.assertEqual(f1.usage_dashboard_has_enriched_insights, True)
+        self.assertEqual(f2.usage_dashboard_has_enriched_insights, False)
+        self.assertEqual(f3.usage_dashboard_has_enriched_insights, False)
+        self.assertEqual(f4.usage_dashboard_has_enriched_insights, False)
+
+        self.assertEqual(f1.usage_dashboard.tiles.count(), 4)
+        self.assertEqual(f3.usage_dashboard.tiles.count(), 2)
+
+        # now try deleting a usage dashboard. It should not delete the feature flag
+        f1.usage_dashboard.delete()
+
+        f1.refresh_from_db()
+        self.assertEqual(f1.has_enriched_analytics, True)
+        self.assertEqual(f1.usage_dashboard, None)
+
+
+class TestCrossProjectEvaluations(ClickhouseTestMixin, APIBaseTest):
+    def test_returns_zero_when_no_events(self):
+        counts = get_evaluations_7d_by_team("some_key", [self.team.id])
+        assert counts == {self.team.id: 0}
+
+    def test_counts_events_by_team(self):
+        other_team = self.organization.teams.create(name="Other")
+        _create_event(
+            team=self.team,
+            distinct_id="u1",
+            event="$feature_flag_called",
+            properties={"$feature_flag": "my_flag", "$feature_flag_response": True},
+        )
+        _create_event(
+            team=self.team,
+            distinct_id="u2",
+            event="$feature_flag_called",
+            properties={"$feature_flag": "my_flag", "$feature_flag_response": False},
+        )
+        _create_event(
+            team=other_team,
+            distinct_id="u3",
+            event="$feature_flag_called",
+            properties={"$feature_flag": "my_flag", "$feature_flag_response": True},
+        )
+        _create_event(
+            team=self.team,
+            distinct_id="u4",
+            event="$feature_flag_called",
+            properties={"$feature_flag": "unrelated", "$feature_flag_response": True},
+        )
+        flush_persons_and_events()
+
+        counts = get_evaluations_7d_by_team("my_flag", [self.team.id, other_team.id])
+
+        assert counts == {self.team.id: 2, other_team.id: 1}
+
+    def test_returns_empty_dict_when_no_team_ids(self):
+        assert get_evaluations_7d_by_team("any_flag", []) == {}
+
+    def test_returns_none_when_clickhouse_fails(self):
+        with patch(
+            "products.feature_flags.backend.flag_analytics.sync_execute",
+            side_effect=RuntimeError("boom"),
+        ):
+            assert get_evaluations_7d_by_team("my_flag", [self.team.id, 99]) is None
+
+
+class TestCachedCrossProjectEvaluations(ClickhouseTestMixin, APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+
+    def test_cached_returns_same_result_on_second_call(self):
+        with patch(
+            "products.feature_flags.backend.flag_analytics.get_evaluations_7d_by_team",
+            return_value={self.team.id: 5},
+        ) as spy:
+            first = get_cached_evaluations_7d_by_team("my_flag", [self.team.id])
+            second = get_cached_evaluations_7d_by_team("my_flag", [self.team.id])
+
+        assert first == {self.team.id: 5}
+        assert second == {self.team.id: 5}
+        assert spy.call_count == 1
+
+    def test_failure_results_are_not_cached(self):
+        with patch(
+            "products.feature_flags.backend.flag_analytics.get_evaluations_7d_by_team",
+            side_effect=[None, {self.team.id: 7}],
+        ) as spy:
+            first = get_cached_evaluations_7d_by_team("my_flag", [self.team.id])
+            second = get_cached_evaluations_7d_by_team("my_flag", [self.team.id])
+
+        assert first is None
+        assert second == {self.team.id: 7}
+        assert spy.call_count == 2
+
+    def test_cached_returns_empty_dict_when_no_team_ids(self):
+        assert get_cached_evaluations_7d_by_team("any_flag", []) == {}
+
+
+class TestFlagKeyFilterSQL(BaseTest):
+    def test_falls_back_to_json_extract_when_not_materialized(self):
+        with patch(
+            "products.feature_flags.backend.flag_analytics.get_materialized_column_for_property",
+            return_value=None,
+        ):
+            sql = _flag_key_filter_sql()
+        assert "JSONExtractString(properties, '$feature_flag')" in sql
+
+    def test_uses_escaped_materialized_column_when_available(self):
+        fake_column = MagicMock()
+        fake_column.name = "mat_$feature_flag"
+        with patch(
+            "products.feature_flags.backend.flag_analytics.get_materialized_column_for_property",
+            return_value=fake_column,
+        ):
+            sql = _flag_key_filter_sql()
+        assert "`mat_$feature_flag` = %(flag_key)s" in sql
+        assert "JSONExtractString" not in sql
+
+
+class TestEnrichedFlagKeyExprSQL(BaseTest):
+    def test_falls_back_to_json_extract_when_not_materialized(self):
+        with patch(
+            "products.feature_flags.backend.flag_analytics.get_materialized_column_for_property",
+            return_value=None,
+        ):
+            sql = _enriched_flag_key_expr_sql()
+        assert sql == "JSONExtractString(properties, 'feature_flag')"
+
+    def test_uses_escaped_materialized_column_when_available(self):
+        fake_column = MagicMock()
+        fake_column.name = "mat_feature_flag"
+        fake_column.is_nullable = False
+        with patch(
+            "products.feature_flags.backend.flag_analytics.get_materialized_column_for_property",
+            return_value=fake_column,
+        ):
+            sql = _enriched_flag_key_expr_sql()
+        assert sql == "`mat_feature_flag`"
+
+    def test_coalesces_nullable_materialized_column(self):
+        fake_column = MagicMock()
+        fake_column.name = "mat_feature_flag"
+        fake_column.is_nullable = True
+        with patch(
+            "products.feature_flags.backend.flag_analytics.get_materialized_column_for_property",
+            return_value=fake_column,
+        ):
+            sql = _enriched_flag_key_expr_sql()
+        assert sql == "ifNull(`mat_feature_flag`, '')"

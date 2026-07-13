@@ -1,119 +1,206 @@
-import React from 'react'
-import { BindLogic, useActions, useValues } from 'kea'
-import { PersonModal } from './PersonModal'
-import {
-    ACTIONS_LINE_GRAPH_LINEAR,
-    ACTIONS_LINE_GRAPH_CUMULATIVE,
-    ACTIONS_TABLE,
-    ACTIONS_PIE_CHART,
-    ACTIONS_BAR_CHART,
-    ACTIONS_BAR_CHART_VALUE,
-} from 'lib/constants'
+import { useActions, useValues } from 'kea'
+import { Suspense } from 'react'
 
-import { ActionsPie, ActionsLineGraph, ActionsBarValueGraph, ActionsTable } from './viz'
-import { SaveCohortModal } from './SaveCohortModal'
-import { trendsLogic } from './trendsLogic'
-import { ViewType } from '~/types'
-import { InsightsTable } from 'scenes/insights/InsightsTable'
-import { Button } from 'antd'
-import { personsModalLogic } from './personsModalLogic'
-import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { LemonButton } from '@posthog/lemon-ui'
+
+import { WrappingLoadingSkeleton } from 'lib/ui/WrappingLoadingSkeleton/WrappingLoadingSkeleton'
+import { lazyWithRetry } from 'lib/utils/retryImport'
 import { insightLogic } from 'scenes/insights/insightLogic'
+import { BoldNumber } from 'scenes/insights/views/BoldNumber'
+import { InsightsTable } from 'scenes/insights/views/InsightsTable/InsightsTable'
+import { Metric } from 'scenes/insights/views/Metric/Metric'
+
+import { InsightVizNode } from '~/queries/schema/schema-general'
+import { QueryContext } from '~/queries/types'
+import { ChartDisplayType, InsightType } from '~/types'
+
+import { trendsDataLogic } from './trendsDataLogic'
+// Lazy-loaded viz types that are rarely used on dashboards
+const WorldMap = lazyWithRetry(() => import('scenes/insights/views/WorldMap').then((m) => ({ default: m.WorldMap })))
+const RegionMap = lazyWithRetry(() => import('scenes/insights/views/RegionMap').then((m) => ({ default: m.RegionMap })))
+const TrendsCalendarHeatMap = lazyWithRetry(() =>
+    import('scenes/insights/views/CalendarHeatMap').then((m) => ({ default: m.TrendsCalendarHeatMap }))
+)
+const BoxPlotChart = lazyWithRetry(() =>
+    import('scenes/insights/views/BoxPlot').then((m) => ({ default: m.BoxPlotChart }))
+)
+// Lazy-loaded — keep the quill/d3 slope chart out of the eager Trends/Dashboard bundle
+const TrendsSlopeChart = lazyWithRetry(() =>
+    import('products/product_analytics/frontend/insights/trends/TrendsSlopeChart/TrendsSlopeChart').then((m) => ({
+        default: m.TrendsSlopeChart,
+    }))
+)
+// Lazy-loaded — keep full d3 out of the eager Trends/Dashboard bundle
+const TrendsLineChart = lazyWithRetry(() =>
+    import('products/product_analytics/frontend/insights/trends/TrendsLineChart/TrendsLineChart').then((m) => ({
+        default: m.TrendsLineChart,
+    }))
+)
+const TrendsBarChart = lazyWithRetry(() =>
+    import('products/product_analytics/frontend/insights/trends/TrendsBarChart/TrendsBarChart').then((m) => ({
+        default: m.TrendsBarChart,
+    }))
+)
+const StickinessLineChart = lazyWithRetry(() =>
+    import('products/product_analytics/frontend/insights/stickiness/StickinessLineChart/StickinessLineChart').then(
+        (m) => ({
+            default: m.StickinessLineChart,
+        })
+    )
+)
+const StickinessBarChart = lazyWithRetry(() =>
+    import('products/product_analytics/frontend/insights/stickiness/StickinessBarChart/StickinessBarChart').then(
+        (m) => ({
+            default: m.StickinessBarChart,
+        })
+    )
+)
+const TrendsPieChart = lazyWithRetry(() =>
+    import('products/product_analytics/frontend/insights/trends/TrendsPieChart/TrendsPieChart').then((m) => ({
+        default: m.TrendsPieChart,
+    }))
+)
+const TrendsLifecycleChart = lazyWithRetry(() =>
+    import('products/product_analytics/frontend/insights/trends/TrendsLifecycleChart/TrendsLifecycleChart').then(
+        (m) => ({
+            default: m.TrendsLifecycleChart,
+        })
+    )
+)
 
 interface Props {
-    view: ViewType
+    view: InsightType
+    context?: QueryContext<InsightVizNode>
+    embedded?: boolean
+    inSharedMode?: boolean
+    editMode?: boolean
 }
 
-export function TrendInsight({ view }: Props): JSX.Element {
-    const { insightProps } = useValues(insightLogic)
-    const { cohortModalVisible } = useValues(personsModalLogic)
-    const { setCohortModalVisible } = useActions(personsModalLogic)
-    const { filters: _filters, loadMoreBreakdownUrl, breakdownValuesLoading } = useValues(trendsLogic(insightProps))
-    const { loadMoreBreakdownValues } = useActions(trendsLogic(insightProps))
-    const { showingPeople } = useValues(personsModalLogic)
-    const { saveCohortWithFilters } = useActions(personsModalLogic)
-    const { reportCohortCreatedFromPersonModal } = useActions(eventUsageLogic)
+export function TrendInsight({ view, context, embedded, inSharedMode, editMode }: Props): JSX.Element {
+    const { insightProps, showPersonsModal: insightLogicShowPersonsModal } = useValues(insightLogic)
+    const showPersonsModal = insightLogicShowPersonsModal && !inSharedMode
+
+    const { display, series, breakdownFilter, hasBreakdownMore, breakdownValuesLoading, isLifecycle, isStickiness } =
+        useValues(trendsDataLogic(insightProps))
+    const { updateBreakdownFilter } = useActions(trendsDataLogic(insightProps))
+
+    const commonProps = {
+        showPersonsModal,
+        context,
+        inCardView: embedded && !inSharedMode,
+        inSharedMode,
+    }
+
     const renderViz = (): JSX.Element | undefined => {
-        if (
-            !_filters.display ||
-            _filters.display === ACTIONS_LINE_GRAPH_LINEAR ||
-            _filters.display === ACTIONS_LINE_GRAPH_CUMULATIVE ||
-            _filters.display === ACTIONS_BAR_CHART
-        ) {
-            return <ActionsLineGraph filters={_filters} />
+        if (isLifecycle) {
+            return <TrendsLifecycleChart context={context} inSharedMode={inSharedMode} />
         }
-        if (_filters.display === ACTIONS_TABLE) {
-            if (view === ViewType.SESSIONS && _filters.session === 'dist') {
-                return <ActionsTable filters={_filters} />
+        if (
+            !display ||
+            display === ChartDisplayType.ActionsLineGraph ||
+            display === ChartDisplayType.ActionsLineGraphCumulative ||
+            display === ChartDisplayType.ActionsAreaGraph
+        ) {
+            if (isStickiness) {
+                return <StickinessLineChart context={context} />
             }
+            return <TrendsLineChart context={context} inSharedMode={inSharedMode} />
+        }
+        if (display === ChartDisplayType.ActionsBar || display === ChartDisplayType.ActionsUnstackedBar) {
+            if (isStickiness) {
+                return <StickinessBarChart context={context} />
+            }
+            return <TrendsBarChart context={context} inSharedMode={inSharedMode} embedded={embedded} />
+        }
+        if (display === ChartDisplayType.BoldNumber) {
+            return <BoldNumber {...commonProps} />
+        }
+        if (display === ChartDisplayType.Metric) {
+            return <Metric {...commonProps} />
+        }
+        if (display === ChartDisplayType.ActionsTable) {
             return (
-                <BindLogic logic={trendsLogic} props={{ dashboardItemId: null, view, filters: null }}>
-                    <InsightsTable isLegend={false} showTotalCount={view !== ViewType.SESSIONS} />
-                </BindLogic>
+                <InsightsTable
+                    embedded
+                    filterKey={`trends_${view}`}
+                    canEditSeriesNameInline={editMode}
+                    editMode={editMode}
+                    isMainInsightView={true}
+                />
             )
         }
-        if (_filters.display === ACTIONS_PIE_CHART) {
-            return <ActionsPie filters={_filters} />
+        if (display === ChartDisplayType.ActionsPie) {
+            return <TrendsPieChart context={context} inSharedMode={inSharedMode} showPersonsModal={showPersonsModal} />
         }
-        if (_filters.display === ACTIONS_BAR_CHART_VALUE) {
-            return <ActionsBarValueGraph filters={_filters} />
+        if (display === ChartDisplayType.ActionsBarValue) {
+            return <TrendsBarChart context={context} inSharedMode={inSharedMode} embedded={embedded} />
+        }
+        if (display === ChartDisplayType.WorldMap) {
+            const hasSubdivisionBreakdown =
+                breakdownFilter?.breakdowns &&
+                breakdownFilter.breakdowns.length >= 2 &&
+                breakdownFilter.breakdowns.some(
+                    (b) => b.property === '$geoip_subdivision_1_code' || b.property === '$geoip_subdivision_1_name'
+                )
+
+            if (hasSubdivisionBreakdown) {
+                return <RegionMap {...commonProps} />
+            }
+
+            return <WorldMap {...commonProps} />
+        }
+        if (display === ChartDisplayType.CalendarHeatmap) {
+            return <TrendsCalendarHeatMap {...commonProps} />
+        }
+        if (display === ChartDisplayType.BoxPlot) {
+            return <BoxPlotChart {...commonProps} inCardView={embedded} />
+        }
+        if (display === ChartDisplayType.SlopeGraph) {
+            return <TrendsSlopeChart context={context} />
         }
     }
 
     return (
         <>
-            {(_filters.actions || _filters.events || _filters.session) && (
-                <div
-                    style={{
-                        minHeight: 'calc(90vh - 16rem)',
-                        position: 'relative',
-                    }}
-                >
-                    {renderViz()}
+            {series && (
+                <div className={embedded ? 'InsightCard__viz' : `TrendsInsight TrendsInsight--${display}`}>
+                    <Suspense
+                        fallback={
+                            <WrappingLoadingSkeleton fullWidth>
+                                <span className="block w-full h-72" />
+                            </WrappingLoadingSkeleton>
+                        }
+                    >
+                        {renderViz()}
+                    </Suspense>
                 </div>
             )}
-            {_filters.breakdown && (
-                <div className="mt text-center">
-                    {loadMoreBreakdownUrl ? (
-                        <>
-                            <div className="text-muted mb">
-                                For readability, <b>not all breakdown values are displayed</b>. Click below to load
-                                them.
-                            </div>
-                            <div>
-                                <Button
-                                    style={{ textAlign: 'center' }}
-                                    onClick={loadMoreBreakdownValues}
-                                    loading={breakdownValuesLoading}
-                                >
-                                    Load more breakdown values
-                                </Button>
-                            </div>
-                        </>
-                    ) : (
-                        <span className="text-muted">
-                            Showing <b>all breakdown values</b>
-                        </span>
-                    )}
-                </div>
-            )}
-            <PersonModal
-                visible={showingPeople && !cohortModalVisible}
-                view={view}
-                filters={_filters}
-                onSaveCohort={() => {
-                    setCohortModalVisible(true)
-                }}
-            />
-            <SaveCohortModal
-                visible={cohortModalVisible}
-                onOk={(title: string) => {
-                    saveCohortWithFilters(title, _filters)
-                    setCohortModalVisible(false)
-                    reportCohortCreatedFromPersonModal(_filters)
-                }}
-                onCancel={() => setCohortModalVisible(false)}
-            />
+            {!embedded &&
+                display !== ChartDisplayType.WorldMap && // the world map doesn't need this cta
+                display !== ChartDisplayType.CalendarHeatmap && // the heatmap doesn't need this cta
+                display !== ChartDisplayType.BoxPlot && // box plot doesn't support breakdowns
+                breakdownFilter &&
+                hasBreakdownMore && (
+                    <div className="p-4">
+                        <div className="text-secondary">
+                            Breakdown limited to {breakdownFilter.breakdown_limit || 25} - more available
+                            <LemonButton
+                                onClick={() =>
+                                    updateBreakdownFilter({
+                                        ...breakdownFilter,
+                                        breakdown_limit: (breakdownFilter.breakdown_limit || 25) * 2,
+                                    })
+                                }
+                                loading={breakdownValuesLoading}
+                                size="xsmall"
+                                type="secondary"
+                                className="inline-block ml-2"
+                            >
+                                Set to {(breakdownFilter.breakdown_limit || 25) * 2}
+                            </LemonButton>
+                        </div>
+                    </div>
+                )}
         </>
     )
 }

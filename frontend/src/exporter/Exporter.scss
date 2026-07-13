@@ -1,0 +1,71 @@
+@import '../styles/mixins';
+@import '../styles/global';
+
+body.ExporterBody {
+    overflow: initial;
+}
+
+.Exporter {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    padding: 1rem;
+
+    &--recording {
+        height: 100vh;
+        max-height: 100vh;
+    }
+
+    &--heatmap {
+        padding: 0;
+
+        ::-webkit-scrollbar {
+            display: none;
+        }
+    }
+
+    .SharedDashboard-header {
+        .SharedDashboard-header-team {
+            margin-top: 0.25rem;
+        }
+
+        @include screen($md) {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+            justify-content: space-between;
+
+            .SharedDashboard-header-title {
+                max-width: 50%;
+                text-align: center;
+            }
+
+            .SharedDashboard-header-team {
+                margin-top: 0;
+            }
+        }
+    }
+}
+
+html.export-type-image {
+    // We don't want scrollbars to show in image captures
+    ::-webkit-scrollbar {
+        display: none;
+    }
+
+    body {
+        // Put our bundled fonts high on the list so rendered images are the same no matter which platform renders them.
+        font-family:
+            'Emoji Flags Polyfill', RoundHog, Inter, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif,
+            'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';
+    }
+}
+
+html.export-type-embed {
+    overflow: hidden;
+    overflow-y: auto;
+
+    .Exporter {
+        padding: 0;
+    }
+}
